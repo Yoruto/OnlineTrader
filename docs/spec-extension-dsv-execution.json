@@ -1,0 +1,10 @@
+{
+  "extension_id": "OT-DSV-EXECUTION-1.2",
+  "extends": "OT-DSV-PROTECTION-1.1",
+  "scope": "DEVELOPMENT_INTERNAL_ONLY",
+  "legacy_resources_unchanged": true,
+  "resources": {
+    "protection-plan-v1.2.schema.json": "3021fd58909e01fc30b695714b0e6eadcdb32946a154a0465995995e4c9f76e3"
+  },
+  "reason": "Explicit SDK price-worsening cancel/reprice and source session close timing need an independent execution policy; previous plans remain immutable."
+}

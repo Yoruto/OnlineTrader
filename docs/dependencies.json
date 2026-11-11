@@ -1,0 +1,149 @@
+[
+  {
+    "name": "attrs",
+    "version": "26.1.0",
+    "license_expression": "MIT",
+    "license": null,
+    "project_urls": [
+      "Documentation, https://www.attrs.org/",
+      "Changelog, https://www.attrs.org/en/stable/changelog.html",
+      "GitHub, https://github.com/python-attrs/attrs",
+      "Funding, https://github.com/sponsors/hynek",
+      "Tidelift, https://tidelift.com/subscription/pkg/pypi-attrs?utm_source=pypi-attrs&utm_medium=pypi"
+    ]
+  },
+  {
+    "name": "jsonschema",
+    "version": "4.26.0",
+    "license_expression": "MIT",
+    "license": null,
+    "project_urls": [
+      "Homepage, https://github.com/python-jsonschema/jsonschema",
+      "Documentation, https://python-jsonschema.readthedocs.io/",
+      "Issues, https://github.com/python-jsonschema/jsonschema/issues/",
+      "Funding, https://github.com/sponsors/Julian",
+      "Tidelift, https://tidelift.com/subscription/pkg/pypi-jsonschema?utm_source=pypi-jsonschema&utm_medium=referral&utm_campaign=pypi-link",
+      "Changelog, https://github.com/python-jsonschema/jsonschema/blob/main/CHANGELOG.rst",
+      "Source, https://github.com/python-jsonschema/jsonschema"
+    ]
+  },
+  {
+    "name": "jsonschema-specifications",
+    "version": "2025.9.1",
+    "license_expression": "MIT",
+    "license": null,
+    "project_urls": [
+      "Documentation, https://jsonschema-specifications.readthedocs.io/",
+      "Homepage, https://github.com/python-jsonschema/jsonschema-specifications",
+      "Issues, https://github.com/python-jsonschema/jsonschema-specifications/issues/",
+      "Funding, https://github.com/sponsors/Julian",
+      "Tidelift, https://tidelift.com/subscription/pkg/pypi-jsonschema-specifications?utm_source=pypi-jsonschema-specifications&utm_medium=referral&utm_campaign=pypi-link",
+      "Source, https://github.com/python-jsonschema/jsonschema-specifications"
+    ]
+  },
+  {
+    "name": "referencing",
+    "version": "0.37.0",
+    "license_expression": "MIT",
+    "license": null,
+    "project_urls": [
+      "Documentation, https://referencing.readthedocs.io/",
+      "Homepage, https://github.com/python-jsonschema/referencing",
+      "Issues, https://github.com/python-jsonschema/referencing/issues/",
+      "Funding, https://github.com/sponsors/Julian",
+      "Tidelift, https://tidelift.com/subscription/pkg/pypi-referencing?utm_source=pypi-referencing&utm_medium=referral&utm_campaign=pypi-link",
+      "Changelog, https://referencing.readthedocs.io/en/stable/changes/",
+      "Source, https://github.com/python-jsonschema/referencing"
+    ]
+  },
+  {
+    "name": "rpds-py",
+    "version": "2026.9.1",
+    "license_expression": "MIT",
+    "license": null,
+    "project_urls": [
+      "Documentation, https://rpds.readthedocs.io/",
+      "Funding, https://github.com/sponsors/Julian",
+      "Homepage, https://github.com/crate-py/rpds",
+      "Issues, https://github.com/crate-py/rpds/issues/",
+      "Source, https://github.com/crate-py/rpds",
+      "Tidelift, https://tidelift.com/subscription/pkg/pypi-rpds-py?utm_source=pypi-rpds-py&utm_medium=referral&utm_campaign=pypi-link",
+      "Upstream, https://github.com/orium/rpds"
+    ]
+  },
+  {
+    "name": "PySide6",
+    "version": "6.8.2.1",
+    "license_expression": null,
+    "license": "LGPL",
+    "project_urls": [
+      "Homepage, https://pyside.org",
+      "Documentation, https://doc.qt.io/qtforpython",
+      "Repository, https://code.qt.io/cgit/pyside/pyside-setup.git/",
+      "Changelog, https://code.qt.io/cgit/pyside/pyside-setup.git/tree/doc/changelogs",
+      "Tracker, https://bugreports.qt.io/projects/PYSIDE"
+    ]
+  },
+  {
+    "name": "PySide6-Addons",
+    "version": "6.8.2.1",
+    "license_expression": null,
+    "license": "LGPL",
+    "project_urls": [
+      "Homepage, https://pyside.org",
+      "Documentation, https://doc.qt.io/qtforpython",
+      "Repository, https://code.qt.io/cgit/pyside/pyside-setup.git/",
+      "Changelog, https://code.qt.io/cgit/pyside/pyside-setup.git/tree/doc/changelogs",
+      "Tracker, https://bugreports.qt.io/projects/PYSIDE"
+    ]
+  },
+  {
+    "name": "PySide6-Essentials",
+    "version": "6.8.2.1",
+    "license_expression": null,
+    "license": "LGPL",
+    "project_urls": [
+      "Homepage, https://pyside.org",
+      "Documentation, https://doc.qt.io/qtforpython",
+      "Repository, https://code.qt.io/cgit/pyside/pyside-setup.git/",
+      "Changelog, https://code.qt.io/cgit/pyside/pyside-setup.git/tree/doc/changelogs",
+      "Tracker, https://bugreports.qt.io/projects/PYSIDE"
+    ]
+  },
+  {
+    "name": "shiboken6",
+    "version": "6.8.2.1",
+    "license_expression": null,
+    "license": "LGPL",
+    "project_urls": [
+      "Homepage, https://pyside.org",
+      "Documentation, https://doc.qt.io/qtforpython",
+      "Repository, https://code.qt.io/cgit/pyside/pyside-setup.git/",
+      "Changelog, https://code.qt.io/cgit/pyside/pyside-setup.git/tree/doc/changelogs",
+      "Tracker, https://bugreports.qt.io/projects/PYSIDE"
+    ]
+  },
+  {
+    "name": "setuptools",
+    "version": "84.0.0",
+    "license_expression": "MIT",
+    "license": null,
+    "project_urls": [
+      "Source, https://github.com/pypa/setuptools",
+      "Documentation, https://setuptools.pypa.io/",
+      "Changelog, https://setuptools.pypa.io/en/stable/history.html"
+    ]
+  },
+  {
+    "name": "wheel",
+    "version": "0.45.1",
+    "license_expression": null,
+    "license": null,
+    "project_urls": [
+      "Changelog, https://wheel.readthedocs.io/en/stable/news.html",
+      "Documentation, https://wheel.readthedocs.io/",
+      "Issue Tracker, https://github.com/pypa/wheel/issues",
+      "Source, https://github.com/pypa/wheel"
+    ]
+  }
+]

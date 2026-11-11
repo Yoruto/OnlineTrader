@@ -1,0 +1,226 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "protocol_version": {
+      "const": "1.0"
+    },
+    "type": {
+      "enum": [
+        "WorkbenchRequest",
+        "WorkbenchSnapshot"
+      ]
+    },
+    "message_id": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"
+    },
+    "connection_id": {
+      "anyOf": [
+        {
+          "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "correlation_id": {
+      "anyOf": [
+        {
+          "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sent_at_utc": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/utc"
+    },
+    "kernel_boot_id": {
+      "anyOf": [
+        {
+          "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "account_key": {
+      "anyOf": [
+        {
+          "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "body": {}
+  },
+  "required": [
+    "protocol_version",
+    "type",
+    "message_id",
+    "connection_id",
+    "correlation_id",
+    "sent_at_utc",
+    "kernel_boot_id",
+    "account_key",
+    "body"
+  ],
+  "additionalProperties": false,
+  "$id": "https://schemas.onlinetrader.invalid/dev18/workbench-ipc.schema.json",
+  "title": "Read-only workbench extension; no inbound broker facts",
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "const": "WorkbenchRequest"
+            },
+            "body": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "WorkbenchSnapshot"
+            },
+            "body": {
+              "type": "object",
+              "properties": {
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "view_schema": {
+                      "const": "workbench/1"
+                    },
+                    "account_key": {
+                      "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"
+                    },
+                    "kernel_boot_id": {
+                      "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"
+                    },
+                    "checkpoint_event_seq": {
+                      "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/seq"
+                    },
+                    "entry_authority": {
+                      "enum": [
+                        "ARMED",
+                        "DISARMED"
+                      ]
+                    },
+                    "execution_scope": {
+                      "type": "string",
+                      "maxLength": 256
+                    },
+                    "connection": {
+                      "type": "object"
+                    },
+                    "configuration": {
+                      "type": "object"
+                    },
+                    "markets": {
+                      "type": "array",
+                      "maxItems": 512,
+                      "items": {
+                        "type": "object",
+                        "maxProperties": 64
+                      }
+                    },
+                    "cycles": {
+                      "type": "array",
+                      "maxItems": 512,
+                      "items": {
+                        "type": "object",
+                        "maxProperties": 64
+                      }
+                    },
+                    "orders": {
+                      "type": "array",
+                      "maxItems": 512,
+                      "items": {
+                        "type": "object",
+                        "maxProperties": 64
+                      }
+                    },
+                    "trades": {
+                      "type": "array",
+                      "maxItems": 512,
+                      "items": {
+                        "type": "object",
+                        "maxProperties": 64
+                      }
+                    },
+                    "blocks": {
+                      "type": "array",
+                      "maxItems": 512,
+                      "items": {
+                        "type": "object",
+                        "maxProperties": 64
+                      }
+                    },
+                    "commands": {
+                      "type": "array",
+                      "maxItems": 512,
+                      "items": {
+                        "type": "object",
+                        "maxProperties": 64
+                      }
+                    },
+                    "policies": {
+                      "type": "array",
+                      "maxItems": 512,
+                      "items": {
+                        "type": "object",
+                        "maxProperties": 64
+                      }
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "view_schema",
+                    "account_key",
+                    "kernel_boot_id",
+                    "checkpoint_event_seq",
+                    "entry_authority",
+                    "execution_scope",
+                    "connection",
+                    "configuration",
+                    "markets",
+                    "cycles",
+                    "orders",
+                    "trades",
+                    "blocks",
+                    "commands",
+                    "policies",
+                    "truncated"
+                  ],
+                  "additionalProperties": false
+                },
+                "content_hash": {
+                  "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/hash"
+                }
+              },
+              "required": [
+                "payload",
+                "content_hash"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

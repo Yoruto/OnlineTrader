@@ -1,0 +1,61 @@
+{
+  "version": "0.1.0.dev19",
+  "sdk_version": "3.10.4",
+  "method": "READ_ONLY_STATIC_SOURCE_NO_SDK_IMPORT_OR_CONNECTION",
+  "sources": [
+    {
+      "path": "E:\\online-trader\\output\\online\\sdk-venv\\Lib\\site-packages\\tqsdk\\objs.py",
+      "sha256": "e348cccd0da94559a19fcb771b0942d8424d8adcb99bb0291e3b61b062558bdc",
+      "locations": {
+        "self.insert_date_time: int": [
+          492,
+          877
+        ],
+        "self.trade_date_time: int": [
+          545,
+          924
+        ],
+        "OPEN=开仓, CLOSE=平仓, CLOSETODAY=平今": [
+          475,
+          538
+        ]
+      },
+      "interpretation": "Native order/trade nanosecond fields and offset spellings"
+    },
+    {
+      "path": "E:\\online-trader\\output\\online\\sdk-venv\\Lib\\site-packages\\tqsdk\\api.py",
+      "sha256": "3b822aa7acd3212ccb22f0a64679e1bc232c462ede75ca50eff7375ce57efd36",
+      "locations": {
+        "def get_order(": [
+          1794
+        ],
+        "def get_trade(": [
+          1856
+        ],
+        "用户当前交易日所有成交记录": [
+          1871
+        ]
+      },
+      "interpretation": "Current snapshot is not a historical-day backfill API"
+    },
+    {
+      "path": "E:\\online-trader\\output\\online\\sdk-venv\\Lib\\site-packages\\tqsdk\\lib\\target_pos_task.py",
+      "sha256": "c2f4d06e2223542d3d25972139bdd457830b6fdc57d5f50a305ae581547f4a80",
+      "locations": {
+        "先平当日新开仓，再平历史仓": [
+          132
+        ],
+        "def _get_order(": [
+          349
+        ],
+        "if self._exchange == \"SHFE\" or self._exchange == \"INE\":": [
+          364,
+          379
+        ]
+      },
+      "interpretation": "Separated close offsets; combined offsets consume today first; independent of money FIFO"
+    }
+  ],
+  "calendar_provenance": "ORIGINAL_SCOPE_BOUND_EXPLICIT_INPUT_NOT_AUTHORITY_DOWNLOAD",
+  "historical_day_completeness": "NOT_PROVED_BY_GET_TRADE_CURRENT_DAY_COLLECTION"
+}

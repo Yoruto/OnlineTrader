@@ -1,0 +1,3 @@
+# Exact versions validated for CPython 3.13.15 Windows x64
+setuptools==84.0.0
+wheel==0.45.1

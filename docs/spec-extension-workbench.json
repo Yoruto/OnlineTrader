@@ -1,0 +1,7 @@
+{
+  "version": "WORKBENCH_READ/1",
+  "resources": {
+    "workbench-ipc.schema.json": "b16b9c57b8b4426caaec6377e737ff401947d7f6ec465feaa6bd06430df5d9c6"
+  },
+  "note": "Read-only workbench extension only; original G0 and protection resources unchanged."
+}

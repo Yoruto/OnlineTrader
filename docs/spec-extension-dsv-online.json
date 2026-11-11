@@ -1,0 +1,7 @@
+{
+  "version": "DSV_ONLINE_SIMULATION/1",
+  "resources": {
+    "protection-plan-v1.3.schema.json": "46011de11d9a3b28b1f8234b7e620b92fd1254bbf8f3353b45978133ecb03a17"
+  },
+  "note": "New resource only; original G0, 1.1 and 1.2 bytes unchanged."
+}

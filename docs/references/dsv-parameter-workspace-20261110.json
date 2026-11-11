@@ -1,0 +1,637 @@
+{
+  "gui_sha256": "07c82c9ada765284ed5a929227024cbf192f5f72192636900740d9a5764032ea",
+  "method": "marshal/dis static constants only; no reference code evaluation",
+  "template_save_keys": [
+    "max_volume",
+    "max_risk_ratio",
+    "max_daily_orders",
+    "max_net_loss_stops",
+    "close_before_seconds",
+    "trailing_activate_ratio",
+    "trailing_pullback_ratio",
+    "stop_day_on_trailing",
+    "manual_close_day_stop",
+    "stale_close_day_stop",
+    "aggressive_mode",
+    "passive_entry_first",
+    "auto_start_on_launch",
+    "risk_per_trade_ratio",
+    "stale_force_close_seconds",
+    "risk_reference_equity",
+    "night_session_close",
+    "entry_slip_ratio",
+    "chase_window_minutes",
+    "chase_slip_ratio",
+    "chase_base_now",
+    "min_one_lot_fallback",
+    "stop_cooldown_enabled",
+    "stop_cooldown_minutes",
+    "require_trigger_update",
+    "max_symbols_enabled",
+    "rollover_stop_enabled",
+    "no_open_after_open",
+    "no_open_after_open_minutes",
+    "max_symbols_on",
+    "total_margin_cap",
+    "no_open_before_close_minutes",
+    "position_sync_seconds"
+  ],
+  "symbol_aliases": {
+    "铜": [
+      "SHFE",
+      "cu"
+    ],
+    "CU": [
+      "SHFE",
+      "cu"
+    ],
+    "铝": [
+      "SHFE",
+      "al"
+    ],
+    "AL": [
+      "SHFE",
+      "al"
+    ],
+    "锌": [
+      "SHFE",
+      "zn"
+    ],
+    "ZN": [
+      "SHFE",
+      "zn"
+    ],
+    "铅": [
+      "SHFE",
+      "pb"
+    ],
+    "PB": [
+      "SHFE",
+      "pb"
+    ],
+    "镍": [
+      "SHFE",
+      "ni"
+    ],
+    "NI": [
+      "SHFE",
+      "ni"
+    ],
+    "锡": [
+      "SHFE",
+      "sn"
+    ],
+    "SN": [
+      "SHFE",
+      "sn"
+    ],
+    "黄金": [
+      "SHFE",
+      "au"
+    ],
+    "AU": [
+      "SHFE",
+      "au"
+    ],
+    "白银": [
+      "SHFE",
+      "ag"
+    ],
+    "AG": [
+      "SHFE",
+      "ag"
+    ],
+    "螺纹钢": [
+      "SHFE",
+      "rb"
+    ],
+    "螺纹": [
+      "SHFE",
+      "rb"
+    ],
+    "RB": [
+      "SHFE",
+      "rb"
+    ],
+    "热卷": [
+      "SHFE",
+      "hc"
+    ],
+    "HC": [
+      "SHFE",
+      "hc"
+    ],
+    "沥青": [
+      "SHFE",
+      "bu"
+    ],
+    "BU": [
+      "SHFE",
+      "bu"
+    ],
+    "燃料油": [
+      "SHFE",
+      "fu"
+    ],
+    "FU": [
+      "SHFE",
+      "fu"
+    ],
+    "橡胶": [
+      "SHFE",
+      "ru"
+    ],
+    "RU": [
+      "SHFE",
+      "ru"
+    ],
+    "纸浆": [
+      "SHFE",
+      "sp"
+    ],
+    "SP": [
+      "SHFE",
+      "sp"
+    ],
+    "不锈钢": [
+      "SHFE",
+      "ss"
+    ],
+    "SS": [
+      "SHFE",
+      "ss"
+    ],
+    "氧化铝": [
+      "SHFE",
+      "ao"
+    ],
+    "AO": [
+      "SHFE",
+      "ao"
+    ],
+    "豆一": [
+      "DCE",
+      "a"
+    ],
+    "A": [
+      "DCE",
+      "a"
+    ],
+    "豆二": [
+      "DCE",
+      "b"
+    ],
+    "B": [
+      "DCE",
+      "b"
+    ],
+    "豆粕": [
+      "DCE",
+      "m"
+    ],
+    "M": [
+      "DCE",
+      "m"
+    ],
+    "豆油": [
+      "DCE",
+      "y"
+    ],
+    "Y": [
+      "DCE",
+      "y"
+    ],
+    "棕榈油": [
+      "DCE",
+      "p"
+    ],
+    "棕榈": [
+      "DCE",
+      "p"
+    ],
+    "P": [
+      "DCE",
+      "p"
+    ],
+    "玉米": [
+      "DCE",
+      "c"
+    ],
+    "C": [
+      "DCE",
+      "c"
+    ],
+    "淀粉": [
+      "DCE",
+      "cs"
+    ],
+    "CS": [
+      "DCE",
+      "cs"
+    ],
+    "鸡蛋": [
+      "DCE",
+      "jd"
+    ],
+    "JD": [
+      "DCE",
+      "jd"
+    ],
+    "生猪": [
+      "DCE",
+      "lh"
+    ],
+    "LH": [
+      "DCE",
+      "lh"
+    ],
+    "塑料": [
+      "DCE",
+      "l"
+    ],
+    "L": [
+      "DCE",
+      "l"
+    ],
+    "PVC": [
+      "DCE",
+      "v"
+    ],
+    "V": [
+      "DCE",
+      "v"
+    ],
+    "聚丙烯": [
+      "DCE",
+      "pp"
+    ],
+    "PP": [
+      "DCE",
+      "pp"
+    ],
+    "乙二醇": [
+      "DCE",
+      "eg"
+    ],
+    "EG": [
+      "DCE",
+      "eg"
+    ],
+    "苯乙烯": [
+      "DCE",
+      "eb"
+    ],
+    "EB": [
+      "DCE",
+      "eb"
+    ],
+    "液化石油气": [
+      "DCE",
+      "pg"
+    ],
+    "PG": [
+      "DCE",
+      "pg"
+    ],
+    "焦炭": [
+      "DCE",
+      "j"
+    ],
+    "J": [
+      "DCE",
+      "j"
+    ],
+    "焦煤": [
+      "DCE",
+      "jm"
+    ],
+    "JM": [
+      "DCE",
+      "jm"
+    ],
+    "铁矿石": [
+      "DCE",
+      "i"
+    ],
+    "I": [
+      "DCE",
+      "i"
+    ],
+    "原木": [
+      "DCE",
+      "lg"
+    ],
+    "LG": [
+      "DCE",
+      "lg"
+    ],
+    "PTA": [
+      "CZCE",
+      "TA"
+    ],
+    "精对苯二甲酸": [
+      "CZCE",
+      "TA"
+    ],
+    "TA": [
+      "CZCE",
+      "TA"
+    ],
+    "菜油": [
+      "CZCE",
+      "OI"
+    ],
+    "菜籽油": [
+      "CZCE",
+      "OI"
+    ],
+    "OI": [
+      "CZCE",
+      "OI"
+    ],
+    "白糖": [
+      "CZCE",
+      "SR"
+    ],
+    "SR": [
+      "CZCE",
+      "SR"
+    ],
+    "棉花": [
+      "CZCE",
+      "CF"
+    ],
+    "CF": [
+      "CZCE",
+      "CF"
+    ],
+    "棉纱": [
+      "CZCE",
+      "CY"
+    ],
+    "CY": [
+      "CZCE",
+      "CY"
+    ],
+    "甲醇": [
+      "CZCE",
+      "MA"
+    ],
+    "MA": [
+      "CZCE",
+      "MA"
+    ],
+    "玻璃": [
+      "CZCE",
+      "FG"
+    ],
+    "FG": [
+      "CZCE",
+      "FG"
+    ],
+    "纯碱": [
+      "CZCE",
+      "SA"
+    ],
+    "SA": [
+      "CZCE",
+      "SA"
+    ],
+    "动力煤": [
+      "CZCE",
+      "ZC"
+    ],
+    "ZC": [
+      "CZCE",
+      "ZC"
+    ],
+    "菜粕": [
+      "CZCE",
+      "RM"
+    ],
+    "RM": [
+      "CZCE",
+      "RM"
+    ],
+    "苹果": [
+      "CZCE",
+      "AP"
+    ],
+    "AP": [
+      "CZCE",
+      "AP"
+    ],
+    "红枣": [
+      "CZCE",
+      "CJ"
+    ],
+    "CJ": [
+      "CZCE",
+      "CJ"
+    ],
+    "花生": [
+      "CZCE",
+      "PK"
+    ],
+    "PK": [
+      "CZCE",
+      "PK"
+    ],
+    "硅铁": [
+      "CZCE",
+      "SF"
+    ],
+    "SF": [
+      "CZCE",
+      "SF"
+    ],
+    "锰硅": [
+      "CZCE",
+      "SM"
+    ],
+    "SM": [
+      "CZCE",
+      "SM"
+    ],
+    "尿素": [
+      "CZCE",
+      "UR"
+    ],
+    "UR": [
+      "CZCE",
+      "UR"
+    ],
+    "短纤": [
+      "CZCE",
+      "PF"
+    ],
+    "PF": [
+      "CZCE",
+      "PF"
+    ],
+    "烧碱": [
+      "CZCE",
+      "SH"
+    ],
+    "SH": [
+      "CZCE",
+      "SH"
+    ],
+    "对二甲苯": [
+      "CZCE",
+      "PX"
+    ],
+    "PX": [
+      "CZCE",
+      "PX"
+    ],
+    "沪深300": [
+      "CFFEX",
+      "IF"
+    ],
+    "IF": [
+      "CFFEX",
+      "IF"
+    ],
+    "上证50": [
+      "CFFEX",
+      "IH"
+    ],
+    "IH": [
+      "CFFEX",
+      "IH"
+    ],
+    "中证500": [
+      "CFFEX",
+      "IC"
+    ],
+    "IC": [
+      "CFFEX",
+      "IC"
+    ],
+    "中证1000": [
+      "CFFEX",
+      "IM"
+    ],
+    "IM": [
+      "CFFEX",
+      "IM"
+    ],
+    "十年国债": [
+      "CFFEX",
+      "T"
+    ],
+    "T": [
+      "CFFEX",
+      "T"
+    ],
+    "五年国债": [
+      "CFFEX",
+      "TF"
+    ],
+    "TF": [
+      "CFFEX",
+      "TF"
+    ],
+    "二年国债": [
+      "CFFEX",
+      "TS"
+    ],
+    "TS": [
+      "CFFEX",
+      "TS"
+    ],
+    "三十国债": [
+      "CFFEX",
+      "TL"
+    ],
+    "TL": [
+      "CFFEX",
+      "TL"
+    ],
+    "原油": [
+      "INE",
+      "sc"
+    ],
+    "SC": [
+      "INE",
+      "sc"
+    ],
+    "20号胶": [
+      "INE",
+      "nr"
+    ],
+    "NR": [
+      "INE",
+      "nr"
+    ],
+    "低硫燃油": [
+      "INE",
+      "lu"
+    ],
+    "LU": [
+      "INE",
+      "lu"
+    ],
+    "国际铜": [
+      "INE",
+      "bc"
+    ],
+    "BC": [
+      "INE",
+      "bc"
+    ],
+    "集运指数": [
+      "INE",
+      "ec"
+    ],
+    "EC": [
+      "INE",
+      "ec"
+    ],
+    "工业硅": [
+      "GFEX",
+      "si"
+    ],
+    "SI": [
+      "GFEX",
+      "si"
+    ],
+    "碳酸锂": [
+      "GFEX",
+      "lc"
+    ],
+    "LC": [
+      "GFEX",
+      "lc"
+    ],
+    "多晶硅": [
+      "GFEX",
+      "ps"
+    ],
+    "PS": [
+      "GFEX",
+      "ps"
+    ]
+  },
+  "source_executable_sha256": "aabeafd83d265ab9b1cf5cc3fd0e9b0f21963ddcc95daa70feefc209997269a3",
+  "functions": {
+    "save_template": "App.on_save_template:15119-15169",
+    "apply_template": "App.on_apply_template:15171-15267",
+    "delete_template": "App.on_delete_template:15269-15282",
+    "import_symbols": "App.on_import_symbols:14980-15057",
+    "export_symbols": "App.on_export_symbols:15059-15117",
+    "aliases": "SYMBOL_ALIAS:3060-3130"
+  },
+  "csv_headers": [
+    "品种名",
+    "合约代码",
+    "开仓偏移",
+    "止损偏移",
+    "止盈偏移",
+    "下单手数",
+    "半仓比例",
+    "滞回点"
+  ],
+  "scope": "Static data facts only. No reference code, SDK, private settings or account execution imported."
+}

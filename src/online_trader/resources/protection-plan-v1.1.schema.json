@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.onlinetrader.invalid/development/protection-plan-v1.1.schema.json",
+  "title": "OnlineTrader DSV ProtectionPlan 1.1",
+  "description": "Internal DEVELOPMENT DSV protection extension. G0 1.0 remains immutable; this version grants no broker or IPC authority.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "plan_revision",
+    "account_key",
+    "position_cycle_id",
+    "contract_id",
+    "trading_day",
+    "direction",
+    "theoretical_entry_price",
+    "initial_open_quantity",
+    "rule_set_id",
+    "config_revision",
+    "config_hash",
+    "execution_scope",
+    "approval_record_id",
+    "market_quality_policy_id",
+    "price_field",
+    "fixed_stop_loss",
+    "fixed_take_profit",
+    "profit_protection",
+    "trailing_stop",
+    "partial_reduction",
+    "close_session",
+    "slippage_exit",
+    "data_gap_exit",
+    "emergency_exit",
+    "execution_policy"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.1"
+    },
+    "plan_id": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/plan_id"
+    },
+    "plan_revision": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/plan_revision"
+    },
+    "account_key": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/account_key"
+    },
+    "position_cycle_id": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/position_cycle_id"
+    },
+    "contract_id": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/contract_id"
+    },
+    "trading_day": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/trading_day"
+    },
+    "direction": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/direction"
+    },
+    "theoretical_entry_price": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/theoretical_entry_price"
+    },
+    "initial_open_quantity": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/initial_open_quantity"
+    },
+    "rule_set_id": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/rule_set_id"
+    },
+    "config_revision": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/config_revision"
+    },
+    "config_hash": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/config_hash"
+    },
+    "execution_scope": {
+      "const": "DEVELOPMENT"
+    },
+    "approval_record_id": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/approval_record_id"
+    },
+    "market_quality_policy_id": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/market_quality_policy_id"
+    },
+    "price_field": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/price_field"
+    },
+    "fixed_stop_loss": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/fixed_stop_loss"
+    },
+    "fixed_take_profit": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/fixed_take_profit"
+    },
+    "profit_protection": {
+      "oneOf": [
+        {
+          "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/trailing_stop/oneOf/0"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "activation_ratio",
+            "floor_ratio",
+            "block_new_for_trading_day"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "activation_ratio": {
+              "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/ratio"
+            },
+            "floor_ratio": {
+              "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/ratio"
+            },
+            "block_new_for_trading_day": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "trailing_stop": {
+      "oneOf": [
+        {
+          "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/trailing_stop/oneOf/0"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "activation_ratio",
+            "drawdown_mode",
+            "drawdown_value",
+            "block_new_for_trading_day"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "activation_ratio": {
+              "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/ratio"
+            },
+            "drawdown_mode": {
+              "const": "DSV_MAX_TP_AND_PEAK_RATIO"
+            },
+            "drawdown_value": {
+              "oneOf": [
+                {
+                  "const": "0"
+                },
+                {
+                  "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/ratio"
+                }
+              ]
+            },
+            "block_new_for_trading_day": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "partial_reduction": {
+      "oneOf": [
+        {
+          "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/trailing_stop/oneOf/0"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "first_trigger_ratio",
+            "quantity_rule",
+            "q0_freeze_policy",
+            "second_stage",
+            "break_even"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "first_trigger_ratio": {
+              "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/ratio"
+            },
+            "quantity_rule": {
+              "const": "DSV_ROUND_HALF_CURRENT"
+            },
+            "q0_freeze_policy": {
+              "const": "ENTRY_TERMINAL_AND_RECONCILED"
+            },
+            "second_stage": {
+              "oneOf": [
+                {
+                  "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/trailing_stop/oneOf/0"
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "enabled",
+                    "trigger_ratio"
+                  ],
+                  "properties": {
+                    "enabled": {
+                      "const": true
+                    },
+                    "trigger_ratio": {
+                      "type": "string",
+                      "maxLength": 32,
+                      "pattern": "^(0|[1-9])(?:\\.[0-9]{0,12}[1-9])?$",
+                      "not": {
+                        "const": "0"
+                      },
+                      "description": "Derived canonical positive ratio, up to 13 fractional places for exact 1.5 times a 12-place source ratio. Semantic check also requires below 1.5."
+                    }
+                  }
+                }
+              ]
+            },
+            "break_even": {
+              "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/break_even"
+            }
+          }
+        }
+      ]
+    },
+    "close_session": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/close_session"
+    },
+    "slippage_exit": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/slippage_exit"
+    },
+    "data_gap_exit": {
+      "oneOf": [
+        {
+          "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/trailing_stop/oneOf/0"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "data_quality_policy_id",
+            "active_trading_gap_ms",
+            "missing_legal_price_action",
+            "block_new_for_trading_day"
+          ],
+          "properties": {
+            "enabled": {
+              "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/data_gap_exit/oneOf/1/properties/enabled"
+            },
+            "data_quality_policy_id": {
+              "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/data_gap_exit/oneOf/1/properties/data_quality_policy_id"
+            },
+            "active_trading_gap_ms": {
+              "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/data_gap_exit/oneOf/1/properties/active_trading_gap_ms"
+            },
+            "missing_legal_price_action": {
+              "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/$defs/data_gap_exit/oneOf/1/properties/missing_legal_price_action"
+            },
+            "block_new_for_trading_day": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "emergency_exit": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/emergency_exit"
+    },
+    "execution_policy": {
+      "$ref": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json#/properties/execution_policy"
+    }
+  }
+}

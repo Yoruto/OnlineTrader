@@ -1,0 +1,195 @@
+{
+  "record_id": "OT-B-DSV-SNAPSHOT-20261109",
+  "observed_at_utc": "2026-11-09T07:54:42.514487+00:00",
+  "purpose": "read-only business-setting reference for user confirmation; not runtime configuration",
+  "status": "SOURCE_SNAPSHOT_ONLY",
+  "runtime_observed": false,
+  "broker_connected": false,
+  "included_sections": [
+    "trade",
+    "auto_offset",
+    "schedule",
+    "symbols"
+  ],
+  "excluded_sections": [
+    "account",
+    "manual_account",
+    "manual_live",
+    "legal",
+    "ui",
+    "notify",
+    "hotkeys",
+    "accounts"
+  ],
+  "files": [
+    {
+      "path": "C:\\Users\\xyc\\Desktop\\trading\\config.json",
+      "size_bytes": 5170,
+      "mtime_asia_shanghai": "2026-11-09T13:27:20.936578+08:00",
+      "sha256": "ca4b0c447c92d3059f00849a50b2cf2a70cf56c5aa390f82bb2830e454161e8f"
+    },
+    {
+      "path": "C:\\Users\\xyc\\Desktop\\trading\\config.json.bak",
+      "size_bytes": 5136,
+      "mtime_asia_shanghai": "2026-11-09T13:27:18.273206+08:00",
+      "sha256": "56cc738a0d69bae036c5411ec793e43d3525ae9317e2aeadbfd47644cd87734b"
+    },
+    {
+      "path": "C:\\Users\\xyc\\Desktop\\trading\\trading.exe",
+      "size_bytes": 26300596,
+      "mtime_asia_shanghai": "2026-11-05T17:20:46+08:00",
+      "sha256": "aabeafd83d265ab9b1cf5cc3fd0e9b0f21963ddcc95daa70feefc209997269a3"
+    },
+    {
+      "path": "C:\\Users\\xyc\\Desktop\\策略核心逻辑_核对版.pdf",
+      "size_bytes": 467690,
+      "mtime_asia_shanghai": "2026-11-05T08:11:55.788674+08:00",
+      "sha256": "7e4e696279a01438b63bc1775287347b624506022c060c76ac6e05508cf030f9"
+    }
+  ],
+  "settings": {
+    "trade": {
+      "max_volume": 30,
+      "max_risk_ratio": 0.85,
+      "max_daily_orders": 200,
+      "max_net_loss_stops": 2,
+      "close_before_seconds": 20,
+      "trailing_activate_ratio": 0.8,
+      "trailing_pullback_ratio": 0.1,
+      "stop_day_on_trailing": true,
+      "protect_80_enabled": true,
+      "protect_80_ratio": 0.8,
+      "protect_keep_ratio": 0.5,
+      "protect_stop_day": true,
+      "entry_slip_abort": true,
+      "entry_slip_abort_ratio": 0.4,
+      "entry_slip_abort_stop_day": false,
+      "half_close_enabled": false,
+      "cont_stop_day_stop": true,
+      "continuation_entry": true,
+      "continuation_ignore_no_open": false,
+      "no_chase_after_act": true,
+      "manual_close_day_stop": false,
+      "tick_diag": false,
+      "risk_per_trade_ratio": 0.002,
+      "stale_force_close_seconds": 180.0,
+      "stale_close_day_stop": false,
+      "aggressive_mode": false,
+      "passive_entry_first": false,
+      "auto_start_on_launch": true,
+      "chase_slip_ratio": 0.05,
+      "chase_base_now": false,
+      "min_one_lot_fallback": true,
+      "stop_cooldown_enabled": false,
+      "stop_cooldown_minutes": 5.0,
+      "require_trigger_update": false,
+      "max_symbols_enabled": false,
+      "max_symbols_on": 4,
+      "rollover_stop_enabled": true,
+      "live_protect": false,
+      "live_max_lots": 2,
+      "live_daily_loss_limit": 5000,
+      "live_first_one_lot": false,
+      "half_close_ratio": 0.5,
+      "manual_tp_drop_ratio": 0.1,
+      "month_stop_days": 4,
+      "night_session_close": "23:00",
+      "holidays": [],
+      "entry_slip_ratio": 0.03,
+      "chase_window_minutes": 1.0,
+      "no_chase_tolerance": 1.0,
+      "no_open_before_close_minutes": 10.0,
+      "no_open_after_open": true,
+      "no_open_after_open_minutes": 5.0,
+      "open_jump_block_ratio": 0.8,
+      "hysteresis_points": 0,
+      "half_stage2": false,
+      "half_stage2_trigger_ratio": 0.6,
+      "half_breakeven": false,
+      "total_margin_cap": 0.7,
+      "position_sync_seconds": 2.0,
+      "participate_auction": false,
+      "close_price_mode": "对手价",
+      "cancel_on_stop": true,
+      "margin_rate_alert_threshold": 0.005,
+      "max_quote_age_seconds": 0,
+      "min_days_to_expiry": 5,
+      "limit_fallback_ratio": 0.01,
+      "open_gap_max_ratio": 0.2,
+      "entry_confirm_timeout": 60,
+      "risk_reference_equity": 0.0
+    },
+    "auto_offset": {
+      "formula": "minrange",
+      "ceiling": 0.5,
+      "floor": 0.4,
+      "coef": {}
+    },
+    "schedule": {
+      "enabled": true,
+      "night_start_time": "20:55",
+      "day_start_time": "08:55",
+      "catch_up_minutes": 60
+    },
+    "symbols": [
+      {
+        "name": "棕榈油",
+        "code": "DCE.p2701",
+        "open_offset": 55,
+        "stop_offset": 16,
+        "profit_offset": 50,
+        "order_volume": 0,
+        "half_close_ratio": 0.4,
+        "hysteresis_points": 0.0
+      },
+      {
+        "name": "塑料",
+        "code": "DCE.l2701",
+        "open_offset": 79,
+        "stop_offset": 20,
+        "profit_offset": 72,
+        "order_volume": 0,
+        "half_close_ratio": 0.4,
+        "hysteresis_points": 0.0
+      },
+      {
+        "name": "沥青",
+        "code": "SHFE.bu2701",
+        "open_offset": 79,
+        "stop_offset": 12,
+        "profit_offset": 72,
+        "order_volume": 0,
+        "half_close_ratio": 0.4,
+        "hysteresis_points": 0.0
+      },
+      {
+        "name": "菜油",
+        "code": "CZCE.OI701",
+        "open_offset": 58,
+        "stop_offset": 15,
+        "profit_offset": 53,
+        "order_volume": 0,
+        "half_close_ratio": 0.4,
+        "hysteresis_points": 0.0
+      },
+      {
+        "name": "白银",
+        "code": "SHFE.ag2612",
+        "open_offset": 0,
+        "stop_offset": 0,
+        "profit_offset": 0,
+        "order_volume": 0,
+        "half_close_ratio": 0.4,
+        "hysteresis_points": 0.0,
+        "code_new": "SHFE.ag2702"
+      }
+    ]
+  },
+  "business_changes_from_backup": [
+    {
+      "path": "$.symbols[4].code_new",
+      "previous": null,
+      "current": "SHFE.ag2702"
+    }
+  ]
+}

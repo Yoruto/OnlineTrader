@@ -1,0 +1,98 @@
+{
+  "source_executable_sha256": "aabeafd83d265ab9b1cf5cc3fd0e9b0f21963ddcc95daa70feefc209997269a3",
+  "module": "PYZ.pyz/offset_calc",
+  "module_marshaled_bytes": 15669,
+  "module_marshaled_sha256": "26af1a7bd803b26c81a2274bbabf682d11af43e0ca41da21325101284887f412",
+  "method": "marshal/dis constants and instructions only; never execute application code",
+  "formula_labels": {
+    "minrange": "双窗 0.45×min(3日,30日)（默认·已反推验证）",
+    "range3x09_contract": "原式 三日振幅和/6×0.9（具体合约）",
+    "range3x09_main": "原式 三日振幅和/6×0.9（主连）",
+    "atr20_main": "主连ATR20",
+    "atr_mixw_main": "主连ATR(5,10,20)Wilder",
+    "range3_main": "主连3日振幅均值"
+  },
+  "coefficients": {
+    "minrange": {
+      "塑料": "0.45",
+      "菜油": "0.45",
+      "棕榈油": "0.45",
+      "PTA": "0.45",
+      "沥青": "0.38"
+    },
+    "range3x09_contract": {
+      "塑料": "0.45",
+      "沥青": "0.4",
+      "菜油": "0.45",
+      "棕榈油": "0.45",
+      "PTA": "0.45"
+    },
+    "range3x09_main": {
+      "塑料": "0.45",
+      "沥青": "0.31",
+      "菜油": "0.45",
+      "棕榈油": "0.45",
+      "PTA": "0.45"
+    },
+    "atr20_main": {
+      "塑料": "0.36",
+      "沥青": "0.37",
+      "菜油": "0.375",
+      "棕榈油": "0.39",
+      "PTA": "0.33"
+    },
+    "atr_mixw_main": {
+      "塑料": "0.355",
+      "沥青": "0.35",
+      "菜油": "0.39",
+      "棕榈油": "0.38",
+      "PTA": "0.335"
+    },
+    "range3_main": {
+      "塑料": "0.38",
+      "沥青": "0.3",
+      "菜油": "0.445",
+      "棕榈油": "0.38",
+      "PTA": "0.45"
+    }
+  },
+  "fixed_stops": {
+    "塑料": 20,
+    "沥青": 12,
+    "菜油": 15,
+    "棕榈油": 16,
+    "PTA": 18
+  },
+  "defaults": {
+    "coefficient_fallback": "0.35",
+    "stop_fallback": 15,
+    "profit_ratio": "0.9",
+    "ceiling": "0.5",
+    "floor": "0.4"
+  },
+  "function_locations": {
+    "source_of": 116,
+    "windows_of": 124,
+    "get_coef": 133,
+    "_tr": 160,
+    "base_series": 168,
+    "completed_only": 194,
+    "calc_one": 214
+  },
+  "gui_locations": {
+    "calculator_page": 13438,
+    "coefficient_override": 13524,
+    "offline_worker": 13558,
+    "calculate": 13634,
+    "apply": 13718
+  },
+  "semantics": {
+    "minrange": "min(available SMA3(range), SMA30(range)); bitumen SMA20(range) on main",
+    "atr20": "SMA20(max(high-low, abs(high-previous_close), abs(low-previous_close)))",
+    "atr_mixw": "mean(EWM(TR, alpha=0.2/0.1/0.05, adjust=False)); first value seeds each series",
+    "rounding": "ties to even for configured open and independent profit; final capped positive open truncates",
+    "cap": "max(int(max(min(open_cfg, realized_range*ceiling), min(open_cfg*floor, open_cfg))),1)",
+    "completed_only": "dates strictly before explicit exclude_date; independent implementation refuses fallback to uncompleted data",
+    "coefficient_zero": "GUI numeric zero falls back to per-formula default, saved zero remains unchanged"
+  }
+}

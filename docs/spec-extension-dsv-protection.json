@@ -1,0 +1,10 @@
+{
+  "extension_id": "OT-DSV-PROTECTION-1.1",
+  "extends": "OT-G0-1",
+  "scope": "DEVELOPMENT_INTERNAL_ONLY",
+  "legacy_resources_unchanged": true,
+  "resources": {
+    "protection-plan-v1.1.schema.json": "f3f6fdb2e4668d404ce47414321c6ec5779d774c32bfaa5ea4d8baf6c42f4a8c"
+  },
+  "reason": "DSV ties-even current quantity stages, configurable day stops and max(T,peak) drawdown cannot be expressed by G0 1.0."
+}

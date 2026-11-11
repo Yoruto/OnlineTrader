@@ -1,0 +1,84 @@
+{
+  "schema_version": "1.0",
+  "plan_id": "plan-dev-001",
+  "plan_revision": "1",
+  "account_key": "DEV:fixture:account-1",
+  "position_cycle_id": "cycle-dev-001",
+  "contract_id": "DEV.TEST001",
+  "trading_day": "2026-11-09",
+  "direction": "LONG",
+  "theoretical_entry_price": "1000",
+  "initial_open_quantity": 5,
+  "rule_set_id": "rules-proposed-fixture-1",
+  "config_revision": "1",
+  "config_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "execution_scope": "DEVELOPMENT",
+  "approval_record_id": null,
+  "market_quality_policy_id": "quality-fixture-1",
+  "price_field": "LAST",
+  "fixed_stop_loss": {
+    "enabled": true,
+    "distance_points": "20"
+  },
+  "fixed_take_profit": {
+    "enabled": true,
+    "distance_points": "100"
+  },
+  "profit_protection": {
+    "enabled": true,
+    "activation_ratio": "0.8",
+    "floor_ratio": "0.5",
+    "block_new_for_trading_day": true
+  },
+  "trailing_stop": {
+    "enabled": false
+  },
+  "partial_reduction": {
+    "enabled": true,
+    "first_trigger_ratio": "0.4",
+    "quantity_rule": "CEIL_Q0_DIV_2_AND_4",
+    "q0_freeze_policy": "ENTRY_TERMINAL_AND_RECONCILED",
+    "second_stage": {
+      "enabled": true,
+      "trigger_ratio": "0.6"
+    },
+    "break_even": {
+      "enabled": true,
+      "anchor": "THEORETICAL_ENTRY",
+      "activate_after": "FIRST_STAGE_CONFIRMED_REDUCTION"
+    }
+  },
+  "close_session": {
+    "enabled": true,
+    "schedule_policy_id": "schedule-fixture-1",
+    "calendar_version": "calendar-fixture-1",
+    "advance_seconds": 20
+  },
+  "slippage_exit": {
+    "enabled": false
+  },
+  "data_gap_exit": {
+    "enabled": false
+  },
+  "emergency_exit": {
+    "enabled": false
+  },
+  "execution_policy": {
+    "policy_id": "exit-fixture-1",
+    "first_price_mode": "OPPONENT_LIMIT",
+    "cancel_check_interval_ms": 5000,
+    "max_child_order_attempts": 3,
+    "price_steps": [
+      {
+        "after_check_count": 1,
+        "price_mode": "OFFSET_TICKS",
+        "offset_ticks": 1
+      },
+      {
+        "after_check_count": 2,
+        "price_mode": "EXCHANGE_LIMIT"
+      }
+    ],
+    "close_offset_policy_id": "offset-fixture-1"
+  }
+}

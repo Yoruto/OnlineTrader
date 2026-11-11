@@ -1,0 +1,10 @@
+{
+  "source_specification": "OT-G0-1",
+  "source_directory": "E:\\Futures Trading Assistant\\Futures Trading Assistant\\docs\\online_trader\\g0",
+  "copied_specification_resources": {
+    "schema.sql": "6fab1ec7ae70e59a2e46174c91135ba5e21ed1bbe0a9f0418afee777436549d2",
+    "schemas/ipc.schema.json": "def8789c02b5f55ec9207b223d18579861449293d5ff4fe5d41e6657da2feb62",
+    "schemas/protection-plan.schema.json": "e78f61b6bd280e128d5aaa0100dcf05933af1c4aa94c2ab127a1f7800e41f923"
+  },
+  "note": "Only specification data was copied; no V7, DSV or broker runtime is reused."
+}
