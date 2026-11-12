@@ -57,11 +57,14 @@ class MoneyOwner:
             'fact_barrier_id':fact['evidence_id']}
 
     def business_state(self):
+        # Checkpoints bind the ordered account history without writing a second
+        # copy of every account observation into the strategy transaction.
         return {'fills':copy.deepcopy(list(self.book.fills.values())),
             'fees':copy.deepcopy(list(self.book.fees.values())),
             'fee_imports':copy.deepcopy(list(self.book.fee_imports.values())),
-            'account_facts':copy.deepcopy(self.book.account_facts),
-            'account_source_boots':copy.deepcopy(self._account_boots),
+            'account_fact_count':len(self.book.account_facts),
+            'account_facts_hash':content_hash(self.book.account_facts),
+            'account_source_boots_hash':content_hash(self._account_boots),
             'expired_account_sources':sorted(self._expired_accounts),'error':self.error}
 
     def poll(self):

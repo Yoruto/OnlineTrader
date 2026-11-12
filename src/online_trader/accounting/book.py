@@ -76,6 +76,7 @@ class MoneyBook:
         self.cycles={};self.fills={};self.fees={};self.fee_evidence={};self.account_facts=[]
         self.account_evidence={};self.nominal={};self.issues=[]
         self.invalid_marks=set()
+        self.daily_equity={}
         self.fee_imports={}
 
     def check_fee(self,fact):
@@ -170,6 +171,12 @@ class MoneyBook:
         if account is not None and self.check_account(account):
             self.account_evidence[account['evidence_id']]=copy.deepcopy(account)
             self.account_facts.append(copy.deepcopy(account)|{'event_seq':event_seq})
+            if account['complete'] and account.get('balance') is not None and Decimal(account['balance'])>0:
+                day=account['trading_day']
+                previous=self.daily_equity.get(day)
+                if previous is None or datetime.fromisoformat(account['observed_at_utc'])>=datetime.fromisoformat(previous['observed_at_utc']):
+                    self.daily_equity[day]={key:account.get(key) for key in
+                        ('trading_day','observed_at_utc','balance','pre_balance')}
             for source_issue in account.get('source_issues',[]):
                 issue=copy.deepcopy(source_issue)|{'evidence_id':account['evidence_id']}
                 if issue not in self.issues:self.issues.append(issue)
@@ -197,7 +204,11 @@ class MoneyBook:
         result=build_report(account_key=self.account_key,checkpoint_event_seq=str(checkpoint_event_seq),
             fills=list(self.fills.values()),fees=list(self.fees.values()),
             account_facts=[copy.deepcopy(fact)|{'source_epoch':str(fact['source_epoch'])} for fact in self.account_facts],
-            marks=marks,nominal=nominal,as_of_utc=at)
+            marks=marks,nominal=nominal,as_of_utc=at,
+            opening_inventory=[cycle['external_adoption']|{'position_cycle_id':cid}
+                for cid,cycle in self.cycles.items() if cycle.get('external_adoption')],
+            inventory_reductions=[row|{'position_cycle_id':cid} for cid,cycle in self.cycles.items()
+                for row in cycle.get('external_reductions',[])])
         result['issues']+=copy.deepcopy(self.issues)
         result['fee_imports']=[copy.deepcopy(row) for _,row in sorted(self.fee_imports.items())]
         for cid,cycle in self.cycles.items():

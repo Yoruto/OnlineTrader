@@ -28,6 +28,11 @@ def _ms(delta):
     return (delta.days*86400000000+delta.seconds*1000000+delta.microseconds)//1000
 
 
+class ExpiredMarketQuote(TraderError):
+    def __init__(self):
+        super().__init__('E_FACT_BARRIER','Quote expired before the scheduler could accept it')
+
+
 class ScheduledRuntime:
     def __init__(self,kernel,calendar,*,clock=None,profile=None,interval_ms=500,max_wall_drift_ms=1000):
         kernel._writable()
@@ -131,8 +136,10 @@ class ScheduledRuntime:
             raise TraderError('E_SCOPE','The quote no longer belongs to the current proved trading session')
         source=datetime.fromisoformat(event['source_time_utc'])
         age=_ms(sample.utc-source)
-        if age < -self.max_wall_drift_ms or age>self.kernel.max_quote_age_ms:
+        if age < -self.max_wall_drift_ms:
             raise TraderError('E_FACT_BARRIER','Quote source time is not fresh against the clock evidence')
+        if age>self.kernel.max_quote_age_ms:
+            raise ExpiredMarketQuote()
         contract=event['contract_id'];previous=self._quotes.get(contract)
         signature=(event['source_epoch'],event['sequence'],content_hash(event))
         if previous and signature[:2]==previous['signature'][:2] and signature!=previous['signature']:

@@ -13,7 +13,9 @@ class OnlineDsvSimulation(OnlineSimulation):
     def __init__(self,kernel,grant):
         super().__init__(kernel,grant)
         from online_trader.kernel.day_recovery import DayRecovery
+        from online_trader.kernel.historical_orders import HistoricalOrders
         self.days=DayRecovery(self)
+        self.historical_orders=HistoricalOrders(self)
 
     def initialize(self):
         snapshot=super().initialize()
@@ -22,14 +24,27 @@ class OnlineDsvSimulation(OnlineSimulation):
         return snapshot
 
     def exit_day_ready(self,cycle,day):
-        return (day==cycle['plan']['trading_day'] or self.grant.multi_day and self.grant.permits_day(day) and self.days.ready(day))
+        if self.grant.multi_day:return self.grant.permits_day(day) and self.days.ready(day) and not self.port.fault
+        return day==cycle['plan']['trading_day']
 
     def reconciliation_snapshot(self,snapshot):
-        return self.days.snapshot(snapshot) if self.grant.multi_day else snapshot
+        if not self.grant.multi_day:return snapshot
+        return self.historical_orders.supplement(self.days.snapshot(snapshot))
+
+    def native_observations(self):
+        observations=super().native_observations()
+        if not self.historical_orders.records or not self.port.complete():return observations
+        current=self.port.snapshot()
+        if not current['complete']:return observations
+        self.historical_orders.supplement(current)
+        return self.historical_orders.observations(observations)
+
+    def historical_terminal(self,observation):
+        return observation['order_id'] in self.historical_orders.records
 
     def authority_policy(self):
-        return {'allowed_origins':['STRATEGY'],'execution_scope':'ONLINE_SIMULATION','provider':self.grant.provider,
-                'grant_hash':self.grant.content_hash,'automatic_strategy':True,
+        return {'allowed_origins':['MANUAL' if self.grant.manual_workbench else 'STRATEGY'],'execution_scope':'ONLINE_SIMULATION','provider':self.grant.provider,
+                'grant_hash':self.grant.content_hash,'automatic_strategy':not self.grant.manual_workbench,
                 'max_order_quantity':self.grant.value['max_order_quantity'],'opening_attempts':self.grant.value['opening_attempts']}
 
     def permit(self,plan):
@@ -58,7 +73,9 @@ class OnlineDsvSimulation(OnlineSimulation):
             raise TraderError('E_NOT_READY','Current DSV owner, calendar, clock and control permission are required')
         return super().arm()
 
-    def validate_entry(self,plan):
+    def validate_entry(self,plan,*,manual=False):
+        if manual!=self.grant.manual_workbench:
+            raise TraderError('E_ONLINE_SCOPE','This scope does not authorize the requested entry origin')
         self.permit(plan)
         self.comparison_gate()
         if not self.port.entry_clock_ready():
@@ -72,6 +89,47 @@ class OnlineDsvSimulation(OnlineSimulation):
         runtime=getattr(self.kernel,'_dsv_runtime',None)
         if runtime is None or runtime.profile.content_hash!=self.grant.value['profile_hash']:
             raise TraderError('E_ONLINE_SCOPE','The active strategy profile differs from its original scope')
+
+    def manual_entry_facts(self,candidate,quantity,*,exclude_decision=None):
+        k=self.kernel;runtime=k._dsv_runtime;code=candidate['contract_id']
+        facts=runtime._latest.get((code,candidate['trading_day']))
+        if not self.grant.manual_workbench or facts is None or not self.days.ready(candidate['trading_day']) or not self.port.fresh(code):
+            raise TraderError('E_NOT_READY','A current manual workbench scope and native quote are required')
+        event=facts['event']
+        if (event['source_epoch']!=self.port.source_epoch or
+                k._quote_age_ns(facts['received_ns'])>k.max_quote_age_ms*1_000_000 or
+                runtime._blocked(event,exclude_decision=exclude_decision) or
+                (facts.get('stop_result') and not facts['stop_result']['allow_new_entries'])):
+            raise TraderError('E_NOT_READY','Current session, account and stop gates block manual entry')
+        account,instrument=self.manual_native_facts(event,k)
+        account['unknown_orders']=any(o['send_state'] in {'SEND_POSSIBLE','UNKNOWN'} for c in k._staged.values()
+            if c['decision_key']!=exclude_decision for o in c['orders'])
+        facts=facts|{'account':account,'instrument':instrument}
+        risk=runtime._risk(candidate|{'entry_kind':'MANUAL'},facts,exclude_decision=exclude_decision)
+        if not risk['allowed'] or quantity>min(risk['quantity'],self.grant.value['max_order_quantity']):
+            raise TraderError('E_RISK','Manual quantity exceeds current account, contract or scope limits')
+        return facts,risk
+
+    def manual_open(self,params,decision,*,context_id,peer_id):
+        from online_trader.strategy.plan import build_simulation_plan
+        k=self.kernel;runtime=k._dsv_runtime;code=params['contract_id']
+        day=self.port.snapshot()['trading_day']
+        symbol=next((row for row in runtime.profile.to_record()['settings']['symbols'] if row['code']==code),None)
+        if symbol is None or code not in self.grant.value['contracts'] or not self.grant.permits_day(day):
+            raise TraderError('E_SCOPE','Manual entry requires a contract and cabinet day in the current scope')
+        price=params['limit_price'];qty=params['quantity']
+        candidate={'account_key':k.account_key,'contract_id':code,'trading_day':day,'direction':params['direction'],
+            'profile_hash':runtime.profile.content_hash,'theoretical_price':price,'limit_price':price,
+            'open_offset':symbol['open_offset'],'stop_distance':symbol['stop_offset'],'take_profit_distance':symbol['profit_offset']}
+        facts,risk=self.manual_entry_facts(candidate,qty)
+        candidate['source_time_utc']=facts['event']['source_time_utc']
+        plan=build_simulation_plan(runtime.profile,candidate,grant=self.grant,account_key=k.account_key,trading_day=day,
+            config_revision=str(k._config_revision),config_hash=k._configuration['payload_hash'],
+            rule_set_id=k._configuration['rule_set_id'],quantity=qty,plan_id='manual-plan-'+decision,
+            position_cycle_id='manual-cycle-'+decision)
+        metadata={'candidate':candidate,'instrument':facts['instrument'],'margin_per_lot':risk['metrics']['margin_per_lot']}
+        child=k.admit_entry(plan,decision,price,context_id=context_id,peer_id=peer_id,_manual=metadata)
+        return plan['position_cycle_id'],child
 
     def comparison_gate(self):
         if getattr(self.kernel,'_comparison_fault',None):
@@ -160,7 +218,7 @@ class OnlineDsvSimulation(OnlineSimulation):
     def entry_attempt_prepared(self,cid):
         self._entry_reconciled.discard(cid);self._closed.discard(cid)
 
-    def recover_working(self,observations):
+    def recover_working(self,observations,*,reconcile_cycles=True):
         k=self.kernel
         if not self.port.complete():return
         snapshot=self.port.snapshot();self._validate_snapshot(snapshot);snapshot=self.reconciliation_snapshot(snapshot)
@@ -180,6 +238,7 @@ class OnlineDsvSimulation(OnlineSimulation):
                              reported_fill_qty=order['filled_qty'],revision=order['revision']+1)
                 cycle['revision']+=1
                 k._stage_cycle(cycle,'TX_ORDER','ONLINE_WORKING_ORDER_PROVED');k.wait_idle()
+        if not reconcile_cycles:return
         for cid in tuple(k._recovery_pending):
             # Reconciliation validates all native order and detailed-fill
             # identities before lifting only the original exit barrier.
@@ -188,6 +247,12 @@ class OnlineDsvSimulation(OnlineSimulation):
             if ('CANCEL_TERMINAL_TIMEOUT' in cycle.get('execution',{}).get('last_reasons',[])
                     and any(o.get('cancel_status') in {'SEND_POSSIBLE','CALL_RETURNED','UNKNOWN'} and not o['terminal_confirmed'] for o in cycle['orders'])):
                 continue
-            try:self.reconcile(cid,allow_working=True)
+            try:self.reconcile(cid,allow_working=True,clear_gateway_fault=False)
             except TraderError as error:
                 if error.code not in {'E_FACT_BARRIER','E_OWNERSHIP'}:raise
+        if self.port.fault and not self.grant.multi_day:
+            # Account sync and original order reconciliation are distinct.
+            # An unresolved cycle stays blocked without freezing unrelated exits.
+            self.capture('ONLINE_DSV_GATEWAY_RESYNCED',{'snapshot':snapshot,'entry_authority':'DISARMED',
+                'unreconciled_cycles':sorted(k._recovery_pending)})
+            self.port.fault=False;self._fault_recorded=False

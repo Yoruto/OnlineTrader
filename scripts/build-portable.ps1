@@ -1,0 +1,44 @@
+param(
+    [Parameter(Mandatory=$true)][string]$Python,
+    [Parameter(Mandatory=$true)][string]$Output
+)
+$ErrorActionPreference = 'Stop'
+$project = Split-Path -Parent $PSScriptRoot
+$release = Join-Path $project 'release'
+$interpreter = (Resolve-Path -LiteralPath $Python).Path
+$destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
+if (Test-Path -LiteralPath $destination) { throw 'Choose a new output directory.' }
+
+& $interpreter -I -c "import importlib.metadata as m,struct,sys; assert sys.platform=='win32' and sys.version_info[:2]==(3,13) and struct.calcsize('P')==8; assert all(m.version(name)==value for name,value in {'pyinstaller':'6.22.3','PySide6':'6.8.2.1','tqsdk':'3.10.4','jsonschema':'4.26.0','referencing':'0.37.0'}.items())"
+if ($LASTEXITCODE -ne 0) { throw 'The portable build needs the documented Windows x64 build environment.' }
+
+$parent = Split-Path -Parent $destination
+New-Item -ItemType Directory -Force -Path $parent | Out-Null
+$staging = Join-Path $parent ('.online-trader-build-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $staging | Out-Null
+& $interpreter -I -m PyInstaller --noconfirm --workpath (Join-Path $staging 'work') `
+    --distpath (Join-Path $staging 'dist') (Join-Path $release 'OnlineTrader.spec')
+if ($LASTEXITCODE -ne 0) { throw "Portable build failed. Inspect $staging" }
+
+$bundle = Join-Path $staging 'dist/OnlineTrader'
+if (-not (Test-Path -LiteralPath (Join-Path $bundle 'OnlineTrader.exe') -PathType Leaf) -or
+    -not (Test-Path -LiteralPath (Join-Path $bundle '_internal') -PathType Container)) {
+    throw "Portable layout is incomplete. Inspect $staging"
+}
+Get-ChildItem -LiteralPath (Join-Path $release 'portable') | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $bundle -Recurse
+}
+$cli = Join-Path $bundle 'OnlineTraderCLI.exe'
+$version = & $interpreter -I -c "import sys,tomllib; print(tomllib.load(open(sys.argv[1],'rb'))['project']['version'])" (Join-Path $project 'pyproject.toml')
+if ($LASTEXITCODE -ne 0) { throw 'Cannot determine the product version.' }
+& $cli --verify-runtime $version
+if ($LASTEXITCODE -ne 0) { throw "Bundled runtime identity check failed. Inspect $staging" }
+& $cli --help
+if ($LASTEXITCODE -ne 0) { throw "Portable CLI smoke check failed. Inspect $staging" }
+[IO.Directory]::Move($bundle,$destination)
+$resolvedStaging = (Resolve-Path -LiteralPath $staging).Path
+if ($resolvedStaging -eq [IO.Path]::GetFullPath($staging) -and
+    [IO.Path]::GetDirectoryName($resolvedStaging) -eq [IO.Path]::GetFullPath($parent)) {
+    Remove-Item -LiteralPath $resolvedStaging -Recurse -Force -ErrorAction Continue
+}
+Write-Output $destination

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QPointF, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
                               QLineEdit, QMainWindow, QPushButton, QTableWidget,
                               QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
 
@@ -61,6 +61,7 @@ class EquityChart(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.rows = []
+        self.heading = "账户权益记录（缺失点留空；非本地成交收益曲线）"
         self.setMinimumHeight(125)
         self.setMaximumHeight(170)
 
@@ -83,7 +84,7 @@ class EquityChart(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor("#f6f8fb"))
         painter.setPen(QColor("#4a5568"))
-        painter.drawText(12, 20, "账户权益记录（缺失点留空；非本地成交收益曲线）")
+        painter.drawText(12, 20, self.heading)
         values = self.values()
         known = [value for value in values if value is not None]
         if not known:
@@ -156,6 +157,10 @@ class _ReportTask(QThread):
                 if metadata and str(report.get("checkpoint_event_seq")) != str(metadata["durable_seq"]):
                     raise TraderError("E_FACT_BARRIER", "Report is outside the accepted owner snapshot")
                 result = {"action": "load", "report": report, "metadata": metadata}
+            elif self.format == "daily_xlsx":
+                from online_trader.reporting import export_daily_report
+                target = export_daily_report(self.report, self.destination, self.table)
+                result = {"action":"export","destination":str(target)}
             else:
                 if self.exporter is None:
                     from online_trader.reporting import export_report
@@ -180,6 +185,7 @@ class ReportsWindow(QMainWindow):
         self.pipe_name, self._reader, self._exporter = pipe_name, reader, exporter
         self._worker = None
         self._task_action = None
+        self._daily_after_load = False
         self._closing = False
         self._stale = True
         self._report = None
@@ -221,9 +227,11 @@ class ReportsWindow(QMainWindow):
         filters.addStretch()
         self.csv_button = QPushButton("导出当前表 CSV")
         self.json_button = QPushButton("导出完整报告 JSON")
+        self.daily_button = QPushButton("导出日报 Excel")
         self.reconciliation_button = QPushButton('成交对照/导入费用')
         self._reconciliation_window = None
         filters.addWidget(self.csv_button); filters.addWidget(self.json_button)
+        filters.addWidget(self.daily_button)
         filters.addWidget(self.reconciliation_button)
         layout.addLayout(filters)
         self.tabs = QTabWidget()
@@ -248,6 +256,7 @@ class ReportsWindow(QMainWindow):
         self.refresh_button.clicked.connect(self.refresh)
         self.csv_button.clicked.connect(lambda: self.export("csv"))
         self.json_button.clicked.connect(lambda: self.export("json"))
+        self.daily_button.clicked.connect(self.export_daily)
         self.reconciliation_button.clicked.connect(self.open_reconciliation)
         self.from_day.currentIndexChanged.connect(self._render_tables)
         self.to_day.currentIndexChanged.connect(self._render_tables)
@@ -261,6 +270,7 @@ class ReportsWindow(QMainWindow):
                        self.from_day, self.to_day):widget.setEnabled(enabled)
         self.reconciliation_button.setEnabled(enabled)
         for button in (self.csv_button, self.json_button):button.setEnabled(enabled and self._report is not None)
+        self.daily_button.setEnabled(enabled and self._report is not None and not self._stale)
 
     def _source_changed(self, _value=None):
         self._stale = True
@@ -381,6 +391,29 @@ class ReportsWindow(QMainWindow):
         self.rows_label.setText(f"当前表 {len(rows)} 行，显示 {min(len(rows), _DISPLAY_LIMIT)} 行；CSV导出包含筛选后的全部行。"
             "日期筛选只影响带交易日明细；顶部、按品种汇总和JSON保持完整账本范围。")
 
+    def request_daily_export(self):
+        self._daily_after_load = bool(self.path_edit.text().strip())
+        if self._daily_after_load:
+            self.refresh()
+        else:
+            self.status_label.setText("请选择账本并刷新，然后导出所选交易日的日报")
+
+    def export_daily(self):
+        if self._report is None or self._stale or self._worker is not None or self._closing:
+            return
+        days = sorted({row.get('trading_day') for key in ('by_day','trades','nominal','equity')
+                       for row in self._report[key] if row.get('trading_day')}, reverse=True)
+        if not days:
+            self.status_label.setText("当前账本没有可导出的交易日报")
+            return
+        day, ok = QInputDialog.getItem(self, "导出日报", "柜台交易日", days, 0, False)
+        if not ok:
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "保存日报", f"日报_{day}.xlsx", "Excel (*.xlsx)")
+        if target:
+            self._start(_ReportTask(action="export", report=copy.deepcopy(self._report),
+                        destination=Path(target), table=day, format="daily_xlsx"))
+
     def export(self, format):
         if self._report is None or self._worker is not None or self._closing:return
         title = "导出当前表 CSV" if format == "csv" else "导出完整资金报告 JSON"
@@ -396,6 +429,7 @@ class ReportsWindow(QMainWindow):
         if self._closing:return
         if self._task_action == "load":
             self._stale = True
+            self._daily_after_load = False
             self.status_label.setText(f"报表读取失败 · 显示已过期 · {code}；保留上次完整记录")
         else:
             self.status_label.setText(f"导出失败 · {code}；已有文件不会被覆盖")
@@ -405,7 +439,11 @@ class ReportsWindow(QMainWindow):
         if worker is not None:worker.deleteLater()
         self._task_action = None
         if self._closing:QTimer.singleShot(0, self.close)
-        else:self._enabled(True)
+        else:
+            self._enabled(True)
+            if self._daily_after_load and not self._stale:
+                self._daily_after_load = False
+                QTimer.singleShot(0, self.export_daily)
 
     def closeEvent(self, event):
         if self._worker is not None:

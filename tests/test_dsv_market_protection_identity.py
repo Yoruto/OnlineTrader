@@ -23,7 +23,7 @@ class DsvMarketProtectionIdentityTests(unittest.TestCase):
         self.runtime = DsvStrategyRuntime(self.kernel, profile=DsvProfile.from_settings(settings))
         self.market = {"account_key": self.key, "contract_id": "DCE.p2701", "trading_day": "2026-11-09",
             "session_id": "day-20261109", "source_epoch": 1, "sequence": 1,
-            "source_time_utc": "2026-11-09T01:05:00Z", "session_open_utc": "2026-11-09T01:00:00Z",
+            "source_time_utc": "2026-11-09T01:05:00.000001Z", "session_open_utc": "2026-11-09T01:00:00Z",
             "session_close_utc": "2026-11-09T07:00:00Z", "last": "1055", "bid1": "1054", "ask1": "1056",
             "day_high": "1090", "day_low": "1000", "tick_size": "1", "quality": "CONTIGUOUS",
             "day_range_complete": True, "path_complete": True, "is_trading": True,

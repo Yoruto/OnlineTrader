@@ -1039,6 +1039,28 @@
       ],
       "additionalProperties": false
     },
+    "Params_STOP_DSV_STRATEGY": {
+      "type": "object",
+      "properties": {"evidence_hash": {"$ref": "#/$defs/hash"}},
+      "additionalProperties": false
+    },
+    "Params_CANCEL_NATIVE_ACCOUNT": {
+      "type": "object",
+      "properties": {"evidence_hash": {"$ref": "#/$defs/hash"}},
+      "required": ["evidence_hash"],
+      "additionalProperties": false
+    },
+    "Params_ADOPT_EXTERNAL_POSITION": {
+      "type": "object",
+      "properties": {
+        "lot_review": {"type": "object"},
+        "contract_id": {"$ref": "#/$defs/id"},
+        "direction": {"enum": ["LONG", "SHORT"]},
+        "evidence_hash": {"$ref": "#/$defs/hash"}
+      },
+      "required": ["contract_id", "direction", "evidence_hash"],
+      "additionalProperties": false
+    },
     "Params_MANUAL_OPEN": {
       "type": "object",
       "properties": {
@@ -1062,7 +1084,10 @@
           "$ref": "#/$defs/id"
         },
         "protection_plan": {
-          "$ref": "protection-plan.schema.json"
+          "anyOf": [
+            {"$ref": "protection-plan.schema.json"},
+            {"type": "null"}
+          ]
         }
       },
       "required": [
@@ -1073,6 +1098,25 @@
         "order_policy_id",
         "protection_plan"
       ],
+      "additionalProperties": false
+    },
+    "ManualClosePriceMode": {
+      "enum": ["对手价", "排队价", "最新价"]
+    },
+    "Params_MANUAL_CLOSE_ALL": {
+      "type": "object",
+      "properties": {
+        "execution_policy_id": {"$ref": "#/$defs/id"},
+        "price_mode": {"$ref": "#/$defs/ManualClosePriceMode"},
+        "positions": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 64,
+          "propertyNames": {"$ref": "#/$defs/id"},
+          "additionalProperties": {"$ref": "#/$defs/positiveQuantity"}
+        }
+      },
+      "required": ["execution_policy_id", "price_mode", "positions"],
       "additionalProperties": false
     },
     "Params_MANUAL_CLOSE": {
@@ -1087,6 +1131,7 @@
         "execution_policy_id": {
           "$ref": "#/$defs/id"
         },
+        "price_mode": {"$ref": "#/$defs/ManualClosePriceMode"},
         "external_takeover_id": {
           "anyOf": [
             {
@@ -1157,6 +1202,8 @@
     "Params_REQUEST_RECONCILIATION": {
       "type": "object",
       "properties": {
+        "query_order_archive": {"const": true},
+        "historical_orders": {"type": "object"},
         "requested_scope": {
           "type": "string",
           "enum": [
@@ -1224,13 +1271,17 @@
           "type": "string",
           "enum": [
             "PAUSE_NEW_ENTRIES",
+            "STOP_DSV_STRATEGY",
             "ARM_ENTRIES",
             "FLATTEN_THEN_STOP",
             "BEGIN_TAKEOVER",
             "CONFIRM_TAKEOVER",
             "ENTER_MAINTENANCE",
             "MANUAL_OPEN",
+            "ADOPT_EXTERNAL_POSITION",
+            "CANCEL_NATIVE_ACCOUNT",
             "MANUAL_CLOSE",
+            "MANUAL_CLOSE_ALL",
             "CANCEL_SELECTED",
             "CANCEL_OWNED",
             "CANCEL_ACCOUNT_CONFIRMED",
@@ -1268,6 +1319,12 @@
                 "parameters": {
                   "$ref": "#/$defs/Params_PAUSE_NEW_ENTRIES"
                 }
+              }
+            },
+            {
+              "properties": {
+                "operation": {"const": "STOP_DSV_STRATEGY"},
+                "parameters": {"$ref": "#/$defs/Params_STOP_DSV_STRATEGY"}
               }
             },
             {
@@ -1330,6 +1387,24 @@
                 }
               }
             },
+          {
+            "properties": {
+              "operation": {"const": "ADOPT_EXTERNAL_POSITION"},
+              "parameters": {"$ref": "#/$defs/Params_ADOPT_EXTERNAL_POSITION"}
+            }
+          },
+          {
+            "properties": {
+              "operation": {"const": "CANCEL_NATIVE_ACCOUNT"},
+              "parameters": {"$ref": "#/$defs/Params_CANCEL_NATIVE_ACCOUNT"}
+            }
+          },
+          {
+            "properties": {
+              "operation": {"const": "MANUAL_CLOSE_ALL"},
+              "parameters": {"$ref": "#/$defs/Params_MANUAL_CLOSE_ALL"}
+            }
+          },
             {
               "properties": {
                 "operation": {

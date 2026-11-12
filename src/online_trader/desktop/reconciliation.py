@@ -344,7 +344,10 @@ class ReconciliationWindow(QMainWindow):
         super().showEvent(event)
 
 
-def run(ledger_path=None,account_key=None,*,pipe_name=None):
+def run(ledger_path=None,account_key=None,*,pipe_name=None,statement_path=None):
     app = QApplication.instance() or QApplication([])
-    window = ReconciliationWindow(ledger_path,account_key,pipe_name=pipe_name);window.show()
+    window = ReconciliationWindow(ledger_path,account_key,pipe_name=pipe_name)
+    if statement_path is not None:
+        window.statement_edit.setText(str(statement_path))
+    window.show()
     return app.exec()

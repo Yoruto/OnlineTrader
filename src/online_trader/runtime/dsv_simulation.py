@@ -12,7 +12,7 @@ from online_trader.gateway.dsv_facts import DsvFactFeed,utc
 from online_trader.gateway.tqkq_dsv import TqKqDsvPort
 from online_trader.gateway.simnow import strategy_port
 from online_trader.kernel import Kernel
-from online_trader.kernel.scheduler import ScheduledRuntime
+from online_trader.kernel.scheduler import ExpiredMarketQuote,ScheduledRuntime
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.simulation import SimulationSession
 from online_trader.runtime.instance import AccountLock
@@ -46,8 +46,10 @@ class DsvSimulationSession(SimulationSession):
         self.driver=ScheduledRuntime(kernel,calendar,profile=profile,clock=clock or NativeReferenceClock(self.port))
         self.driver.activate();kernel.wait_idle()
         self.feed=DsvFactFeed(self.port,profile,calendar);self.last_decisions={};self._primed=False
+        self.owner.manual_native_facts=self.feed.facts
         self._last_funds_capture=0
         self._source_epoch=self.port.source_epoch
+        self._deferred_session_paths={}
         self._arm_request_revision=None
         self._calendar_anchor=utc(self.port.clock.now())
         self._day_barriers=set()
@@ -121,16 +123,18 @@ class DsvSimulationSession(SimulationSession):
         k=self.kernel;snapshot=self.port.snapshot();day=snapshot['trading_day']
         if not snapshot['complete']:
             self.owner.days.invalidate();self._day_resume_revision=None
+            self._rollover_key=None
             if not self._incomplete_day_barrier:
                 k._record_conflict('ONLINE_DSV_DAY_SCOPE_INCOMPLETE',{'trading_day':day,'source_epoch':self.port.source_epoch})
                 k.wait_idle();self._incomplete_day_barrier=True
             return True
         self._incomplete_day_barrier=False
-        old_owned=any(c['plan']['trading_day']!=day and c['lifecycle']!='CLOSED' for c in k._staged.values())
-        if day==self._managed_day and (not old_owned or self.owner.days.ready(day)):return False
+        if (day==self._managed_day and self.port.source_epoch==self._source_epoch and not self.port.fault
+                and self.owner.days.ready(day)):return False
         key=(day,self.port.source_epoch)
         if self._rollover_key!=key:
-            resume=k._armed and self.grant.value['resume_entries_on_day_change']
+            resume=(day!=self._managed_day and self.port.source_epoch==self._source_epoch and not self.port.fault
+                and k._armed and self.grant.value['resume_entries_on_day_change'])
             self.owner.days.invalidate()
             # Old cached prices cannot describe the new session. Preserve
             # durable protection, but wait for this day's real fresh quote.
@@ -159,13 +163,36 @@ class DsvSimulationSession(SimulationSession):
         if self.kernel._staged:raise TraderError('E_NOT_READY','A restored ledger manages original exits only')
         self._arm_request_revision=self.kernel._authority_revision
 
+    def _market_batches(self):
+        if self.kernel._staged or not self.driver.strategy._states:
+            return self.feed.batches()
+        return self.feed.batches(resume_states=self.driver.strategy._states,calendar_event=self.driver._event)
+
     def prime(self,*,manage_owned=False):
         """Rebuild available history with zero signal execution and no arming."""
         self.kernel.pause();self.kernel.wait_idle()
+        self._deferred_session_paths.clear()
+        now=utc(self.port.clock.now())
+        for code in self.grant.value['contracts']:
+            at=self.driver.calendar.query(code,now)
+            upcoming=at['next_session']
+            if not at['complete'] or at['is_trading'] or upcoming is None:continue
+            day,session=upcoming['trading_day'],upcoming['session_id']
+            state=self.driver.strategy._states.get((code,day))
+            if state and state['source_epoch']<self.port.source_epoch and state['session_id']!=session:
+                self._deferred_session_paths[code]=(day,session)
         rebuilt={}
-        for code,events in self.feed.batches():
+        for code,events in self._market_batches():
             if events and all(e['path_complete'] for e in events):
-                rebuilt[code]=self._prime_path(code,events)
+                first=events[0]
+                state=self.driver.strategy._states.get((code,first['trading_day']))
+                extends_checkpoint=(state is not None and not state['coverage_lost']
+                    and (state['source_epoch']==first['source_epoch'] or
+                         (code,first['source_epoch']) in self.feed.resume_anchors)
+                    and state['session_id']==first['session_id']
+                    and state['last_sequence']+1==first['sequence'])
+                rebuilt[code]=self._prime_path(code,events,extend=True) if extends_checkpoint else self._prime_path(code,events)
+                self._deferred_session_paths.pop(code,None)
         # Replaying a long session can outlive the freshness budget. Catch up
         # the native path first, then register a fresh quote for execution.
         catchup_deadline=time.monotonic()+8
@@ -185,7 +212,8 @@ class DsvSimulationSession(SimulationSession):
                 if (event['source_epoch']!=self.port.source_epoch or not 0<=age<=self.kernel.max_quote_age_ms/1000
                         or not at['is_trading'] or at['session']['session_id']!=event['session_id']):continue
                 account,instrument=self.feed.facts(event,self.kernel)
-                future=self.driver.on_market(event,account,instrument,_allow_entry=False)
+                try:future=self.driver.on_market(event,account,instrument,_allow_entry=False)
+                except ExpiredMarketQuote:continue
                 self.kernel.wait_idle();future.result()
                 del rebuilt[code]
                 if manage_owned:
@@ -200,13 +228,40 @@ class DsvSimulationSession(SimulationSession):
         self._comparison('poll')
         self.status('DSV_PRIMED_DISARMED',strategy=self.driver.strategy.status())
 
-    def _prime_path(self,code,events,*,extend=False):
+    def _prime_path(self,code,events,*,extend=False,preserve_authority=False):
         enriched=[self.driver._event(event) for event in events]
+        anchor_key=(code,events[0]['source_epoch'])
         evidence='native-path-'+self.kernel.boot_id+'-'+str(events[0]['source_epoch'])+'-'+code+'-'+content_hash(enriched)[:16]
-        future=self.driver.strategy.rebuild_observation(enriched,evidence_id=evidence,extend=extend)
+        future=self.driver.strategy.rebuild_observation(enriched,evidence_id=evidence,extend=extend,
+            _preserve_authority=preserve_authority,_resume_anchor=self.feed.resume_anchors.get(anchor_key))
         self.kernel.wait_idle();future.result()
+        self.feed.resume_anchors.pop(anchor_key,None)
         self.feed.accept(events[-1])
         return events[-1]
+
+    def _extend_late_path(self,code,events):
+        first=events[0];state=self.driver.strategy._states.get((code,first['trading_day']))
+        if (state is not None and not state['coverage_lost'] and state['session_id']==first['session_id']
+                and state['source_epoch']==first['source_epoch'] and state['last_sequence']+1==first['sequence']
+                and all(event['path_complete'] for event in events)):
+            self._prime_path(code,events,extend=True,preserve_authority=True)
+
+    def _rebuild_deferred_paths(self,batches):
+        rebuilt=set()
+        for code,events in batches:
+            first=events[0]
+            expected=self._deferred_session_paths.get(code)
+            if expected==(first['trading_day'],first['session_id']) and all(e['path_complete'] for e in events):
+                # Priming during a break could not prove the next session yet.
+                # Rebuild its first complete batch with the usual disarm.
+                self._prime_path(code,events)
+                del self._deferred_session_paths[code]
+                rebuilt.add(code)
+        return rebuilt
+
+    def _quote_expired(self,event):
+        age=(self.port.clock.now()-datetime.fromisoformat(event['source_time_utc'])).total_seconds()
+        return age>self.kernel.max_quote_age_ms/1000
 
     def step(self):
         k=self.kernel
@@ -221,9 +276,16 @@ class DsvSimulationSession(SimulationSession):
                 self.owner.observe_native_orders();k.wait_idle()
                 self.status('DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION',armed=False)
                 return
+            if self.port.fault and not self.port.complete():
+                self.owner.tick();k.wait_idle()
+                self.status('DSV_WAITING_GATEWAY_SYNC',armed=False)
+                return
             if self.port.source_epoch!=self._source_epoch:
+                self.driver._quotes.clear();self.driver._ages.clear()
                 self.prime();self._source_epoch=self.port.source_epoch
             self.owner.tick();k.wait_idle()
+            batches=self._market_batches()
+            rebuilt=self._rebuild_deferred_paths(batches)
             if self._arm_request_revision is not None:
                 if k._authority_revision!=self._arm_request_revision:
                     self._arm_request_revision=None
@@ -231,17 +293,34 @@ class DsvSimulationSession(SimulationSession):
                     try:self.owner.arm();k.wait_idle();self._arm_request_revision=None
                     except TraderError as error:
                         if error.code!='E_NOT_READY':raise
-            for code,events in self.feed.batches():
+            for code,events in batches:
+                replayed=code in rebuilt
+                if replayed:
+                    events=events[-1:]
+                elif (code,events[0]['source_epoch']) in self.feed.resume_anchors and all(e['path_complete'] for e in events):
+                    self._prime_path(code,events,extend=True)
+                    continue
+                late=[]
                 for index,event in enumerate(events):
-                    age=(self.port.clock.now()-datetime.fromisoformat(event['source_time_utc'])).total_seconds()
-                    if age>k.max_quote_age_ms/1000:
-                        # Late startup/reconnect history is only a path rebuild;
-                        # never run an old signal through a current send gate.
+                    if self._quote_expired(event):
+                        late.append(event)
                         continue
+                    if late:
+                        # Rebuild a proved suffix for observation only. Entry
+                        # and existing exits still require fresh market facts.
+                        self._extend_late_path(code,late);late=[]
+                        if self._quote_expired(event):
+                            late.append(event)
+                            continue
                     account,instrument=self.feed.facts(event,k)
-                    future=self.driver.on_market(event,account,instrument,_allow_entry=index==len(events)-1)
+                    try:future=self.driver.on_market(event,account,instrument,_allow_entry=not replayed and index==len(events)-1)
+                    except ExpiredMarketQuote:
+                        late.append(event)
+                        continue
                     k.wait_idle();self.last_decisions[code]=future.result();self.feed.accept(event)
+                    self._deferred_session_paths.pop(code,None)
                     self._comparison('market',event,account,instrument,self.last_decisions[code])
+                if late:self._extend_late_path(code,late)
             self.driver.poll();k.wait_idle();self.owner.tick();k.wait_idle()
             if time.monotonic()-self._last_funds_capture>=10:
                 self.owner.capture('ONLINE_DSV_ACCOUNT_REFRESH',{'snapshot':self.port.snapshot()})
@@ -259,7 +338,7 @@ class DsvSimulationSession(SimulationSession):
         except Exception as error:
             if not k._failed:
                 if getattr(error,'code',None) in {'E_DUPLICATE_CONFLICT','E_SCOPE','E_OWNERSHIP','E_FACT_BARRIER'}:
-                    k._record_conflict('ONLINE_DSV_FACT_BARRIER',{'error_code':error.code});k.wait_idle()
+                    k._record_conflict('ONLINE_DSV_FACT_BARRIER',{'error_code':error.code,'detail':str(error)});k.wait_idle()
                 k.pause();k.wait_idle()
             self.status('DSV_BLOCKED_'+getattr(error,'code','E_GATEWAY_RUNTIME'),error_code=getattr(error,'code','E_GATEWAY_RUNTIME'))
         finally:self._comparison('poll')
@@ -268,6 +347,8 @@ class DsvSimulationSession(SimulationSession):
 def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=False,dsv_config=None,dsv_log_dir=None):
     """Future explicitly scoped connection path. Offline tests never call it."""
     grant,profile,calendar=load_inputs(scope,profile_path,calendar_path)
+    if grant.manual_workbench and (arm or not pipe):
+        raise TraderError('E_ONLINE_SCOPE','Manual workbench runs need a control pipe and explicit arming after attachment')
     source_grant,source_profile=grant,profile;automatic=grant.automatic_offsets;preparation=None
     if dsv_log_dir is not None and not Path(dsv_log_dir).is_dir():
         raise TraderError('E_COMPARISON_LOG','Explicit DSV log directory does not exist')
@@ -327,6 +408,13 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
                 'error_code':getattr(error,'code','E_GATEWAY_RUNTIME'),'entry_authority':'DISARMED'}),Path(output)/'startup-failure.json')
         if kernel is not None:
             kernel.pause();kernel.wait_idle()
+            if session is None or not session._primed:
+                try:
+                    publish_new_bytes(canonical_bytes({'status':'CONNECTED_BUT_NOT_PRIMED','provider':grant.provider,
+                        'error_code':getattr(error,'code','E_GATEWAY_RUNTIME'),'error_type':type(error).__name__,
+                        'detail':str(error) if isinstance(error,TraderError) else None,'entry_authority':'DISARMED'}),
+                        Path(output)/'startup-failure.json')
+                except OSError:pass
             # Closing a controller cannot terminate existing execution protection.
             if session is not None and any(c['lifecycle']!='CLOSED' for c in kernel._staged.values()):
                 session.status('DSV_CONTROLLER_INTERRUPTED_ORIGINAL_PROTECTION_CONTINUES',error_code=getattr(error,'code','E_CONTROL_INTERRUPTED'))
@@ -449,6 +537,8 @@ def prepare(scope,profile_path,calendar_path,output,*,dsv_config=None,dsv_log_di
             'provider':grant.provider,'dsv_settings_verified':dsv_config is not None,
             'dsv_log_directory_attached':dsv_log_dir is not None,'maximum_windows_clock_skew_ms':1000,
             'scope_schema':grant.value['schema_version'],'trading_days':grant.trading_days,
+            'manual_workbench':grant.manual_workbench,
+            'external_allocation_allowed':grant.external_allocation_allowed,
             'resume_entries_on_day_change':grant.value.get('resume_entries_on_day_change',False),
             'broker_connected':False,'account_state_checked':False,'entry_authority':'DISARMED',
             'source':'OFFLINE_CONFIGURATION_REVIEW_ONLY'}

@@ -1,11 +1,14 @@
 """Trading workbench over the original owner IPC. Closing is local only."""
 from pathlib import Path
-from PySide6.QtCore import QThread,QTimer,Signal
-from PySide6.QtWidgets import (QApplication,QHBoxLayout,QLabel,QLineEdit,QPushButton,QTabWidget,QTableWidget,
+from PySide6.QtCore import QItemSelectionModel,QSettings,Qt,QThread,QTimer,Signal
+from PySide6.QtWidgets import (QApplication,QLabel,QLineEdit,QPushButton,QTableWidget,
     QTableWidgetItem,QInputDialog,QFileDialog,QMessageBox)
 
 from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.app import StatusWindow
+from online_trader.desktop.notifications import WorkbenchSounds
+from online_trader.desktop.tray import WorkbenchTray
+from online_trader.desktop.workbench_layout import ACTIVATION_MESSAGES,WorkbenchLayout
 from online_trader.errors import TraderError
 from online_trader.transport.status_client import StatusClient
 
@@ -32,20 +35,23 @@ class _WorkbenchRequest(QThread):
 
 
 TABLES={
+ 'external_positions':(['合约','方向','柜台手数','自有手数','差额','今仓','昨仓','参考开仓价','可调整','核对异常'],
+            ['contract_id','direction','native_quantity','owned_quantity','difference','today','historical','reference_price','eligible','review_error']),
  'markets':(['合约','名称','允许该品种新增','最新','买一','卖一','日高','日低','交易日','来源时间','新鲜','路径完整','阻挡原因'],
             ['contract_id','name','enabled','last','bid1','ask1','day_high','day_low','trading_day','source_time_utc','fresh','path_complete','entry_reasons']),
- 'orders':(['合约','子单','开平','手数','已成','在途占量','价格','原生开平','发送','柜台','撤单'],
-            ['contract_id','child_order_id','effect','original_qty','filled_qty','potential_remaining','limit_price','native_offset','send_state','broker_state','cancel_status']),
+ 'orders':(['合约','子单','柜台单号','柜台日','开平','手数','已成','在途占量','价格','原生开平','发送','柜台','撤单'],
+            ['contract_id','child_order_id','native_order_id','native_trading_day','effect','original_qty','filled_qty','potential_remaining','limit_price','native_offset','send_state','broker_state','cancel_status']),
  'trades':(['合约','成交身份','方向','开平','手数','价格','交易日'],['contract_id','trade_key','direction','effect','quantity','price','trading_day']),
  'protection':(['合约','周期','模式','质量','第一档','第二档','保本','最高有利变动','剩量','目标','管理权','今昨仓路由核对'],
                ['contract_id','position_cycle_id','mode','quality','phase1_status','phase2_status','break_even_status','max_favorable_move','remaining_quantity','target_remaining_quantity','management_state','close_route_review']),
- 'blocks':(['原因','生效'],['reason_code','active']),
+ 'blocks':(['原因','生效','合约'],['reason_code','active','contract_id']),
  'commands':(['命令','状态','错误','说明','回执版本'],['command_id','status','error_code','reason','receipt_revision'])}
 
 DISPLAY={'LONG':'多','SHORT':'空','OPEN':'开仓','REDUCE':'减仓','NORMAL':'普通','PROTECTED':'利润保护',
     'CONTIGUOUS':'连续','DATA_GAP':'断流','UNKNOWN':'未知','NOT_TRIGGERED':'未触发','DONE':'完成','ACTIVE':'生效',
     'OFF':'关闭','WAITING_FILL':'等待成交','WAITING_ENTRY_TERMINAL':'等待开仓终态','SUPPRESSED_PROTECTED':'利润保护优先',
-    'MANAGED':'原内核管理','TAKEN_OVER':'已交接','TAKEOVER_PENDING':'交接待确认','NONE':'无'}
+    'MANAGED':'原内核管理','TAKEN_OVER':'已交接','TAKEOVER_PENDING':'交接待确认','NONE':'无',
+    'EXIT_REDUCTION_TERMINAL_UNFILLED':'平仓已终态，剩余目标待核对'}
 
 
 def display_cell(key,value):
@@ -54,97 +60,244 @@ def display_cell(key,value):
         if value.get('status')=='NO_OWNED_QUANTITY':return '无自有持仓'
         routes=' / '.join(('平今' if r['native_offset']=='CLOSETODAY' else '平仓')+' '+str(r['quantity'])+'手' for r in value.get('routes',[]))
         return f"今{value['owned_today']} / 昨{value['owned_historical']} · {routes or '已预占'}（核对预览）"
-    if key=='entry_reasons' and isinstance(value,list):return ' / '.join(value) if value else '无新增原因'
+    if key=='entry_reasons' and isinstance(value,list):
+        return ' / '.join(ACTIVATION_MESSAGES.get(reason,reason) for reason in value) if value else '无新增原因'
     if value is None:return '原周期' if key=='management_state' else '未知'
     if type(value) is bool:return '是' if value else '否'
     return DISPLAY.get(str(value),str(value))
 
 
 class WorkbenchWindow(StatusWindow):
-    def __init__(self,pipe_name,*,store=None,account_id=None,client_factory=StatusClient):
+    def __init__(self,pipe_name,*,store=None,account_id=None,client_factory=StatusClient,paired_launcher=None):
         super().__init__(pipe_name,client_factory=client_factory)
         self.store=store;self.selected_account=store.get(account_id) if store is not None and account_id is not None else None
+        self.paired_launcher=paired_launcher
+        self.paired_account_key=None
+        if paired_launcher is not None:
+            self.paired_account_key=paired_launcher.review()['account_key']
         self.view=None;self.receipt_identity=None;self._boot=None;self._account_dialog=None
+        self._deferred_request=None;self._control_notice=None
+        preferences = QSettings('OnlineTrader','Workbench')
+        self._sounds=WorkbenchSounds(preferences, log=self._notification_log)
+        self._tray = WorkbenchTray(self, preferences)
         self.setWindowTitle('OnlineTrader · 交易工作台');self.resize(1360,820)
-        layout=self.centralWidget().layout();layout.removeWidget(self.cycles)
-        self.tabs=QTabWidget();self.tabs.addTab(self.cycles,'自有持仓');self.tables={}
-        for name,title in [('markets','行情'),('orders','委托'),('trades','成交'),('protection','保护明细'),('blocks','阻挡'),('commands','命令回执')]:
-            table=QTableWidget(0,len(TABLES[name][0]));table.setHorizontalHeaderLabels(TABLES[name][0])
-            table.setEditTriggers(QTableWidget.NoEditTriggers);table.setSelectionBehavior(QTableWidget.SelectRows)
-            self.tables[name]=table;self.tabs.addTab(table,title)
-        layout.insertWidget(5,self.tabs)
-        self.connection_detail=QLabel('登录/交易同步/行情/时钟/自动权限尚未核对');layout.insertWidget(3,self.connection_detail)
-        tools=QHBoxLayout();self.filter_input=QLineEdit();self.filter_input.setPlaceholderText('搜索合约、名称或月份')
-        self.accounts_button=QPushButton('账户管理');self.attach_button=QPushButton('查看所选账户')
-        self.accounts_button.clicked.connect(self.open_accounts);self.attach_button.clicked.connect(self.attach_selected)
-        self.data_button=QPushButton('历史与交易日历');self.data_button.clicked.connect(self.open_data);self._data_dialog=None
-        self.session_button=QPushButton('模拟连接设置');self.session_button.clicked.connect(self.open_session);self._session_dialog=None
-        for widget in (self.accounts_button,self.attach_button,self.session_button,self.data_button,self.filter_input):tools.addWidget(widget)
-        layout.insertLayout(5,tools);self.filter_input.textChanged.connect(self.filter_markets)
-        commands=QHBoxLayout();self.command_buttons={}
-        for name,text,callback in [('arm','启动策略',self.arm),('close','平选定自有仓',self.close_selected),('flatten','平仓后停开',self.flatten),
-                                  ('cancel','撤所选自有单',self.cancel_selected),('cancel_entries','撤自有开仓单',self.cancel_entries),
-                                  ('buy','手动开多',lambda:self.manual_open('LONG')),('sell','手动开空',lambda:self.manual_open('SHORT')),
-                                  ('reconcile','请求完整核对',self.reconcile),('receipt','查询上次回执',self.receipt)]:
-            button=QPushButton(text);button.clicked.connect(callback);commands.addWidget(button);self.command_buttons[name]=button
-        layout.addLayout(commands);self.notice_label.setText('选择账户、保存参数或关闭窗口不授予交易权；控制请求按原内核回执显示。')
-        symbols=QHBoxLayout();symbols.addWidget(QLabel('行情页所选品种（保留已有保护）：'))
-        for name,text,enabled in [('symbol_enable','启用品种新增',True),('symbol_pause','停用品种新增',False)]:
-            button=QPushButton(text);button.clicked.connect(lambda checked=False,value=enabled:self.set_symbol_entries(value))
-            symbols.addWidget(button);self.command_buttons[name]=button
-        symbols.addStretch();layout.addLayout(symbols)
+        self.tables={}
+        for name,(headers,_) in TABLES.items():
+            table=QTableWidget(0,len(headers))
+            table.setHorizontalHeaderLabels(headers)
+            table.setEditTriggers(QTableWidget.NoEditTriggers)
+            table.setSelectionBehavior(QTableWidget.SelectRows)
+            self.tables[name]=table
+        self.connection_detail=QLabel('尚未连接 · 等待柜台同步')
+        self.filter_input=QLineEdit()
+        self.filter_input.setPlaceholderText('搜索合约、名称或月份')
+        self.filter_input.textChanged.connect(self.filter_markets)
+        self.accounts_button=QPushButton('账户管理')
+        self.attach_button=QPushButton('查看所选账户')
+        self.accounts_button.clicked.connect(self.open_accounts)
+        self.attach_button.clicked.connect(self.attach_selected)
+        self.data_button=QPushButton('历史与交易日历')
+        self.data_button.clicked.connect(self.open_data)
+        self.session_button=QPushButton('连接 SimNow 模拟盘' if paired_launcher else '模拟连接设置')
+        self.session_button.clicked.connect(self.open_session)
+        self._session_dialog=None
+        self.command_buttons={}
+        for name,text,callback in (
+            ('arm','启动策略 (F5)',self.start_strategy),('close','平选定自有仓',self.close_selected),
+            ('flatten','平仓后停开',self.flatten),('cancel','撤所选自有单',self.cancel_selected),
+            ('cancel_entries','撤自有开仓单',self.cancel_entries),('buy','手动开多',lambda:self.manual_open('LONG')),
+            ('sell','手动开空',lambda:self.manual_open('SHORT')),('reconcile','请求完整核对',self.reconcile),
+            ('receipt','查询上次回执',self.receipt),('adopt','核对并调整所选持仓',self.adopt_selected),
+            ('lot_review','核对等量换仓',lambda:self.adopt_selected(lot_review=True)),
+            ('cancel_account','账户全部撤单',self.cancel_account),('historical_orders','回补历史原单',self.import_historical_orders),
+            ('order_archive','查询原单留档',self.query_order_archive),
+            ('symbol_enable','启用品种新增',lambda:self.set_symbol_entries(True)),
+            ('symbol_pause','停用品种新增',lambda:self.set_symbol_entries(False)),
+        ):
+            button=QPushButton(text)
+            button.clicked.connect(callback)
+            self.command_buttons[name]=button
+        if paired_launcher:
+            self.setWindowTitle('OnlineTrader · SimNow 交易工作台')
+        self.pause_button.setText('停止策略 (F6)')
+        self.dashboard=WorkbenchLayout(self)
+        self._tray.restore_geometry()
+        self._tray.sync_icon()
         self.timer=QTimer(self);self.timer.setInterval(2500);self.timer.timeout.connect(self.refresh);self.timer.start()
         self._enable_commands(False)
 
     def _enable_commands(self,enabled):
         for button in self.command_buttons.values():button.setEnabled(enabled)
+        self.command_buttons['arm'].setEnabled((enabled and self.view['entry_authority']!='ARMED'
+            and not self.view['configuration'].get('stop_cancel_pending')) or
+            (self.view is None and not self._closing))
+        self.pause_button.setEnabled(enabled and self.view['entry_authority']=='ARMED')
+        self.dashboard.update_manual_controls(enabled)
         self.command_buttons['receipt'].setEnabled(enabled and self.receipt_identity is not None)
 
     def _start_job(self,action,args=None):
-        if self._worker is not None or self._closing:return
+        if self._closing:return
+        if self._worker is not None:
+            if action!='refresh':
+                if self._worker.action=='refresh' and self._deferred_request is None and self.view is not None:
+                    self._deferred_request=(self._command_binding(),action,args)
+                    self.notice_label.setText('请求已接收，等待当前刷新完成。')
+                else:self.notice_label.setText('当前请求仍在处理，请等待回执。')
+            return
         if self.pipe_name is None:
             self.notice_label.setText('请在账户管理中新增并选择账户，再查看所选账户；账户选择不启动连接。')
             return
-        self.refresh_button.setEnabled(False);self.pause_button.setEnabled(False);self._enable_commands(False)
-        account=self.selected_account['account_key'] if self.selected_account is not None else self.view['account_key'] if self.view is not None else None
+        if action!='refresh':
+            self.refresh_button.setEnabled(False);self._enable_commands(False)
+        account=self.paired_account_key or (self.selected_account['account_key'] if self.selected_account is not None else self.view['account_key'] if self.view is not None else None)
         worker=_WorkbenchRequest(self.pipe_name,self._factory,action,args,account,None if action=='refresh' else self._boot)
         self._worker=worker;worker.result.connect(self._job_result);worker.failed.connect(self._job_failed);worker.finished.connect(self._finished);worker.start()
 
     def refresh(self):self._start_job('refresh')
-    def pause_entries(self):self.send('PAUSE_NEW_ENTRIES',{'scope_type':'ACCOUNT','scope_ids':[]},{'cancel_owned_entry_remainders':False})
+    def create_sound_settings(self):return self._sounds.settings_panel()
+
+    def _notification_log(self, message):
+        try:
+            self.dashboard.add_activity(message)
+            self.dashboard.update_logs()
+        except RuntimeError:
+            return  # A pending network result may arrive after the workbench closes.
+
+    def pause_entries(self):
+        if self._stale or self.view is None or self.view['entry_authority']!='ARMED':
+            return
+        scope={'scope_type':'ACCOUNT','scope_ids':[]}
+        config=self.view['configuration']
+        if 'cancel_on_stop' not in config:
+            self.send('PAUSE_NEW_ENTRIES',scope,{'cancel_owned_entry_remainders':False})
+            return
+        params={}
+        review=config.get('native_cancel_review',{})
+        if config['cancel_on_stop'] and review.get('eligible') and review.get('external_count'):
+            identity=self._command_binding()
+            contracts='、'.join(f'{code} {count} 笔' for code,count in sorted(review['by_contract'].items()))
+            message=f"停止策略时，是否同时撤销当前 {review['external_count']} 笔外部委托？\n{contracts}\n选择否仍会停止策略，并按设置处理自有委托。"
+            confirm=QMessageBox.question(self,'停止策略并撤单',message,QMessageBox.Yes | QMessageBox.No,QMessageBox.No)
+            if self._stale or self.view is None or identity!=self._command_binding():
+                self.notice_label.setText('停止请求未发送。请刷新并核对当前账户。')
+                return
+            if confirm==QMessageBox.Yes:
+                params['evidence_hash']=review['evidence_hash']
+        self.send('STOP_DSV_STRATEGY',scope,params)
+
+    def _show_receipt(self,receipt):
+        notice=f"命令回执：{receipt['status']} · {receipt['error_code']} · {receipt['reason']}"
+        if notice!=self._control_notice:
+            error=receipt['status'] in {'FAILED','REJECTED','NEEDS_RECONCILIATION'}
+            self.dashboard.add_activity(notice,category='error' if error else None)
+        self._control_notice=notice
+        self.notice_label.setText(notice)
 
     def _job_result(self,result):
         if self._closing:return
         if result['action']=='refresh':
-            value=result['value'];super()._result({'action':'snapshot','value':value['base'],'metadata':value['metadata']})
+            value=result['value']
+            if self._boot is not None and self._boot!=value['view']['kernel_boot_id']:
+                self.receipt_identity=None;self._control_notice=None
+            selected=(self._selected_identities() if self._boot==value['view']['kernel_boot_id']
+                      and self.view is not None and self.view['account_key']==value['view']['account_key'] else {})
+            self._last_account_record=next(row for row in value['base']['records'] if row['record_type']=='ACCOUNT')
+            super()._result({'action':'snapshot','value':value['base'],'metadata':value['metadata']})
             self._base_cycle_ids=[r['record_id'] for r in value['base']['records'] if r['record_type']=='CYCLE']
-            self.view=value['view'];self._boot=self.view['kernel_boot_id'];self.render_view()
+            self.view=value['view'];self._boot=self.view['kernel_boot_id']
+            if self.receipt_identity:
+                receipt=next((row for row in self.view['commands'] if all(
+                    row.get(key)==expected for key,expected in self.receipt_identity.items())),None)
+                if receipt:self._show_receipt(receipt)
+            self.render_view()
+            self._restore_selection(selected)
         else:
             receipt=result['value'];self.receipt_identity={k:receipt[k] for k in ('command_id','payload_hash')}
-            self._stale=True;self.notice_label.setText(f"命令回执：{receipt['status']} · {receipt['error_code']} · {receipt['reason']}。持久回执不冒充成交。")
+            self._stale=True
+            self._show_receipt(receipt)
+
+    def _selectable_rows(self):
+        if self.view is None:return {}
+        return {
+            'cycles':(self.cycles,self._base_cycle_ids),
+            'orders':(self.tables['orders'],[row['child_order_id'] for row in self.view['orders']]),
+            'markets':(self.tables['markets'],[row['contract_id'] for row in self.view['markets']]),
+            'external_positions':(self.tables['external_positions'],[(row['contract_id'],row['direction'])
+                for row in self.view.get('external_positions',[])]),
+        }
+
+    def _selected_identities(self):
+        return {name:{identities[index.row()] for index in table.selectionModel().selectedRows()
+                if index.row()<len(identities) and not table.isRowHidden(index.row())}
+                for name,(table,identities) in self._selectable_rows().items()}
+
+    def _restore_selection(self,selected):
+        for name,(table,identities) in self._selectable_rows().items():
+            table.clearSelection()
+            selection=table.selectionModel()
+            for row,identity in enumerate(identities):
+                if identity in selected.get(name,()) and not table.isRowHidden(row):
+                    selection.setCurrentIndex(table.model().index(row,0),QItemSelectionModel.Select | QItemSelectionModel.Rows)
+                    # Current row and selection must reference the same new snapshot.
+                    if name in {'cycles','external_positions'}:break
 
     def _job_failed(self,error):
+        self._sounds.observe_request_error()
+        if self.view is not None:self._tray.set_status('error')
         if error['identity'] is not None:self.receipt_identity=error['identity']
         self._failed(error['code'])
-        if error['identity'] is not None:self.notice_label.setText('请求结果未知，保留原命令身份。请查询上次回执；不会自动重新发送。')
+        if self.view is not None:self.dashboard.add_activity('状态刷新失败 · '+error['code'],category='error')
+        if self.view is not None:
+            self.dashboard.quote_status.setText('行情 · 上次快照已过期')
+            self.dashboard.manual_status.setText('连接或请求失败 · 等待重新同步')
+        if self.paired_launcher is not None and self.view is None and error['code']=='E_TIMEOUT':
+            self.connection_label.setText('SimNow 执行器尚未连接')
+            self.notice_label.setText('通过「连接 SimNow 模拟盘」核对并启动今晚的范围。')
+        if error['identity'] is not None:
+            self._control_notice='请求结果未知，已保留原命令身份。请查询上次回执。'
+            self.notice_label.setText(self._control_notice)
 
     def _finished(self):
+        action=self._worker.action if self._worker is not None else None
         super()._finished()
         self._enable_commands(not self._closing and not self._stale and self.view is not None and not self.view['truncated'])
         self.command_buttons['receipt'].setEnabled(not self._closing and self._worker is None and self.receipt_identity is not None)
+        deferred,self._deferred_request=self._deferred_request,None
+        if self._closing:return
+        if deferred is None:
+            if action in ('command','status') and self.timer.isActive():self.refresh()
+            return
+        identity,action,args=deferred
+        if (self.view is None or identity!=self._command_binding() or
+                (action=='command' and (self._stale or self.view['truncated']))):
+            self._control_notice='请求未发送。请核对当前账户、执行器与参数状态。'
+            self.notice_label.setText(self._control_notice)
+        elif not (action=='command' and args[0]=='ARM_ENTRIES' and args[1]['scope_type']=='ACCOUNT'
+                  and self.view['entry_authority']=='ARMED'):
+            self._control_notice=None
+            self._start_job(action,args)
 
     def render_view(self):
         v=self.view;c=v['connection']
-        self.connection_detail.setText(f"账户连接：{'已连接' if c['broker_connected'] else '未连接'} · 事实同步：{'完整' if c['synchronized'] else '不完整'} · 通道：{'故障' if c['fault'] else '无已知故障'} · 持仓核对：{'待处理' if c['recovery_required'] else '无未决屏障'} · 时钟：{'故障' if c['clock_fault'] else '无已知故障'} · 自动权限：{v['entry_authority']}")
+        self._tray.set_status('error' if c['fault'] or c['recovery_required'] or c['clock_fault'] else
+                              'running' if v['entry_authority']=='ARMED' else 'idle')
+        authority_label='人工开仓权限' if v['configuration'].get('manual_workbench') else '自动开仓权限'
+        self.connection_detail.setText(f"账户连接：{'已连接' if c['broker_connected'] else '未连接'} · 事实同步：{'完整' if c['synchronized'] else '不完整'} · 通道：{'故障' if c['fault'] else '无已知故障'} · 持仓核对：{'待处理' if c['recovery_required'] else '无未决屏障'} · 时钟：{'故障' if c['clock_fault'] else '无已知故障'} · {authority_label}：{v['entry_authority']}")
         for name,table in self.tables.items():
-            rows=v['cycles'] if name=='protection' else v[name];table.setRowCount(len(rows))
+            rows=v['cycles'] if name=='protection' else v.get(name,[]);table.setRowCount(len(rows))
             for i,row in enumerate(rows):
                 for j,key in enumerate(TABLES[name][1]):
                     value=row.get(key);item=QTableWidgetItem(display_cell(key,value));item.setToolTip(str(value));table.setItem(i,j,item)
             table.resizeColumnsToContents()
             for column in range(table.columnCount()):table.setColumnWidth(column,min(260,table.columnWidth(column)))
         self.filter_markets()
-        self.notice_label.setText('视图超过容量，已截断；批量操作关闭。' if v['truncated'] else '状态来自原内核；行情来源时间与新鲜度单独显示。关闭工作台保留原持仓保护。')
+        self.command_buttons['arm'].setText('启用人工开仓 (F5)' if v['configuration'].get('manual_workbench') else '启动策略 (F5)')
+        self.pause_button.setText('停止策略 (F6)' if 'cancel_on_stop' in v['configuration'] else '暂停开仓 (F6)')
+        self.command_buttons['arm'].setToolTip('等待原停止指令的撤单结果' if v['configuration'].get('stop_cancel_pending') else '')
+        self.dashboard.render(v)
+        self._sounds.observe(v)
+        self.notice_label.setText('视图超过容量，已截断；批量操作关闭。' if v['truncated'] else
+            self._control_notice or '状态来自原内核；行情来源时间与新鲜度单独显示。关闭工作台保留原持仓保护。')
 
     def filter_markets(self):
         table=self.tables['markets'];term=self.filter_input.text().casefold()
@@ -157,8 +310,9 @@ class WorkbenchWindow(StatusWindow):
         return items[0]
 
     def send(self,operation,scope,parameters):
-        if self._stale or self.view is None:
+        if self._stale or self.view is None or self.view['truncated']:
             self.notice_label.setText('状态未知或已过期，请先刷新。');return
+        self._control_notice=None
         self._start_job('command',(operation,scope,parameters))
 
     def _action(self,callback):
@@ -166,17 +320,33 @@ class WorkbenchWindow(StatusWindow):
         except TraderError as error:self.notice_label.setText(str(error)+' · '+error.code)
         except (OSError,KeyError,ValueError,TypeError):self.notice_label.setText('输入文件或当前选中记录不完整，请重新核对。')
 
+    def start_strategy(self):
+        if self.view is None:
+            self.open_session()
+        elif not self._stale:
+            self.arm()
+
+    def _command_binding(self):
+        config=self.view['configuration']
+        return (self.pipe_name,self.view['account_key'],self._boot,config['rule_set_id'],config['config_revision'])
+
     def arm(self):
         def action():
-            config=self.view['configuration'];policy=self.policy('AUTHORITY')
+            identity=self._command_binding();policy=self.policy('AUTHORITY')
             if QMessageBox.question(self,'启动策略','向当前已显示账户请求启动策略？原范围、时窗和核对门禁仍由内核复核。')==QMessageBox.Yes:
-                self.send('ARM_ENTRIES',{'scope_type':'ACCOUNT','scope_ids':[]},{'authority_policy_id':policy,'rule_set_id':config['rule_set_id'],'config_revision':config['config_revision']})
+                if self._stale or self.view is None or identity!=self._command_binding():
+                    self.notice_label.setText('启动请求未发送。请刷新并重新核对账户与参数。')
+                    return
+                if self.view['entry_authority']=='ARMED':return
+                self.send('ARM_ENTRIES',{'scope_type':'ACCOUNT','scope_ids':[]},
+                    {'authority_policy_id':policy,'rule_set_id':identity[-2],'config_revision':identity[-1]})
         self._action(action)
 
     def close_selected(self):
         def action():
-            i=self.cycles.currentRow()
-            if i<0:raise TraderError('E_SCOPE','请选择一个自有持仓周期')
+            selected=self.cycles.selectionModel().selectedRows()
+            if len(selected)!=1:raise TraderError('E_SCOPE','请选择一个自有持仓周期')
+            i=selected[0].row()
             # Base STATUS row identities, not a potentially different detail ordering.
             cid=self._base_cycle_ids[i]
             row=next(r for r in self.view['cycles'] if r['position_cycle_id']==cid)
@@ -185,9 +355,50 @@ class WorkbenchWindow(StatusWindow):
             if ok:self.send('MANUAL_CLOSE',{'scope_type':'CYCLE','scope_ids':[cid]},{'position_cycle_id':cid,'quantity':qty,'execution_policy_id':self.policy('EXECUTION'),'external_takeover_id':None})
         self._action(action)
 
+    def close_manual_cycle(self, cycle_id, quantity=None):
+        def action():
+            if self.view is None:
+                raise TraderError('E_NOT_READY', '请先刷新持仓')
+            cycle = next((row for row in self.view['cycles'] if row['position_cycle_id'] == cycle_id), None)
+            if cycle is None or cycle['remaining_quantity'] <= 0:
+                raise TraderError('E_SCOPE', '所选周期没有可平的自有持仓')
+            remaining = cycle['remaining_quantity']
+            amount = remaining if quantity is None else min(quantity, remaining)
+            params = {
+                'position_cycle_id': cycle_id, 'quantity': amount,
+                'execution_policy_id': self.policy('EXECUTION'), 'external_takeover_id': None,
+            }
+            if 'manual_close_price_mode' in self.view['configuration']:
+                params['price_mode'] = self.dashboard.manual_close_price_mode.currentText()
+            self.send('MANUAL_CLOSE', {'scope_type': 'CYCLE', 'scope_ids': [cycle_id]}, params)
+        self._action(action)
+
+    def manual_close_all(self):
+        def action():
+            if self.view is None or 'manual_close_price_mode' not in self.view['configuration']:
+                raise TraderError('E_NOT_READY','请先连接支持批量平仓的执行器')
+            cycles = [row for row in self.view['cycles'] if row['remaining_quantity'] > 0
+                      and row.get('management_state') not in {'TAKEOVER_PENDING', 'TAKEN_OVER'}]
+            if not cycles:
+                raise TraderError('E_SCOPE','没有可平的自有持仓')
+            positions = {row['position_cycle_id']: row['remaining_quantity'] for row in cycles}
+            identity = self._command_binding()
+            mode = self.dashboard.manual_close_price_mode.currentText()
+            policy = self.policy('EXECUTION')
+            message = f"按{mode}平掉 {len(positions)} 个自有持仓周期，共 {sum(positions.values())} 手？"
+            if QMessageBox.question(self, '平所有自有持仓', message) != QMessageBox.Yes:
+                return
+            if self._stale or self.view is None or identity != self._command_binding():
+                self.notice_label.setText('批量平仓未发送。请核对当前账户和持仓。')
+                return
+            self.send('MANUAL_CLOSE_ALL', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                      {'positions': positions, 'price_mode': mode, 'execution_policy_id': policy})
+        self._action(action)
+
     def set_symbol_entries(self,enabled):
         def action():
-            selected=sorted({index.row() for index in self.tables['markets'].selectedIndexes()})
+            table=self.tables['markets']
+            selected=sorted({index.row() for index in table.selectedIndexes() if not table.isRowHidden(index.row())})
             if not selected:raise TraderError('E_SCOPE','请在行情页选择要启停的品种')
             codes=sorted({self.view['markets'][index]['contract_id'] for index in selected})
             scope={'scope_type':'CONTRACT','scope_ids':codes}
@@ -206,18 +417,67 @@ class WorkbenchWindow(StatusWindow):
         self._action(action)
 
     def cancel_selected(self):
-        rows=sorted({index.row() for index in self.tables['orders'].selectedIndexes()})
-        if not rows:self.notice_label.setText('请选择自有委托。');return
-        ids=[self.view['orders'][i]['child_order_id'] for i in rows]
-        self.send('CANCEL_SELECTED',{'scope_type':'SELECTED_ORDERS','scope_ids':ids},{'child_order_ids':ids})
+        table=self.tables['orders']
+        rows=sorted({index.row() for index in table.selectedIndexes() if not table.isRowHidden(index.row())})
+        self.cancel_manual_children([self.view['orders'][i]['child_order_id'] for i in rows] if self.view else [])
+
+    def cancel_manual_children(self, ids):
+        if not ids:
+            self.notice_label.setText('请选择自有委托。')
+            return
+        available = {order['child_order_id'] for order in (self.view or {}).get('orders', [])}
+        if not set(ids) <= available:
+            self.notice_label.setText('所选自有委托已变化，请重新选择。')
+            return
+        self.send('CANCEL_SELECTED', {'scope_type': 'SELECTED_ORDERS', 'scope_ids': ids}, {'child_order_ids': ids})
 
     def cancel_entries(self):self.send('CANCEL_OWNED',{'scope_type':'OWNED_ORDERS','scope_ids':[]},{'include_exits':False})
+    def cancel_account(self):
+        def action():
+            review=self.view['configuration'].get('native_cancel_review',{})
+            if not review.get('eligible'):
+                raise TraderError('E_FACT_BARRIER','需要完整的柜台委托范围，且全部活动单必须在人工授权合约内')
+            message=f"暂停新增，并撤销账户当前 {review['active_count']} 笔活动委托（含外部单和保护委托）？已有持仓的保护目标继续生效。"
+            message+='\n'+'、'.join(f'{code} {count} 笔' for code,count in sorted(review['by_contract'].items()))
+            if QMessageBox.question(self,'确认账户全部撤单',message)==QMessageBox.Yes:
+                self.send('CANCEL_NATIVE_ACCOUNT',{'scope_type':'ACCOUNT','scope_ids':[]},{'evidence_hash':review['evidence_hash']})
+        self._action(action)
+
     def reconcile(self):self.send('REQUEST_RECONCILIATION',{'scope_type':'ACCOUNT','scope_ids':[]},{'requested_scope':'FULL_ACCOUNT','position_cycle_id':None})
+
+    def query_order_archive(self):
+        if QMessageBox.question(self,'查询原单留档','查找缺失原单已有的完整终态记录。核对通过后，原内核可以继续管理原退出。')==QMessageBox.Yes:
+            self.send('REQUEST_RECONCILIATION',{'scope_type':'ACCOUNT','scope_ids':[]},
+                {'requested_scope':'FULL_ACCOUNT','position_cycle_id':None,'query_order_archive':True})
+
+    def import_historical_orders(self):
+        def action():
+            filename,_=QFileDialog.getOpenFileName(self,'选择已核对的柜台终态证据','','JSON (*.json)')
+            if not filename:return
+            with Path(filename).open('rb') as stream:raw=stream.read(131073)
+            if len(raw)>131072:raise TraderError('E_SCHEMA','历史证据文件过大')
+            packet=strict_loads(raw)
+            if packet['account_key']!=self.view['account_key']:raise TraderError('E_SCOPE','文件账户与当前工作台不符')
+            message=f"柜台来源 {packet['statement_reference']}\n核对 {len(packet['orders'])} 笔历史原单及其逐笔成交。确认这些记录来自当前账户的柜台终态证据？"
+            if QMessageBox.question(self,'确认历史原单证据',message)==QMessageBox.Yes:
+                self.send('REQUEST_RECONCILIATION',{'scope_type':'ACCOUNT','scope_ids':[]},
+                    {'requested_scope':'FULL_ACCOUNT','position_cycle_id':None,'historical_orders':packet})
+        self._action(action)
     def receipt(self):
         if self.receipt_identity is not None:self._start_job('status',self.receipt_identity)
 
     def manual_open(self,direction):
         def action():
+            config=self.view['configuration']
+            if config.get('manual_workbench'):
+                code,ok=QInputDialog.getItem(self,'人工开仓','合约',config['scoped_contracts'],0,False)
+                if not ok:return
+                qty,ok=QInputDialog.getInt(self,'人工开仓',code+' · 手数',1,1,2147483647)
+                if not ok:return
+                price,ok=QInputDialog.getText(self,'人工限价',f"{code} · {'开多' if direction=='LONG' else '开空'} {qty}手 · 限价")
+                if ok:self.send('MANUAL_OPEN',{'scope_type':'CONTRACT','scope_ids':[code]},{'contract_id':code,
+                    'direction':direction,'quantity':qty,'limit_price':price,'order_policy_id':self.policy('EXECUTION'),'protection_plan':None})
+                return
             file,_=QFileDialog.getOpenFileName(self,'选择已审批的人工计划（不从预览参数生成权限）','','JSON (*.json)')
             if not file:return
             path=Path(file)
@@ -227,6 +487,67 @@ class WorkbenchWindow(StatusWindow):
             price,ok=QInputDialog.getText(self,'人工限价',f"{plan['contract_id']} · {plan['initial_open_quantity']}手 · 限价")
             if ok:self.send('MANUAL_OPEN',{'scope_type':'CONTRACT','scope_ids':[plan['contract_id']]},{'contract_id':plan['contract_id'],
                 'direction':direction,'quantity':plan['initial_open_quantity'],'limit_price':price,'order_policy_id':self.policy('EXECUTION'),'protection_plan':plan})
+        self._action(action)
+
+    def submit_manual(self,code,direction,qty,price):
+        def action():
+            from online_trader.domain.values import decimal_value
+            if self._stale or not self.view or not self.view['configuration'].get('manual_workbench'):
+                raise TraderError('E_NOT_READY','当前执行范围未启用人工开仓')
+            if code not in self.view['configuration']['scoped_contracts']:
+                raise TraderError('E_SCOPE','请选择已授权的合约')
+            limit = price
+            if price in {'', '0', 'OPPONENT'}:
+                quote = next((row for row in self.view.get('markets', [])
+                              if row['contract_id'] == code and row.get('fresh')), None)
+                field = ('ask1' if direction == 'LONG' else 'bid1') if price == 'OPPONENT' else 'last'
+                if quote is None or quote.get(field) is None:
+                    raise TraderError('E_NOT_READY', '所选合约没有新鲜的下单报价')
+                limit = quote[field]
+            decimal_value(limit,positive=True)
+            if QMessageBox.question(self,'确认人工开仓',
+                    f"{code} · {'开多' if direction=='LONG' else '开空'} {qty} 手 · 限价 {limit}")==QMessageBox.Yes:
+                self.send('MANUAL_OPEN',{'scope_type':'CONTRACT','scope_ids':[code]},{'contract_id':code,
+                    'direction':direction,'quantity':qty,'limit_price':limit,'order_policy_id':self.policy('EXECUTION'),
+                    'protection_plan':None})
+        self._action(action)
+
+    def adopt_selected(self,*,lot_review=False):
+        def action():
+            selected=self.tables['external_positions'].selectionModel().selectedRows()
+            if len(selected)!=1:raise TraderError('E_SCOPE','请选择一条柜台持仓')
+            index=selected[0].row()
+            rows=self.view.get('external_positions',[])
+            field='lot_review_available' if lot_review else 'eligible'
+            if not 0<=index<len(rows) or not rows[index].get(field,False):
+                raise TraderError('E_SCOPE','请选择一条当前可接管的柜台持仓')
+            row=rows[index];code=row['contract_id'];positions=[]
+            params={key:row[key] for key in ('contract_id','direction','evidence_hash')}
+            if lot_review:
+                filename,_=QFileDialog.getOpenFileName(self,'选择已审核的原批次存续明细','','JSON (*.json)')
+                if not filename:return
+                with Path(filename).open('rb') as stream:raw=stream.read(131073)
+                if len(raw)>131072:raise TraderError('E_SCHEMA','批次证据文件过大')
+                proof=strict_loads(raw)
+                if proof['contract_id']!=code or proof['account_key']!=self.view['account_key']:
+                    raise TraderError('E_SCOPE','文件与所选账户或合约不符')
+                params['lot_review']=proof
+                positions=[f"柜台来源 {proof['statement_reference']}"]
+                for item in proof['original_lots']:
+                    lot=row['original_lots'][item['lot_key']]
+                    if lot['quantity']!=item['remaining_quantity']:
+                        positions.append(f"原批次 {item['lot_key']} · {lot['quantity']} → {item['remaining_quantity']} 手")
+                positions.extend(f"替换成交 {item['trade_id']} · {item['remaining_quantity']} 手" for item in proof['replacement_lots'])
+            for side,bucket in row['additions'].items():
+                label='多' if side=='long' else '空'
+                positions.append(f"新增{label}仓周期 · 今 {bucket['today']} 手 · 昨 {bucket['historical']} 手 · 保护参考价 {bucket['reference_price']}")
+            for reduction in row['reductions']:
+                label='今' if reduction['bucket']=='today' else '昨'
+                positions.append(f"调减 {reduction['position_cycle_id']} · {label}仓 {reduction['quantity']} 手")
+            message=f"确认 {code} 的柜台持仓差异并暂停新增？\n"+'\n'.join(positions or ['持仓数量一致，仅确认本次外部委托变化。'])
+            if QMessageBox.question(self,'确认持仓归属调整',message)==QMessageBox.Yes:
+                self.send('ADOPT_EXTERNAL_POSITION',{'scope_type':'CONTRACT','scope_ids':[code]},
+                    params)
         self._action(action)
 
     def open_accounts(self):
@@ -241,6 +562,8 @@ class WorkbenchWindow(StatusWindow):
         if state['selected_id'] is None:self.notice_label.setText('请先在账户管理中选择账户。');return
         self.selected_account=self.store.get(state['selected_id']);self.pipe_name=self.store.pipe_name(self.selected_account)
         self._boot=None;self.view=None;self.receipt_identity=None;self._stale=True;self._account_key=None
+        self._control_notice=None
+        self._tray.set_status('idle')
         # Child report windows are account-bound and must not silently follow.
         if self._reports_window is not None:self._reports_window.close();self._reports_window=None
         self.refresh()
@@ -253,6 +576,14 @@ class WorkbenchWindow(StatusWindow):
         self._data_dialog=DataDialog(ReferenceStore(self.store.directory/'reference'),self);self._data_dialog.show()
 
     def open_session(self):
+        if self.paired_launcher is not None:
+            if self._session_dialog is not None and self._session_dialog.scheduled_request is not None:
+                self._session_dialog.show()
+                self._session_dialog.raise_()
+                return
+            from online_trader.desktop.session import SessionDialog
+            self._session_dialog=SessionDialog(None,None,self,paired_launcher=self.paired_launcher);self._session_dialog.show()
+            return
         if self.store is None or self.selected_account is None:
             self.notice_label.setText('请先通过本产品账户管理选择模拟账户。');return
         from online_trader.desktop.session import SessionDialog
@@ -261,10 +592,19 @@ class WorkbenchWindow(StatusWindow):
     def _result(self,result):super()._result(result)
 
     def closeEvent(self,event):
+        self._tray.save_geometry()
+        if not self._closing and self._tray.minimize_on_close():
+            event.ignore()
+            return
+        if self._session_dialog is not None:
+            self._session_dialog.clear_scheduled_start()
         self.timer.stop();super().closeEvent(event)
 
 
-def run(pipe_name,*,store=None,account_id=None):
+def run(pipe_name,*,store=None,account_id=None,paired_launcher=None):
     app=QApplication.instance() or QApplication([])
-    window=WorkbenchWindow(pipe_name,store=store,account_id=account_id);window.show();QTimer.singleShot(0,window.refresh)
+    window=WorkbenchWindow(pipe_name,store=store,account_id=account_id,paired_launcher=paired_launcher)
+    window.setAttribute(Qt.WA_DeleteOnClose)
+    window.destroyed.connect(app.quit)
+    window.show();QTimer.singleShot(0,window.refresh)
     return app.exec()

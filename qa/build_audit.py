@@ -56,7 +56,13 @@ def main():
         smoke_source=ROOT/'output/artifacts/20261110T080156Z-dev17-final-c9fd8967/smoke-source.py'
         # Re-execute the established business assertions against the new wheel;
         # the old artifact and its result remain untouched and are not reused.
-        smoke=out/'installed-smoke.py';smoke.write_text(smoke_source.read_text(encoding='utf-8').replace('0.1.0.dev17',__version__),encoding='utf-8')
+        fixture=smoke_source.read_text(encoding='utf-8').replace('0.1.0.dev17',__version__)
+        # DSV's ordinary entry wait includes the exact five-minute boundary.
+        # Keep the positive smoke quote in the same candle, one second later.
+        boundary='2026-11-09T01:05:00Z'
+        assert fixture.count(boundary)==1
+        smoke=out/'installed-smoke.py'
+        smoke.write_text(fixture.replace(boundary,'2026-11-09T01:05:01Z'),encoding='utf-8')
         run('installed-smoke',[python,'-I',smoke],cwd=out)
         run('installed-dsv-ipc',[python,'-I',ROOT/'qa/dsv_session_rehearsal.py','--output',out/'installed-dsv-ipc'],cwd=out)
         run('installed-workbench-ipc',[python,'-I',ROOT/'qa/workbench_rehearsal.py','--output',out/'installed-workbench-ipc'],cwd=out)

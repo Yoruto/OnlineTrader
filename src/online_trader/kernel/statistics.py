@@ -176,6 +176,7 @@ class StatisticsOwner:
         return update
 
     def prepare_close(self,cycle,at_utc=None):
+        if cycle.get('external_reductions'):return None
         profile=self._profile(cycle)
         if profile is None or cycle.get('statistics_close_id') is not None:return None
         event=self._event(cycle,profile,'CYCLE_CLOSED',cycle['entry_reconciliation_id'])

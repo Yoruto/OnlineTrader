@@ -19,9 +19,9 @@ from online_trader.gateway.ports import UnavailablePort
 
 
 FINAL = frozenset({"SUCCEEDED", "REJECTED", "FAILED", "SUPERSEDED"})
-OPERATIONS = frozenset({"PAUSE_NEW_ENTRIES", "ARM_ENTRIES", "FLATTEN_THEN_STOP", "BEGIN_TAKEOVER", "CONFIRM_TAKEOVER",
-    "ENTER_MAINTENANCE", "MANUAL_OPEN", "MANUAL_CLOSE", "CANCEL_SELECTED", "CANCEL_OWNED", "CANCEL_ACCOUNT_CONFIRMED",
-    "REQUEST_RECONCILIATION", "RESUME_ORIGINAL_EXITS"})
+OPERATIONS = frozenset({"PAUSE_NEW_ENTRIES", "STOP_DSV_STRATEGY", "ARM_ENTRIES", "FLATTEN_THEN_STOP", "BEGIN_TAKEOVER", "CONFIRM_TAKEOVER",
+    "ENTER_MAINTENANCE", "MANUAL_OPEN", "MANUAL_CLOSE", "MANUAL_CLOSE_ALL", "CANCEL_SELECTED", "CANCEL_OWNED", "CANCEL_ACCOUNT_CONFIRMED",
+    "REQUEST_RECONCILIATION", "RESUME_ORIGINAL_EXITS", "ADOPT_EXTERNAL_POSITION", "CANCEL_NATIVE_ACCOUNT"})
 
 
 def _new(prefix): return prefix + "-" + uuid.uuid4().hex
@@ -40,18 +40,24 @@ class ControlProtocol:
         self.maintenance = next(iter(kernel.ledger.query("SELECT * FROM maintenance_locks")), None)
         kernel._maintenance_state = None if self.maintenance is None else self.maintenance["status"]
         self._updating = set()
+        self.native_cancel_results={}
         self._polling = False
+        self.preserve_open_orders_revision = None
         self.symbol_entries={};self._symbol_staged={}
         for row in kernel.ledger.query("SELECT command_id,payload_hash,payload_json,result_json FROM operator_commands"):
             self.states[row["command_id"]] = {"body": strict_loads(row["payload_json"]), "digest": row["payload_hash"], "receipt": strict_loads(row["result_json"]), "metadata": {}}
-        for row in kernel.ledger.query("SELECT payload_json FROM event_journal ORDER BY event_seq"):
+        for row in kernel.ledger.query("SELECT event_type,payload_json FROM event_journal ORDER BY event_seq"):
             data = strict_loads(row["payload_json"]); data = data.get("data", data)
             if data.get("control_metadata"):
                 item = data["control_metadata"]
                 if item["command_id"] in self.states: self.states[item["command_id"]]["metadata"] = item["metadata"]
+                if "preserve_open_orders_revision" in item["metadata"]:
+                    self.preserve_open_orders_revision = item["metadata"]["preserve_open_orders_revision"]
             if data.get("control_evidence"):
                 item = data["control_evidence"]; self.evidence[item["id"]] = item
             if data.get('symbol_entry_state'):self.symbol_entries.update(data['symbol_entry_state'])
+            if row["event_type"]=="NATIVE_ACCOUNT_CANCEL_RESULTS":
+                self.native_cancel_results[data['command_id']]=data['attempts']
         self._symbol_staged=copy.deepcopy(self.symbol_entries)
         # A safe window from another boot is never a current stopping decision.
         if self.maintenance and self.maintenance["status"]=="SAFE_TO_STOP":self.poll()
@@ -242,6 +248,9 @@ class ControlProtocol:
         if op == "MANUAL_CLOSE":
             if scope != {"scope_type":"CYCLE","scope_ids":[params["position_cycle_id"]]}: raise TraderError("E_SCOPE", "Close cycle scope differs")
             return params["position_cycle_id"]
+        if op == "ADOPT_EXTERNAL_POSITION":
+            if scope != {"scope_type":"CONTRACT","scope_ids":[params["contract_id"]]}:raise TraderError('E_SCOPE','Adoption contract differs')
+            return params['contract_id']
         self._cycles(scope)
         if scope["scope_type"] in {"ACCOUNT", "OWNED_ORDERS"}: return self.kernel.account_key
         return scope["scope_ids"][0] if len(scope["scope_ids"]) == 1 else content_hash(scope)
@@ -249,11 +258,16 @@ class ControlProtocol:
     def context_scope(self, operation, scope, parameters=None):
         return self._context_scope({"operation":operation,"scope":scope,"parameters":parameters or {}})
 
+    def stop_cancel_pending(self):
+        return any(state["metadata"].get("operation")=="STOP_DSV_STRATEGY" and state["metadata"].get("native_cancel_orders")
+                   and state.get("receipt",{}).get("status") not in FINAL for state in self.states.values())
+
     def can_increase(self, contract_id=None):
         if contract_id is not None and not self.symbol_entry_enabled(contract_id):return False
         if self.maintenance and self.maintenance["status"] not in {"COMPLETE", "FAILED"}: return False
         if any(c.get("management_state") in {"TAKEOVER_PENDING","TAKEN_OVER"} and (contract_id is None or c["plan"]["contract_id"] == contract_id) for c in self.kernel._staged.values()): return False
         if any(s["metadata"].get("operation") == "ENTER_MAINTENANCE" and s.get("receipt",{}).get("status") not in FINAL for s in self.states.values()): return False
+        if self.stop_cancel_pending():return False
         return not any(s["metadata"].get("operation") == "FLATTEN_THEN_STOP" and s.get("receipt",{}).get("status") not in FINAL for s in self.states.values())
 
     def symbol_entry_enabled(self,contract_id,*,committed=False):
@@ -270,7 +284,7 @@ class ControlProtocol:
         if not codes or not set(codes)<=allowed:raise TraderError('E_SCOPE','Contract switches are confined to the current strategy scope')
         if enabled:
             policy=self._policy(p['authority_policy_id'],'AUTHORITY')
-            origin='STRATEGY' if getattr(k.simulation,'strategy_enabled',False) else 'MANUAL'
+            origin=k.simulation.authority_policy()['allowed_origins'][0] if k.simulation else 'MANUAL'
             if origin not in policy.get('allowed_origins',[]):raise TraderError('E_RULE_UNAPPROVED','Current policy does not permit this strategy origin')
             if p['rule_set_id']!=k._configuration['rule_set_id'] or p['config_revision']!=str(k._config_revision):
                 raise TraderError('E_RULE_UNAPPROVED','Contract enable must bind the current immutable configuration')
@@ -297,9 +311,12 @@ class ControlProtocol:
         ids = self._cycles(scope); binding["metadata"]["cycle_ids"] = ids
         if op in {'PAUSE_NEW_ENTRIES','ARM_ENTRIES'} and scope['scope_type']=='CONTRACT':
             return self._symbol_entry_command(binding)
-        if op in {"PAUSE_NEW_ENTRIES", "ARM_ENTRIES", "FLATTEN_THEN_STOP", "ENTER_MAINTENANCE", "CANCEL_ACCOUNT_CONFIRMED"} and scope["scope_type"] != "ACCOUNT":
+        if op in {"PAUSE_NEW_ENTRIES", "STOP_DSV_STRATEGY", "ARM_ENTRIES", "FLATTEN_THEN_STOP", "MANUAL_CLOSE_ALL", "ENTER_MAINTENANCE", "CANCEL_ACCOUNT_CONFIRMED", "CANCEL_NATIVE_ACCOUNT"} and scope["scope_type"] != "ACCOUNT":
             raise TraderError("E_SCOPE", "This command requires the whole account scope")
-        if op == "PAUSE_NEW_ENTRIES":
+        if op == "STOP_DSV_STRATEGY":
+            from online_trader.kernel.native_control import prepare_strategy_stop
+            prepare_strategy_stop(self,binding)
+        elif op == "PAUSE_NEW_ENTRIES":
             binding.update(initial_status="SUCCEEDED",reason="New entries disabled; existing protection retained")
             targets = [o["child_order_id"] for cid in ids for o in k._staged[cid]["orders"] if o["effect"] == "OPEN" and OrderState.from_dict(o).potential_remaining]
             k._armed=False;k.contexts.revoke_all();k._authority_revision+=1
@@ -314,7 +331,7 @@ class ControlProtocol:
         elif op == "ARM_ENTRIES":
             policy = self._policy(p["authority_policy_id"], "AUTHORITY")
             online_dsv=bool(getattr(k.simulation,'strategy_enabled',False))
-            origin='STRATEGY' if online_dsv else 'MANUAL'
+            origin=k.simulation.authority_policy()['allowed_origins'][0] if online_dsv else 'MANUAL'
             if not self.can_increase() or origin not in policy.get("allowed_origins",[]): raise TraderError("E_RULE_UNAPPROVED", "Authority policy cannot enable the requested entry origin")
             if p["rule_set_id"] != k._configuration["rule_set_id"] or p["config_revision"] != str(k._config_revision): raise TraderError("E_RULE_UNAPPROVED", "Rule/configuration identity is not applicable")
             binding["metadata"]["authority_revision"] = k._authority_revision + 1
@@ -324,11 +341,20 @@ class ControlProtocol:
             self._policy(p["order_policy_id"], "EXECUTION")
             if not self.can_increase(): raise TraderError("E_NOT_READY", "A stop or maintenance decision blocks new risk")
             plan = p["protection_plan"]
+            decision="command-" + content_hash(b["command_id"])[:40]
+            if getattr(getattr(k.simulation,'grant',None),'manual_workbench',False):
+                if plan is not None:raise TraderError('E_SCOPE','The original owner builds the manual protection plan')
+                binding["initial_status"]="EXECUTING"
+                binding["metadata"]["cycle_ids"]=['manual-cycle-'+decision]
+                cycle,child=k.simulation.manual_open(p,decision,context_id=b["context_id"],peer_id=binding["peer_id"])
+                binding["metadata"].update(cycle_ids=[cycle],order_ids=[child])
+                return
+            if plan is None:raise TraderError('E_SCOPE','A manual workbench scope is required')
             if (plan["contract_id"],plan["direction"],plan["initial_open_quantity"]) != (p["contract_id"],p["direction"],p["quantity"]): raise TraderError("E_SCHEMA", "Manual order and protection plan disagree")
             binding["initial_status"] = "EXECUTING"; binding["metadata"]["cycle_ids"] = [plan["position_cycle_id"]]
-            child = k.admit_entry(plan, "command-" + content_hash(b["command_id"])[:40], p["limit_price"], context_id=b["context_id"], peer_id=binding["peer_id"])
+            child = k.admit_entry(plan, decision, p["limit_price"], context_id=b["context_id"], peer_id=binding["peer_id"])
             binding["metadata"]["order_ids"] = [child]
-        elif op in {"MANUAL_CLOSE", "FLATTEN_THEN_STOP"}:
+        elif op in {"MANUAL_CLOSE", "MANUAL_CLOSE_ALL", "FLATTEN_THEN_STOP"}:
             self._policy(p["execution_policy_id"], "EXECUTION")
             if not (k.development or k.simulation) or isinstance(k.port, UnavailablePort): raise TraderError("E_RULE_UNAPPROVED", "A permitted execution adapter is required")
             if op == "MANUAL_CLOSE":
@@ -336,7 +362,13 @@ class ControlProtocol:
                 c = k._staged[p["position_cycle_id"]]
                 if p["quantity"] > c["protection"]["owned_qty"]: raise TraderError("E_RISK", "Close quantity exceeds owned position")
                 binding["metadata"]["desired_remaining"] = {p["position_cycle_id"]:c["protection"]["owned_qty"]-p["quantity"]}
-                binding["initial_status"] = "EXECUTING"; k.manual_close(p["position_cycle_id"], p["quantity"])
+                binding["initial_status"] = "EXECUTING"
+                k.manual_close(p["position_cycle_id"],p["quantity"],price_mode=p.get("price_mode"),request_id=b["command_id"])
+            elif op == "MANUAL_CLOSE_ALL":
+                positions=p["positions"]
+                binding["metadata"].update(cycle_ids=list(positions),desired_remaining=dict.fromkeys(positions,0))
+                binding["initial_status"]="EXECUTING"
+                k.manual_close_all(positions,price_mode=p["price_mode"],request_id=b["command_id"])
             else:
                 binding["metadata"]["desired_remaining"] = {cid:0 for cid in ids}
                 binding["initial_status"] = "EXECUTING"; k.flatten(ids)
@@ -364,6 +396,16 @@ class ControlProtocol:
                 k.recovery_required = bool(k._recovery_pending) or k._has_unknown()
                 for cid in ids:k._progress_exits(cid)
             self._stage(cycles,"TX_RECONCILE","CONTROL_RESUME_ORIGINAL_EXITS",after=resumed)
+        elif op == "CANCEL_NATIVE_ACCOUNT":
+            if not getattr(getattr(k.simulation,'grant',None),'manual_workbench',False):
+                raise TraderError('E_SCOPE','The current scope does not support native account cancellation')
+            from online_trader.kernel.native_control import prepare_account_cancel
+            prepare_account_cancel(self,binding)
+        elif op == "ADOPT_EXTERNAL_POSITION":
+            if not getattr(getattr(k.simulation,'grant',None),'external_allocation_allowed',False):
+                raise TraderError('E_SCOPE','The current scope does not support external adoption')
+            from online_trader.kernel.external_positions import adopt_position
+            adopt_position(k.simulation,binding)
         elif op == "BEGIN_TAKEOVER": self._begin_takeover(binding)
         elif op == "CONFIRM_TAKEOVER": self._confirm_takeover(binding)
         elif op == "ENTER_MAINTENANCE": self._enter_maintenance(binding)
@@ -413,6 +455,31 @@ class ControlProtocol:
             if p["position_cycle_id"] is not None or scope!={"scope_type":"ACCOUNT","scope_ids":[]}:raise TraderError("E_SCOPE","Full account reconciliation scope differs")
         elif scope!={"scope_type":"CYCLE","scope_ids":[p["position_cycle_id"]]}:raise TraderError("E_SCOPE","Original cycle reconciliation scope differs")
         run_id="control-recon-"+content_hash(binding["body"]["command_id"])[:32]
+        if "historical_orders" in p or p.get("query_order_archive"):
+            k=self.kernel;owner=k.simulation
+            if not getattr(owner,'strategy_enabled',False) or not owner.grant.multi_day or scope['scope_type']!='ACCOUNT' or k._pending:
+                raise TraderError('E_SCOPE','Historical recovery needs a settled multi-day account owner')
+            if p.get("query_order_archive") and "historical_orders" in p:
+                raise TraderError('E_SCHEMA','Select archive query or reviewed import')
+            records=(owner.historical_orders.query_archive() if p.get('query_order_archive')
+                     else owner.historical_orders.prepare(p['historical_orders']))
+            binding.update(initial_status='SUCCEEDED',reason='Historical evidence saved for original recovery' if records
+                else 'No new terminal history was proved; original reservations retained',
+                evidence_ids=[r['observation']['child_order_id'] for r in records])
+            if not records:return
+            k._armed=False;k.contexts.revoke_all();k._authority_revision+=1;k._state_revision+=1
+            k._recovery_pending.update(c['position_cycle_id'] for c in k._staged.values() if c['lifecycle']!='CLOSED')
+            k.recovery_required=True
+            owner.days.invalidate()
+            authority=k._authority()
+            def accepted():
+                owner.historical_orders.records.update({r['order']['order_id']:r for r in records})
+            k._submit('TX_RECONCILE','ONLINE_REVIEWED_TERMINAL_HISTORY',{'historical_orders':records,'authority':authority},
+                lambda conn,seq:k._write_authority(conn,seq,authority),after=accepted)
+            return
+        if self.kernel.simulation:
+            from online_trader.kernel.native_control import record_reconciliation
+            return record_reconciliation(self,binding,run_id)
         binding["metadata"]["run_id"]=run_id
         binding.update(initial_status="NEEDS_RECONCILIATION",error_code="E_NOT_READY",reason="Reconciliation requested; complete source facts have not arrived",evidence_ids=[run_id])
         def extra(conn,seq):
@@ -492,22 +559,63 @@ class ControlProtocol:
             return ("SUCCEEDED","NONE","New entry authority granted",[]) if k._armed else ("SUPERSEDED","NONE","A newer authority decision superseded this grant",[])
         if op=="MANUAL_OPEN":
             selected=[orders[oid] for oid in m.get("order_ids",[]) if oid in orders]
-            if selected and all(o["terminal_confirmed"] and o["reported_fill_qty"]==o["filled_qty"] for o in selected):return "SUCCEEDED","NONE","Entry cycle reached a proved order terminal state",m["order_ids"]
+            if selected and all(o["terminal_confirmed"] and o["reported_fill_qty"]==o["filled_qty"] for o in selected):
+                if any(k._committed[cid].get('manual_limit_order') for cid in ids):
+                    if all(o['send_state']=='DEFINITELY_NOT_SENT' for o in selected):
+                        return "FAILED","E_NOT_READY","Final native or risk gate rejected the limit order before sending",m["order_ids"]
+                    return "SUCCEEDED","NONE",f"Native terminal order confirmed; filled quantity {sum(o['filled_qty'] for o in selected)}",m["order_ids"]
+                return "SUCCEEDED","NONE","Entry cycle reached a proved order terminal state",m["order_ids"]
             if any(o["send_state"]=="UNKNOWN" for o in selected):return "NEEDS_RECONCILIATION","E_UNKNOWN_SEND","Opening result is unknown; original identity retained",m.get("order_ids",[])
         elif op in {"CANCEL_SELECTED","CANCEL_OWNED","CANCEL_ACCOUNT_CONFIRMED","PAUSE_NEW_ENTRIES"}:
             selected=[orders[oid] for oid in m.get("order_ids",[]) if oid in orders]
             if selected and all(o["terminal_confirmed"] and o["reported_fill_qty"]==o["filled_qty"] for o in selected):return "SUCCEEDED","NONE","Related orders reached quantity-consistent terminal states",m.get("order_ids",[])
             if any(o["send_state"]=="UNKNOWN" or o["cancel_status"]=="UNKNOWN" or (o["cancel_status"]=="SEND_POSSIBLE" and o["kernel_boot_id"]!=k.boot_id) for o in selected):return "NEEDS_RECONCILIATION","E_UNKNOWN_SEND","Cancellation outcome is unknown; quantity remains reserved",m.get("order_ids",[])
-        elif op in {"MANUAL_CLOSE","FLATTEN_THEN_STOP"}:
+        elif op in {"MANUAL_CLOSE","MANUAL_CLOSE_ALL","FLATTEN_THEN_STOP"}:
             goals=m.get("desired_remaining",{})
             if any(o["send_state"]=="UNKNOWN" or o["cancel_status"]=="UNKNOWN" for o in orders.values()):return "NEEDS_RECONCILIATION","E_UNKNOWN_SEND","Reduction outcome is unknown; original target and quantity remain reserved",list(goals)
+            if op!="FLATTEN_THEN_STOP" and not any(OrderState.from_dict(o).potential_remaining for o in orders.values()):
+                unfinished={cid for cid,target in goals.items()
+                            if cid in k._committed and k._committed[cid]["protection"]["owned_qty"]>target}
+                if unfinished and all(k.execution.manual_reduction_failed(k._committed[cid],state["body"]["command_id"])
+                                      for cid in unfinished):
+                    failures = {k._committed[cid].get('manual_reduction',{}).get('price_failure') for cid in unfinished}
+                    if 'MANUAL_PRICE_CONTEXT_CHANGED' in failures or 'MANUAL_PRICE_CLOCK_CHANGED' in failures:
+                        reason = "柜台会话或报价时钟已变化，请重新确认手动平仓。"
+                    elif 'MANUAL_LIMIT_FALLBACK_TOO_FAR' in failures:
+                        reason = "手动平仓等候报价超时，涨跌停兜底价超过已配置的偏离比例。"
+                    elif any(failures):
+                        reason = "手动平仓等候报价结束，未取得可用的限价。"
+                    else:
+                        reason = "手动平仓仍有未平数量，已终结的限价委托未自动追价。"
+                    return "FAILED","E_NOT_READY",reason,sorted(unfinished)
             for cycle_id,target in goals.items():
                 c=k._committed.get(cycle_id)
                 if not c or c["protection"]["owned_qty"]>target:return None
                 if any(OrderState.from_dict(o).potential_remaining or o["send_state"]=="UNKNOWN" for o in c["orders"]):return None
             if op=="FLATTEN_THEN_STOP":
+                if k.simulation:
+                    closed=[k._committed[cid] for cid in goals]
+                    if any(c['lifecycle']!='CLOSED' or not c.get('entry_reconciliation_id') for c in closed):return None
+                    snapshot=k.port.snapshot()
+                    try:k.simulation._validate_snapshot(snapshot)
+                    except TraderError:return None
+                    contracts={c['plan']['contract_id'] for c in closed}
+                    if any(p['contract_id'] in contracts for p in snapshot['positions']):return None
+                    evidence=[c['entry_reconciliation_id'] for c in closed]
+                    return "SUCCEEDED","NONE","All managed cycles are reconciled flat; new entries remain disabled",evidence
                 if not any(self._usable_evidence(e,{"scope_type":"ACCOUNT","scope_ids":[]}) for e in self.evidence.values()):return None
             return "SUCCEEDED","NONE","Requested reduction is confirmed; new entry authority remains separate",list(goals)
+        elif op=="CANCEL_NATIVE_ACCOUNT":
+            from online_trader.kernel.native_control import account_cancel_result
+            return account_cancel_result(k.simulation,m,state['body']['command_id'])
+        elif op=="STOP_DSV_STRATEGY" and m.get('native_cancel_orders'):
+            from online_trader.kernel.native_control import account_cancel_result
+            result=account_cancel_result(k.simulation,m,state['body']['command_id'],strategy_stop=True)
+            if result is None:return None
+            status,code,_,evidence=result
+            if status=='SUCCEEDED':
+                return status,code,m['stop_message']+'。已核实所请求撤销的委托终态。',evidence
+            return status,code,m['stop_message']+'。撤单尚待柜台核对。',evidence
         elif op=="REQUEST_RECONCILIATION":
             evidence=self.evidence.get(m.get("run_id"))
             if evidence and self._usable_evidence(evidence,m["scope"]):return "SUCCEEDED","NONE","Four fact ranges completed at the current scope",[evidence["id"]]

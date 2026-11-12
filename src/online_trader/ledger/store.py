@@ -299,7 +299,21 @@ class Ledger:
             conn.execute("UPDATE reservations SET status='UNKNOWN',state_revision=state_revision+1,updated_event_seq=? WHERE status='HELD' AND intent_id IN (SELECT intent_id FROM order_intents WHERE status='UNKNOWN')", (sequence,))
             conn.execute("UPDATE reconciliation_parts SET status='INVALIDATED' WHERE status='COMPLETE'")
             conn.execute("UPDATE reconciliation_runs SET status='INVALIDATED' WHERE status='COMPLETE'")
-            conn.execute("UPDATE operator_commands SET status='NEEDS_RECONCILIATION',receipt_revision=receipt_revision+1,updated_event_seq=? WHERE status IN ('ACCEPTED_PENDING_COMMIT','COMMITTED','EXECUTING')", (sequence,))
+            # Advance the projected receipt and its JSON together so later owner
+            # reconciliation uses the same revision as the compare-and-set row.
+            conn.execute("""
+                UPDATE operator_commands
+                SET status='NEEDS_RECONCILIATION', receipt_revision=receipt_revision+1, updated_event_seq=?,
+                    result_json=json_set(result_json,
+                        '$.status','NEEDS_RECONCILIATION',
+                        '$.receipt_revision',CAST(receipt_revision+1 AS TEXT),
+                        '$.event_seq',?, '$.durable_seq',?, '$.tx_id',?, '$.state_revision',?,
+                        '$.error_code','E_FACT_BARRIER',
+                        '$.reason','Original command needs current reconciliation after owner restart')
+                WHERE status IN ('ACCEPTED_PENDING_COMMIT','COMMITTED','EXECUTING')
+                   OR (status='NEEDS_RECONCILIATION'
+                       AND json_extract(result_json,'$.receipt_revision') IS NOT CAST(receipt_revision AS TEXT))
+            """, (sequence, str(sequence), str(sequence), tx_id, str(revision)))
             conn.commit()
         except BaseException:
             conn.rollback()

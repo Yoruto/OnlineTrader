@@ -97,7 +97,7 @@ def _number(value, line, field):
         raise SymbolCsvError(line, field, "invalid_decimal") from None
 
 
-def import_symbols(raw, profile, *, mode="replace"):
+def import_symbols(raw, profile, *, mode="replace", escaped_names=True):
     """Return a complete immutable preview or fail with a physical CSV line.
 
     Replace changes the list; merge updates matching codes and appends new ones.
@@ -134,7 +134,7 @@ def import_symbols(raw, profile, *, mode="replace"):
                 if field == "name":
                     # A reversible apostrophe escape protects CSV opened in Excel.
                     rest = value[1:]
-                    if value.startswith("'") and (rest[:1] in {"=", "+", "-", "@", "'"}
+                    if escaped_names and value.startswith("'") and (rest[:1] in {"=", "+", "-", "@", "'"}
                             or rest != rest.strip()): value = rest
                     row[field] = value
                 else:

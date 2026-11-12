@@ -128,6 +128,34 @@
                     "configuration": {
                       "type": "object"
                     },
+                    "account_metrics": {
+                      "type": "object",
+                      "maxProperties": 16
+                    },
+                    "equity_history": {
+                      "type": "array",
+                      "maxItems": 512,
+                      "items": {"type": "object", "maxProperties": 4}
+                    },
+                    "minute_bars": {
+                      "type": "object",
+                      "maxProperties": 64,
+                      "additionalProperties": {
+                        "type": "array",
+                        "maxItems": 48,
+                        "items": {
+                          "type": "array",
+                          "minItems": 5,
+                          "maxItems": 5,
+                          "prefixItems": [{"type": "integer", "minimum": 1}],
+                          "items": {"type": "string", "maxLength": 32}
+                        }
+                      }
+                    },
+                    "symbol_entry_switches": {
+                      "type": "object",
+                      "maxProperties": 512
+                    },
                     "markets": {
                       "type": "array",
                       "maxItems": 512,
@@ -135,6 +163,11 @@
                         "type": "object",
                         "maxProperties": 64
                       }
+                    },
+                    "external_positions": {
+                      "type": "array",
+                      "maxItems": 512,
+                      "items": {"type": "object", "maxProperties": 64}
                     },
                     "cycles": {
                       "type": "array",

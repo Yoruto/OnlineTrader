@@ -18,7 +18,7 @@ from qa.recording_port import RecordingPort
 def facts(account_key):
     market = {"account_key": account_key, "contract_id": "DCE.p2701", "trading_day": "2026-11-09",
         "session_id": "day-20261109", "source_epoch": 1, "sequence": 1,
-        "source_time_utc": "2026-11-09T01:05:00Z", "session_open_utc": "2026-11-09T01:00:00Z",
+        "source_time_utc": "2026-11-09T01:05:00.000001Z", "session_open_utc": "2026-11-09T01:00:00Z",
         "session_close_utc": "2026-11-09T07:00:00Z", "last": "1055", "bid1": "1054", "ask1": "1056",
         "day_high": "1090", "day_low": "1000", "tick_size": "1", "quality": "CONTIGUOUS",
         "day_range_complete": True, "path_complete": True, "is_trading": True, "calendar_complete": True,
@@ -98,6 +98,51 @@ class DsvRuntimeTests(unittest.TestCase):
         self.assertEqual(len(proposal), 1)
         self.assertEqual((proposal[0]["proposal_kind"], proposal[0]["status"]), ("DECISION", "COMMITTED"))
         self.assertIsNotNone(proposal[0]["intent_id"])
+
+    def test_unreachable_profit_consumes_ordinary_signal_but_equality_allows_next_bar(self):
+        self.arm()
+        rejected=self.observe(instrument=self.instrument | {"upper_limit": "1104"})
+        self.assertIn("TAKE_PROFIT_OUTSIDE_PRICE_LIMIT",rejected["reasons"])
+        self.assertEqual(self.port.orders,[])
+        instrument=self.instrument | {"upper_limit": "1105"}
+        same_bar=self.market | {"sequence": 2, "source_time_utc": "2026-11-09T01:05:01Z"}
+        self.assertIn("CANDLE_OPPORTUNITY_CONSUMED",self.observe(same_bar,instrument=instrument)["reasons"])
+        next_bar=same_bar | {"sequence": 3, "source_time_utc": "2026-11-09T01:06:00Z", "candle_id": "20261109-0106"}
+        self.assertEqual(self.observe(next_bar,instrument=instrument)["status"],"ENTRY_COMMITTED")
+
+    def test_ordinary_price_limit_uses_both_sides_and_strict_one_percent(self):
+        candidate={"direction": "LONG", "theoretical_price": "950", "take_profit_distance": "40"}
+        limits={"lower_limit": "900", "upper_limit": "1000"}
+        check=self.runtime._ordinary_limit_reason
+        self.assertIsNone(check(candidate,"990",limits))
+        self.assertEqual(check(candidate,"991",limits),"LAST_NEAR_PRICE_LIMIT")
+        self.assertIsNone(check(candidate,"909",limits))
+        self.assertEqual(check(candidate,"908",limits),"LAST_NEAR_PRICE_LIMIT")
+        candidate.update(direction="SHORT",theoretical_price="939")
+        self.assertEqual(check(candidate,"950",limits),"TAKE_PROFIT_OUTSIDE_PRICE_LIMIT")
+
+    def test_one_second_throttle_applies_across_minutes_and_consumes_the_rejected_bar(self):
+        self.arm()
+        first=self.market | {"source_time_utc": "2026-11-09T01:05:59.900500Z"}
+        child=self.observe(first)["child_order_id"]
+        self.kernel.confirm_terminal(child,"CANCELLED",0)
+        self.kernel.wait_idle()
+        second=first | {"sequence": 2, "source_time_utc": "2026-11-09T01:06:00.899999Z",
+                       "candle_id": "20261109-0106"}
+        self.assertIn("SAME_DIRECTION_WITHIN_ONE_SECOND",self.observe(second)["reasons"])
+        later=second | {"sequence": 3, "source_time_utc": "2026-11-09T01:06:00.900000Z"}
+        self.assertIn("CANDLE_OPPORTUNITY_CONSUMED",self.observe(later)["reasons"])
+        self.assertEqual(len(self.port.orders),1)
+
+    def test_one_second_throttle_allows_exact_integer_millisecond_boundary(self):
+        self.arm()
+        first=self.market | {"source_time_utc": "2026-11-09T01:05:59.000499Z"}
+        child=self.observe(first)["child_order_id"]
+        self.kernel.confirm_terminal(child,"CANCELLED",0)
+        self.kernel.wait_idle()
+        second=first | {"sequence": 2, "source_time_utc": "2026-11-09T01:06:00Z", "candle_id": "20261109-0106"}
+        self.assertEqual(self.observe(second)["status"],"ENTRY_COMMITTED")
+        self.assertEqual(len(self.port.orders),2)
 
     def test_first_partial_and_late_fill_keep_the_frozen_original_protection(self):
         self.account.update(equity="300000", available="200000")
@@ -227,7 +272,8 @@ class DsvRuntimeTests(unittest.TestCase):
         self.arm();child=self.observe()["child_order_id"]
         self.kernel.record_fill(child,"partial-margin-coverage",1,"1056");self.kernel.wait_idle()
         candidate=self.cycle()["strategy_metadata"]["candidate"]|{"contract_id":"DCE.l2701","stop_distance":"20"}
-        facts={"account":copy.deepcopy(self.account),"instrument":self.instrument|{"contract_id":"DCE.l2701"}}
+        facts={"account":copy.deepcopy(self.account),"instrument":self.instrument|{"contract_id":"DCE.l2701"},
+               "event":self.market|{"contract_id":"DCE.l2701"}}
         result=self.runtime._risk(candidate,facts)
         self.assertEqual(result["metrics"]["used_margin"],"12000")
         facts["account"].update(margin="11000",covered_local_cycle_ids=[self.cycle()["position_cycle_id"]])
@@ -245,7 +291,7 @@ class DsvRuntimeTests(unittest.TestCase):
         self.kernel=Kernel(self.path,self.account_key,development=True,port=self.port,risk_budget="1000000")
         self.runtime=DsvStrategyRuntime(self.kernel);self.arm()
         market=self.market|{"trading_day":"2026-11-10","session_id":"day-20261110","candle_id":"20261110-0105",
-            "source_time_utc":"2026-11-10T01:05:00Z","session_open_utc":"2026-11-10T01:00:00Z","session_close_utc":"2026-11-10T07:00:00Z"}
+            "source_time_utc":"2026-11-10T01:05:00.000001Z","session_open_utc":"2026-11-10T01:00:00Z","session_close_utc":"2026-11-10T07:00:00Z"}
         account={k:v for k,v in self.account.items() if k!="strategy_stop_facts"}|{"trading_day":"2026-11-10","revision":2}
         report=self.observe(market,account,self.instrument|{"trading_day":"2026-11-10"})
         self.assertIn("DSV_PERSISTED_DAY_OR_MONTH_STOP",report["reasons"])

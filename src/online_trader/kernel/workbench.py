@@ -4,11 +4,15 @@ No SDK methods that wait for network data and no second execution state exist.
 Business rows come exclusively from accepted commits at the stated watermark.
 """
 import copy
+from datetime import datetime
+from decimal import Decimal
 
 from online_trader.contracts.codec import canonical_bytes, strict_loads
 from online_trader.domain.orders import OrderState
+from online_trader.domain.values import decimal_text
 from online_trader.kernel.projection import projection_batch
 from online_trader.errors import TraderError
+from online_trader.gateway.tqkq import number
 
 
 def workbench_view(kernel):
@@ -17,19 +21,132 @@ def workbench_view(kernel):
     records=projection_batch(snapshot)['records'];scheduler=getattr(kernel,'_scheduled_runtime',None)
     runtime=getattr(kernel,'_dsv_runtime',None)
     markets=[];decisions={}
+    scoped=bool(getattr(kernel.simulation,'strategy_enabled',False))
+    native=None;external_positions=[];native_cancel_review=None;native_error=None
+    if scoped:
+        from online_trader.kernel.external_positions import review_positions
+        from online_trader.kernel.native_control import cancel_review
+        try:
+            native,external_positions=review_positions(kernel.simulation)
+            if kernel.simulation.grant.manual_workbench:
+                _,_,native_cancel_review=cancel_review(kernel.simulation)
+        except TraderError as error:
+            native_error=error.code
+    day=native['trading_day'] if native and native['complete'] else None
+    symbols={row['code']:row for row in runtime.profile.to_record()['settings']['symbols']} if runtime else {}
     for row in kernel.ledger.query('SELECT payload_json FROM strategy_proposals WHERE recorded_event_seq<=? ORDER BY recorded_event_seq DESC LIMIT 512',(kernel._durable_seq,)):
         value=strict_loads(row['payload_json']);state=value.get('state',{})
         decisions.setdefault((state.get('contract_id'),state.get('trading_day')),value.get('report') or {})
-    for code,row in sorted((runtime._latest if runtime else {}).items(),key=lambda item:str(item[0])):
+    latest={}
+    for (code,trading_day),row in sorted((runtime._latest if runtime else {}).items()):
+        if day is None or trading_day==day:
+            latest[code]=(row,False)
+    if scheduler is not None:
+        # Rebuilding an observation invalidates strategy send facts. The
+        # scheduler still has the last live quote and its original age anchor.
+        for code,row in scheduler._quotes.items():
+            if day is None or row['event']['trading_day']==day:
+                latest.setdefault(code,(row,True))
+    for code,(row,from_scheduler) in sorted(latest.items()):
         event=row['event'];name=event['contract_id']
-        profile=runtime.profile.to_record()['settings']['symbols']
-        symbol=next((s for s in profile if s['code']==name),{})
+        symbol=symbols.get(name,{})
         received=row.get('received_ns');fresh=received is not None and kernel._quote_age_ns(received)<=kernel.max_quote_age_ms*1000000
+        if from_scheduler:
+            fresh=fresh and scheduler.scope_current(code,event['trading_day'],event['session_id'])
+            if scoped:
+                fresh=fresh and day is not None and not port.fault and event['source_epoch']==port.source_epoch
+        quote_details={}
+        quote=getattr(port,'quotes',{}).get(name)
+        if fresh and quote is not None:
+            try:
+                stamp=datetime.fromisoformat(event['source_time_utc'])
+                quote_stamp=datetime.fromisoformat(quote.datetime)
+                if quote_stamp.tzinfo is None:
+                    from online_trader.strategy.entry import CHINA_TIME
+                    quote_stamp=quote_stamp.replace(tzinfo=CHINA_TIME)
+                if quote_stamp==stamp:
+                    quote_details={key:number(getattr(quote,key,None)) for key in (
+                        'open','pre_settlement','settlement','volume','open_interest',
+                        'upper_limit','lower_limit','margin','commission','price_tick','bid_volume1','ask_volume1','volume_multiple')}
+            except (TypeError,ValueError,AttributeError):
+                pass
         markets.append({key:event.get(key) for key in ('contract_id','trading_day','session_id','last','bid1','ask1','day_high','day_low','source_time_utc','path_complete')}
             |{'name':symbol.get('name',name),'fresh':fresh,'enabled':kernel.control.symbol_entry_enabled(name,committed=True),
               'entry_switch_revision':kernel.control.symbol_entries.get(name,{}).get('revision',0),
-              'entry_reasons':copy.deepcopy(decisions.get(code,{}).get('reasons',[]))})
-    cycles=[];orders=[]
+              'entry_reasons':copy.deepcopy(decisions.get((name,event['trading_day']),{}).get('reasons',[]))}
+            |quote_details)
+    if scoped:
+        displayed={row['contract_id'] for row in markets}
+        for code in kernel.simulation.grant.value['contracts']:
+            if code in displayed:continue
+            markets.append(dict.fromkeys(('session_id','last','bid1','ask1','day_high','day_low','source_time_utc'))
+                |{'contract_id':code,'name':symbols.get(code,{}).get('name',code),'path_complete':False,'fresh':False,
+                  'trading_day':day,
+                  'enabled':kernel.control.symbol_entry_enabled(code,committed=True),
+                  'entry_switch_revision':kernel.control.symbol_entries.get(code,{}).get('revision',0),
+                  'entry_reasons':['WAITING_FRESH_QUOTE']})
+    day_stops={}
+    for cycle in snapshot['cycles']:
+        plan=cycle['plan'];protection=cycle['protection']
+        if not protection.get('block_new_for_trading_day'):
+            continue
+        reasons=protection.get('exit_reasons',[])
+        if protection.get('protected_event_seq') and plan['profit_protection'].get('block_new_for_trading_day'):
+            ratio=Decimal(plan['profit_protection']['activation_ratio'])*100
+            reason=f'浮盈曾达止盈{decimal_text(ratio)}%'
+        elif 'TRAILING_STOP' in reasons:
+            reason='移动止盈后停开'
+        elif 'DATA_GAP_EXIT' in reasons:
+            reason='断流强平后停开'
+        elif 'MANUAL_EXIT' in reasons:
+            reason='手动平仓后停开'
+        elif 'ADVERSE_SLIPPAGE' in reasons:
+            reason='开仓滑点超限'
+        else:
+            reason='持仓保护已锁定当日停开'
+        day_stops[(plan['contract_id'],plan['trading_day'])]=reason
+    for market in markets:
+        code=market['contract_id'];trading_day=market['trading_day']
+        if runtime is None or trading_day is None:
+            continue
+        key=(code,trading_day)
+        stats=kernel.statistics.snapshot(code,trading_day) or {}
+        stop=stats.get('stop_result',{}).get('state',{})
+        strategy_stop=runtime._stop_states.get(key,{}).get('state',{})
+        stop_reason=next((state.get('day_stopped_reason') or '当日已停止开仓'
+                          for state in (stop,strategy_stop) if state.get('day_stopped')),None)
+        if stop_reason is None and any(c==code and d<=trading_day and
+                result['state'].get('month_stop')==trading_day[:7]
+                for (c,d),result in runtime._stop_states.items()):
+            stop_reason='本月连续停机停开'
+        if stop_reason is None and runtime._states.get(key,{}).get('first_minute_blocks'):
+            stop_reason='开盘首分钟跳空'
+        market['day_stop_reason']=stop_reason or day_stops.get(key)
+        market['net_loss_points']=(stop or strategy_stop).get('net_loss_points')
+    rollover_reader=getattr(port,'rollover_market_facts',None)
+    if scoped and callable(rollover_reader):
+        for market in markets:
+            facts=rollover_reader(market['contract_id'],day)
+            if facts:market['rollover']=facts
+    market_by_code={item['contract_id']:item for item in markets}
+    broker_orders=port.api.get_order(account=port.account) if day is not None else {}
+    broker_positions=port.api.get_position(account=port.account) if day is not None else {}
+    broker_trades={port.trade_prefix+item['trade_id']:item for item in native['trades']} if day is not None else {}
+    position_owners={}
+    for cycle in snapshot['cycles']:
+        plan=cycle['plan']
+        if cycle['protection']['owned_qty']:
+            key=(plan['contract_id'],plan['direction'])
+            position_owners[key]=position_owners.get(key,0)+1
+    trades=[];position_fees={}
+    for fill in kernel.money.book.fills.values():
+        fee=kernel.money.book.fees.get(fill['trade_key']) or fill.get('original_fee') or {}
+        broker_trade=broker_trades.get(fill['trade_key'],{})
+        confirmed_fee=fee.get('amount') if fee.get('quality')=='CONFIRMED' else None
+        trades.append(copy.deepcopy(fill)|{'commission':confirmed_fee,'native_trade_id':broker_trade.get('trade_id'),
+            'source_time_ns':broker_trade.get('source_time_ns')})
+        position_fees.setdefault(fill['position_cycle_id'],[]).append(confirmed_fee)
+    cycles=[];orders=[];exit_blocks=[]
     for cycle in snapshot['cycles']:
         p=cycle['plan'];s=cycle['protection'];cid=cycle['position_cycle_id']
         route_review={'status':'NO_OWNED_QUANTITY'}
@@ -37,17 +154,77 @@ def workbench_view(kernel):
             from online_trader.execution.close_routes import preview_owned_routes
             try:route_review=preview_owned_routes(kernel,cid,s['owned_qty'])
             except TraderError as error:route_review={'status':'BLOCKED','error_code':error.code,'execution_eligible':False}
+        target=s.get('target_remaining_qty')
+        exit_pending=(target is not None and target<s['owned_qty']) or any(
+            order['effect']=='REDUCE' and (OrderState.from_dict(order).potential_remaining or
+                order['send_state'] in {'UNKNOWN','SEND_POSSIBLE'}) for order in cycle['orders'])
+        if target is not None and target<s['owned_qty'] and cycle.get('management_state')!='TAKEN_OVER':
+            reductions=[order for order in cycle['orders'] if order['effect']=='REDUCE']
+            reserved=sum(OrderState.from_dict(order).potential_remaining for order in reductions)
+            execution=cycle.get('execution') or {}
+            cancellations=execution.get('cancel_reasons',{})
+            manual_children=execution.get('manual_reduction_children',{})
+            manual=kernel.execution.manual_reduction(cycle)
+            failed=any(order['terminal_confirmed'] and order['filled_qty']<order['original_qty'] and
+                (order['broker_state']=='REJECTED' or (order['broker_state']=='CANCELLED' and not order['cancel_status']
+                 and order['child_order_id'] not in cancellations)) for order in reductions
+                if order['child_order_id'] not in manual_children or
+                (manual and manual_children[order['child_order_id']]==manual['request_id']))
+            if failed and s['owned_qty']-target>reserved:
+                exit_blocks.append({'reason_code':'EXIT_REDUCTION_TERMINAL_UNFILLED','active':True,
+                                    'contract_id':p['contract_id'],'position_cycle_id':cid})
+        market=market_by_code.get(p['contract_id'],{})
+        price=market.get('last') if market.get('fresh') else None
+        average=cycle.get('actual_average_entry_price')
+        sign=Decimal(1 if p['direction']=='LONG' else -1)
+        base=Decimal(p['theoretical_entry_price'])
+        take=Decimal(p['fixed_take_profit']['distance_points'])
+        stop_move=-Decimal(p['fixed_stop_loss']['distance_points'])
+        if s['mode']=='PROTECTED':
+            stop_move=take*Decimal(p['profit_protection']['floor_ratio'])
+        elif s.get('break_even_status')=='ACTIVE':
+            stop_move=Decimal(0)
+        if s['mode']=='NORMAL' and s.get('trailing_floor_move') is not None:
+            stop_move=max(stop_move,Decimal(s['trailing_floor_move']))
+        broker_position=broker_positions.get(p['contract_id'])
+        margin=floating=None
+        side=p['direction'].lower()
+        if (s['owned_qty'] and broker_position is not None and
+                position_owners[(p['contract_id'],p['direction'])]==1 and
+                getattr(broker_position,'pos_'+side,None)==s['owned_qty']):
+            margin=number(getattr(broker_position,'margin_'+side,None))
+            other_side='short' if side=='long' else 'long'
+            if margin is None and getattr(broker_position,'pos_'+other_side,None)==0:
+                margin=number(getattr(broker_position,'margin',None))
+            floating=number(getattr(broker_position,'float_profit_'+side,None))
+        fees=position_fees.get(cid,[])
         cycles.append({'position_cycle_id':cid,'contract_id':p['contract_id'],'direction':p['direction'],
             'trading_day':p['trading_day'],'lifecycle':cycle['lifecycle'],'remaining_quantity':s['owned_qty'],
-            'target_remaining_quantity':s.get('target_remaining_qty'),'mode':s['mode'],'quality':s['quality'],
+            'target_remaining_quantity':target,'mode':s['mode'],'quality':s['quality'],'exit_pending':bool(exit_pending),
+            'entry_price':average,'stop_price':decimal_text(base+sign*stop_move),
+            'take_profit_price':decimal_text(base+sign*take),'last_price':price,
+            'price_difference':decimal_text(sign*(Decimal(price)-Decimal(average))) if price is not None and average is not None else None,
+            'margin':margin,'floating_profit':floating,
+            'commission':decimal_text(sum(Decimal(fee) for fee in fees)) if fees and all(fee is not None for fee in fees) else None,
             'phase1_status':s.get('phase1_status'),'phase2_status':s.get('phase2_status'),
+            'phase1_target':s.get('phase1_target'),'phase2_target':s.get('phase2_target'),
+            'initial_open_confirmation':copy.deepcopy(cycle.get('initial_open_confirmation')),
+            'entry_tag':(cycle.get('strategy_metadata') or {}).get('candidate',{}).get('entry_kind'),
+            'exit_reasons':copy.deepcopy(s.get('exit_reasons',[])),
+            'exit_reason':(cycle.get('nominal_exit') or {}).get('exit_reason'),
+            'exit_reference_price':(cycle.get('nominal_exit') or {}).get('nominal_exit_price'),
             'break_even_status':s.get('break_even_status'),'max_favorable_move':s.get('max_favorable_move'),
             'management_state':cycle.get('management_state'),'plan_id':p['plan_id'],'plan_revision':p['plan_revision'],'close_route_review':route_review})
         for order in cycle['orders']:
+            native_id=port.order_id(order['child_order_id']) if kernel.simulation else None
+            broker_order=broker_orders.get(native_id)
+            native_time=getattr(broker_order,'insert_date_time',None)
             orders.append({key:order.get(key) for key in ('child_order_id','intent_id','attempt_id','effect','original_qty','filled_qty',
-                'limit_price','native_offset','send_state','broker_state','cancel_status','terminal_confirmed')}
+                'limit_price','native_offset','native_trading_day','send_state','broker_state','cancel_status','terminal_confirmed')}
+                |{'native_order_id':native_id,'direction':p['direction'],
+                  'source_time_ns':str(native_time) if type(native_time) is int and native_time>0 else None,
+                  'native_message':str(getattr(broker_order,'last_msg',''))[:200] if broker_order is not None else None}
                 |{'position_cycle_id':cid,'contract_id':p['contract_id'],'potential_remaining':OrderState.from_dict(order).potential_remaining})
-    trades=list(kernel.money.book.fills.values())
     commands=[copy.deepcopy(s['receipt']) for s in kernel.control.states.values() if s.get('receipt')]
     policies=[]
     for row in kernel.ledger.query('SELECT policy_id,policy_kind,policy_json FROM policy_revisions'):
@@ -62,14 +239,53 @@ def workbench_view(kernel):
             'recovery_required':snapshot['recovery_required'],'storage_failed':snapshot['storage_failed'],
             'clock_fault':copy.deepcopy(scheduler._fault) if scheduler else None,'pending_transactions':len(kernel._pending)},
         'markets':markets,'cycles':cycles,'orders':orders,'trades':copy.deepcopy(trades),
-        'blocks':[r for r in records if r['record_type']=='BLOCK']+[{'reason_code':e,'active':True} for e in snapshot['errors'][-64:]],
+        'blocks':[r for r in records if r['record_type']=='BLOCK']+[{'reason_code':e,'active':True} for e in snapshot['errors'][-64:]]+exit_blocks,
         'commands':commands,'policies':policies,'truncated':False}
     result['symbol_entry_switches']=copy.deepcopy(kernel.control.symbol_entries)
+    equity=kernel.money.book.daily_equity
+    if equity:
+        result['equity_history']=[equity[key].copy() for key in sorted(equity)[-512:]]
+    if scoped:
+        if runtime is not None:
+            trade=runtime.profile.to_record()['settings']['trade']
+            result['configuration']['cancel_on_stop']=trade['cancel_on_stop']
+            result['configuration']['manual_close_price_mode']=trade['close_price_mode']
+            result['configuration']['stop_cancel_pending']=kernel.control.stop_cancel_pending()
+            result['configuration']['margin_rate_alert_threshold']=trade['margin_rate_alert_threshold']
+            if getattr(port,'started_at',None) is not None:
+                try:result['configuration']['margin_alert_grace']=(port.clock.now()-port.started_at).total_seconds()<60
+                except TraderError:pass
+        result['configuration']['manual_workbench']=kernel.simulation.grant.manual_workbench
+        result['configuration']['scoped_contracts']=kernel.simulation.grant.value['contracts']
+        result['configuration']['gateway_identity']=port.gateway_identity
+        result['configuration']['calendar_hash']=kernel.simulation.grant.value['calendar_hash']
+        result['external_positions']=external_positions
+        if native_cancel_review is not None:
+            result['configuration']['native_cancel_review']=native_cancel_review
+        if native_error is not None:
+            result['blocks'].append({'reason_code':native_error,'active':True})
+        if callable(getattr(port,'minute_chart_bars',None)):
+            bars=port.minute_chart_bars()
+            if bars:result['minute_bars']=bars
+        if day is not None and not result['connection']['fault']:
+            if scheduler is not None:
+                schedules={code:scheduler.calendar.session_times(code,day) for code in result['configuration']['scoped_contracts']}
+                result['configuration']['schedule_display']={'trading_day':day,
+                    'intervals':{code:rows[:16] for code,rows in schedules.items()},
+                    'truncated':any(len(rows)>16 for rows in schedules.values())}
+            funds=native['funds']
+            native_ids={item['order_id'] for item in native['orders']}
+            opening_orders=sum(order['effect']=='OPEN' and order['native_trading_day']==day and
+                order['native_order_id'] in native_ids for order in orders)
+            result['account_metrics']={key:funds.get(key) for key in
+                ('balance','available','margin','risk_ratio','pre_balance','close_profit','position_profit','commission')}
+            result['account_metrics'].update(trading_day=day,opening_orders=opening_orders)
     # Every table has an explicit cap. Keep the last records; state that the view
     # is incomplete and disable bulk actions at the desktop when it is truncated.
-    for key in ('markets','cycles','orders','trades','blocks','commands','policies'):
+    for key in ('markets','cycles','orders','trades','blocks','commands','policies','external_positions'):
+        if key not in result:continue
         if len(result[key])>512:result['truncated']=True;result[key]=result[key][-512:]
     while len(canonical_bytes(result))>800000:
-        key=max(('trades','commands','orders','cycles','blocks','markets'),key=lambda k:len(canonical_bytes(result[k])))
+        key=max(('trades','commands','orders','cycles','blocks','markets','external_positions'),key=lambda k:len(canonical_bytes(result.get(k,[]))))
         result[key]=result[key][len(result[key])//2+1:];result['truncated']=True
     return result

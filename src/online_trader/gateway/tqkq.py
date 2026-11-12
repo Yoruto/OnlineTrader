@@ -113,6 +113,18 @@ class TqKqPort(OnlineSimulationPort):
             return not q.expired and -1<=age<=5 and all(math.isfinite(v) and v>0 for v in values) and q.lower_limit<=q.bid_price1<=q.ask_price1<=q.upper_limit and q.bid_volume1>0 and q.ask_volume1>0
         except (KeyError,AttributeError,TypeError,ValueError,TraderError):return False
 
+    def fresh_manual_reduction(self,code):
+        """Validate a current native quote for a frozen manual reduction limit."""
+        try:
+            q = self.quotes[code]
+            stamp = datetime.fromisoformat(q.datetime).replace(tzinfo=timezone(timedelta(hours=8)))
+            age = (self.clock.now()-stamp).total_seconds()
+            values = (q.last_price,q.price_tick,q.lower_limit,q.upper_limit)
+            return (not q.expired and -1<=age<=5 and all(math.isfinite(v) and v>0 for v in values)
+                    and q.lower_limit<=q.last_price<=q.upper_limit)
+        except (KeyError,AttributeError,TypeError,ValueError,TraderError):
+            return False
+
     def position(self,code):
         p=self.api.get_position(code,account=self.account)
         return {'long':p.pos_long,'short':p.pos_short}
@@ -142,7 +154,7 @@ class TqKqPort(OnlineSimulationPort):
                 'quantity':t.volume,'price':number(t.price),'source_time_ns':str(t.trade_date_time)})
         return {'snapshot_id':'kq-snapshot-'+uuid.uuid4().hex,'gateway_identity':self.gateway_identity,'source_epoch':self.source_epoch,
             'account_key':self.grant.account_key,'trading_day':self.grant.value['trading_day'],'complete':self.complete(),
-            'funds':{key:number(getattr(funds,key,None)) for key in ('balance','pre_balance','available','margin','frozen_margin','close_profit','position_profit','float_profit','commission')},
+            'funds':{key:number(getattr(funds,key,None)) for key in ('balance','pre_balance','available','margin','frozen_margin','close_profit','position_profit','float_profit','commission','risk_ratio')},
             'positions':positions,'orders':orders,'trades':trades}
 
     def validate_send(self,request):

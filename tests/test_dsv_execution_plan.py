@@ -157,7 +157,12 @@ class DsvExecutionPlanTests(unittest.TestCase):
     def test_old_versions_and_resource_evidence_are_not_rewritten(self):
         root=Path(__file__).resolve().parents[1]
         original=json.loads((root/'docs/spec-source.json').read_text(encoding='utf-8'))
+        extension=json.loads((root/'docs/spec-extension-workbench.json').read_text(encoding='utf-8'))
+        self.assertEqual(set(extension['extends_copied_resources']),{'schemas/ipc.schema.json'})
         for name,digest in original['copied_specification_resources'].items():
+            if name in extension['extends_copied_resources']:
+                self.assertEqual(extension['extends_copied_resources'][name],digest)
+                digest=extension['resources'][Path(name).name]
             self.assertEqual(hashlib.sha256((root/'src/online_trader/resources'/Path(name).name).read_bytes()).hexdigest(),digest)
         old=json.loads((root/'docs/spec-extension-dsv-protection.json').read_text(encoding='utf-8'))
         for name,digest in old['resources'].items():

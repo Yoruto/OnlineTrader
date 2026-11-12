@@ -62,6 +62,21 @@ class ReportingTests(unittest.TestCase):
             conn.execute('PRAGMA ignore_check_constraints=ON')
             conn.execute(sql,params)
 
+    def test_excel_daily_report_exports_only_the_selected_cabinet_day(self):
+        from zipfile import ZipFile
+        from online_trader.reporting import export_daily_report
+
+        report = self.seed(entry_fee="1")
+        path = self.folder / "日报.xlsx"
+        export_daily_report(report, path, DAY)
+        with ZipFile(path) as workbook:
+            detail = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
+            self.assertIn("report-entry", detail)
+            self.assertIn("report-exit", detail)
+        with self.assertRaises(TraderError) as error:
+            export_daily_report(report, self.folder / "missing.xlsx", "2026-11-11")
+        self.assertEqual(error.exception.code, "E_REPORT_DAY")
+
     def test_missing_ledger_does_not_create_a_database_or_writer_lock(self):
         missing=self.folder/'missing.db'
         with self.assertRaises(TraderError):read_report(missing,self.key)

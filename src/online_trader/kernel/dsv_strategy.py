@@ -22,7 +22,7 @@ from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
 from online_trader.gateway.ports import UnavailablePort
 from online_trader.kernel.strategy import StrategyCoordinator
-from online_trader.strategy.entry import DsvEntryStrategy
+from online_trader.strategy.entry import CHINA_TIME, DsvEntryStrategy, epoch_milliseconds, is_night_session
 from online_trader.strategy.risk import evaluate_entry
 
 
@@ -48,6 +48,9 @@ class DsvStrategyRuntime:
         if self.online and self.profile.content_hash!=kernel.simulation.grant.value['profile_hash']:
             raise TraderError('E_ONLINE_SCOPE','The selected DSV profile differs from the explicit strategy grant')
         self.strategy=DsvEntryStrategy(self.profile)
+        trade=self.profile.to_record()['settings']['trade']
+        self._continuation_seconds=float(trade['chase_window_minutes'])*60 if trade['continuation_entry'] else None
+        self._quote_age_limit = Decimal(trade['max_quote_age_seconds'])
         self._states={};self._stop_states={};self._latest={};self._rebuilds={};self._pending=None;self.epoch=None;self._account_revision=0
         def restore_state(state):
             if state is None:return
@@ -139,9 +142,15 @@ class DsvStrategyRuntime:
             k._submit("TX_CONFIG","DSV_DEVELOPMENT_CONFIG_ACTIVATED",{"authority":authority,"dsv_execution":descriptor},mutate,after=accepted)
             k.wait_idle()
         coordinator=StrategyCoordinator(k)
-        _,checkpoint=coordinator.checkpoint()
-        epoch=coordinator.register_shadow("dsv-builtin-"+uuid4().hex,checkpoint)
-        barrier,checkpoint=coordinator.checkpoint()
+        for _ in range(2):
+            _,registered=coordinator.checkpoint()
+            epoch=coordinator.register_shadow("dsv-builtin-"+uuid4().hex,registered)
+            barrier,checkpoint=coordinator.checkpoint()
+            # Waiting for the shadow commit may also commit source expiry.
+            # Prove the resulting checkpoint before switching authority.
+            if checkpoint==registered:break
+        else:
+            raise TraderError('E_STATE_HASH','Business facts changed while proving the strategy checkpoint')
         coordinator.switch(epoch,expected_old_epoch=k.active_epoch,barrier_seq=barrier,state_hash=checkpoint)
         k.wait_idle();self.epoch=epoch
         return self.status()
@@ -231,7 +240,7 @@ class DsvStrategyRuntime:
         self._latest[key]={"event":copy.deepcopy(event),"account":copy.deepcopy(account),
                            "instrument":copy.deepcopy(instrument),"received_ns":arrival,"stop_result":self._stop_decision(event,account)}
 
-    def _risk(self,candidate,facts,*,exclude_decision=None,exclude_attempt=None):
+    def _risk(self,candidate,facts,*,exclude_decision=None,exclude_attempt=None,previous_attempt=None):
         account=copy.deepcopy(facts["account"])
         instrument=facts["instrument"]
         pending=Decimal(0);symbol_extra=Decimal(0);attempts=0;active=set(account["active_symbols"])
@@ -259,10 +268,36 @@ class DsvStrategyRuntime:
         account["pending_margin"]=decimal_text(Decimal(account["pending_margin"])+pending) if account["pending_margin"] is not None else None
         account["symbol_margin"]=decimal_text(Decimal(account["symbol_margin"])+symbol_extra) if account["symbol_margin"] is not None else None
         account["orders_today"]+=attempts;account["active_symbols"]=sorted(active)
-        return evaluate_entry(self.profile,direction=candidate["direction"],contract_id=candidate["contract_id"],
-            stop_distance=candidate["stop_distance"],limit_price=candidate["limit_price"],
+        result=evaluate_entry(self.profile,direction=candidate["direction"],contract_id=candidate["contract_id"],
+            stop_distance=candidate["stop_distance"],limit_price=candidate["limit_price"],market_price=facts["event"]["last"],
             requested_qty=next(row["order_volume"] for row in self.profile.to_record()["settings"]["symbols"] if row["code"]==candidate["contract_id"]),
             account=account,instrument=instrument)
+        if exclude_attempt is None and candidate.get('entry_kind','NORMAL')=='NORMAL':
+            reason=self._ordinary_limit_reason(candidate,facts['event']['last'],instrument)
+            if reason is None and previous_attempt is not None and previous_attempt['direction']==candidate['direction']:
+                now=epoch_milliseconds(datetime.fromisoformat(candidate['decision_time_utc']))
+                last=epoch_milliseconds(datetime.fromisoformat(previous_attempt['at_utc']))
+                if now-last<1000:
+                    reason='SAME_DIRECTION_WITHIN_ONE_SECOND'
+            if reason is not None:
+                result.update(allowed=False,quantity=0,reasons=[*result['reasons'],reason])
+        return result
+
+    @staticmethod
+    def _ordinary_limit_reason(candidate,last,instrument):
+        # DSV _run 8281–8309 checks the theoretical TP and the last quote
+        # before sizing. Both near-limit checks apply to either direction.
+        if instrument.get('lower_limit') is None or instrument.get('upper_limit') is None:
+            return None
+        lower,upper,last=map(Decimal,(instrument['lower_limit'],instrument['upper_limit'],last))
+        theory=Decimal(candidate['theoretical_price'])
+        take=Decimal(candidate['take_profit_distance'])
+        if ((candidate['direction']=='LONG' and upper>0 and theory+take>upper)
+                or (candidate['direction']=='SHORT' and lower>0 and theory-take<lower)):
+            return 'TAKE_PROFIT_OUTSIDE_PRICE_LIMIT'
+        if ((upper>0 and upper-last<upper/100) or (lower>0 and last-lower<lower/100)):
+            return 'LAST_NEAR_PRICE_LIMIT'
+        return None
 
     def _blocked(self,event,*,exclude_decision=None):
         k=self.kernel;reasons=[]
@@ -300,12 +335,58 @@ class DsvStrategyRuntime:
         if self._blocked(event,exclude_decision=original["decision_key"]):return False
         if self.kernel.statistics.entry_reasons(event['contract_id'],event['trading_day'],profile=self.profile,
                 direction=original['direction'],entry_kind=original.get('entry_kind','NORMAL'),now_utc=event['source_time_utc']):return False
-        current=self.strategy.evaluate(pre_state,event)
+        current=self._evaluate_entry(pre_state,event,stops,exclude_decision=original["decision_key"])
         candidates=[candidate for candidate in current["candidates"] if all(candidate[k]==original[k] for k in
-            ("direction","theoretical_price","limit_price","decision_key","profile_hash"))]
+            ("direction","theoretical_price","limit_price","decision_key","profile_hash","entry_kind"))]
         if not candidates:return False
-        result=self._risk(candidates[0],facts,exclude_decision=original["decision_key"])
+        result=self._risk(candidates[0],facts,exclude_decision=original["decision_key"],
+                          previous_attempt=pre_state.get('last_ordinary_attempt'))
         return result["allowed"] and result["quantity"]>=quantity
+
+    def _evaluate_entry(self,state,event,stops,*,exclude_decision=None):
+        decision_time=self.kernel.port.clock.now() if self.online else None
+        ordinary_quote_stale = False
+        current=decision_time or datetime.fromisoformat(event['source_time_utc'])
+        if decision_time is not None and self._quote_age_limit > 0:
+            elapsed = current - datetime.fromisoformat(event['source_time_utc'])
+            age = Decimal(elapsed.days * 86400 + elapsed.seconds) + Decimal(elapsed.microseconds).scaleb(-6)
+            ordinary_quote_stale = age > self._quote_age_limit
+        timing={'ordinary_quote_stale':ordinary_quote_stale,'decision_time':decision_time}
+        if self._continuation_seconds is None or (state.get('night_reference') is None and event.get('night_reference') is None):
+            return self.strategy.evaluate(state,event,**timing)
+        opening=datetime.fromisoformat(event['session_open_utc'])
+        if (opening.astimezone(CHINA_TIME).strftime('%H:%M')!='09:00'
+                or not 0 <= (current-opening).total_seconds() <= self._continuation_seconds):
+            return self.strategy.evaluate(state,event,**timing)
+        k=self.kernel
+        contract,day=event['contract_id'],event['trading_day']
+        day_key=self.strategy.continuation_key(event)
+        attempted=day_key!=exclude_decision and day_key in k._decision_keys
+        allowed=(stops is None or stops['allow_continuation']) and not (
+            self._blocked(event,exclude_decision=exclude_decision) or k.statistics.entry_reasons(
+                contract,day,profile=self.profile,entry_kind='CONTINUATION',now_utc=event['source_time_utc']))
+        fallback=None
+        if allowed and not attempted:
+            latest_close=None
+            for cycle in k._staged.values():
+                plan=cycle['plan']
+                if plan['contract_id']!=contract or plan['trading_day']!=day:
+                    continue
+                candidate=(cycle.get('strategy_metadata') or {}).get('candidate',{})
+                entry_at=candidate.get('source_time_utc')
+                if (candidate.get('entry_kind')=='CONTINUATION' and cycle['decision_key']!=exclude_decision
+                        and entry_at is not None and not is_night_session(datetime.fromisoformat(entry_at))):
+                    attempted=True
+                    break
+                closing=cycle.get('nominal_exit') or {}
+                at=(closing.get('trigger_clock') or {}).get('now_utc')
+                if cycle['lifecycle']!='CLOSED' or closing.get('exit_reason')!='SESSION_CLOSE' or at is None:
+                    continue
+                closed=datetime.fromisoformat(at)
+                if closed < opening and is_night_session(closed) and (latest_close is None or closed > latest_close):
+                    latest_close,fallback=closed,plan['direction']
+        return self.strategy.evaluate(state,event,continuation_allowed=allowed,
+                                      continuation_attempted=attempted,fallback_direction=fallback,**timing)
 
     def prepare_replacement(self,cycle,order):
         """Issue a fresh development entry context for an original target remainder."""
@@ -338,10 +419,12 @@ class DsvStrategyRuntime:
         return {'authorization':{'context_id':context['context_id'],'peer_id':peer,'authority_revision':k._authority_revision,
                                 'purpose':'ENTRY_PROPOSAL','operation':'DSV_ENTRY'},'gate':ready}
 
-    def rebuild_observation(self,events,*,evidence_id,extend=False):
+    def rebuild_observation(self,events,*,evidence_id,extend=False,_preserve_authority=False,_resume_anchor=None):
         """Commit a complete path or its contiguous suffix without executing signals."""
         from online_trader.domain.values import identifier
         identifier(evidence_id);self._development();k=self.kernel
+        if _preserve_authority and not (extend and self.online):
+            raise TraderError('E_FACT_BARRIER','Only a continuous native suffix can retain current authority')
         if self.epoch is None or self.epoch!=k.active_epoch:raise TraderError("E_EPOCH_REVOKED","Observation rebuild requires the active owner")
         if self._pending is not None or k._pending:raise TraderError("E_FACT_BARRIER","Observation rebuild requires an accepted boundary")
         if type(events) is not list or not 1<=len(events)<=10000:raise TraderError("E_SCHEMA","Expected a bounded explicit source path")
@@ -356,16 +439,32 @@ class DsvStrategyRuntime:
         first=events[0];key=(first.get("contract_id"),first.get("trading_day")) if type(first) is dict else (None,None)
         old=self._states.get(key)
         observation="dsv-observation-"+content_hash({"account":k.account_key,"contract":key[0],"day":key[1]})
+        resume=False
+        if _resume_anchor is not None:
+            from online_trader.strategy.entry import market_fingerprint
+            anchor=_resume_anchor
+            if (not self.online or not extend or old is None or old['source_epoch']>=first['source_epoch']
+                    or anchor['source_epoch']!=first['source_epoch'] or anchor['sequence']!=old['last_sequence']
+                    or int(anchor['native_tick_id'])+1!=int(first['native_tick_id'])
+                    or market_fingerprint(anchor|{'source_epoch':old['source_epoch']},anchor['is_opening_session'])
+                    !=old['last_event_hash']):
+                raise TraderError("E_FACT_BARRIER","Native checkpoint overlap did not prove the restored market path")
+            resume=True
         if extend:
-            if (old is None or old["coverage_lost"] or old["source_epoch"]!=first.get("source_epoch")
+            if (old is None or old["coverage_lost"] or (old["source_epoch"]!=first.get("source_epoch") and not resume)
                     or old["session_id"]!=first.get("session_id") or old["last_sequence"]+1!=first.get("sequence")):
                 raise TraderError("E_FACT_BARRIER","Observation suffix does not continue its accepted path")
             rows=k.ledger.query("SELECT observed_from_utc FROM observation_windows WHERE observation_id=?",(observation,))
             if not rows:raise TraderError("E_FACT_BARRIER","Observation suffix has no durable starting window")
             observed_from=rows[0]["observed_from_utc"]
             state=copy.deepcopy(old)
+            if resume:state["source_epoch"]=first["source_epoch"]
         else:
             state=self.strategy.initial_state(k.account_key,*key)
+            night=None if old is None else old.get('night_reference')
+            if (night is not None and datetime.fromisoformat(night['source_time_utc'])<
+                    datetime.fromisoformat(first['source_time_utc'])):
+                state['night_reference']=copy.deepcopy(night)
         for event in events:
             if (type(event) is not dict or event.get("account_key")!=k.account_key
                     or (event.get("contract_id"),event.get("trading_day"))!=key
@@ -373,9 +472,12 @@ class DsvStrategyRuntime:
                     or event.get("quality")!="CONTIGUOUS" or not event.get("path_complete") or not event.get("day_range_complete")
                     or not event.get("calendar_complete")):
                 raise TraderError("E_FACT_BARRIER","Replay does not prove a complete single source path")
-            evaluated=self.strategy.evaluate(state,event);new=evaluated["state"]
+            evaluated=self.strategy.evaluate(state,event,continuation_allowed=False);new=evaluated["state"]
             if new["coverage_lost"] or new["last_sequence"]!=event["sequence"] or state["last_sequence"]==new["last_sequence"]:
                 raise TraderError("E_FACT_BARRIER","Replay is incomplete, repeated or out of order")
+            if self.online and (evaluated["candidates"] or any(
+                    reason.endswith(':NO_CHASE_AFTER_ACT') for reason in evaluated['entry_log'])):
+                new["last_signal_bar"]=state["last_signal_bar"]
             state=new
         if not extend:observed_from=first["source_time_utc"]
         if old is not None:
@@ -386,12 +488,18 @@ class DsvStrategyRuntime:
                 raise TraderError("E_REVISION_CONFLICT","Replay ends before the accepted source boundary")
             state["first_minute_blocks"]=sorted(set(old["first_minute_blocks"])|set(state["first_minute_blocks"]))
             if events[-1]["candle_id"]==old["last_signal_bar"]:state["last_signal_bar"]=old["last_signal_bar"]
+            if old.get('night_close_fallback_cleared'):state['night_close_fallback_cleared']=True
+            if old.get('last_ordinary_attempt') is not None:
+                state['last_ordinary_attempt']=copy.deepcopy(old['last_ordinary_attempt'])
         result=Future();self._pending=result
         proof={"evidence_id":evidence_id,"event_count":len(events),"path_hash":path_hash,"profile_hash":self.profile.content_hash,
                "contract_id":key[0],"trading_day":key[1],"source_epoch":str(state["source_epoch"]),
                "last_source_sequence":str(state["last_sequence"]),"signals_executed":0}
         if extend:proof["continued_from_sequence"]=str(old["last_sequence"])
-        k._armed=False;k.contexts.revoke_all();k._state_revision+=1;k._risk_revision+=1;k._authority_revision+=1
+        if resume:proof["resumed_from_source_epoch"]=str(old["source_epoch"])
+        if not _preserve_authority:
+            k._armed=False;k._authority_revision+=1
+        k.contexts.revoke_all();k._state_revision+=1;k._risk_revision+=1
         authority=k._authority()
         def mutate(conn,seq):
             k._write_authority(conn,seq,authority)
@@ -399,7 +507,7 @@ class DsvStrategyRuntime:
                 (observation,key[0],first["session_id"],first["source_epoch"],1,"CONTIGUOUS",observed_from,events[-1]["source_time_utc"],canonical_bytes(state).decode(),seq))
         def accepted():
             self._states[key]=state;self._latest.pop(key,None);self._pending=None
-            receipt=proof|{"status":"OBSERVATION_REBUILT","armed":False,"durable_seq":str(k._durable_seq)}
+            receipt=proof|{"status":"OBSERVATION_REBUILT","armed":authority['armed'],"durable_seq":str(k._durable_seq)}
             self._rebuilds[evidence_id]=receipt;result.set_result(copy.deepcopy(receipt))
         try:k._submit("TX_OBSERVATION","DSV_OBSERVATION_REBUILT",{"dsv_strategy_state":state,"rebuild_proof":proof,"authority":authority},mutate,after=accepted)
         except BaseException:self._pending=None;raise
@@ -414,7 +522,12 @@ class DsvStrategyRuntime:
             raise TraderError("E_FACT_BARRIER","Accept the preceding owner transaction before processing another market fact")
         key=(event["contract_id"],event["trading_day"])
         previous=copy.deepcopy(self._states.get(key) or self.strategy.initial_state(k.account_key,*key))
-        decision=self.strategy.evaluate(previous,event)
+        stop_result=self._latest[key].get("stop_result")
+        decision=(self._evaluate_entry(previous,event,stop_result) if _allow_entry
+                  else self.strategy.evaluate(previous,event,continuation_allowed=False))
+        if self.online and not _allow_entry and (decision["candidates"] or any(
+                reason.endswith(':NO_CHASE_AFTER_ACT') for reason in decision['entry_log'])):
+            decision["state"]["last_signal_bar"]=previous["last_signal_bar"]
         # Existing owned positions get the quote before any new entry decision.
         # This stages their protection on the same owner/writer without waiting
         # in a broker loop or delegating protection to the strategy worker. A
@@ -424,8 +537,11 @@ class DsvStrategyRuntime:
         if not stale.intersection(decision["reasons"]):
             ordered=sorted(k._staged.values(),key=lambda c:bool(c['protection']['owned_qty'] or
                 any(OrderState.from_dict(o).potential_remaining for o in c['orders'])),reverse=True)
+            mixed=self.online and any(c.get('external_adoption') and c['lifecycle']!='CLOSED'
+                and c['plan']['contract_id']==event['contract_id'] for c in ordered)
             for cycle in ordered:
                 if cycle['plan']['contract_id']!=event['contract_id']:continue
+                if mixed and cycle['lifecycle']=='CLOSED':continue
                 working=cycle['protection']['owned_qty'] or any(OrderState.from_dict(o).potential_remaining for o in cycle['orders'])
                 ex=cycle.get('execution') or {}
                 retryable=not ex.get('entry_stopped') and cycle['protection']['entry_filled_qty']<cycle['plan']['initial_open_quantity'] and any(
@@ -451,15 +567,15 @@ class DsvStrategyRuntime:
                             'upper_limit':instrument.get('upper_limit'),'lower_limit':instrument.get('lower_limit'),
                             'since_open_ms':since,'near_open':opening and 0<=since<=cycle['plan']['execution_policy']['chase_window_ms']}}
                     scheduler=getattr(k,'_scheduled_runtime',None)
+                    if k._pending:k.wait_idle()
                     if scheduler is not None:
                         execution_event=scheduler.execution_event(cycle,event,instrument)
                         k.execution.tick(cycle['position_cycle_id'],execution_event,_market_received_ns=scheduler.received_for(event['contract_id']))
                     else:k.execution_tick(cycle['position_cycle_id'],execution_event)
-                    break
+                    if not mixed:break
                 elif cycle['protection']['owned_qty']:
                     k.observe(cycle['position_cycle_id'],event['last'],bid1=event['bid1'],ask1=event['ask1'],valid=event['quality']=='CONTIGUOUS',observed_at_utc=event['source_time_utc'],
                               _adapter_token=k.port.callback_token if self.online else None)
-        stop_result=self._latest[key].get("stop_result")
         money_account=k.simulation.money_fact(k.port.snapshot()) if self.online else k.money.account_from_risk(event,account)
         state=decision["state"];report={"status":"OBSERVED","candidates":decision["candidates"],
             "reasons":list(decision["reasons"]),"source_notes":decision.get("source_notes",[]),
@@ -487,10 +603,15 @@ class DsvStrategyRuntime:
         def accepted():
             self._states[key]=copy.deepcopy(state);self._pending=None
             if stop_result is not None:self._stop_states[key]=copy.deepcopy(stop_result)
-            if not result.done():result.set_result(copy.deepcopy(report)|{"durable_seq":str(k._durable_seq)})
+            if not result.done():
+                outcome=copy.deepcopy(report)|{"durable_seq":str(k._durable_seq)}
+                if _allow_entry and decision['entry_log']:
+                    outcome['entry_log']=decision['entry_log']
+                result.set_result(outcome)
         try:
             reasons=self._blocked(event)
             if not _allow_entry:reasons.append('OBSERVATION_ONLY_BACKLOG')
+            if self.online and k.simulation.grant.manual_workbench:reasons.append('MANUAL_WORKBENCH_SCOPE')
             candidate=decision["candidates"][0] if decision["candidates"] else None
             if candidate is not None:
                 reasons+=k.statistics.entry_reasons(event['contract_id'],event['trading_day'],profile=self.profile,
@@ -501,7 +622,8 @@ class DsvStrategyRuntime:
                     reasons+=stop_result["reasons"]
             if candidate is not None and candidate["decision_key"] in k._decision_keys:reasons.append("OPPORTUNITY_ALREADY_COMMITTED")
             if candidate is not None and not reasons:
-                risk=self._risk(candidate,self._latest[key]);report["risk"]=risk;reasons+=risk["reasons"]
+                risk=self._risk(candidate,self._latest[key],previous_attempt=previous.get('last_ordinary_attempt'))
+                report["risk"]=risk;reasons+=risk["reasons"]
                 if risk["allowed"]:
                     from online_trader.strategy.plan import build_development_plan
                     compiler=build_development_plan;online_values={}
@@ -518,8 +640,17 @@ class DsvStrategyRuntime:
                         "strategy_state":state,"stop_result":stop_result,"margin_per_lot":risk["metrics"]["margin_per_lot"],"instrument":copy.deepcopy(instrument)},
                         "gate":lambda frozen=copy.deepcopy(instrument):self._final_gate(candidate,previous,risk["quantity"],frozen),"mutate":mutate,"accepted":accepted}
                     if self.online:hook['initial_market']={'event':event,'received_ns':self._latest[key]['received_ns']}
-                    child=k.admit_entry(plan,candidate["decision_key"],candidate["limit_price"],context_id=context["context_id"],
-                        peer_id="dsv-owner-"+str(self.epoch),_strategy=hook)
+                    if candidate['entry_kind']=='NORMAL':
+                        state['last_ordinary_attempt']={'direction':candidate['direction'],'at_utc':candidate['decision_time_utc']}
+                    try:
+                        child=k.admit_entry(plan,candidate["decision_key"],candidate["limit_price"],context_id=context["context_id"],
+                            peer_id="dsv-owner-"+str(self.epoch),_strategy=hook)
+                    except TraderError:
+                        if 'last_ordinary_attempt' in previous:
+                            state['last_ordinary_attempt']=previous['last_ordinary_attempt']
+                        else:
+                            state.pop('last_ordinary_attempt',None)
+                        raise
                     report["child_order_id"]=child
                     return result
             report["reasons"]=list(dict.fromkeys(report["reasons"]+reasons))

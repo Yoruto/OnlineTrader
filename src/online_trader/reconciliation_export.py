@@ -258,26 +258,35 @@ def _xlsx(material):
         overview.append(['费用拟登记','仅预览；未写入',action.get('trade_key'),action.get('amount'),action.get('quality'),
             action.get('revision'),action.get('evidence_id'),before.get('amount'),before.get('quality'),
             action.get('row_number'),action.get('fill_binding_hash')])
+    return tabular_workbook([
+        ('成交对照', main, [10,30,40,34,18,10,10,10,24,24,26,34,24,12,24,20,24,42]),
+        ('本地缺失', local, [34,18,12,12,12,10,24,24,20,16,28,36,20]),
+        ('概览', overview, [30,68,34,24,20,14,44,24,20,12,68]),
+    ])
+
+
+def tabular_workbook(tables):
+    """Encode local export tables as text cells, with no formula evaluation."""
     workbook=ET.Element(_tag('workbook'));views=ET.SubElement(workbook,_tag('bookViews'));ET.SubElement(views,_tag('workbookView'))
     sheets=ET.SubElement(workbook,_tag('sheets'))
-    for index,name in enumerate(('成交对照','本地缺失','概览'),1):
+    for index,(name, _, _) in enumerate(tables,1):
         ET.SubElement(sheets,_tag('sheet'),{'name':name,'sheetId':str(index),'{'+_REL+'}id':'rId'+str(index)})
     rels=ET.Element('{'+_PKG+'}Relationships')
-    for index in range(1,4):ET.SubElement(rels,'{'+_PKG+'}Relationship',{'Id':'rId'+str(index),'Type':_REL+'/worksheet','Target':'worksheets/sheet'+str(index)+'.xml'})
-    ET.SubElement(rels,'{'+_PKG+'}Relationship',{'Id':'rId4','Type':_REL+'/styles','Target':'styles.xml'})
+    sheet_parts=[f'worksheets/sheet{index}.xml' for index in range(1,len(tables)+1)]
+    for index, part in enumerate(sheet_parts,1):
+        ET.SubElement(rels,'{'+_PKG+'}Relationship',{'Id':f'rId{index}','Type':_REL+'/worksheet','Target':part})
+    ET.SubElement(rels,'{'+_PKG+'}Relationship',{'Id':f'rId{len(tables)+1}','Type':_REL+'/styles','Target':'styles.xml'})
     package=ET.Element('{'+_PKG+'}Relationships');ET.SubElement(package,'{'+_PKG+'}Relationship',{'Id':'rId1','Type':_REL+'/officeDocument','Target':'xl/workbook.xml'})
     content_ns='http://schemas.openxmlformats.org/package/2006/content-types';types=ET.Element('{'+content_ns+'}Types')
     for extension,kind in (('rels','application/vnd.openxmlformats-package.relationships+xml'),('xml','application/xml')):
         ET.SubElement(types,'{'+content_ns+'}Default',{'Extension':extension,'ContentType':kind})
-    for part,kind in (('workbook.xml','sheet.main'),('styles.xml','styles'),
-                      ('worksheets/sheet1.xml','worksheet'),('worksheets/sheet2.xml','worksheet'),('worksheets/sheet3.xml','worksheet')):
+    for part,kind in [('workbook.xml','sheet.main'),('styles.xml','styles')]+[(part,'worksheet') for part in sheet_parts]:
         ET.SubElement(types,'{'+content_ns+'}Override',{'PartName':'/xl/'+part,
             'ContentType':'application/vnd.openxmlformats-officedocument.spreadsheetml.'+kind+'+xml'})
     parts={'[Content_Types].xml':_xml(types),'_rels/.rels':_xml(package),'xl/workbook.xml':_xml(workbook),
-        'xl/_rels/workbook.xml.rels':_xml(rels),'xl/styles.xml':_styles(),
-        'xl/worksheets/sheet1.xml':_sheet(main,[10,30,40,34,18,10,10,10,24,24,26,34,24,12,24,20,24,42]),
-        'xl/worksheets/sheet2.xml':_sheet(local,[34,18,12,12,12,10,24,24,20,16,28,36,20]),
-        'xl/worksheets/sheet3.xml':_sheet(overview,[30,68,34,24,20,14,44,24,20,12,68])}
+        'xl/_rels/workbook.xml.rels':_xml(rels),'xl/styles.xml':_styles()}
+    for part, (_, rows, widths) in zip(sheet_parts, tables):
+        parts['xl/'+part] = _sheet(rows, widths)
     if sum(map(len,parts.values()))>MAX_EXPORT_BYTES:_error('LIMIT','Uncompressed workbook exceeds export capacity')
     output=BytesIO()
     with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as archive:

@@ -127,6 +127,20 @@ class MoneyRuntimeTests(unittest.TestCase):
         self.assertNotIn('rolled-back-money-fill',t.kernel.money.book.fills)
         self.assertEqual(t.kernel.ledger.query("SELECT trade_key FROM fill_facts WHERE trade_key='rolled-back-money-fill'"),[])
 
+    def test_strategy_checkpoint_binds_account_history_without_copying_rows(self):
+        owner=self.env.kernel.money
+        initial=owner.business_state()
+        for index in range(1,257):
+            fact=self.account(evidence_id=f'checkpoint-account-{index}',revision=index)
+            owner.accept({'money_account':fact},index,fact['observed_at_utc'])
+        checkpoint=owner.business_state()
+        self.assertIsNone(owner.error)
+        self.assertEqual(checkpoint['account_fact_count'],256)
+        self.assertNotEqual(checkpoint['account_facts_hash'],initial['account_facts_hash'])
+        self.assertNotEqual(checkpoint['account_source_boots_hash'],initial['account_source_boots_hash'])
+        self.assertLess(len(canonical_bytes(checkpoint)),1024)
+        self.assertEqual(len(owner.book.account_facts),256)
+
     def test_account_pnl_uses_source_equity_and_keeps_cash_flow_adjustment_separate(self):
         t=self.env;t.kernel.money.record_account(self.account());t.kernel.wait_idle()
         row=self.report()['account']

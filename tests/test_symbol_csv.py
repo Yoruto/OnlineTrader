@@ -38,6 +38,36 @@ class SymbolCsvTests(unittest.TestCase):
         if field: self.assertEqual(caught.exception.field, field)
         return caught.exception
 
+    def test_dsv_eight_column_excel_round_trip_preserves_symbols(self):
+        from online_trader.configuration.symbol_xlsx import export_symbol_workbook, load_symbol_workbook
+
+        path = self.root / "品种列表.xlsx"
+        export_symbol_workbook(self.profile, path)
+        self.assertEqual(load_symbol_workbook(path, self.profile).content_hash, self.profile.content_hash)
+        with self.assertRaises(TraderError):
+            export_symbol_workbook(self.profile, path)
+
+    def test_excel_cells_with_formulas_do_not_update_the_symbol_preview(self):
+        from io import BytesIO
+        from zipfile import ZipFile
+        from online_trader.configuration.symbol_xlsx import export_symbol_workbook, load_symbol_workbook
+
+        template = self.root / "template.xlsx"
+        export_symbol_workbook(self.profile, template)
+        sheet_path = "xl/worksheets/sheet1.xml"
+        buffer = BytesIO()
+        with ZipFile(template) as source, ZipFile(buffer, "w") as modified:
+            for name in source.namelist():
+                payload = source.read(name)
+                if name == sheet_path:
+                    payload = payload.replace(b'<c r="C2" t="inlineStr" s="0">', b'<c r="C2" t="inlineStr" s="0"><f>1+1</f>')
+                modified.writestr(name, payload)
+        path = self.root / "invalid.xlsx"
+        path.write_bytes(buffer.getvalue())
+        with self.assertRaises(TraderError) as raised:
+            load_symbol_workbook(path, self.profile)
+        self.assertEqual(raised.exception.code, "E_SYMBOL_XLSX")
+
     def test_baseline_csv_roundtrip_includes_candidate_zero_and_dormant_values(self):
         target = self.root / "symbols.csv"
         export_symbols(self.profile, target)

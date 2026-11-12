@@ -58,6 +58,8 @@ class AutoOffsetRuntimeTests(unittest.TestCase):
             contracts=[self.code],trading_days=['2026-11-10'],resume_entries_on_day_change=False,
             auto_offsets={'schema_version':'DSV_START_OFFSETS/1','as_of_date':'2026-11-10','last_completed_day':'2026-11-09'})
         self.api=DailyApi(self.clock,self.code,self.code)
+        # The computed long take-profit is 1140 + 315, inside this test's legal range.
+        self.api.quotes[self.code].upper_limit = 1800.
         self.port=SimNowDsvPort(self.api,self.api._account,self.source,self.clock);self.port.configure_calendar(self.calendar)
 
     def tearDown(self):

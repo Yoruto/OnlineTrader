@@ -108,13 +108,14 @@ class DayRecovery:
         if not o.grant.multi_day or not o.grant.permits_day(day):return False
         raw=port.snapshot();o._validate_snapshot(raw)
         if raw['trading_day']!=day:return False
-        observations=o.observe_native_orders();o.recover_working(observations)
+        observations=o.observe_native_orders();o.recover_working(observations,reconcile_cycles=False)
         by_id={item['order_id']:item for item in raw['orders']}
         waiting=False
         for original in tuple(k._staged.values()):
             cycle=copy.deepcopy(k._staged[original['position_cycle_id']]);changed=False
-            if cycle['plan']['trading_day']!=day and not cycle.get('execution',{}).get('entry_stopped'):
-                cycle['execution']['entry_stopped']=True;cycle['cancel_entries']=True;changed=True
+            if cycle['plan']['trading_day']!=day and not cycle.get('cancel_entries'):
+                if 'execution' in cycle:cycle['execution']['entry_stopped']=True
+                cycle['cancel_entries']=True;changed=True
             cancel=[]
             for order in cycle['orders']:
                 if not OrderState.from_dict(order).potential_remaining:continue
@@ -123,7 +124,7 @@ class DayRecovery:
                 # Missing original IDs remain occupied, including UNKNOWN.
                 if item is None or item['status']!='ALIVE':continue
                 if order.get('cancel_status'):continue
-                cycle['execution'].setdefault('cancel_reasons',{})[order['child_order_id']]='CABINET_DAY_ROLLOVER'
+                if 'execution' in cycle:cycle['execution'].setdefault('cancel_reasons',{})[order['child_order_id']]='CABINET_DAY_ROLLOVER'
                 changed=True;cancel.append(order['child_order_id'])
             if changed:
                 cycle['revision']+=1
@@ -132,7 +133,10 @@ class DayRecovery:
                 k.wait_idle()
         if waiting or k._has_unknown():return False
         positions={p['contract_id']:p for p in raw['positions']}
-        for code in o.grant.value['contracts']:
+        # Foreign inventory on a different contract has no claim on the
+        # original cycles. It stays visible and blocks openings on that code.
+        managed={c['plan']['contract_id'] for c in k._staged.values() if c['lifecycle']!='CLOSED'}
+        for code in managed:
             expected={side:sum(c['protection']['owned_qty'] for c in k._staged.values()
                 if c['plan']['contract_id']==code and c['plan']['direction']==side.upper()) for side in ('long','short')}
             native=positions.get(code,{'long':0,'short':0})
@@ -141,12 +145,14 @@ class DayRecovery:
         from online_trader.execution.close_routes import preview_owned_routes
         for cid in tuple(k._staged):
             cycle=k._staged[cid]
+            if cycle['lifecycle']=='CLOSED' and cid not in k._recovery_pending:continue
             if cycle.get('management_state')=='TAKEN_OVER':
                 raise TraderError('E_OWNERSHIP','A transferred cycle cannot be implicitly recovered on a new day')
-            o.reconcile(cid,allow_working=True)
+            o.reconcile(cid,allow_working=True,clear_gateway_fault=False)
             if cycle['protection']['owned_qty']:
-                preview_owned_routes(k,cid,cycle['protection']['owned_qty'])
+                preview_owned_routes(k,cid,cycle['protection']['owned_qty'],_recovery_review=True)
         if k._recovery_pending or k._has_unknown() or getattr(k._scheduled_runtime,'_fault',None):return False
+        k.recovery_required=False
         o.capture('ONLINE_DSV_DAY_RECONCILED',{'trading_day':day,'source_epoch':port.source_epoch,
             'calendar_hash':port.calendar.content_hash,'grant_hash':o.grant.content_hash,
             'cycle_revisions':{cid:c['revision'] for cid,c in k._staged.items()},

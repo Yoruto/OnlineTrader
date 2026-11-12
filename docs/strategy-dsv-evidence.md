@@ -29,6 +29,7 @@
 | 3%和5% | 处于开盘CHASE_WINDOW_MINUTES窗口内用chase_slip_ratio，否则entry_slip_ratio；当前分别0.05/0.03。普通入场cap=`max(1.0,round(O×ratio))`，round无ndigits。CHASE_BASE_NOW在初始化直接置false | `_run` 行4004；行8212–8221，offset77664–77780 |
 | 双价有利豁免 | 多用ask与last；adverse为>A+cap的价，favourable为0<P≤A的价。adverse为空**或**favourable非空即通过；否则拒绝，over=max(adverse)−(A+cap)。空用bid与last，adverse为0<P<A−cap，favourable为P≥A，同样规则 | `chase_within_cap` 行1695起，关键offset162–368和472–678 |
 | 双价边界 | 等于A±cap不算超限。任一价有利可以覆盖另一价不利超限，因此不是简单“任一超限拒绝”的OR，也不是只检查两价同时超限的AND。原helper缺价按0，异常默认通过；新产品不可把这个默认当完整行情证据 | 同上 |
+| 普通开仓的理论止盈与涨跌停 | 多头理论止盈严格高于涨停、空头理论止盈严格低于跌停时跳过。两种方向均检查最新价到涨停的比例 `(upper−last)/upper` 和到跌停的比例 `(last−lower)/lower`。任一严格小于 1% 时跳过。三条拒绝均消耗该分钟信号。延续开走独立报单路径 | `_run`8281–8309，offset78850–79540 |
 | 成交不利滑点 | 多=实际成交价−理论entry_level；空=理论entry_level−实际成交价 | `_run` 行7314–7315，offset54238–54332 |
 | 滑点退出阈值 | cap=`max(2.0,S×entry_slip_abort_ratio)`；开关真、滑点来源有效且slip严格>cap才退出。保存ratio0.4，但有2点下限；等于不退 | `_run` 行7347–7350，offset55240–55366 |
 
@@ -63,6 +64,12 @@
 | 到期阈值 | left=(expire_datetime前10字符解析成当天00:00−datetime.now()).days；left≤min_days_to_expiry即no_new_open。是自然时间差截整，含当天时刻，不是交易日计数 | `_run` 行7939–7944，offset70144–70348 |
 | 月停定义 | 当日net_loss_points达到S×MAX_NET_LOSS_STOPS时把交易日记入stop_days（保留尾12项）；从当日向前找连续N个is_trading_day日期，若它们全部在stop_days，month_stop=当前年月并品种日停。不是月内任意累计4日 | `_run` 行6019–6040；行6037生成器offset14–68 |
 | 月停解除 | 当前交易日年月与已存month_stop不同则清旧month_stop；只在原day_stopped_reason等于“本月连续停机停开”时一并清该日停原因 | `_run` 行6007–6018 |
+
+### 主力和换月
+
+DSV 主连通过 `KQ.m@交易所.品种` 的 `underlying_symbol` 给出非主力提醒。另查同交易所、同品种的期货合约。成交量严格超过当前且至少 1000 时可提示换月，持仓量严格超过当前时可提示非主力。在持仓量和成交量均为正的合约中，取持仓量最高的候选，其持仓和成交量均严格超过当前时登记 `code_new`。下一次加载配置把不同的 `code_new` 写入 `code` 并移除登记字段，原偏移和其他品种参数继续使用。见 `_main_kq_of` 4206–4216 行、`check_main_contracts` 4218–4402 行、`App._update_symbols_main_contract` 15539–15584 行、`load_config` 2566–2575 行。
+
+到期提醒按北京时间的自然日期显示已过期、最后一日、剩余不超过 3 天、剩余 4 至 30 天和到期日期。DSV 日期显示函数兼容文字日期和秒、毫秒、微秒、纳秒时间戳。见 `parse_expire_date` 1448–1483 行、`format_expire_text` 1486–1501 行。OnlineTrader 用现有行情通道异步更新主力与换月候选，同交易日的原生报价才参与持仓量和成交量比较。“换月预览”更新所选品种的业务草稿，下一次使用新合约须审查新范围及合约日历。原范围和保护计划保持绑定原合约。
 
 ## 首分钟、滞回调用顺序与静态缺陷
 
@@ -245,7 +252,7 @@ HALF_BREAKEVEN未定义、重复close_booked早退以及虚拟量超时被实际
 
 | 路径 | 源行为与边界 | 定位 |
 | --- | --- | --- |
-| 普通开盘后等待 | 开关开启且分钟数>0时调用`session_open_recent`，因此只适用09:00/09:30/21:00对应窗口，包含等待终点等号，不在午间恢复后重新套用普通5分钟等待。 | `_run`7876–7890，offset68586–68972 |
+| 普通开盘后等待 | 开关开启且分钟数>0时以本机决策时钟 `datetime.now()` 调用合约的 `session_open_recent`。只适用09:00/09:30/21:00对应窗口，包含等待终点等号，午间恢复不套用普通5分钟等待。同一秒内的报价时刻和判定时刻可能落在边界两侧。 | `_run`7876–7890，offset68586–68972。Helper 1690，offset242–328 |
 | 普通收盘前禁开 | 调用`is_before_session_close`；它先取得通用当前会话，只在结束hour==15、>=21或<3时检查`0<=end-now<=分钟数`。10:15与11:30休市前不触发此普通门禁。 | `is_before_session_close`1882–1894，offset66–318；`_run`7894–7902，offset68978–69338 |
 | 延续专用等待 | 夜盘延续路径另有门禁：开关开启且`continuation_ignore_no_open=false`时，使用`current_session_for`的任意当前盘段，`0<=elapsed<minutes*60`，上界为严格小于；没有普通recent的开盘hour筛选。不能把两个分支擅自统一成一个比较符或同一适用范围。 | `_run`7136–7153，offset49826–50250，特别50066–50120 |
 | 实际收盘平仓 | `_near_close_tot`只判`[night_close-advance,night_close)`及`[15:00-advance,15:00)`，忽略10:15与11:30休市；夜盘下界若为负被夹到0。该处15:00硬编码，与债券会话helper的15:15存在源差异。 | `_run.<locals>._near_close_tot`4529–4545，offset122–262 |
@@ -253,12 +260,24 @@ HALF_BREAKEVEN未定义、重复close_booked早退以及虚拟量超时被实际
 
 独立实现应区分盘段结束、最终清仓终点及禁开终点，并明确每个会话的用途；不能仅因有一个`session_close_utc`就推定每次午间休市需要强平。对显式柜台/权威日历给出的不同终点，新产品需记录来源差异，不沿用源代码的品种名/weekday猜测作为批准。
 
+### 日盘延续开 B08
+
+| 项目 | 源规则 | 定位 |
+| --- | --- | --- |
+| 夜盘参考 | 取同一交易日夜盘报价的日高最大值、日低最小值和最后有效最新价。夜盘收盘清仓保存原方向和清仓参考价 | `_run`6829–6840、6957–6963 |
+| 开盘资格 | 无策略方向、无未决入场、未日停、当日未发起延续开、连续止损数低于限额。当前报价属日盘，且决策时钟位于通用开盘追单窗口内。日振幅高于正几何上限时跳过，净亏达到阈值时不延续 | `_run`7075–7109 |
+| 方向 | 多线=夜盘低点加开仓偏移，空线=夜盘高点减开仓偏移。当前最新价触及多线优先选多，否则触及空线选空。最新价等于夜盘最后价时，先采用触线方向，未触线则用夜盘收盘清仓方向。高于夜盘最后价只接受触线空头，低于时只接受触线多头 | `decide_continuation`1410–1445，`_run`7111–7123 |
+| 发起与保护 | 有效信号按独立的严格等待边界和资金量发起。开盘追价窗口内使用主动对手价，当前最新价作为理论开仓及保护距离基准。建立未决入场即消耗当日资格 | `_run`7136–7204 |
+
+源码对齐验证在隔离解释器中比对原纯方向函数与 OnlineTrader 实现，覆盖 946,110 组整数行情与回退方向，结果一致。注入原生形状数据验证跨夜盘和日盘、零成交终结后同日重启不重复。实际柜台带仓场景仍需对照。夜盘基准从当前原生数据及已核对的同日持久记录取得。
+
 ### 报价新鲜度、无行情循环与断流时钟
 
 | 项目 | 已核对源行为 | 定位 |
 | --- | --- | --- |
 | 真正刷新报价到达时钟 | 取非空`str(q.datetime)`，且与`last_quote_dt`不相等才写新`last_quote_dt`、`last_quote_ts=time.time()`和`last_quote_mono=time.monotonic()`。重复同datetime不刷新；源仅比较`!=`，没有在此验证时间严格前进。 | `_run`6133–6139，offset25082–25440，特别25324、25390、25438 |
-| 未使用的字段 | 对`gui`全部代码对象的指令引用扫描未见`last_update_time`；本段不得改称依赖该SDK字段。 | `gui`静态名称/常量扫描 |
+| 未使用的字段 | 对 `gui` 全部代码对象的指令引用扫描未见 `last_update_time`。 | `gui` 静态名称及常量扫描 |
+| 开仓报价年龄 | 普通入场在开盘等待和尾盘检查后，取 `quote_age_sec(q.datetime)`。仅当配置 `max_quote_age_seconds > 0`、年龄可取得且严格大于阈值时跳过。保存 0 关闭该策略过滤。原程序加载配置时把旧默认值 120 迁移到 0。 | `load_config` 2528–2530，`_run` 4425、7909–7918 |
 | 周期推进 | 每轮`api.wait_update(deadline=time.time()+0.5)`，调用返回值直接丢弃，随后继续本轮处理；不是只有新报价才处理pending、收盘或断流。异常则记录连续超时/提示，不能从异常次数证明柜台维护或成交结果。 | `_run`5892–5895，offset18310–18418；异常分支5897–5905 |
 | 活跃断流基点 | 必须存在当前`current_session_for`且断流阈值>0、尚无force_close_pending。`ref=max(session_start_ts,last_quote_ts or session_start_ts)`，`quiet=time.time()-ref`；需`quiet>threshold`及`time.time()-session_start_ts>60`双重严格比较。休市不进入该分支，新盘以新起点截断上一段静默时间。 | `_run`7436–7465，offset57430–58474；常量`STALE_SESSION_GRACE_SECONDS`模块591 |
 | 睡眠/校时提示的静态缺口 | 源另算`wall_gap>300 AND mono_gap>0 AND mono_gap<wall_gap*0.5`的sleeping标志并提示暂不强平；但该提示分支之后仍落入quiet判断，未见明确continue/return阻止同轮退出。不能据日志措辞宣称已正确处理休眠或墙钟跳变。 | `_run`7444–7463，offset57752–58462 |

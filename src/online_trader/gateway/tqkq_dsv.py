@@ -1,10 +1,13 @@
 """Finite DSV TqKq adapter; inherits native binding/callbacks, never a matcher."""
+import asyncio
+import copy
 from datetime import datetime,timezone,timedelta
 from decimal import Decimal
-import copy
+import time
 
+from online_trader.configuration.rollover import CHINA_TIME, expiry_date, future_product, rollover_hint
 from online_trader.errors import TraderError
-from online_trader.gateway.tqkq import TqKqPort
+from online_trader.gateway.tqkq import TqKqPort, number
 from online_trader.online_scope import DsvSimulationGrant
 
 
@@ -24,6 +27,129 @@ class TqKqDsvPort(TqKqPort):
         # Pinned SDK 3.10.4 api.get_tick_serial explicitly caps native history
         # at 10000. Use its supported full window; never synthesize older ticks.
         self.tick_serials={code:api.get_tick_serial(code,data_length=10000) for code in grant.value['contracts']}
+        self.minute_chart_serials={}
+        self.minute_chart_requested=False
+        self._rollover_main = {}
+        self._rollover_catalog = {}
+        self._rollover_poll_at = None
+        self._rollover_task = None
+
+    async def _subscribe_rollover_quotes(self, epoch):
+        products = dict.fromkeys(filter(None, map(future_product, self.quotes)))
+        for exchange, product in products:
+            if epoch != self.source_epoch:
+                return
+            key = exchange, product
+            try:
+                self._rollover_main[key] = self.api.get_quote(f"KQ.m@{exchange}.{product}")
+            except Exception:
+                pass
+        for exchange, product in products:
+            if epoch != self.source_epoch:
+                return
+            key = exchange, product
+            try:
+                listed = await asyncio.wait_for(self.api.query_quotes(
+                    ins_class="FUTURE", exchange_id=exchange, product_id=product, expired=False), timeout=8)
+                if epoch != self.source_epoch:
+                    return
+                codes = list(dict.fromkeys(code for code in listed if future_product(code) == key))
+                if len(codes) <= 64:
+                    self._rollover_catalog[key] = dict(zip(codes, self.api.get_quote_list(codes))) if codes else {}
+            except Exception:
+                continue
+
+    def _refresh_rollover_quotes(self):
+        if (not self.broker_connected or self.read_only or self.fault or self.calendar is None or
+                not all(callable(getattr(self.api, name, None)) for name in
+                        ("create_task", "query_quotes", "get_quote_list"))):
+            return
+        now = time.monotonic()
+        if self._rollover_poll_at is not None and now - self._rollover_poll_at < 300:
+            return
+        if self._rollover_task is not None and not self._rollover_task.done():
+            return
+        self._rollover_poll_at = now
+        task = self._subscribe_rollover_quotes(self.source_epoch)
+        try:
+            self._rollover_task = self.api.create_task(task)
+        except Exception:
+            task.close()
+
+    def _rollover_quote_matches_day(self, code, quote, day):
+        if day is None or self.calendar is None or self.fault:
+            return False
+        try:
+            stamp = datetime.fromisoformat(quote.datetime)
+            stamp = stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=CHINA_TIME)
+            now = self.clock.now()
+            if stamp > now:
+                return False
+            at = self.calendar.query(code, stamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"))
+            return at["complete"] and at["is_trading"] and at["trading_day"] == day
+        except (AttributeError, TypeError, ValueError, TraderError):
+            return False
+
+    def rollover_market_facts(self, code, day):
+        """Read already received contract metadata separately from order and tick maps."""
+        product = future_product(code)
+        current = self.quotes.get(code)
+        if product is None or current is None:
+            return {}
+        main_quote = self._rollover_main.get(product)
+        main = (getattr(main_quote, "underlying_symbol", None)
+                if self._rollover_quote_matches_day(code, main_quote, day) else None)
+        catalog = self._rollover_catalog.get(product, {})
+        activity = {}
+        if code in catalog and self._rollover_quote_matches_day(code, current, day):
+            for candidate, quote in (catalog | {code: current}).items():
+                if not getattr(quote, "expired", False) and self._rollover_quote_matches_day(code, quote, day):
+                    fields = (number(getattr(quote, key, None)) for key in ("open_interest", "volume"))
+                    activity[candidate] = tuple(Decimal(value) if value is not None else None for value in fields)
+        facts = rollover_hint(code, main, activity)
+        current_expiry = expiry_date(getattr(current, "expire_datetime", None))
+        main_expiry = expiry_date(getattr(current if main == code else catalog.get(main), "expire_datetime", None))
+        try:
+            today = self.clock.now().astimezone(CHINA_TIME).date().isoformat()
+        except TraderError:
+            today = None
+        return facts | {"as_of_date": today,
+                        "expiry_date": current_expiry.isoformat() if current_expiry else None,
+                        "main_expiry_date": main_expiry.isoformat() if main_expiry else None}
+
+    async def _subscribe_minute_charts(self):
+        # TqSdk's public call waits synchronously for initialization outside its
+        # own loop. Inside the SDK loop it returns the chart frame immediately.
+        for code in self.tick_serials:
+            try:self.minute_chart_serials[code]=self.api.get_kline_serial(code,60,data_length=500)
+            except Exception:continue
+
+    def minute_chart_bars(self):
+        from online_trader.gateway.dsv_facts import native_integer
+        from online_trader.gateway.tqkq import number
+        if (not self.minute_chart_requested and self.broker_connected and
+                callable(getattr(self.api,'create_task',None))):
+            self.minute_chart_requested=True
+            task=self._subscribe_minute_charts()
+            try:self.api.create_task(task)
+            except Exception:task.close()
+        result={}
+        for code,serial in self.minute_chart_serials.items():
+            try:
+                if not self.api.is_serial_ready(serial):continue
+                bars={}
+                for row in serial.tail(48).to_dict('records'):
+                    try:stamp=native_integer(row.get('datetime'),minimum=60_000_000_000)
+                    except TraderError:continue
+                    opening,high,low,closing=(number(row.get(key)) for key in ('open','high','low','close'))
+                    if any(value is None or len(value)>32 for value in (opening,high,low,closing)):continue
+                    o,h,l,c=map(Decimal,(opening,high,low,closing))
+                    if 0<l<=min(o,c)<=max(o,c)<=h:
+                        bars[stamp//60_000_000_000]=[opening,high,low,closing]
+                if bars:result[code]=[[minute,*bars[minute]] for minute in sorted(bars)]
+            except (AttributeError,TypeError,ValueError,ArithmeticError):
+                continue
+        return result
 
     def configure_calendar(self,calendar):
         if calendar.content_hash!=self.grant.value['calendar_hash']:
@@ -35,7 +161,16 @@ class TqKqDsvPort(TqKqPort):
         if self.calendar is None:raise TraderError('E_CALENDAR','Explicit strategy calendar is required')
         now=self.clock.now().isoformat().replace('+00:00','Z')
         windows=[self.calendar.query(code,now) for code in self.grant.value['contracts']]
-        days={item.get('trading_day') or (item.get('next_session') or {}).get('trading_day') for item in windows}
+        days=set()
+        for item in windows:
+            day=item['trading_day'] or (item['next_session'] or {}).get('trading_day')
+            if day is None and item['complete'] and item['is_trading'] is False:
+                # The covered interval after the last session still needs its
+                # cabinet day to reconcile terminal orders and verify flatness.
+                transition=self.calendar.transition(item['contract_id'],item['coverage_from_utc'],now)
+                if transition['complete'] and transition['days']:
+                    day=transition['days'][-1]
+            days.add(day)
         # Day labels come from explicit current calendar evidence, never from
         # blindly copying the requested grant into a native-current claim.
         value['trading_day']=next(iter(days)) if len(days)==1 else None
@@ -46,8 +181,16 @@ class TqKqDsvPort(TqKqPort):
 
     def poll_updates(self,seconds=0.1):
         epoch=self.source_epoch
+        self._refresh_rollover_quotes()
         super().poll_updates(seconds)
-        if self.source_epoch!=epoch:self.started_at=self.clock.now();self.subscription_ready_at.clear()
+        if self.source_epoch!=epoch:
+            self.started_at=self.clock.now();self.subscription_ready_at.clear()
+            if self._rollover_task is not None:
+                self._rollover_task.cancel()
+                self._rollover_task = None
+            self._rollover_poll_at = None
+            self._rollover_main.clear()
+            self._rollover_catalog.clear()
 
     def observations(self):
         from online_trader.gateway.native_days import native_day
@@ -73,7 +216,7 @@ class TqKqDsvPort(TqKqPort):
                 or request.get('account_key')!=self.grant.account_key or request.get('contract_id') not in self.quotes
                 or not self.grant.permits_day(request.get('trading_day')) or request.get('direction') not in {'BUY','SELL'}
                 or request.get('effect') not in {'OPEN','REDUCE'} or type(request.get('original_qty')) is not int
-                or not 1<=request['original_qty']<=value['max_order_quantity'] or not self.fresh(request['contract_id'])):
+                or not 1<=request['original_qty']<=value['max_order_quantity']):
             raise TraderError('E_GATEWAY_SCOPE','A fresh, complete and exactly owned DSV simulated order is required')
         snapshot=self.snapshot()
         if not snapshot['complete'] or snapshot['trading_day']!=request['trading_day']:
@@ -83,6 +226,11 @@ class TqKqDsvPort(TqKqPort):
         if (cycle['position_cycle_id']!=request.get('position_cycle_id') or cycle.get('management_state')=='TAKEN_OVER'
                 or any(order[key]!=request[key] for key in ('effect','original_qty','limit_price','native_offset'))):
             raise TraderError('E_OWNERSHIP','Native order is not the exact committed original child')
+        manual = kernel.execution.manual_reduction(cycle) if order['effect']=='REDUCE' else None
+        direct = (manual and manual.get('price')==request['limit_price']
+                  and cycle['execution'].get('manual_reduction_children',{}).get(order['child_order_id'])==manual['request_id'])
+        if not self.fresh(request['contract_id']) and not (direct and self.fresh_manual_reduction(request['contract_id'])):
+            raise TraderError('E_GATEWAY_SCOPE','A current native quote is required before sending')
         expected='BUY' if (cycle['plan']['direction']=='LONG')==(order['effect']=='OPEN') else 'SELL'
         if request['direction']!=expected:raise TraderError('E_OWNERSHIP','Native order direction differs from the original cycle')
         position=self.position(request['contract_id'])
@@ -94,6 +242,8 @@ class TqKqDsvPort(TqKqPort):
                if o['contract_id']==request['contract_id'] and o['status']=='ALIVE'):
             raise TraderError('E_OWNERSHIP','An active foreign order blocks native execution on the selected contract')
         if request['effect']=='OPEN':
+            if (cycle['entry_origin']=='MANUAL')!=self.grant.manual_workbench:
+                raise TraderError('E_GATEWAY_SCOPE','Native opening origin differs from the finite scope')
             kernel.simulation.comparison_gate()
             if not self.entry_clock_ready():
                 raise TraderError('E_CLOCK','Windows clock alignment is required immediately before native opening send')
@@ -101,6 +251,9 @@ class TqKqDsvPort(TqKqPort):
             current=datetime.fromisoformat(self.quotes[request['contract_id']].datetime).replace(tzinfo=timezone(timedelta(hours=8)))
             if facts is None or current!=datetime.fromisoformat(facts['event']['source_time_utc']):
                 raise TraderError('E_GATEWAY_SCOPE','The entry proposal does not reflect the latest native quote')
+            if cycle.get('manual_limit_order'):
+                kernel.simulation.manual_entry_facts(cycle['strategy_metadata']['candidate'],request['original_qty'],
+                    exclude_decision=cycle['decision_key'])
             if (not self.grant.in_window(self.clock.now()) or kernel.recovery_required
                     or kernel.simulation.opening_attempt_count()>value['opening_attempts']
                     or any(o['order_id']!=self.order_id(request['child_order_id']) for o in self.active_orders(request['contract_id']))):
@@ -110,6 +263,7 @@ class TqKqDsvPort(TqKqPort):
         if request['effect']=='REDUCE':
             if not kernel.simulation.exit_day_ready(cycle,request['trading_day']):
                 raise TraderError('E_FACT_BARRIER','Original exits require current-day native reconciliation')
+            kernel.simulation.verify_foreign_orders(cycle,snapshot)
             from online_trader.execution.close_routes import preview_owned_routes
             state=cycle['protection'];target=state.get('target_remaining_qty')
             if target is None:raise TraderError('E_FACT_BARRIER','Native reduction lacks its common remaining target')
@@ -140,3 +294,12 @@ class TqKqDsvPort(TqKqPort):
         if not self.api.is_serial_ready(serial):return []
         self.subscription_ready_at.setdefault(code,self.clock.now())
         return serial.to_dict('records')
+
+    def cancel_external(self,order,day):
+        if (self.read_only or not self.grant.manual_workbench or self.fault or not self.grant.in_window(self.clock.now())
+                or order['contract_id'] not in self.quotes or order['order_id'] in {self.order_id(child) for child in self._bindings}):
+            raise TraderError('E_OWNERSHIP','External cancellation is outside the reviewed account scope')
+        snapshot=self.snapshot()
+        if not snapshot['complete'] or snapshot['trading_day']!=day or order not in snapshot['orders'] or order['status']!='ALIVE':
+            raise TraderError('E_FACT_BARRIER','The original active order changed before cancellation')
+        return self.api.cancel_order(order['order_id'],account=self.account)

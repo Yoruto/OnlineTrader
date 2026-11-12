@@ -140,7 +140,7 @@ class Kernel:
                 if order["child_order_id"] in current_orders:
                     order["send_state"] = current_orders[order["child_order_id"]]["send_state"]
         self._staged = copy.deepcopy(self._committed)
-        self._recovery_pending = set(self._committed)
+        self._recovery_pending = {cid for cid,c in self._committed.items() if c['lifecycle']!='CLOSED'}
         self.recovery_required = bool(self._recovery_pending)
         from online_trader.kernel.control import ControlProtocol
         self.control=ControlProtocol(self)
@@ -355,12 +355,14 @@ class Kernel:
                 total += Decimal(cycle["risk_per_lot"]) * (state["owned_qty"] + potential)
         return total
 
-    def admit_entry(self, plan: dict, decision_key: str, limit_price: str, *, context_id: str, peer_id: str = "qa", _strategy=None) -> str:
+    def admit_entry(self, plan: dict, decision_key: str, limit_price: str, *, context_id: str, peer_id: str = "qa", _strategy=None, _manual=None) -> str:
         self._writable()
         validate_plan(plan)
         if self.simulation is not None:
-            self.simulation.validate_entry(plan)
-            if bool(_strategy is not None)!=bool(getattr(self.simulation,'strategy_enabled',False)):
+            if getattr(self.simulation,'strategy_enabled',False):
+                self.simulation.validate_entry(plan,manual=_manual is not None)
+            else:self.simulation.validate_entry(plan)
+            if (_strategy is not None or _manual is not None)!=bool(getattr(self.simulation,'strategy_enabled',False)):
                 raise TraderError('E_UNSUPPORTED','Online strategy and manual scopes cannot be interchanged')
         elif not self.development or plan["execution_scope"] != "DEVELOPMENT":
             raise TraderError("E_RULE_UNAPPROVED", "This baseline only executes isolated development events")
@@ -409,7 +411,8 @@ class Kernel:
                     "authority_revision":self._authority_revision,"purpose":purpose,"operation":operation},
                  "entry_origin":"MANUAL" if _strategy is None else "STRATEGY",
                  "strategy_epoch":None if _strategy is None else _strategy["epoch"],
-                 "strategy_metadata":None if _strategy is None else copy.deepcopy(_strategy["metadata"]),"instrument":instrument}
+                 "strategy_metadata":copy.deepcopy(_manual if _strategy is None else _strategy["metadata"]),"instrument":instrument}
+        if _manual is not None:cycle['manual_limit_order']=True
         cycle['financial_instrument']={'multiplier':instrument.get('multiplier',str(self.multiplier)),
             'currency':'CNY','basis':'ORIGINAL_INSTRUMENT','max_quote_age_ms':self.max_quote_age_ms}
         if _strategy is not None and self.simulation and getattr(self.simulation,'strategy_enabled',False):
@@ -426,8 +429,8 @@ class Kernel:
         self.statistics.enroll(cycle)
         if _strategy is not None:
             cycle['statistics_observed_at_utc']=_strategy['metadata']['candidate']['source_time_utc']
-        if scheduler is not None and _strategy is not None:
-            cycle['schedule_binding']=scheduler.binding_for(plan,entry_time_utc=_strategy['metadata']['candidate']['source_time_utc'])
+        if scheduler is not None and cycle['strategy_metadata'] is not None:
+            cycle['schedule_binding']=scheduler.binding_for(plan,entry_time_utc=cycle['strategy_metadata']['candidate']['source_time_utc'])
         if _strategy is not None:self._entry_gates[order.attempt_id]=_strategy["gate"]
         self._decision_keys.add(decision_key)
         self._risk_revision += 1
@@ -471,7 +474,7 @@ class Kernel:
             if old and {k:v for k,v in order.items() if k!="revision"}!={k:v for k,v in old.items() if k!="revision"}:
                 order["revision"]=max(order["revision"],old["revision"]+1)
 
-    def stage_control_cycles(self,cycles,kind,event_type,*,extra_mutate=None,after=None):
+    def stage_control_cycles(self,cycles,kind,event_type,*,extra_mutate=None,after=None,allocation_review=None):
         self._writable()
         self._state_revision+=1;self._risk_revision+=1
         frozen=[]
@@ -488,23 +491,46 @@ class Kernel:
             for cycle in frozen:self._project_cycle(conn,seq,cycle,None)
             self._write_authority(conn,seq,authority)
             if extra_mutate:extra_mutate(conn,seq)
-        return self._submit(kind,event_type,{"cycles":frozen,"authority":authority},mutate,cycles=frozen,after=after)
+        data={"cycles":frozen,"authority":authority}
+        if allocation_review is not None:data['allocation_review']=copy.deepcopy(allocation_review)
+        return self._submit(kind,event_type,data,mutate,cycles=frozen,after=after)
 
-    def manual_close(self,cycle_id,qty,*,statistics_at_utc=None):
-        self._writable();quantity(qty,positive=True)
+    def _manual_close_available(self):
+        self._writable()
         if not (self.development or self.simulation) or isinstance(self.port,UnavailablePort):raise TraderError("E_NOT_READY","A trusted execution adapter is required")
+
+    def _manual_close_cycle(self,cycle_id,qty,statistics_at_utc,price_mode,request_id):
+        quantity(qty,positive=True)
         cycle=copy.deepcopy(self._staged.get(cycle_id))
         if not cycle:raise TraderError("E_OWNERSHIP","Cycle is not managed by this kernel")
-        if cycle.get("management_state")=="TAKEN_OVER":raise TraderError("E_OWNERSHIP","Cycle management was handed over")
+        if cycle.get("management_state") in {"TAKEOVER_PENDING","TAKEN_OVER"}:raise TraderError("E_OWNERSHIP","Cycle is not under original management")
         self.statistics.mark_observation(cycle,statistics_at_utc)
         state=cycle["protection"]
         if qty>state["owned_qty"]:raise TraderError("E_QUANTITY","Close quantity exceeds owned position")
         target=state["owned_qty"]-qty
         if state.get("target_remaining_qty") is not None:target=min(target,state["target_remaining_qty"])
+        if price_mode is not None:
+            self.execution.prepare_manual_reduction(cycle,target,price_mode,request_id)
         state.update(target_remaining_qty=target,block_new=True,state_revision=str(int(state["state_revision"])+1))
         cycle.update(cancel_entries=True,lifecycle="EXIT_PENDING",reasons=sorted(set(cycle.get("reasons",[]))|{"MANUAL_EXIT"}))
         self.statistics.freeze_exit(cycle,'MANUAL_EXIT')
+        return cycle
+
+    def manual_close(self,cycle_id,qty,*,statistics_at_utc=None,price_mode=None,request_id=None):
+        self._manual_close_available()
+        cycle=self._manual_close_cycle(cycle_id,qty,statistics_at_utc,price_mode,request_id or _id("manual-close"))
         return self.stage_control_cycles([cycle],"TX_PROTECT","MANUAL_CLOSE",after=lambda:self._progress_exits(cycle_id))
+
+    def manual_close_all(self,positions,*,price_mode,request_id):
+        self._manual_close_available()
+        current={cid:cycle["protection"]["owned_qty"] for cid,cycle in self._staged.items()
+                 if cycle["protection"]["owned_qty"] and cycle.get("management_state") not in {"TAKEOVER_PENDING","TAKEN_OVER"}}
+        if not current or positions!=current:
+            raise TraderError("E_FACT_BARRIER","Reviewed managed positions differ from the current owned quantities")
+        cycles=[self._manual_close_cycle(cid,qty,None,price_mode,request_id) for cid,qty in sorted(current.items())]
+        def progress():
+            for cid in current:self._progress_exits(cid)
+        return self.stage_control_cycles(cycles,"TX_PROTECT","MANUAL_CLOSE_ALL",after=progress)
 
     def flatten(self,cycle_ids,*,statistics_at_utc=None):
         self._writable()
@@ -536,10 +562,12 @@ class Kernel:
     def _project_cycle(self, conn, seq, c, fill):
         plan, state = c["plan"], c["protection"]
         cid = c["position_cycle_id"]
+        adopted=c.get('external_adoption',{}).get('native_quantity',0)
+        external_reduced=sum(row['quantity'] for row in c.get('external_reductions',[]))
         self._upsert(conn, "position_cycles", {"position_cycle_id":cid,"contract_id":plan["contract_id"],"direction":plan["direction"],
             "trading_day":plan["trading_day"],"ownership":"MANAGED","lifecycle":c["lifecycle"],
-            "confirmed_open_qty":state["entry_filled_qty"],"confirmed_close_qty":state["exit_filled_qty"],
-            "allocation_adjustment_qty":0,"remaining_qty":state["owned_qty"],"actual_average_entry_price":c.get("actual_average_entry_price"),
+            "confirmed_open_qty":state["entry_filled_qty"]-adopted,"confirmed_close_qty":state["exit_filled_qty"]-external_reduced,
+            "allocation_adjustment_qty":adopted-external_reduced,"remaining_qty":state["owned_qty"],"actual_average_entry_price":c.get("actual_average_entry_price"),
             "state_revision":c["revision"],"created_event_seq":seq,"updated_event_seq":seq}, ["position_cycle_id"])
         existing = conn.execute("SELECT plan_hash FROM protection_plans WHERE plan_id=? AND plan_revision=?",(plan["plan_id"],int(plan["plan_revision"]))).fetchone()
         if existing is None:
@@ -551,7 +579,7 @@ class Kernel:
             rid = c["entry_reconciliation_id"]
             online=c.get('online_reconciliation')
             conn.execute("INSERT OR IGNORE INTO reconciliation_runs VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                         (rid,online['gateway_identity'] if online else 'DEV',online['source_epoch'] if online else 1,plan["trading_day"],"COMPLETE",
+                         (rid,online['gateway_identity'] if online else 'DEV',online['source_epoch'] if online else 1,online['trading_day'] if online else plan["trading_day"],"COMPLETE",
                           canonical_bytes({'cycle_id':cid,'snapshot_id':online['snapshot_id'],'snapshot_hash':content_hash(online)} if online else {"cycle_id":cid,"development_only":True}).decode(),0,seq,0,seq,seq))
             for part in ("FUNDS","POSITIONS","ORDERS","TRADES"):
                 evidence={'kind':'TQKQ_FULL_SYNC_SNAPSHOT','snapshot_id':online['snapshot_id'],'source_epoch':online['source_epoch'],'complete':True} if online else {'development_only':True}
@@ -593,14 +621,15 @@ class Kernel:
                 self._upsert(conn,"cancel_actions",{"cancel_id":"cancel-"+item["child_order_id"],"child_order_id":item["child_order_id"],
                     "status":item["cancel_status"],"request_hash":content_hash({"child_order_id":item["child_order_id"]}),"attempt_count":1,
                     "created_event_seq":seq,"updated_event_seq":seq},["cancel_id"])
-        opening = next(o for o in c["orders"] if o["effect"]=="OPEN")
+        opening = next((o for o in c["orders"] if o["effect"]=="OPEN"),None)
         risk_qty = state["owned_qty"]+sum(OrderState.from_dict(o).potential_remaining for o in c["orders"] if o["effect"]=="OPEN")
         with localcontext() as context:
             context.prec = 80
             amount = decimal_text(Decimal(c["risk_per_lot"])*risk_qty)
-        self._upsert(conn,"reservations",{"reservation_id":"risk-"+cid,"intent_id":opening["intent_id"],"child_order_id":opening["child_order_id"],
-            "reservation_kind":"RISK_BUDGET","amount":amount,"quantity":None,"status":"RELEASED" if risk_qty==0 else "UNKNOWN" if any(o['send_state']=='UNKNOWN' for o in c['orders'] if o['effect']=='OPEN') else "HELD",
-            "state_revision":c["revision"],"updated_event_seq":seq},["reservation_id"])
+        if opening is not None:
+            self._upsert(conn,"reservations",{"reservation_id":"risk-"+cid,"intent_id":opening["intent_id"],"child_order_id":opening["child_order_id"],
+                "reservation_kind":"RISK_BUDGET","amount":amount,"quantity":None,"status":"RELEASED" if risk_qty==0 else "UNKNOWN" if any(o['send_state']=='UNKNOWN' for o in c['orders'] if o['effect']=='OPEN') else "HELD",
+                "state_revision":c["revision"],"updated_event_seq":seq},["reservation_id"])
         if state.get("block_new_for_trading_day"):
             conn.execute("INSERT OR IGNORE INTO day_blocks VALUES(?,?,?,?,?,?,?,?)",("block-"+cid,plan["contract_id"],plan["trading_day"],"PROTECTION_LOCK","{}","ACTIVE",seq,None))
         if fill is not None:
@@ -684,7 +713,8 @@ class Kernel:
         if self.simulation and order['send_state']=='UNKNOWN':self.pause()
 
     def record_fill(self, child_id: str, trade_key: str, qty: int, price: str, *, observed_at_utc=None,
-                    trading_day=None,commission=None,estimated_commission=None,native_day_evidence=None,_adapter_token=None):
+                    trading_day=None,commission=None,estimated_commission=None,native_day_evidence=None,
+                    _initial_entry_confirmation=None,_defer_entry_slippage=False,_adapter_token=None):
         self._writable()
         if not self.development and not (self.simulation and _adapter_token is self.port.callback_token):
             raise TraderError("E_UNSUPPORTED", "No trusted broker callback adapter is installed")
@@ -741,6 +771,14 @@ class Kernel:
         order["send_state"] = "CONFIRMED"
         order["revision"] += 1
         event={"type":"FILL" if order["effect"]=="OPEN" else "EXIT_FILL","quantity":qty,"price":price,"event_seq":self._sequence+1,"event_id":trade_key}
+        if (order["effect"] == "OPEN" and cycle["plan"]["schema_version"] == "1.3"
+                and cycle["plan"]["slippage_exit"]["enabled"]):
+            seen = cycle.get("entry_slippage_confirmation_seen", bool(cycle["protection"]["entry_filled_qty"]))
+            if seen or _defer_entry_slippage:
+                event["skip_entry_slippage"] = True
+            elif _initial_entry_confirmation is not None:
+                event["initial_entry_confirmation"] = _initial_entry_confirmation
+            cycle["entry_slippage_confirmation_seen"] = seen or not _defer_entry_slippage
         quote=cycle.get("last_quote")
         if quote:
             field="price" if cycle["plan"]["price_field"]=="LAST" else ("bid1" if cycle["plan"]["direction"]=="LONG" else "ask1")
@@ -748,6 +786,14 @@ class Kernel:
                 event.update(current_price=quote[field],quote_valid=quote["kernel_boot_id"]==self.boot_id and self._quote_age_ns(quote["received_ns"])<=self.max_quote_age_ms*1_000_000)
         decision = reduce_event(cycle["plan"],ProtectionState.from_dict(cycle["protection"]),event,simulation_permit=self.simulation.permit(cycle['plan']) if self.simulation else None)
         self._apply_decision(cycle,decision)
+        if order["effect"] == "OPEN" and cycle.get("entry_origin") == "STRATEGY":
+            notice = cycle.get("initial_open_confirmation")
+            if notice is None or notice["status"] == "PENDING":
+                if _defer_entry_slippage:
+                    cycle["initial_open_confirmation"] = {"status":"PENDING"}
+                elif _initial_entry_confirmation is not None:
+                    status = "SLIPPAGE_EXIT" if "ADVERSE_SLIPPAGE" in decision.reasons else "CONFIRMED"
+                    cycle["initial_open_confirmation"] = {"status":status, **_initial_entry_confirmation}
         if self.simulation:self.simulation.mark_fill(cycle,order)
         if closed_statistics:
             cycle['statistics_review_required']=True
@@ -882,7 +928,7 @@ class Kernel:
     def _record_conflict(self,event_type,details):
         self._armed=False
         self.recovery_required=True
-        self._recovery_pending.update(self._staged)
+        self._recovery_pending.update(cid for cid,c in self._staged.items() if c['lifecycle']!='CLOSED')
         self.contexts.revoke_all()
         self._state_revision+=1
         self._authority_revision+=1
@@ -890,12 +936,14 @@ class Kernel:
         return self._submit("TX_RECONCILE",event_type,{"conflict":details,"authority":authority},
                             lambda conn,seq:self._write_authority(conn,seq,authority))
 
-    def request_cancel(self, child_id: str):
+    def request_cancel(self, child_id: str, *, retain_exit_target=False):
         self._writable()
         cycle,_ = self._find(child_id)
         order = next(o for o in cycle["orders"] if o["child_order_id"]==child_id)
         if order["terminal_confirmed"] or order["cancel_status"]:
             return
+        if retain_exit_target and order['effect']=='REDUCE' and self.execution.active(cycle):
+            cycle['execution'].setdefault('cancel_reasons',{})[child_id]='ACCOUNT_CANCEL_RETAIN_EXIT_TARGET'
         if order["attempt_id"] not in self._dispatched and order["kernel_boot_id"]==self.boot_id and order["send_state"]=="SEND_POSSIBLE":
             order.update(send_state="DEFINITELY_NOT_SENT",terminal_confirmed=True,reported_fill_qty=order["filled_qty"],cancel_status="NOT_NEEDED")
             cycle["revision"]+=1
@@ -914,7 +962,7 @@ class Kernel:
             self._stage_cycle(updated,"TX_CANCEL","CANCEL_RESULT",after=lambda:self._progress_exits(cycle['position_cycle_id']))
         self._stage_cycle(cycle,"TX_CANCEL","CANCEL_PREPARED",after=send_cancel)
 
-    def confirm_terminal(self, child_id: str, status: str, cumulative_fill_qty: int,*,_adapter_token=None):
+    def confirm_terminal(self, child_id: str, status: str, cumulative_fill_qty: int,*,_adapter_token=None,_historical_recovery=False):
         self._writable()
         if not (self.development or self.simulation and _adapter_token is self.port.callback_token) or status not in {"FILLED","CANCELLED","REJECTED"}:
             raise TraderError("E_EVIDENCE", "Development terminal evidence is required")
@@ -929,6 +977,8 @@ class Kernel:
         order.update(broker_state=status,reported_fill_qty=cumulative_fill_qty,terminal_confirmed=True,send_state="CONFIRMED")
         if order["cancel_status"]:
             order["cancel_status"]="CONFIRMED" if status=="CANCELLED" else "NOT_NEEDED"
+        if _historical_recovery and status=='CANCELLED' and order['effect']=='REDUCE' and self.execution.active(cycle):
+            cycle['execution'].setdefault('cancel_reasons',{})[child_id]='HISTORICAL_TERMINAL_RECONCILED'
         cycle["revision"]+=1
         return self._stage_cycle(cycle,"TX_ORDER","ORDER_TERMINAL",after=lambda:self._progress_exits(cycle["position_cycle_id"]))
 

@@ -207,6 +207,41 @@ def _cell(value):
     return text
 
 
+def export_daily_report(report, destination, day):
+    """Export the selected cabinet day from the already accepted ledger report."""
+    from online_trader.accounting.book import trading_day
+    from online_trader.configuration.files import publish_new_bytes
+    from online_trader.reconciliation_export import tabular_workbook
+
+    day = trading_day(day)
+    material = _export_material(report)
+    selected = {key:[row for row in material[key] if row.get('trading_day') == day]
+                for key in ('by_day','nominal','trades','equity')}
+    if not any(selected.values()):
+        raise TraderError('E_REPORT_DAY', '所选柜台交易日没有已接受的日报数据')
+    account = selected['equity'][-1] if selected['equity'] else {}
+    totals = selected['by_day'][0] if selected['by_day'] else {}
+    overview = [
+        ('项目','值'),('交易日',day),('账户',material['account_key']),('账本事件',material['checkpoint_event_seq']),
+        ('账户权益',account.get('balance')),('可用资金',account.get('available')),('保证金',account.get('margin')),
+        ('柜台当日盈亏',account.get('today_pnl')),('柜台手续费',account.get('commission')),
+        ('已实现毛收益',totals.get('gross_realized_pnl')),('确认费用',totals.get('confirmed_fees')),
+        ('已实现净收益',totals.get('net_realized_pnl')),
+        ('开仓手数',totals.get('entry_quantity')),('平仓手数',totals.get('exit_quantity')),
+    ]
+    symbols = [('合约','名义盈亏点数','净亏点数','止损次数','成交次数','当日已停开','停开原因')]
+    symbols.extend([row.get(field) for field in ('contract_id','daily_pnl_points','net_loss_points','stop_count',
+                   'trade_count','day_stopped','day_stopped_reason')] for row in selected['nominal'])
+    trades = [('成交身份','合约','方向','开平','手数','成交价','手续费','费用质量','成交时间')]
+    trades.extend([row.get(field) for field in ('trade_key','contract_id','direction','effect','quantity','price',
+                  'fee','fee_quality','observed_at_utc')] for row in selected['trades'])
+    workbook = tabular_workbook([
+        ('交易日报',overview,[23,46]),('品种统计',symbols,[18,18,18,14,14,18,38]),
+        ('逐笔成交',trades,[34,18,12,12,12,16,16,18,35]),
+    ])
+    return publish_new_bytes(workbook,destination)
+
+
 def export_report(report,destination,*,table='trades',format=None):
     """Export trusted columns only, to a new CSV or JSON file.
 

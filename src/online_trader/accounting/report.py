@@ -216,7 +216,7 @@ def _account_rows(values, account_key, checkpoint, issues):
 
 
 def build_report(*, account_key, checkpoint_event_seq, fills, fees=(), account_facts=(),
-                 marks=None, nominal=(), as_of_utc=None):
+                 marks=None, nominal=(), as_of_utc=None, opening_inventory=(), inventory_reductions=()):
     """Build an immutable cost-basis report without creating or changing facts.
 
     ``marks.valid`` means the owner has verified market freshness. This pure
@@ -235,6 +235,10 @@ def build_report(*, account_key, checkpoint_event_seq, fills, fees=(), account_f
             if content_hash(old)!=content_hash(item):raise TraderError('E_DUPLICATE_CONFLICT','Trade identity changed content')
             continue
         identities[identity]=item;items.append(item)
+    for row in _list(inventory_reductions,'Inventory reductions'):
+        if _seq(row['event_seq'])<=checkpoint:
+            items.append({'position_cycle_id':_id(row['position_cycle_id']),'quantity':row['quantity'],
+                'event_seq':row['event_seq'],'trading_day':_day(row['trading_day']),'effect':'INVENTORY_REDUCTION'})
     items.sort(key=lambda row:int(row['event_seq']))
     fee_index=_fee_index(fees,account_key)
     if marks is None:marks={}
@@ -247,10 +251,38 @@ def build_report(*, account_key, checkpoint_event_seq, fills, fees=(), account_f
         if mark.get('trading_day') is not None:_day(mark['trading_day'])
     overall=_Bucket();days={};contracts={};cycles={};trades=[]
     def day_bucket(day):return days.setdefault(day,_Bucket())
+    for allocation in _list(opening_inventory,'Opening inventory'):
+        if _seq(allocation['allocation_event_seq'])>checkpoint:continue
+        cid=_id(allocation['position_cycle_id']);contract=_id(allocation['contract_id']);day=_day(allocation['trading_day'])
+        qty=allocation['native_quantity'];direction=allocation['direction']
+        if (allocation['account_key']!=account_key or cid in cycles or direction not in {'LONG','SHORT'}
+                or type(qty) is not int or qty<=0):
+            _invalid('Opening inventory has an invalid or repeated owner allocation')
+        reference=allocation['reference_price'];price=_number(reference,positive=True)
+        cycles[cid]={'position_cycle_id':cid,'contract_id':contract,'direction':direction,'trading_day':day,
+            'last_fill_trading_day':day,'theoretical_entry_price':reference,'lots':deque([[qty,price,None]]),
+            'bucket':_Bucket(),'invalid_quantity':False,'multiplier':None,'adopted_inventory':True}
+        contracts.setdefault(contract,_Bucket())
+        _issue(issues,'EXTERNAL_INVENTORY_COST_UNVERIFIED',position_cycle_id=cid)
     with localcontext() as context:
         context.prec=80
         for fill in items:
-            cid=fill['position_cycle_id'];contract=fill['contract_id'];direction=fill['direction']
+            cid=fill['position_cycle_id']
+            if fill['effect']=='INVENTORY_REDUCTION':
+                cycle=cycles.get(cid);qty=fill['quantity']
+                if cycle is None or type(qty) is not int or not 0<qty<=sum(lot[0] for lot in cycle['lots']):
+                    _invalid('Reviewed inventory reduction exceeds the original position')
+                remaining=qty
+                while remaining:
+                    lot=cycle['lots'][0];used=min(remaining,lot[0]);remaining-=used;lot[0]-=used
+                    if not lot[0]:cycle['lots'].popleft()
+                for lot in cycle['lots']:lot[2]=None
+                cycle['last_fill_trading_day']=fill['trading_day']
+                for bucket in (overall,day_bucket(fill['trading_day']),contracts[cycle['contract_id']],cycle['bucket']):
+                    bucket.gross=None
+                _issue(issues,'EXTERNAL_REDUCTION_COST_UNVERIFIED',position_cycle_id=cid,trading_day=fill['trading_day'])
+                continue
+            contract=fill['contract_id'];direction=fill['direction']
             cycle=cycles.get(cid)
             if cycle is None:
                 cycle={'position_cycle_id':cid,'contract_id':contract,'direction':direction,
@@ -272,7 +304,9 @@ def build_report(*, account_key, checkpoint_event_seq, fills, fees=(), account_f
                 needed=qty
                 while needed and cycle['lots']:
                     lot=cycle['lots'][0];matched=min(needed,lot[0]);needed-=matched;lot[0]-=matched
-                    if lot[2] is None:gross=None;_issue(issues,'MULTIPLIER_UNKNOWN',trade_key=fill['trade_key'],position_cycle_id=cid)
+                    if lot[2] is None:
+                        gross=None
+                        if not cycle.get('adopted_inventory'):_issue(issues,'MULTIPLIER_UNKNOWN',trade_key=fill['trade_key'],position_cycle_id=cid)
                     elif gross is not None:gross+=sign*(price-lot[1])*matched*lot[2]
                     if not lot[0]:cycle['lots'].popleft()
                 if needed:
@@ -307,13 +341,15 @@ def build_report(*, account_key, checkpoint_event_seq, fills, fees=(), account_f
                     sign=Decimal(1) if cycle['direction']=='LONG' else Decimal(-1)
                     for remaining,price,multiplier in cycle['lots']:
                         if multiplier is None:
-                            unrealized=None;_issue(issues,'MULTIPLIER_UNKNOWN',position_cycle_id=cid);break
+                            unrealized=None
+                            if not cycle.get('adopted_inventory'):_issue(issues,'MULTIPLIER_UNKNOWN',position_cycle_id=cid)
+                            break
                         unrealized+=sign*(Decimal(mark['price'])-price)*remaining*multiplier
             for aggregate in (overall,day_bucket(valuation_day),contracts[cycle['contract_id']],cycle['bucket']):aggregate.value(unrealized)
             result=cycle['bucket'].record(issues,position_cycle_id=cid)
             result.update({name:cycle[name] for name in ('position_cycle_id','contract_id','direction','trading_day','last_fill_trading_day','theoretical_entry_price')})
             result.update(remaining_quantity=None if cycle['invalid_quantity'] else _count(qty,issues,position_cycle_id=cid),
-                closed=bool(qty==0 and not cycle['invalid_quantity'] and cycle['bucket'].entries),
+                closed=bool(qty==0 and not cycle['invalid_quantity'] and (cycle['bucket'].entries or cycle.get('adopted_inventory'))),
                 valuation_trading_day=valuation_day,
                 valuation_observed_at_utc=None if not mark else mark.get('observed_at_utc'))
             cycle_rows.append(result)

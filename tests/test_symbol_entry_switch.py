@@ -59,6 +59,8 @@ class SymbolEntrySwitchTests(unittest.TestCase):
         view=workbench_view(x.kernel)
         self.assertFalse(view['symbol_entry_switches'][x.code]['enabled'])
         self.assertFalse(view['markets'][-1]['enabled'])
+        self.assertFalse(view['markets'][-1]['fresh'])
+        self.assertIn('WAITING_FRESH_QUOTE',view['markets'][-1]['entry_reasons'])
 
     def test_out_of_scope_symbol_is_rejected_without_switch_or_account_pause(self):
         future,_=self.command(False,code='DCE.l2701')

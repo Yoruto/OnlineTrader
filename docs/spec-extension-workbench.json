@@ -1,7 +1,11 @@
 {
   "version": "WORKBENCH_READ/1",
-  "resources": {
-    "workbench-ipc.schema.json": "b16b9c57b8b4426caaec6377e737ff401947d7f6ec465feaa6bd06430df5d9c6"
+  "extends_copied_resources": {
+    "schemas/ipc.schema.json": "def8789c02b5f55ec9207b223d18579861449293d5ff4fe5d41e6657da2feb62"
   },
-  "note": "Read-only workbench extension only; original G0 and protection resources unchanged."
+  "resources": {
+    "ipc.schema.json": "68bee449c968752827e0a6d0f6e0dce562f55d6ab59a18563bb80bb12b7a4f71",
+    "workbench-ipc.schema.json": "8eff6a1a5acb57d2ca335ea7e0e21f81b80a8a1879b3f84170eceade948b3ac9"
+  },
+  "note": "Workbench projections and the additive manual-account, external-position and historical-evidence controls. The G0 IPC source digest is retained; protection and storage resources are unchanged."
 }

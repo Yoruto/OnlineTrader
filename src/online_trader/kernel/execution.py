@@ -10,7 +10,7 @@ from online_trader.contracts.codec import canonical_bytes, content_hash
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text, identifier, quantity
 from online_trader.errors import TraderError
-from online_trader.execution.policy import select_price, close_price_context, decide_order_action
+from online_trader.execution.policy import select_price, select_manual_price, close_price_context, decide_order_action
 from online_trader.gateway.ports import UnavailablePort
 from online_trader.protection import ProtectionState, reduce_event
 
@@ -86,14 +86,18 @@ class ExecutionCoordinator:
         market=event['market']
         if event.get('close_due'):
             started=event['elapsed_ms'] if planned_close is None else planned_close
-            if ex['close_start_ms'] is None:ex['close_start_ms']=started
+            if ex['close_start_ms'] is None:
+                ex['close_start_ms']=started
+                if ex['force_start_ms'] is None:ex['context_ms'].pop('REDUCE',None)
             else:ex['close_start_ms']=min(ex['close_start_ms'],started)
             state=cycle['protection'];state['target_remaining_qty']=0;state['block_new']=True
             state['state_revision']=str(int(state['state_revision'])+1)
             cycle['cancel_entries']=True;cycle['reasons']=sorted(set(cycle.get('reasons',[]))|{'SESSION_CLOSE'})
             k.statistics.freeze_exit(cycle,'SESSION_CLOSE',reference_price=market.get('last'))
         if event.get('force_close'):
-            if ex['force_start_ms'] is None:ex['force_start_ms']=event['elapsed_ms']
+            if ex['force_start_ms'] is None:
+                ex['force_start_ms']=event['elapsed_ms']
+                ex['context_ms'].pop('REDUCE',None)
             state=cycle['protection'];state['target_remaining_qty']=0;state['block_new']=True
             cycle['cancel_entries']=True
             k.statistics.freeze_exit(cycle,'MANUAL_EXIT',reference_price=market.get('last'))
@@ -156,16 +160,100 @@ class ExecutionCoordinator:
             if effect=='OPEN' and (mode!='CAP' or not p['passive_entry_first']):born_ms=0
             ex['contexts'][effect]={'mode':mode,'row':row};ex['context_ms'][effect]=born_ms
 
-    def price(self,cycle,effect):
+    @staticmethod
+    def manual_reduction(cycle):
+        manual=cycle.get('manual_reduction')
+        if not manual:return None
+        state=cycle['protection'];execution=cycle['execution']
+        if (state.get('target_remaining_qty')==manual['target'] and
+                state.get('exit_reasons',[])==manual['protection_reasons'] and
+                execution['close_start_ms'] is None and execution['force_start_ms'] is None):
+            return manual
+        return None
+
+    def prepare_manual_reduction(self,cycle,target,mode,request_id):
+        if not self.active(cycle):
+            raise TraderError('E_NOT_READY','A fresh owner-side market observation is required for the manual price mode')
+        state=cycle['protection'];previous=state.get('target_remaining_qty')
+        if previous is not None and previous<state['owned_qty'] and not self.manual_reduction(cycle):
+            return  # The ongoing protective exit keeps its execution policy.
+        execution=cycle['execution']
+        if execution['close_start_ms'] is not None or execution['force_start_ms'] is not None:
+            return
+        priced=self.price(cycle,'REDUCE',manual_mode=mode)
+        manual = {'request_id':request_id,'price':priced['price'],'mode':mode,'target':target,
+            'protection_reasons':copy.deepcopy(state.get('exit_reasons',[]))}
+        if not priced['allowed']:
+            context = self._manual_price_context(cycle)
+            if context is None or not set(priced['reasons']) & {'MANUAL_PRICE_UNAVAILABLE','MARKET_FACTS_NOT_EXECUTABLE'}:
+                raise TraderError('E_NOT_READY','Manual close price is unavailable from a fresh legal quote')
+            manual['price_wait'] = context
+        cycle['manual_reduction'] = manual
+
+    def _manual_price_context(self,cycle):
+        k = self.kernel
+        scheduler = getattr(k,'_scheduled_runtime',None)
+        if not getattr(k.simulation,'strategy_enabled',False) or scheduler is None or scheduler._sample is None:
+            return None
+        sample = scheduler._sample
+        at = scheduler.calendar.query(cycle['plan']['contract_id'],sample.to_record()['now_utc'])
+        if (not at['complete'] or not at['is_trading'] or not k.simulation.exit_day_ready(cycle,at['trading_day'])):
+            return None
+        return {'kernel_boot_id':k.boot_id,'source_epoch':k.port.source_epoch,'trading_day':at['trading_day'],
+                'session_id':at['session']['session_id'],'monotonic_ns':str(sample.monotonic)}
+
+    def _resolve_manual_price(self,cycle,manual):
+        wait = manual['price_wait']
+        current = self._manual_price_context(cycle)
+        if current is None or any(current[key] != wait[key] for key in
+                                   ('kernel_boot_id','source_epoch','trading_day','session_id')):
+            manual['price'] = None
+            manual['price_failure'] = 'MANUAL_PRICE_CONTEXT_CHANGED'
+            return True
+        if manual['price'] is not None:
+            return False
+        elapsed = (int(current['monotonic_ns'])-int(wait['monotonic_ns']))//1_000_000
+        if elapsed < 0:
+            manual['price_failure'] = 'MANUAL_PRICE_CLOCK_CHANGED'
+            return True
+        priced = self.price(cycle,'REDUCE',manual_mode=manual['mode'],elapsed_ms=elapsed)
+        if priced['allowed']:
+            manual['price'] = priced['price']
+            return True
+        if elapsed >= 4_000:
+            manual['price_failure'] = priced['reasons'][0]
+            return True
+        return False
+
+    def manual_reduction_failed(self,cycle,request_id):
+        manual=self.manual_reduction(cycle)
+        if not manual or manual['request_id']!=request_id:return False
+        if manual.get('price_failure'):return True
+        children=cycle['execution'].get('manual_reduction_children',{})
+        return any(children.get(o['child_order_id'])==request_id and o['terminal_confirmed']
+                   and o['filled_qty']<o['original_qty'] for o in cycle['orders'])
+
+    def price(self,cycle,effect,*,manual_mode=None,elapsed_ms=0):
         ex=cycle['execution'];market=copy.deepcopy(ex['market']);quote=cycle.get('last_quote');k=self.kernel
         if not quote or quote['kernel_boot_id']!=k.boot_id or k._quote_age_ns(quote['received_ns'])>k.max_quote_age_ms*1_000_000:
             market['fresh']=False
         else:market.update(last=quote['price'],bid1=quote.get('bid1'),ask1=quote.get('ask1'))
+        side=self.side(cycle,effect)
+        if manual_mode is not None:
+            runtime = getattr(k,'_dsv_runtime',None)
+            ratio = (runtime.profile.to_record()['settings']['trade']['limit_fallback_ratio']
+                     if runtime is not None else '0.01')
+            return select_manual_price(manual_mode,side,market,elapsed_ms=elapsed_ms,limit_fallback_ratio=ratio)
+        manual=self.manual_reduction(cycle) if effect=='REDUCE' else None
+        if manual:
+            if manual['price'] is None:
+                return {'allowed':False,'price':None,'reasons':[manual.get('price_failure','MANUAL_PRICE_WAIT')]}
+            return select_price(side,market,contexts={'PASSIVE':{'side':side,'age_ms':0,'level':manual['price']}})
         contexts={};saved=ex['contexts'].get(effect)
         if saved and saved['mode']!='ACTIVE':
             row=copy.deepcopy(saved['row']);row['age_ms']=ex['elapsed_ms']-ex['context_ms'][effect]
             contexts[saved['mode']]=row
-        result=select_price(self.side(cycle,effect),market,contexts=contexts)
+        result=select_price(side,market,contexts=contexts)
         if effect=='OPEN' and ('OPEN' not in ex['contexts']):
             result.update(allowed=False,price=None,reasons=['OPEN_SESSION_CLOCK_UNKNOWN'])
         return result
@@ -178,25 +266,41 @@ class ExecutionCoordinator:
         ex=cycle['execution'];state=cycle['protection'];target=state.get('target_remaining_qty')
         if getattr(k.simulation,'strategy_enabled',False):
             snapshot=k.port.snapshot()
-            if not snapshot['complete'] or not k.simulation.exit_day_ready(cycle,snapshot['trading_day']):return
+            if k.port.fault or not snapshot['complete'] or not k.simulation.exit_day_ready(cycle,snapshot['trading_day']):return
         if set(state.get('exit_reasons',[]))&{'ADVERSE_SLIPPAGE','DATA_GAP_EXIT'} and ex['force_start_ms'] is None:
-            ex['force_start_ms']=ex['elapsed_ms'];self._contexts(cycle)
+            ex['force_start_ms']=ex['elapsed_ms'];ex['context_ms'].pop('REDUCE',None);self._contexts(cycle)
+        manual=self.manual_reduction(cycle)
+        if manual and manual.get('price_wait') and not manual.get('price_failure') and self._resolve_manual_price(cycle,manual):
+            cycle['revision'] += 1
+            k._stage_cycle(cycle,'TX_PROTECT','MANUAL_REDUCTION_PRICE_RESOLVED',
+                           after=lambda:self.progress(cid,allow_open=allow_open,allow_retry=allow_retry))
+            return
+        manual_children=ex.get('manual_reduction_children',{})
         for effect in ('OPEN','REDUCE'):
             orders=[o for o in cycle['orders'] if o['effect']==effect]
             if not orders:continue
             desired=max(0,cycle['plan']['initial_open_quantity']-state['entry_filled_qty']) if effect=='OPEN' else (max(0,state['owned_qty']-target) if target is not None else 0)
             stop_open=bool(effect=='OPEN' and (ex['entry_stopped'] or cycle.get('cancel_entries') or target is not None))
-            timeout=bool(effect=='OPEN' and state['entry_filled_qty']==0 and ex['elapsed_ms']>cycle['plan']['execution_policy']['entry_confirm_timeout_ms'])
+            timeout=bool(effect=='OPEN' and not cycle.get('manual_limit_order') and state['entry_filled_qty']==0
+                         and ex['elapsed_ms']>cycle['plan']['execution_policy']['entry_confirm_timeout_ms'])
+            hold_open = (effect=='OPEN' and not stop_open
+                         and k.control.preserve_open_orders_revision==k._authority_revision)
             can_increase=not stop_open and not timeout and k._armed and not k.recovery_required and k.control.can_increase(cycle['plan']['contract_id'])
             priced=self.price(cycle,effect)
             working=[o for o in orders if OrderState.from_dict(o).potential_remaining]
             candidates=working or [orders[-1]]
             for order in candidates:
+                if hold_open and not order['cancel_status']:
+                    continue
                 pending=sum(OrderState.from_dict(o).potential_remaining for o in orders if o['child_order_id']!=order['child_order_id'])
-                action=decide_order_action(order|{'side':self.side(cycle,effect)},priced['price'] if priced['allowed'] else None,
+                manual_limit=(effect=='OPEN' and cycle.get('manual_limit_order')) or (manual and order['child_order_id'] in manual_children)
+                desired_price=order['limit_price'] if manual_limit else priced['price'] if priced['allowed'] else None
+                action=decide_order_action(order|{'side':self.side(cycle,effect)},desired_price,
                     can_increase=can_increase if effect=='OPEN' else True,remaining_quantity=0 if stop_open else desired,
                     other_pending_quantity=pending,timeout_due=timeout,
-                    reprice_cancelled=ex['cancel_reasons'].get(order['child_order_id']) in {'NEW_QUOTE_PRICE_WORSENED','TARGET_QUANTITY_REDUCED','CABINET_DAY_ROLLOVER'})
+                    reprice_cancelled=ex['cancel_reasons'].get(order['child_order_id']) in {
+                        'NEW_QUOTE_PRICE_WORSENED','TARGET_QUANTITY_REDUCED','CABINET_DAY_ROLLOVER',
+                        'ACCOUNT_CANCEL_RETAIN_EXIT_TARGET','HISTORICAL_TERMINAL_RECONCILED'})
                 if action['action']=='CANCEL':
                     reason=action['reasons'][0]
                     if timeout:ex['entry_stopped']=True
@@ -213,6 +317,8 @@ class ExecutionCoordinator:
                     k._armed=False;k.contexts.revoke_all();k._recovery_pending.add(cid);k.recovery_required=True
                     k._stage_cycle(cycle,'TX_RECONCILE','EXECUTION_CANCEL_TIMEOUT');return
                 if action['action']=='REPLACE' and (effect!='OPEN' or allow_open):
+                    if manual_limit:continue
+                    if manual and effect=='REDUCE':continue
                     if order['send_state']=='DEFINITELY_NOT_SENT' and not allow_retry:continue
                     self._replace(cycle,order,action);return
                 if (action['action']=='STOP' and effect=='OPEN' and not ex['entry_stopped'] and
@@ -224,10 +330,13 @@ class ExecutionCoordinator:
             pending=sum(OrderState.from_dict(o).potential_remaining for o in cycle['orders'] if o['effect']=='REDUCE')
             qty=max(0,state['owned_qty']-target-pending)
             reduces=[o for o in cycle['orders'] if o['effect']=='REDUCE']
+            relevant=[o for o in reduces if o['child_order_id'] not in manual_children
+                      or (manual and manual_children[o['child_order_id']]==manual['request_id'])]
             blocked=any(o['broker_state']=='REJECTED' or
                 (o['terminal_confirmed'] and o['filled_qty']<o['original_qty'] and
-                 o['send_state']!='DEFINITELY_NOT_SENT' and o['child_order_id'] not in ex['cancel_reasons']) for o in reduces)
-            blocked=blocked or bool(reduces and reduces[-1]['send_state']=='DEFINITELY_NOT_SENT' and not allow_retry)
+                 (o['child_order_id'] in manual_children or
+                  (o['send_state']!='DEFINITELY_NOT_SENT' and o['child_order_id'] not in ex['cancel_reasons']))) for o in relevant)
+            blocked=blocked or bool(relevant and relevant[-1]['send_state']=='DEFINITELY_NOT_SENT' and not allow_retry)
             if qty and not blocked:
                 priced=self.price(cycle,'REDUCE')
                 if priced['allowed']:self._new_reduction(cycle,qty,priced['price'])
@@ -266,6 +375,8 @@ class ExecutionCoordinator:
         k=self.kernel
         order=OrderState(_id('child'),_id('exit-intent'),_id('attempt'),'REDUCE',qty,price,kernel_boot_id=k.boot_id)
         if getattr(k.simulation,'strategy_enabled',False) and k.simulation.prepare_order(cycle,order) is False:return
+        manual=self.manual_reduction(cycle)
+        if manual:cycle['execution'].setdefault('manual_reduction_children',{})[order.child_order_id]=manual['request_id']
         cycle['orders'].append(order.to_dict());cycle['revision']+=1
         cycle['execution']['last_action']='REDUCE'
         k._stage_cycle(cycle,'TX_INTENT','EXIT_PREPARED',after=lambda:k._dispatch(cycle['position_cycle_id'],order.child_order_id))

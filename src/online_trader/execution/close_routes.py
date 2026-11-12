@@ -9,15 +9,10 @@ from online_trader.errors import TraderError
 from online_trader.scheduling.calendar import _day
 
 
-def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_quantity,position_cycle_id=None):
-    """Return additional routes for a total requested reduction, including pending.
-
-    A cycle selection constrains both original lots and existing reservations;
-    the native position proof still covers the whole owned side.
-    """
-    _day(current_day);quantity(target_quantity);lots=[];seen=set()
+def replay_lots(contract_id,direction,current_day,fills,*,require_allocations):
+    _day(current_day);lots=[];seen=set()
     if direction not in {'LONG','SHORT'}:raise TraderError('E_SCOPE','Expected an explicit owned side')
-    if type(fills) is not list or type(orders) is not list:raise TraderError('E_FACT_BARRIER','Explicit original fill and order facts are required')
+    if type(fills) is not list:raise TraderError('E_FACT_BARRIER','Explicit original position facts are required')
     separated=contract_id.split('.')[0] in {'SHFE','INE'}
     for fill in sorted(fills,key=lambda row:int(row['event_seq'])):
         if (fill['contract_id']!=contract_id or fill['direction']!=direction or fill['trade_key'] in seen):
@@ -25,9 +20,20 @@ def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_
         seen.add(fill['trade_key']);day=_day(fill['trading_day']);qty=quantity(fill['quantity'],positive=True)
         if day>current_day:raise TraderError('E_FACT_BARRIER','A fill belongs to a future cabinet day')
         owner=fill.get('position_cycle_id')
-        if position_cycle_id is not None and not isinstance(owner,str):
+        if require_allocations and not isinstance(owner,str):
             raise TraderError('E_OWNERSHIP','Every original fill needs its cycle allocation')
-        if fill['effect']=='OPEN':lots.append({'day':day,'quantity':qty,'owner':owner})
+        if fill['effect'] in {'OPEN','ADOPTED_TODAY','ADOPTED_HISTORICAL'}:
+            lots.append({'day':day,'quantity':qty,'owner':owner,'lot_key':fill['trade_key'],
+                'already_historical':fill['effect']=='ADOPTED_HISTORICAL'})
+        elif fill['effect']=='EXTERNAL_REDUCE':
+            remaining=qty;bucket=fill['bucket']
+            if bucket not in {'today','historical'}:raise TraderError('E_FACT_BARRIER','External reduction bucket is invalid')
+            for lot in lots:
+                is_today=lot['day']==day and not lot['already_historical']
+                if (lot['owner']==owner and lot['day']<=day and is_today==(bucket=='today')
+                        and ('lot_key' not in fill or fill['lot_key']==lot['lot_key'])):
+                    matched=min(remaining,lot['quantity']);remaining-=matched;lot['quantity']-=matched
+            if remaining:raise TraderError('E_OWNERSHIP','Reviewed reduction exceeds its original cycle bucket')
         elif fill['effect']=='REDUCE':
             offset=fill.get('offset_kind')
             if separated and offset not in {'CLOSE_TODAY','CLOSE_YESTERDAY','CLOSETODAY','CLOSE'}:
@@ -38,22 +44,32 @@ def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_
             # Pinned SDK TargetPosTask._get_order documents today first on
             # combined exchanges. Native buckets and FIFO monetary cost are
             # separate ledgers; cost FIFO cannot prove a native close bucket.
-            candidates=lots if separated else sorted(lots,key=lambda lot:lot['day']!=day)
+            candidates=lots if separated else sorted(lots,key=lambda lot:lot['day']!=day or lot['already_historical'])
             for lot in candidates:
-                eligible=(position_cycle_id is None or lot['owner']==owner) and lot['day']<=day
-                eligible=eligible and (not separated or (lot['day']==day if offset in {'CLOSE_TODAY','CLOSETODAY'} else lot['day']<day))
+                eligible=(not require_allocations or lot['owner']==owner) and lot['day']<=day
+                is_today=lot['day']==day and not lot['already_historical']
+                eligible=eligible and (not separated or is_today==(offset in {'CLOSE_TODAY','CLOSETODAY'}))
                 if eligible:
                     matched=min(remaining,lot['quantity']);remaining-=matched;lot['quantity']-=matched
             if remaining:raise TraderError('E_OWNERSHIP','Confirmed closes exceed the proved original lot bucket')
         else:raise TraderError('E_FACT_BARRIER','Unknown fill effect')
-    today=sum(l['quantity'] for l in lots if l['day']==current_day)
-    historical=sum(l['quantity'] for l in lots if l['day']<current_day)
+    return lots
+
+
+def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_quantity,position_cycle_id=None):
+    """Allocate the remaining exit across proved lots and existing reservations."""
+    quantity(target_quantity)
+    separated=contract_id.split('.')[0] in {'SHFE','INE'}
+    if type(orders) is not list:raise TraderError('E_FACT_BARRIER','Explicit original order facts are required')
+    lots=replay_lots(contract_id,direction,current_day,fills,require_allocations=position_cycle_id is not None)
+    today=sum(l['quantity'] for l in lots if l['day']==current_day and not l['already_historical'])
+    historical=sum(l['quantity'] for l in lots)-today
     if (type(native) is not dict or set(native)!={'today','historical','total'} or
             any(type(v) is not int or v<0 for v in native.values()) or native!={'today':today,'historical':historical,'total':today+historical}):
         raise TraderError('E_OWNERSHIP','Native today/historical quantities do not exactly match original owned fills')
     selected=[l for l in lots if position_cycle_id is None or l['owner']==position_cycle_id]
-    selected_lots={'today':sum(l['quantity'] for l in selected if l['day']==current_day),
-                   'historical':sum(l['quantity'] for l in selected if l['day']<current_day)}
+    selected_today=sum(l['quantity'] for l in selected if l['day']==current_day and not l['already_historical'])
+    selected_lots={'today':selected_today,'historical':sum(l['quantity'] for l in selected)-selected_today}
     if target_quantity>sum(selected_lots.values()):raise TraderError('E_RISK','Requested reduction exceeds the exact owned cycle quantity')
     reserved={'today':0,'historical':0,'combined':0}
     selected_reserved={'today':0,'historical':0,'combined':0}
@@ -106,24 +122,35 @@ def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_
     return result|{'evidence_hash':content_hash(result)}
 
 
-def preview_owned_routes(kernel,cycle_id,target_quantity,*,_exclude_child=None):
-    """Review accepted original ledger lots against the current native buckets.
+def owned_lot_facts(kernel,contract_id,direction,cycles):
+    mapping={c['position_cycle_id']:c for c in cycles if c['plan']['contract_id']==contract_id and c['plan']['direction']==direction}
+    facts=kernel.ledger.query('SELECT f.trade_key,f.contract_id,f.trading_day,f.offset_kind,f.recorded_event_seq AS event_seq,a.effect,a.quantity,a.position_cycle_id '
+        'FROM fill_facts f JOIN fill_allocations a ON a.fill_id=f.fill_id WHERE f.contract_id=? AND f.recorded_event_seq<=? ORDER BY f.recorded_event_seq',
+        (contract_id,kernel._durable_seq))
+    fills=[f|{'direction':direction} for f in facts if f['position_cycle_id'] in mapping]
+    for cid,owned_cycle in mapping.items():
+        adoption=owned_cycle.get('external_adoption')
+        if adoption:
+            lots=adoption.get('lots',[{'lot_key':cid+'-'+bucket,'bucket':bucket,'quantity':adoption[bucket]}
+                for bucket in ('today','historical') if adoption[bucket]])
+            for lot in lots:
+                fills.append({'contract_id':contract_id,'direction':direction,'trade_key':lot['lot_key'],
+                    'position_cycle_id':cid,'trading_day':adoption['trading_day'],'event_seq':adoption['allocation_event_seq'],
+                    'effect':'ADOPTED_'+lot['bucket'].upper(),'quantity':lot['quantity']})
+        for adjustment in owned_cycle.get('external_reductions',[]):
+            fills.append(adjustment|{'contract_id':contract_id,'direction':direction,'position_cycle_id':cid,'effect':'EXTERNAL_REDUCE'})
+    return fills,mapping
 
-    Read-only use by the workbench. Across-day native sending remains blocked
-    until original order/fill reconciliation and grant/day gates also succeed.
-    """
+
+def preview_owned_routes(kernel,cycle_id,target_quantity,*,_exclude_child=None,_recovery_review=False):
+    """Review accepted original ledger lots against the current native buckets."""
     kernel._check_owner();cycle=kernel._committed[cycle_id];plan=cycle['plan'];port=kernel.port
     calendar=getattr(port,'calendar',None)
     if calendar is None:raise TraderError('E_CALENDAR_INCOMPLETE','A current bound calendar is required')
     window=calendar.query(plan['contract_id'],port.clock.now().isoformat().replace('+00:00','Z'))
     if not window['complete'] or not window['is_trading']:raise TraderError('E_CALENDAR_INCOMPLETE','Current native close buckets need a proved active trading day')
-    if not port.complete() or port.fault:raise TraderError('E_FACT_BARRIER','Current native position sync is incomplete')
-    relevant=[c for c in kernel._committed.values() if c['plan']['contract_id']==plan['contract_id'] and c['plan']['direction']==plan['direction']]
-    mapping={c['position_cycle_id']:c for c in relevant}
-    facts=kernel.ledger.query('SELECT f.trade_key,f.contract_id,f.trading_day,f.offset_kind,f.recorded_event_seq AS event_seq,a.effect,a.quantity,a.position_cycle_id '
-        'FROM fill_facts f JOIN fill_allocations a ON a.fill_id=f.fill_id WHERE f.contract_id=? AND f.recorded_event_seq<=? ORDER BY f.recorded_event_seq',
-        (plan['contract_id'],kernel._durable_seq))
-    fills=[f|{'direction':plan['direction']} for f in facts if f['position_cycle_id'] in mapping]
+    if not port.complete() or (port.fault and not _recovery_review):raise TraderError('E_FACT_BARRIER','Current native position sync is incomplete')
+    fills,mapping=owned_lot_facts(kernel,plan['contract_id'],plan['direction'],kernel._committed.values())
     side='long' if plan['direction']=='LONG' else 'short';native=port.api.get_position(plan['contract_id'],account=port.account)
     native={'today':getattr(native,'pos_'+side+'_today',None),'historical':getattr(native,'pos_'+side+'_his',None),'total':getattr(native,'pos_'+side,None)}
     # Reservations include prepared owner work as well as accepted work. Never

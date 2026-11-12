@@ -14,6 +14,28 @@ from tests.test_online_dsv import day_calendar,scope_for
 
 
 class MultiContractDsvTests(unittest.TestCase):
+    def test_scope_finishes_in_covered_post_close_interval(self):
+        clock=FactClock('2026-11-10T06:59:59Z');calendar=day_calendar()
+        profile=load_confirmed_baseline()[0]
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            grant=scope_for(root/'ledger.db',profile,calendar,schema_version='KQ_DSV_SIM/2',
+                trading_days=['2026-11-10'],resume_entries_on_day_change=False)
+            api=NativeFactApi(clock);port=TqKqDsvPort(api,api._account,grant,clock)
+            port.configure_calendar(calendar)
+            with Kernel(root/'ledger.db',grant.account_key,port=port,simulation_grant=grant,risk_budget='1000000') as kernel:
+                kernel.simulation.initialize()
+                session=DsvSimulationSession(kernel,root/'session',profile=profile,calendar=calendar,clock=clock,emit=lambda value:None)
+                try:
+                    session.prime();clock.advance(2000);session.step()
+                    self.assertTrue(session.stop.is_set())
+                    self.assertEqual(session.result['status'],'DSV_SCOPE_FINISHED')
+                    self.assertEqual(port.snapshot()['trading_day'],'2026-11-10')
+                    self.assertEqual(api.inserted,[])
+                    clock.advance(3_600_000)
+                    self.assertFalse(port.snapshot()['complete'])
+                finally:session.close()
+
     def test_two_contracts_share_owner_reservations_and_keep_exits_separate(self):
         codes=('DCE.p2701','DCE.l2701');clock=FactClock()
         record=day_calendar().to_record();row=record['contracts'][0]

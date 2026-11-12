@@ -30,7 +30,7 @@ class NativeFactApi:
             expire_datetime=datetime(2027,1,20,tzinfo=timezone.utc).timestamp()) for code in contracts}
         self.serials={code:NativeRows() for code in contracts}
         self.funds=NS(balance=1000000.,pre_balance=1000000.,available=1000000.,margin=0.,frozen_margin=0.,
-                      close_profit=0.,position_profit=0.,float_profit=0.,commission=0.)
+                      close_profit=0.,position_profit=0.,float_profit=0.,commission=0.,risk_ratio=0.)
     def get_quote(self,code):return self.quotes[code]
     def get_tick_serial(self,code,**kwargs):return self.serials[code]
     def is_serial_ready(self,serial):return bool(serial.rows)

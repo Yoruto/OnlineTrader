@@ -467,6 +467,7 @@ def _entry_fill(plan: Mapping[str, Any], state: ProtectionState, event: Mapping[
     if state.entry_filled_qty + quantity > plan["initial_open_quantity"]:
         raise TraderError("E_FILL_OVER_TARGET", "Entry fill exceeds the original proven target")
     late = state.entry_terminal_reconciled
+    first_confirmation = state.entry_filled_qty == 0
     state = replace(state, owned_qty=state.owned_qty + quantity,
                     entry_filled_qty=state.entry_filled_qty + quantity,
                     entry_value=state.entry_value + price * quantity,
@@ -475,9 +476,22 @@ def _entry_fill(plan: Mapping[str, Any], state: ProtectionState, event: Mapping[
                     quality="DATA_GAP" if state.last_price is None or late else state.quality)
     reasons = ["LATE_ENTRY_AFTER_BARRIER"] if late else []
     slip = plan["slippage_exit"]
+    confirmation = event.get("initial_entry_confirmation")
+    if not slip["enabled"] or (plan["schema_version"] == "1.3" and
+                               (event.get("skip_entry_slippage") is True or
+                                (not first_confirmation and confirmation is None))):
+        return state, reasons
     direction = Decimal(1) if state.direction == "LONG" else Decimal(-1)
-    adverse = direction * (state.entry_value / state.entry_filled_qty - _decimal(plan["theoretical_entry_price"]))
-    if slip["enabled"] and adverse > _decimal(slip["adverse_threshold_points"]):
+    confirmed_qty, confirmed_value = state.entry_filled_qty, state.entry_value
+    if plan["schema_version"] == "1.3" and confirmation is not None:
+        confirmed_qty = _quantity(confirmation["quantity"], positive=True)
+        confirmed_value = _decimal(confirmation["value"], input_value=False)
+        if (not state.entry_filled_qty <= confirmed_qty <= plan["initial_open_quantity"]
+                or confirmed_value < state.entry_value):
+            raise TraderError("E_FACT_BARRIER", "The first broker entry confirmation does not cover its fill")
+    # Compare weighted values without rounding a repeated average through the threshold.
+    adverse_value = direction * (confirmed_value - _decimal(plan["theoretical_entry_price"]) * confirmed_qty)
+    if adverse_value > _decimal(slip["adverse_threshold_points"]) * confirmed_qty:
         if state.mode == "NORMAL" or event.get("allow_protected_override") is True:
             state = _target(state, 0, "ADVERSE_SLIPPAGE")
             state = replace(state, block_new_for_trading_day=state.block_new_for_trading_day or slip["block_new_for_trading_day"])
@@ -571,6 +585,12 @@ def reduce_event(plan: Mapping[str, Any], state: ProtectionState, event: Mapping
                 if sign * (_decimal(event["current_price"]) - _decimal(plan["theoretical_entry_price"])) <= 0 and state.owned_qty:
                     state = _target(state, 0, "BREAK_EVEN")
                     reasons.append("BREAK_EVEN")
+        elif kind == "EXTERNAL_ALLOCATION_REDUCTION":
+            state=_exit_fill(plan,state,dict(event)|{'external':True})
+            target=state.target_remaining_qty
+            state=replace(state,target_remaining_qty=None if target is None else min(target,state.owned_qty),
+                          reconciliation_required=True,block_new=True)
+            reasons.append("EXTERNAL_ALLOCATION_REDUCTION")
         elif kind == "QUOTE":
             state, reasons = _quote(plan, state, event, seq)
         elif kind == "ENTRY_TERMINAL_RECONCILED":

@@ -24,6 +24,10 @@ def main(argv=None):
         command=commands.add_parser(action);command.add_argument("--pipe",required=True)
     workbench=commands.add_parser('workbench',help='完整工作台；只附着原内核，不建立交易连接')
     workbench.add_argument('--pipe');workbench.add_argument('--account-store',type=Path);workbench.add_argument('--account-id')
+    qpro=commands.add_parser('qpro-history',help='从本机快期专业版查询历史成交，仅用于对照')
+    for field in ('company','client-id','start-day','end-day'):qpro.add_argument('--'+field,required=True)
+    qpro.add_argument('--port',type=int,default=8815)
+    qpro.add_argument('--output',required=True,type=Path)
     accounts=commands.add_parser('accounts',help='本地账户档案，Windows凭据库；不登录')
     account_actions=accounts.add_subparsers(dest='account_action',required=True)
     for name in ('list','add','edit','select','delete','desktop'):
@@ -57,15 +61,23 @@ def main(argv=None):
         if provider=='simnow':
             command=dsv_actions.add_parser('credentials',help='交互式保存Windows凭据及无密码引用文件；不登录')
             command.add_argument('--output',type=Path,required=True)
-            command=dsv_actions.add_parser('scope',help='从无密码凭据引用和明确额度/时间生成独立范围；不连接')
-            for field in ('credential-reference','profile','calendar','ledger','output'):
-                command.add_argument('--'+field,type=Path,required=True)
-            command.add_argument('--contract',action='append',required=True)
-            command.add_argument('--trading-day',action='append',required=True)
-            command.add_argument('--not-before-utc',required=True);command.add_argument('--not-after-utc',required=True)
-            command.add_argument('--max-order-quantity',type=int,required=True)
-            command.add_argument('--opening-attempts',type=int,required=True);command.add_argument('--risk-budget',required=True)
-            command.add_argument('--authorization-reference',required=True)
+        command=dsv_actions.add_parser('scope',help='按明确额度、账户档案和时间生成独立范围；不连接')
+        for field in ('profile','calendar','ledger','output'):
+            command.add_argument('--'+field,type=Path,required=True)
+        command.add_argument('--contract',action='append',required=True)
+        command.add_argument('--trading-day',action='append',required=True)
+        command.add_argument('--not-before-utc',required=True);command.add_argument('--not-after-utc',required=True)
+        command.add_argument('--max-order-quantity',type=int,required=True)
+        command.add_argument('--opening-attempts',type=int,required=True);command.add_argument('--risk-budget',required=True)
+        command.add_argument('--authorization-reference',required=True)
+        command.add_argument('--manual-workbench',action='store_true',help='生成独立人工交易与外部持仓接管范围')
+        command.add_argument('--allow-external-allocation',action='store_true',help='允许在工作台明确复核并登记外部持仓归属调整')
+        if provider=='dsv':
+            command.add_argument('--account-store',type=Path,required=True)
+            command.add_argument('--account-id',required=True)
+            command.add_argument('--resume-entries-on-day-change',action='store_true')
+        else:
+            command.add_argument('--credential-reference',type=Path,required=True)
             command.add_argument('--resume-entries-on-day-change',action='store_true')
             command.add_argument('--automatic-offsets',action='store_true',help='按已绑定DSV公式在首次开仓前自动计算；当前仅支持一个明确柜台日')
             command.add_argument('--last-completed-day',help='自动计算明确使用的最后完整日线交易日')
@@ -124,6 +136,12 @@ def main(argv=None):
             command.add_argument('--format',choices=('csv','json','xlsx'))
     args=parser.parse_args(argv)
     try:
+        if args.action=='qpro-history':
+            from online_trader.configuration.files import publish_new_bytes
+            from online_trader.gateway.qpro_history import query_trades
+            report=query_trades(args.company,args.client_id,args.start_day,args.end_day,port=args.port)
+            publish_new_bytes(json.dumps(report,ensure_ascii=False,default=str,indent=2).encode('utf-8'),args.output)
+            print(json.dumps({'total':report['total'],'usage':report['usage'],'output':str(args.output)}));return 0
         if args.action=='accounts':
             from online_trader.accounts import AccountStore
             store=AccountStore(args.store)
@@ -179,25 +197,37 @@ def main(argv=None):
                 from online_trader.scheduling.calendar import TradingCalendar
                 from online_trader.contracts.codec import canonical_bytes,strict_loads
                 from online_trader.configuration.files import publish_new_bytes
-                reference=strict_loads(args.credential_reference.read_bytes())
-                if (type(reference) is not dict or reference.keys()!={'schema_version','account_fingerprint'}
-                        or reference['schema_version']!='SIMNOW_CREDENTIAL_REFERENCE/1'):
-                    raise TraderError('E_CREDENTIALS','Scope preparation reads only a password-free SimNow credential reference')
+                if args.action=='simnow':
+                    reference=strict_loads(args.credential_reference.read_bytes())
+                    if (type(reference) is not dict or reference.keys()!={'schema_version','account_fingerprint'}
+                            or reference['schema_version']!='SIMNOW_CREDENTIAL_REFERENCE/1'):
+                        raise TraderError('E_CREDENTIALS','Scope preparation reads only a password-free SimNow credential reference')
+                    fingerprint=reference['account_fingerprint']
+                    schema='SIMNOW_WORKBENCH_SIM/1' if args.manual_workbench else 'SIMNOW_DSV_SIM/1'
+                else:
+                    from online_trader.accounts import AccountStore
+                    store=AccountStore(args.account_store);account=store.get(args.account_id)
+                    if store.ledger_path(account)!=args.ledger.resolve():
+                        raise TraderError('E_SCOPE','The scope ledger must be the selected account archive ledger')
+                    fingerprint=account['account_key'].removeprefix('SIM:KQ:')
+                    schema='KQ_WORKBENCH_SIM/1' if args.manual_workbench else 'KQ_DSV_SIM/2'
                 profile=DsvProfile.from_record(strict_loads(args.profile.read_bytes()))
                 calendar=TradingCalendar.from_record(strict_loads(args.calendar.read_bytes()))
-                value={'schema_version':'SIMNOW_DSV_SIM/1','grant_id':'simnow-'+uuid.uuid4().hex,
-                    'account_fingerprint':reference['account_fingerprint'],'ledger_path':str(args.ledger.resolve()),
+                value={'schema_version':schema,'grant_id':args.action+'-'+uuid.uuid4().hex,
+                    'account_fingerprint':fingerprint,'ledger_path':str(args.ledger.resolve()),
                     'contracts':args.contract,'trading_day':args.trading_day[0],'trading_days':args.trading_day,
                     'resume_entries_on_day_change':args.resume_entries_on_day_change,
                     'not_before_utc':args.not_before_utc,'not_after_utc':args.not_after_utc,
                     'max_order_quantity':args.max_order_quantity,'opening_attempts':args.opening_attempts,
                     'risk_budget':args.risk_budget,'profile_hash':profile.content_hash,'calendar_hash':calendar.content_hash,
                     'authorization_reference':args.authorization_reference}
-                if args.automatic_offsets:
+                if args.allow_external_allocation:value['allow_external_allocation']=True
+                if getattr(args,'automatic_offsets',False):
+                    if args.manual_workbench:raise TraderError('E_ONLINE_SCOPE','Startup auto calculation needs a strategy-only scope')
                     if args.last_completed_day is None:raise TraderError('E_AUTO_OFFSETS','An explicit last completed daily date is required')
                     value.update(schema_version='SIMNOW_DSV_AUTO/1',auto_offsets={'schema_version':'DSV_START_OFFSETS/1',
                         'as_of_date':args.trading_day[0],'last_completed_day':args.last_completed_day})
-                elif args.last_completed_day is not None:
+                elif getattr(args,'last_completed_day',None) is not None:
                     raise TraderError('E_AUTO_OFFSETS','The completed daily date belongs to an explicit automatic calculation scope')
                 grant=DsvSimulationGrant.parse(canonical_bytes(value))
                 dsv_simulation.validate_inputs(grant,profile,calendar)
@@ -218,7 +248,7 @@ def main(argv=None):
                 result=dsv_simulation.prepare(args.scope,args.profile,args.calendar,args.output,
                     dsv_config=args.dsv_config,dsv_log_dir=args.dsv_log_dir)
                 print(json.dumps(result,ensure_ascii=False,indent=2));return 0
-            credential=args.credentials
+            credential=args.credentials;pipe=args.pipe
             if getattr(args,'account_store',None) is not None:
                 from online_trader.accounts import AccountStore
                 store=AccountStore(args.account_store)
@@ -228,7 +258,8 @@ def main(argv=None):
                 if row['account_key']!=grant.account_key or store.ledger_path(row)!=Path(grant.value['ledger_path']).resolve():
                     raise TraderError('E_SCOPE','Selected account and original ledger differ from the explicit scope')
                 credential=store.credential_reference(account_id)
-            return dsv_simulation.run(args.scope,credential,args.profile,args.calendar,args.output,pipe=args.pipe,arm=args.arm,
+                if grant.manual_workbench and pipe is None:pipe=store.pipe_name(row)
+            return dsv_simulation.run(args.scope,credential,args.profile,args.calendar,args.output,pipe=pipe,arm=args.arm,
                 dsv_config=args.dsv_config,dsv_log_dir=args.dsv_log_dir)
         elif args.action=='simulation':
             from online_trader.runtime.simulation import run_session
@@ -274,7 +305,10 @@ def main(argv=None):
                 worker=None
                 if args.shadow_worker:
                     instance="shadow-"+uuid.uuid4().hex
-                    worker=subprocess.Popen([sys.executable,"-m","online_trader.strategy.worker","--pipe",args.pipe,"--instance-id",instance,
+                    from online_trader.runtime.executable import bundled_cli
+                    packaged=bundled_cli()
+                    prefix=[str(packaged),'--strategy-worker'] if packaged else [sys.executable,'-m','online_trader.strategy.worker']
+                    worker=subprocess.Popen([*prefix,"--pipe",args.pipe,"--instance-id",instance,
                         "--parent-pid",str(os.getpid()),"--report-file",str(args.data_dir/"worker-status.json")],creationflags=subprocess.CREATE_NO_WINDOW)
                     server.register_peer(instance,worker.pid)
                 if args.ready_file:

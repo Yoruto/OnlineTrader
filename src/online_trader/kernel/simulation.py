@@ -1,8 +1,10 @@
 """Bounded ONLINE_SIM owner operations using the original kernel and writer."""
 from datetime import datetime,timezone,timedelta
+from decimal import Decimal, localcontext
 import copy,time,uuid
 
 from online_trader.contracts.codec import canonical_bytes,content_hash,strict_loads
+from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
 from online_trader.protection import ProtectionState,reduce_event
 
@@ -83,7 +85,8 @@ class OnlineSimulation:
                 if self.strategy_enabled:policies.append(('AUTHORITY','authority'))
                 for kind,name in policies:
                     payload={'kind':'KQ_MANUAL_SIMULATION_'+kind,'grant_hash':self.grant.content_hash,'execution_scope':'ONLINE_SIMULATION'}
-                    if self.strategy_enabled:payload.update(kind='KQ_DSV_SIMULATION_'+kind,allowed_origins=['STRATEGY'])
+                    if self.strategy_enabled:payload.update(kind='KQ_DSV_SIMULATION_'+kind,
+                        allowed_origins=self.authority_policy()['allowed_origins'])
                     if getattr(self.grant,'provider','TQKQ')=='TQ_SIMNOW':payload['kind']='SIMNOW_DSV_SIMULATION_'+kind
                     conn.execute('INSERT OR IGNORE INTO policy_revisions VALUES(?,?,?,?,?,?)',('sim-'+name+'-'+self.grant.content_hash[:24],kind,rule,canonical_bytes(payload).decode(),content_hash(payload),seq))
                 k._write_authority(conn,seq,authority)
@@ -168,6 +171,10 @@ class OnlineSimulation:
 
     def validate_native_order(self,observation):pass
 
+    def native_observations(self):return self.port.observations()
+
+    def historical_terminal(self,observation):return False
+
     def observe_native_orders(self):
         """Commit received facts without authorizing sends or lifting recovery.
 
@@ -175,7 +182,7 @@ class OnlineSimulation:
         barrier remains set. The legacy manual owner keeps its original day.
         """
         k=self.kernel;k._writable()
-        try:observations=self.port.observations()
+        try:observations=self.native_observations()
         except TraderError as error:
             k._record_conflict('ONLINE_NATIVE_ORDER_CONFLICT',{'error_code':error.code});k.wait_idle();raise
         digest=content_hash(observations)
@@ -193,37 +200,67 @@ class OnlineSimulation:
                 except TraderError as error:
                     k._record_conflict('ONLINE_NATIVE_ORDER_DAY_UNPROVED',{'child_order_id':child,'error_code':error.code})
                     k.wait_idle();continue
-                proved=True
+                proved_fills = []
                 for fill in observation['fills']:
                     try:day=self.fill_day(observation,fill)
                     except TraderError as error:
-                        proved=False
                         k._record_conflict('ONLINE_NATIVE_DAY_UNPROVED',{'child_order_id':child,
                             'trade_key':fill['trade_key'],'source_time_ns':fill['source_time_ns'],'error_code':error.code})
                         k.wait_idle();continue
+                    proved_fills.append((fill, day))
+                proved = len(proved_fills) == len(observation['fills'])
+                total = sum(fill['quantity'] for fill in observation['fills'])
+                cycle, _ = k._find(child)
+                order = next(order for order in cycle['orders'] if order['child_order_id'] == child)
+                first_confirmation = None
+                defer_entry_slippage = False
+                opening = order['effect'] == 'OPEN' and cycle['plan']['schema_version'] == '1.3'
+                initial_fill = not cycle['protection']['entry_filled_qty']
+                needs_slippage = (cycle['plan']['slippage_exit']['enabled']
+                                  and not cycle.get('entry_slippage_confirmation_seen', not initial_fill))
+                notice = cycle.get('initial_open_confirmation')
+                needs_notice = (cycle.get('entry_origin') == 'STRATEGY' and
+                                (notice == {'status':'PENDING'} or (initial_fill and notice is None)))
+                if opening and (needs_slippage or needs_notice):
+                    defer_entry_slippage = not proved or total != observation['reported_fill_qty']
+                    if not defer_entry_slippage and total > 0:
+                        with localcontext() as context:
+                            context.prec = 80
+                            value = sum(Decimal(fill['price']) * fill['quantity'] for fill, _ in proved_fills)
+                        first_confirmation = {'quantity': total, 'value': decimal_text(value)}
+                for fill, day in proved_fills:
                     changed=k.record_fill(child,fill['trade_key'],fill['quantity'],fill['price'],trading_day=day,
-                        native_day_evidence=fill.get('native_day_evidence'),_adapter_token=self.port.callback_token)
+                        native_day_evidence=fill.get('native_day_evidence'),_initial_entry_confirmation=first_confirmation,
+                        _defer_entry_slippage=defer_entry_slippage,_adapter_token=self.port.callback_token)
                     k.wait_idle()
                     if changed:
                         cycle,_=k._find(child);cid=cycle['position_cycle_id']
                         self._closed.discard(cid);self._entry_reconciled.discard(cid)
-                total=sum(fill['quantity'] for fill in observation['fills'])
                 if proved and observation['status']=='FINISHED' and total==observation['reported_fill_qty']:
                     terminal_key=(child,total)
                     if terminal_key not in self._terminal:
                         cycle,_=k._find(child);order=next(o for o in cycle['orders'] if o['child_order_id']==child)
                         status='FILLED' if total==order['original_qty'] else 'CANCELLED'
-                        k.confirm_terminal(child,status,total,_adapter_token=self.port.callback_token);k.wait_idle();self._terminal.add(terminal_key)
+                        k.confirm_terminal(child,status,total,_adapter_token=self.port.callback_token,
+                            _historical_recovery=self.historical_terminal(observation))
+                        k.wait_idle();self._terminal.add(terminal_key)
             self._last_observations=digest
         return observations
 
     def tick(self):
         k=self.kernel;k._writable()
         if self.port.fault and not self._fault_recorded:
-            k.pause();k.wait_idle();self.capture('ONLINE_GATEWAY_DISCONTINUITY',{'source_epoch':self.port.source_epoch});self._fault_recorded=True
+            details={'source_epoch':self.port.source_epoch}
+            if self.strategy_enabled and any(cycle['lifecycle']!='CLOSED' for cycle in k._staged.values()):
+                k._record_conflict('ONLINE_GATEWAY_DISCONTINUITY',details);k.wait_idle()
+            else:
+                k.pause();k.wait_idle();self.capture('ONLINE_GATEWAY_DISCONTINUITY',details)
+            self._fault_recorded=True
         observations=self.observe_native_orders()
         self.recover_working(observations)
+        if self.strategy_enabled and self.port.fault:return
         for cid,cycle in list(k._staged.items()):
+            if self.strategy_enabled and cid in k._recovery_pending:continue
             if cid in self._closed and cycle['lifecycle']=='CLOSED':continue
             code=cycle['plan']['contract_id']
             if self.port.fault and self.port.complete() and self.port.fresh(code) and all(o['terminal_confirmed'] for o in cycle['orders'] if o['effect']=='OPEN'):
@@ -253,7 +290,7 @@ class OnlineSimulation:
 
     def can_close(self,cycle):return True
 
-    def reconcile(self,cid,*,close=False,allow_working=False):
+    def reconcile(self,cid,*,close=False,allow_working=False,clear_gateway_fault=True):
         k=self.kernel;k._writable();snapshot=self.port.snapshot();self._validate_snapshot(snapshot)
         snapshot=self.reconciliation_snapshot(snapshot)
         cycle=copy.deepcopy(k._staged[cid]);code=cycle['plan']['contract_id']
@@ -264,8 +301,36 @@ class OnlineSimulation:
         if any((not o['terminal_confirmed'] and (close or (not allow_working and (not self.strategy_enabled or o['effect']=='OPEN'))))
                or o['reported_fill_qty'] not in (None,o['filled_qty']) or o['send_state']=='UNKNOWN' for o in orders):
             raise TraderError('E_FACT_BARRIER','Native terminal orders and all owned fills must agree')
+        self.verify_foreign_orders(cycle,snapshot)
+        self.verify_cycle_orders(cycle,orders,snapshot)
+        position=next((p for p in snapshot['positions'] if p['contract_id']==code),{'long':0,'short':0})
+        expected={direction:sum(c['protection']['owned_qty'] for c in k._staged.values()
+                   if c['plan']['contract_id']==code and c['plan']['direction']==direction.upper()) for direction in ('long','short')}
+        if position['long']!=expected['long'] or position['short']!=expected['short']:
+            raise TraderError('E_OWNERSHIP','Native position differs from the exact owned quantity')
+        rid='sim-reconcile-'+uuid.uuid4().hex;cycle['entry_reconciliation_id']=rid
+        cycle['online_reconciliation']=snapshot
+        if close:
+            if cycle['protection']['owned_qty']:raise TraderError('E_FACT_BARRIER','Owned cycle is not flat')
+            cycle['lifecycle']='CLOSED'
+        elif all(o['terminal_confirmed'] for o in cycle['orders'] if o['effect']=='OPEN'):
+            decision=reduce_event(cycle['plan'],ProtectionState.from_dict(cycle['protection']),{'type':'ENTRY_TERMINAL_RECONCILED','owned_quantity':cycle['protection']['owned_qty'],
+                'reconciliation_id':rid,'event_seq':k._sequence+1,'event_id':'sim-evidence-'+uuid.uuid4().hex},simulation_permit=self.permit(cycle['plan']))
+            k._apply_decision(cycle,decision)
+        else:
+            cycle['protection'].update(reconciliation_required=False,block_new=True)
+        cycle['revision']+=1
+        statistics=k.statistics.prepare_close(cycle) if close else None
+        def accepted():
+            k._recovery_pending.discard(cid);k.recovery_required=bool(k._recovery_pending) or k._has_unknown()
+            if clear_gateway_fault and self.port.fault and self.port.fresh(code):self.port.fault=False
+            k._progress_exits(cid)
+        result=k._stage_cycle(cycle,'TX_RECONCILE','ONLINE_SIMULATION_RECONCILED',after=accepted,money_account=self.money_fact(snapshot),nominal_statistics=statistics);k.wait_idle();return result.result()
+
+    def verify_foreign_orders(self,cycle,snapshot):
+        code=cycle['plan']['contract_id'];k=self.kernel
         native={o['order_id']:o for o in snapshot['orders']}
-        baseline=cycle.get('online_entry_baseline',self.baseline or {})
+        baseline=cycle.get('reviewed_foreign_baseline',cycle.get('online_entry_baseline',self.baseline or {}))
         original={o['order_id'] for o in baseline.get('orders',[])}
         owned={self.port.order_id(order['child_order_id']) for c in k._staged.values() for order in c['orders']}
         if any(o['contract_id']==code and o['order_id'] not in original|owned for o in snapshot['orders']):
@@ -275,6 +340,10 @@ class OnlineSimulation:
                         and o.get('status')=='FINISHED' and o['order_id'] not in native)
                for o in baseline.get('orders',[])):
             raise TraderError('E_OWNERSHIP','A preexisting foreign order changed on the selected contract')
+
+    def verify_cycle_orders(self,cycle,orders,snapshot):
+        k=self.kernel;code=cycle['plan']['contract_id']
+        native={o['order_id']:o for o in snapshot['orders']}
         for order in orders:
             if order['send_state']=='DEFINITELY_NOT_SENT' and not order['filled_qty']:continue
             item=native.get(self.port.order_id(order['child_order_id']))
@@ -297,32 +366,6 @@ class OnlineSimulation:
                     or any(t.get('contract_id')!=code or t.get('direction')!=direction or t.get('offset')!=offset for t in trades)
                     or any(f['source_time_ns'] is None for f in expected.values())):
                 raise TraderError('E_FACT_BARRIER','Full-day native trade identities and economics differ from committed owned fills')
-        position=next((p for p in snapshot['positions'] if p['contract_id']==code),{'long':0,'short':0})
-        expected={direction:sum(c['protection']['owned_qty'] for c in k._staged.values()
-                   if c['plan']['contract_id']==code and c['plan']['direction']==direction.upper()) for direction in ('long','short')}
-        if position['long']!=expected['long'] or position['short']!=expected['short']:
-            raise TraderError('E_OWNERSHIP','Native position differs from the exact owned quantity')
-        rid='sim-reconcile-'+uuid.uuid4().hex;cycle['entry_reconciliation_id']=rid
-        cycle['online_reconciliation']=snapshot
-        if close:
-            if cycle['protection']['owned_qty']:raise TraderError('E_FACT_BARRIER','Owned cycle is not flat')
-            cycle['lifecycle']='CLOSED'
-        elif all(o['terminal_confirmed'] for o in cycle['orders'] if o['effect']=='OPEN'):
-            decision=reduce_event(cycle['plan'],ProtectionState.from_dict(cycle['protection']),{'type':'ENTRY_TERMINAL_RECONCILED','owned_quantity':cycle['protection']['owned_qty'],
-                'reconciliation_id':rid,'event_seq':k._sequence+1,'event_id':'sim-evidence-'+uuid.uuid4().hex},simulation_permit=self.permit(cycle['plan']))
-            k._apply_decision(cycle,decision)
-        else:
-            # Full native working-order proof restores original management,
-            # but does not satisfy the entry-terminal barrier for half exits.
-            cycle['protection'].update(reconciliation_required=False,block_new=True)
-        cycle['revision']+=1
-        statistics=k.statistics.prepare_close(cycle) if close else None
-        def accepted():
-            k._recovery_pending.discard(cid);k.recovery_required=bool(k._recovery_pending) or k._has_unknown()
-            if self.port.fault and self.port.fresh(code):self.port.fault=False
-            k._progress_exits(cid)
-        result=k._stage_cycle(cycle,'TX_RECONCILE','ONLINE_SIMULATION_RECONCILED',after=accepted,money_account=self.money_fact(snapshot),nominal_statistics=statistics);k.wait_idle();return result.result()
-
     def plan(self,code,price,*,stop_points,take_profit_points):
         k=self.kernel;identity=self.grant.content_hash[:24]
         return {'schema_version':'1.0','plan_id':'sim-plan-'+uuid.uuid4().hex,'plan_revision':'1','account_key':k.account_key,

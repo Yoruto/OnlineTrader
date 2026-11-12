@@ -1,7 +1,7 @@
 """Pure entry sizing and admission checks for the captured DSV reference.
 
 This module never opens an account or sends an order.  ``margin_per_lot`` is the
-captured quote margin amount; DSV falls back to price * multiplier * 0.15 when
+captured quote margin amount; DSV falls back to last price * multiplier * 0.15 when
 that amount is absent.  Independent owner/ledger guards still run after this
 calculation and immediately before a development request is dispatched.
 """
@@ -87,7 +87,7 @@ def calculate_daily_loss(*, balance, pre_balance, close_profit, float_profit, co
 
 
 def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_price,
-                   requested_qty, account, instrument):
+                   requested_qty, account, instrument, market_price=None):
     """Return a bounded canonical result for one configured strategy row.
 
     Account ``pending_margin`` excludes amounts already in margin/frozen_margin;
@@ -103,6 +103,7 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
     except TraderError:_invalid("Invalid entry contract")
     requested_qty = _integer(requested_qty)
     stop = _decimal(stop_distance, nullable=False); price = _decimal(limit_price, nullable=False)
+    last = price if market_price is None else _decimal(market_price, nullable=False)
     if type(account) is not dict or not _ACCOUNT_REQUIRED <= account.keys():
         _invalid("Incomplete account fact structure")
     if type(instrument) is not dict or not _INSTRUMENT_REQUIRED <= instrument.keys():
@@ -152,8 +153,11 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
         reject("SYMBOL_OFFSETS_INCOMPLETE")
     if stop <= 0:reject("STOP_DISTANCE_INVALID")
     if price <= 0:reject("PRICE_NOT_POSITIVE")
-    required_values = ("equity", "available", "margin", "frozen_margin", "pending_margin", "symbol_margin", "risk_ratio")
-    if any(values[key] is None for key in required_values):reject("ACCOUNT_VALUES_UNKNOWN")
+    if (margin_amount is None or margin_amount <= 0) and last <= 0:
+        reject("MARGIN_REFERENCE_PRICE_NOT_POSITIVE")
+    required_values = ("equity", "available", "margin", "frozen_margin", "pending_margin", "symbol_margin")
+    if any(values[key] is None for key in required_values) or (requested_qty == 0 and values["risk_ratio"] is None):
+        reject("ACCOUNT_VALUES_UNKNOWN")
     if any(values[key] is not None and values[key] < 0 for key in ("margin", "frozen_margin", "pending_margin", "symbol_margin", "risk_ratio")):
         reject("ACCOUNT_VALUES_INVALID")
     if values["equity"] is not None and values["equity"] <= 0:reject("EQUITY_NOT_POSITIVE")
@@ -188,7 +192,7 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
         equity, available = values["equity"], values["available"]
         cap = min(Decimal(trade["max_risk_ratio"]), Decimal(trade["total_margin_cap"]), Decimal(1))
         used = values["margin"] + values["frozen_margin"] + values["pending_margin"]
-        per_lot = margin_amount if margin_amount is not None and margin_amount > 0 else price * metadata["multiplier"] * Decimal("0.15")
+        per_lot = margin_amount if margin_amount is not None and margin_amount > 0 else last * metadata["multiplier"] * Decimal("0.15")
         configured_stops = {symbol for symbol in stopped if symbol in rows}
         participating = max(1, len(rows) - len(configured_stops))
         symbol_ratio = cap / participating

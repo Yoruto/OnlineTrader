@@ -26,7 +26,7 @@ def main():
     before={str(path.relative_to(ROOT)):hashlib.sha256(path.read_bytes()).hexdigest() for path in sources if path.is_file()}
     validation_files=sorted((ROOT/'tests').rglob('*.py'))+sorted((ROOT/'qa').rglob('*.py'))+[
         ROOT/'scripts/check.ps1',ROOT/'pyproject.toml',ROOT/'requirements-core.lock',
-        ROOT/'requirements-desktop.lock',ROOT/'requirements-build.lock']
+        ROOT/'requirements-desktop.lock',ROOT/'requirements-build.lock']+sorted((ROOT/'docs').glob('spec-*.json'))
     validation_before={str(path.relative_to(ROOT)):hashlib.sha256(path.read_bytes()).hexdigest() for path in validation_files}
     prohibited={"v7_trader","vnpy","wt9_v7","tqsdk","qa","tests","pickle"}
     violations=[]
@@ -41,8 +41,15 @@ def main():
                     and any(isinstance(parent,(ast.FunctionDef,ast.AsyncFunctionDef)) and parent.name=='connect' and node in ast.walk(parent) for parent in ast.walk(tree)))
                 if module.split(".")[0] in prohibited and not optional_sdk:violations.append(str(path.relative_to(ROOT))+":"+module)
     manifest=json.loads((ROOT/"docs/spec-source.json").read_text(encoding="utf-8"))
+    workbench=json.loads((ROOT/"docs/spec-extension-workbench.json").read_text(encoding="utf-8"))
+    extended=workbench.get("extends_copied_resources",{})
+    for source,digest in extended.items():
+        if manifest["copied_specification_resources"].get(source)!=digest or Path(source).name not in workbench["resources"]:
+            violations.append("extension-source-drift:"+source)
     for source,digest in manifest["copied_specification_resources"].items():
         actual=ROOT/"src/online_trader/resources"/Path(source).name
+        if source in extended:
+            digest=workbench["resources"].get(Path(source).name)
         if hashlib.sha256(actual.read_bytes()).hexdigest()!=digest:violations.append("spec-resource-drift:"+source)
     for manifest_name in ("spec-extension-dsv-protection.json","spec-extension-dsv-execution.json","spec-extension-dsv-online.json","spec-extension-workbench.json"):
         extension=json.loads((ROOT/"docs"/manifest_name).read_text(encoding="utf-8"))

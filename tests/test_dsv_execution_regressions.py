@@ -11,6 +11,7 @@ from online_trader.errors import TraderError
 from online_trader.domain.orders import OrderState
 from online_trader.kernel.dsv_strategy import DsvStrategyRuntime
 from online_trader.kernel.strategy import StrategyCoordinator
+from online_trader.kernel.workbench import workbench_view
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.dsv import DsvProfile
 
@@ -38,7 +39,7 @@ class DsvExecutionReviewTests(unittest.TestCase):
         runtime.activate();owner.kernel.arm_development();owner.kernel.wait_idle()
         market,account,instrument=strategy_fixtures.facts(owner.account)
         def observe(sequence,seconds):
-            event=market|{'sequence':sequence,'source_time_utc':f'2026-11-09T01:05:0{seconds}Z'}
+            event=market|{'sequence':sequence,'source_time_utc':f'2026-11-09T01:05:0{seconds}.000001Z'}
             f=runtime.on_market(event,account,instrument);owner.kernel.wait_idle();return f.result()
         observe(1,0)
         first=owner.port.orders[0]
@@ -89,6 +90,9 @@ class DsvExecutionReviewTests(unittest.TestCase):
         self.assertEqual(len([o for o in owner.port.orders if o['effect']=='REDUCE']),2)
         owner.tick(owner.event(1000,entry_context=False))
         self.assertEqual(len([o for o in owner.port.orders if o['effect']=='REDUCE']),2)
+        blocks=workbench_view(owner.kernel)['blocks']
+        self.assertIn({'reason_code':'EXIT_REDUCTION_TERMINAL_UNFILLED','active':True,
+                       'contract_id':owner.cycle()['plan']['contract_id'],'position_cycle_id':cid},blocks)
 
     def test_execution_tick_cannot_replace_the_original_instrument_tick(self):
         owner=self.owner

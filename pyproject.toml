@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "online-trader"
-version = "0.1.0.dev22"
+version = "0.1.0.dev28"
 description = "Independent Windows trading kernel engineering baseline"
 requires-python = ">=3.13,<3.14"
 dependencies = ["jsonschema==4.26.0", "referencing==0.37.0"]
@@ -15,6 +15,9 @@ simulation = ["tqsdk==3.10.4"]
 
 [project.scripts]
 online-trader = "online_trader.cli:main"
+
+[project.gui-scripts]
+online-trader-desktop = "online_trader.desktop.entrypoint:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

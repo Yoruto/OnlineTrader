@@ -6,6 +6,7 @@ from decimal import Decimal
 import json
 from pathlib import Path
 
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget,
     QTextEdit, QVBoxLayout)
@@ -135,6 +136,9 @@ def _cell(table, row, column, text, tooltip=None):
 
 class SettingsDialog(QDialog):
     """Offline preview, exclusive exports and explicit local trade-form templates."""
+    preview_changed = Signal(object)
+    templates_changed = Signal()
+    template_directory_changed = Signal(str)
 
     def __init__(self, parent=None, *, baseline_loader=None):
         super().__init__(parent)
@@ -170,8 +174,8 @@ class SettingsDialog(QDialog):
         self.symbol_mode = QComboBox()
         self.symbol_mode.addItem("替换品种预览", "replace")
         self.symbol_mode.addItem("合并品种预览", "merge")
-        self.symbol_import_button = QPushButton("导入品种CSV")
-        self.symbol_export_button = QPushButton("导出品种CSV")
+        self.symbol_import_button = QPushButton("导入品种")
+        self.symbol_export_button = QPushButton("导出品种")
         symbols_controls.addWidget(QLabel("品种清单："))
         for widget in (self.symbol_mode, self.symbol_import_button, self.symbol_export_button):
             symbols_controls.addWidget(widget)
@@ -266,6 +270,7 @@ class SettingsDialog(QDialog):
                 notes.append(symbol["name"] + "：偏移含0，保留待核状态，不自动补值。")
         self.diagnostics_text.setPlainText("\n\n".join(notes))
         for table in (self.parameters_table, self.symbols_table, self.differences_table): table.resizeColumnsToContents()
+        self.preview_changed.emit(self._profile)
 
     def _failure(self, code):
         hint = "请重新载入模板后再操作。" if code == "E_TEMPLATE_CONFLICT" else ""
@@ -314,9 +319,18 @@ class SettingsDialog(QDialog):
         return True
 
     def _choose_editor(self):
+        self.edit_preview()
+
+    def edit_preview(self, *, symbol_row=None, add_symbol=False):
         from online_trader.desktop.editor import ParameterEditorDialog
         dialog = ParameterEditorDialog(self._profile, self)
         try:
+            if add_symbol or symbol_row is not None:
+                dialog.tabs.setCurrentIndex(3)
+                if add_symbol:
+                    dialog.add_symbol()
+                elif 0 <= symbol_row < dialog.symbols_table.rowCount():
+                    dialog.symbols_table.selectRow(symbol_row)
             if dialog.exec() == QDialog.Accepted:
                 self.apply_edited_preview(dialog.result_profile, expected_hash=dialog.base_hash)
         finally: dialog.deleteLater()
@@ -330,21 +344,28 @@ class SettingsDialog(QDialog):
         finally: dialog.deleteLater()
 
     def import_symbols_bytes(self, raw, *, mode="replace"):
-        from online_trader.configuration.symbol_csv import import_symbols, SymbolCsvError
-        try: candidate = import_symbols(raw, self._profile, mode=mode)
+        from online_trader.configuration.symbol_csv import import_symbols
+        return self._apply_symbol_import(lambda: import_symbols(raw, self._profile, mode=mode), "CSV")
+
+    def _apply_symbol_import(self, load, label):
+        from online_trader.configuration.symbol_csv import SymbolCsvError
+        try: candidate = load()
         except SymbolCsvError as error:
             field = _CSV_FIELDS.get(error.field, "品种参数")
             reason = _CSV_REASONS.get(error.reason, "未通过校验")
-            self.error_label.setText(f"CSV第{error.line}行：{field}{reason}；整批未导入，当前预览已保留。")
+            self.error_label.setText(f"{label}第{error.line}行：{field}{reason}。当前预览已保留。")
             return False
         except TraderError as error: return self._failure(error.code)
         self._profile = candidate
         self.error_label.clear(); self._render()
         self.tabs.setCurrentIndex(1)
-        self.notice_label.setText("品种CSV已整批导入预览。运行参数与持仓计划未改变；可查看差异或导出业务参数。")
+        self.notice_label.setText(f"品种{label}已导入预览。运行参数与持仓计划未改变。")
         return True
 
     def import_symbols_file(self, path, *, mode="replace"):
+        if Path(path).suffix.lower() == ".xlsx":
+            from online_trader.configuration.symbol_xlsx import load_symbol_workbook
+            return self._apply_symbol_import(lambda: load_symbol_workbook(path, self._profile, mode=mode), "Excel")
         from online_trader.configuration.symbol_csv import MAX_CSV_BYTES
         try:
             with Path(path).open("rb") as stream: raw = stream.read(MAX_CSV_BYTES + 1)
@@ -353,10 +374,13 @@ class SettingsDialog(QDialog):
 
     def export_symbols_file(self, path):
         from online_trader.configuration.symbol_csv import export_symbols
-        try: export_symbols(self._profile, path)
+        from online_trader.configuration.symbol_xlsx import export_symbol_workbook
+        excel = Path(path).suffix.lower() == ".xlsx"
+        export = export_symbol_workbook if excel else export_symbols
+        try: export(self._profile, path)
         except TraderError as error: return self._failure(error.code)
         self.error_label.clear()
-        self.notice_label.setText("品种CSV已导出到新文件，包含候选换月列；运行参数与持仓计划未改变。")
+        self.notice_label.setText("已导出 DSV 八列 Excel 品种表。" if excel else "已导出 CSV 品种表及候选换月列。")
         return True
 
     def _render_template_controls(self):
@@ -374,6 +398,7 @@ class SettingsDialog(QDialog):
         except TraderError as error: return self._failure(error.code)
         self._template_store, self._template_snapshot = store, snapshot
         self._show_templates(); self.error_label.clear()
+        self.template_directory_changed.emit(str(Path(path)))
         return True
 
     def _show_templates(self, selected=None):
@@ -384,6 +409,7 @@ class SettingsDialog(QDialog):
         self.template_label.setText(f"模板目录：{self._template_store.directory} · 版本 {self._template_snapshot.revision} · "
                                     "仅33项交易参数，应用只更新预览，品种清单和未收录参数保留。")
         self._render_template_controls()
+        self.templates_changed.emit()
 
     def reload_templates(self):
         if self._template_store is None: return self._failure("E_TEMPLATE_DIRECTORY")
@@ -424,11 +450,11 @@ class SettingsDialog(QDialog):
         return True
 
     def _choose_symbol_import(self):
-        path, _ = QFileDialog.getOpenFileName(self, "导入到品种预览", "", "品种CSV (*.csv)")
+        path, _ = QFileDialog.getOpenFileName(self, "导入到品种预览", "", "品种表 (*.xlsx *.csv)")
         if path: self.import_symbols_file(path, mode=self.symbol_mode.currentData())
 
     def _choose_symbol_export(self):
-        path, _ = QFileDialog.getSaveFileName(self, "导出到新的品种CSV", "品种列表.csv", "品种CSV (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(self, "导出品种表", "品种列表.xlsx", "Excel (*.xlsx);;CSV (*.csv)")
         if path: self.export_symbols_file(path)
 
     def _choose_template_directory(self):

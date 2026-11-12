@@ -174,6 +174,11 @@ class TradingCalendar:
         """Return a detached record; callers cannot alter validated coverage."""
         return strict_loads(self._record_bytes)
 
+    def session_times(self, contract_id, trading_day):
+        """Return the recorded UTC intervals for one cabinet day."""
+        sessions = self._scope(contract_id) or ()
+        return [[period.open_utc, period.close_utc] for period in sessions if period.trading_day == trading_day]
+
     def _scope(self, contract_id):
         identifier(contract_id)
         return next((sessions for contract, sessions in self._contracts if contract == contract_id), None)

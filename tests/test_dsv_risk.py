@@ -54,6 +54,14 @@ class DsvRiskTests(unittest.TestCase):
                 self.assertEqual(result["metrics"]["margin_per_lot"], "1500")
                 self.assertEqual(result["metrics"]["margin_source"], "PRICE_MULTIPLIER_15_PERCENT")
 
+    def test_margin_fallback_uses_market_last_and_validates_the_order_limit_separately(self):
+        self.instrument['margin_per_lot'] = None
+        result = self.evaluate(market_price='900', limit_price='1000')
+        self.assertTrue(result['allowed'])
+        self.assertEqual(result['metrics']['margin_per_lot'], '1350')
+        invalid = self.evaluate(market_price='900', limit_price='1300')
+        self.assertIn('PRICE_OUTSIDE_LIMITS', invalid['reasons'])
+
     def test_zero_risk_volume_does_not_replace_positive_margin_volume_with_one(self):
         self.account.update(equity="1000", available="1000", margin="0", frozen_margin="0", pending_margin="0",
                             symbol_margin="0", risk_ratio="0")

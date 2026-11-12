@@ -19,6 +19,7 @@ from online_trader.configuration.files import publish_new_bytes
 from online_trader.contracts.codec import canonical_bytes,content_hash,strict_loads
 from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
+from online_trader.runtime.strategy_log import DsvEntryLog
 from online_trader.scheduling.reference import clock_observation
 
 
@@ -41,6 +42,7 @@ def verify_dsv_profile(path,profile,*,source_profile=None):
 
 _CODE=re.compile(r'\(((?:DCE|SHFE|INE|CZCE)\.[A-Za-z]+[0-9]+)\)')
 _TIME=re.compile(r'^((?:\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]\s*)+)')
+_START_HEADER=re.compile(r'^启动时间[:：]\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})\s*$')
 _NUMBER=r'([0-9]+(?:\.[0-9]+)?)'
 
 
@@ -70,15 +72,25 @@ def parse_dsv_line(line,civil_date,*,directions=None):
         m=re.search(r'理论开仓价\s*'+_NUMBER,line)
         if m:row['theoretical_price']=decimal_text(Decimal(m[1]))
     elif '[平仓]' in line:
-        row.update(kind='EXIT_DECISION',direction='SHORT' if '空头' in line else 'LONG' if '多头' in line else None,
+        side=re.search(r'\)\s+(long|short)\b',line,re.IGNORECASE)
+        row.update(kind='EXIT_DECISION',direction='SHORT' if '空头' in line else 'LONG' if '多头' in line else
+                   side[1].upper() if side else directions.get(code),
                    fill_confirmed=False)
-        for field,pattern in (('quantity',r'数量[:：]\s*([0-9]+)'),('reference_price',r'出场[:：]\s*'+_NUMBER)):
+        for field,pattern in (('quantity',r'(?:数量|手数)[:：]\s*([0-9]+)'),
+                              ('reference_price',r'(?:出场|价格)[:：]\s*'+_NUMBER)):
             m=re.search(pattern,line)
             if m:row[field]=int(m[1]) if field=='quantity' else decimal_text(Decimal(m[1]))
     elif '[跳过]' in line or '[提示]' in line:
         row.update(kind='ENTRY_FILTER',reason='GEOMETRY' if '几何' in line or '振幅' in line else
                    'ACTIVATION_PASSED' if '激活位' in line else 'PRICE_SLIPPAGE' if '超出上限' in line else 'OTHER')
     else:return None
+    tags=re.match(r'(?:\[[^\]]+\]\s*)+',line[clocks.end():])
+    if tags:
+        categories={'自动':'auto','手动':'manual','错误':'error'}
+        for tag in re.findall(r'\[([^\]]+)\]',tags[0]):
+            if tag in categories:
+                row['operator_tag']=categories[tag]
+                break
     return row
 
 
@@ -107,7 +119,14 @@ class DsvLogTail:
                     if not raw.endswith(b'\n'):stream.seek(offset);break
                     try:line=raw.decode('utf-8-sig')
                     except UnicodeError:raise TraderError('E_COMPARISON_LOG','DSV log is not valid UTF-8') from None
-                    context=self.dates.setdefault(path.name,{'date':m[1],'last_seconds':None,'rollovers':0})
+                    context=self.dates.setdefault(path.name,{'date':m[1],'last_seconds':None,'rollovers':0,'anchored':False})
+                    header=_START_HEADER.fullmatch(line.rstrip('\r\n'))
+                    if header:
+                        try:started=datetime.fromisoformat(header[1]+'T'+header[2])
+                        except ValueError:raise TraderError('E_COMPARISON_LOG','Invalid DSV startup header timestamp') from None
+                        context.update(date=started.date().isoformat(),rollovers=0,anchored=True,
+                            last_seconds=started.hour*3600+started.minute*60+started.second)
+                        continue
                     leading=_TIME.match(line);regression=False
                     if leading:
                         stamp=re.findall(r'\[([0-9:]+)\]',leading[0])[-1]
@@ -122,8 +141,11 @@ class DsvLogTail:
                         context['last_seconds']=seconds
                     item=parse_dsv_line(line,context['date'],directions=self.directions.setdefault(path.name,{}))
                     if item is not None:
+                        source='DSV_START_HEADER' if context['anchored'] else 'LOG_FILENAME'
+                        if context['rollovers']:
+                            source='DSV_START_HEADER_MIDNIGHT' if context['anchored'] else 'LOG_CHRONOLOGY_MIDNIGHT_INFERENCE'
                         rows.append(item|{'file':path.name,'byte_offset':str(offset),'line_sha256':hashlib.sha256(raw).hexdigest(),
-                                          'civil_date_source':'LOG_CHRONOLOGY_MIDNIGHT_INFERENCE' if context['rollovers'] else 'LOG_FILENAME',
+                                          'civil_date_source':source,
                                           'midnight_rollovers_inferred':context['rollovers'],'timestamp_ambiguous':regression,
                                           'cabinet_day_inferred_from_filename':False})
                 self.offsets[path.name]=stream.tell()
@@ -156,6 +178,7 @@ class ComparisonRecorder:
                 effective_profile_hash=profile.content_hash,automatic_offsets=True,
                 dsv_effective_parameters_verified=False)
         try:
+            self.entry_log = DsvEntryLog(kernel, output, profile)
             self.write('RUN_START',self.manifest|{'profile':profile.to_record(),'calendar':calendar.to_record()})
             publish_new_bytes(canonical_bytes(self.manifest),self.directory/'manifest.json')
             if self.source_profile is not None:
@@ -178,6 +201,7 @@ class ComparisonRecorder:
         self.write('PRODUCT_MARKET_DECISION',{'event':event,'account':account,'instrument':instrument,
             'decision':decision,'durable_seq':str(self.kernel._durable_seq),
             'source_epoch':self.kernel.port.source_epoch,'profile_hash':self.profile.content_hash})
+        self.entry_log.market(event, decision)
 
     def poll(self):
         k=self.kernel

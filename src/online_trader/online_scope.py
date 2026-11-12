@@ -67,15 +67,23 @@ class DsvSimulationGrant:
     def parse(cls,raw):
         from online_trader.domain.values import decimal_value
         value=strict_loads(raw)
+        schema=value.get('schema_version') if type(value) is dict else None
+        if type(schema) is not str:
+            raise TraderError('E_ONLINE_SCOPE','Expected an independent finite DSV simulation grant')
         required={'schema_version','grant_id','account_fingerprint','ledger_path','contracts','trading_day',
                   'not_before_utc','not_after_utc','max_order_quantity','opening_attempts','risk_budget',
                   'profile_hash','calendar_hash','authorization_reference'}
-        if type(value) is dict and value.get('schema_version') in {'KQ_DSV_SIM/2','SIMNOW_DSV_SIM/1','SIMNOW_DSV_AUTO/1'}:
+        multi_day_schemas={'KQ_DSV_SIM/2','SIMNOW_DSV_SIM/1','SIMNOW_DSV_AUTO/1','KQ_WORKBENCH_SIM/1','SIMNOW_WORKBENCH_SIM/1'}
+        if schema in multi_day_schemas:
             required=required|{'trading_days','resume_entries_on_day_change'}
-        if type(value) is dict and value.get('schema_version')=='SIMNOW_DSV_AUTO/1':required=required|{'auto_offsets'}
-        if type(value) is not dict or value.keys()!=required or value['schema_version'] not in {'KQ_DSV_SIM/1','KQ_DSV_SIM/2','SIMNOW_DSV_SIM/1','SIMNOW_DSV_AUTO/1'}:
+            if 'allow_external_allocation' in value:
+                if type(value['allow_external_allocation']) is not bool:
+                    raise TraderError('E_ONLINE_SCOPE','External position allocation needs an explicit boolean policy')
+                required.add('allow_external_allocation')
+        if schema=='SIMNOW_DSV_AUTO/1':required=required|{'auto_offsets'}
+        if value.keys()!=required or schema not in multi_day_schemas|{'KQ_DSV_SIM/1'}:
             raise TraderError('E_ONLINE_SCOPE','Expected an independent finite DSV simulation grant')
-        if value['schema_version'] in {'KQ_DSV_SIM/2','SIMNOW_DSV_SIM/1','SIMNOW_DSV_AUTO/1'}:
+        if value['schema_version'] in multi_day_schemas:
             from online_trader.scheduling.calendar import _day
             days=value['trading_days']
             if (type(days) is not list or not 1<=len(days)<=366 or any(type(day) is not str for day in days)
@@ -83,6 +91,8 @@ class DsvSimulationGrant:
                     or type(value['resume_entries_on_day_change']) is not bool):
                 raise TraderError('E_ONLINE_SCOPE','Multi-day scopes need explicit ordered cabinet days and rollover policy')
             for day in days:_day(day)
+            if value['schema_version'] in {'KQ_WORKBENCH_SIM/1','SIMNOW_WORKBENCH_SIM/1'} and value['resume_entries_on_day_change']:
+                raise TraderError('E_ONLINE_SCOPE','Manual workbench authority must be granted again after a cabinet-day change')
         if value['schema_version']=='SIMNOW_DSV_AUTO/1':
             policy=value['auto_offsets']
             if (type(policy) is not dict or policy.keys()!={'schema_version','as_of_date','last_completed_day'}
@@ -138,13 +148,17 @@ class DsvSimulationGrant:
     @property
     def account_key(self):return ('SIM:SIMNOW:' if self.provider=='TQ_SIMNOW' else 'SIM:KQ:')+self.value['account_fingerprint']
     @property
-    def provider(self):return 'TQ_SIMNOW' if self.value['schema_version'] in {'SIMNOW_DSV_SIM/1','SIMNOW_DSV_AUTO/1'} else 'TQKQ'
+    def provider(self):return 'TQ_SIMNOW' if self.value['schema_version'] in {'SIMNOW_DSV_SIM/1','SIMNOW_DSV_AUTO/1','SIMNOW_WORKBENCH_SIM/1'} else 'TQKQ'
+    @property
+    def manual_workbench(self):return self.value['schema_version'] in {'KQ_WORKBENCH_SIM/1','SIMNOW_WORKBENCH_SIM/1'}
+    @property
+    def external_allocation_allowed(self):return self.value.get('allow_external_allocation',self.manual_workbench)
     @property
     def automatic_offsets(self):return self.value['schema_version']=='SIMNOW_DSV_AUTO/1'
     @property
     def trading_days(self):return self.value.get('trading_days',[self.value['trading_day']])
     @property
-    def multi_day(self):return self.value['schema_version'] in {'KQ_DSV_SIM/2','SIMNOW_DSV_SIM/1','SIMNOW_DSV_AUTO/1'}
+    def multi_day(self):return 'trading_days' in self.value
     def permits_day(self,day):return day in self.trading_days
     def in_window(self,now):
         value=self.value

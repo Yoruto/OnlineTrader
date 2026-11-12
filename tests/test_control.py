@@ -273,9 +273,35 @@ class ControlTests(unittest.TestCase):
         self.kernel.close();self.port=RecordingPort();self.kernel=Kernel(self.path,self.account,development=True,port=self.port,risk_budget="1000")
         self.kernel.wait_idle()
         status=self.kernel.control.get_status(receipt["command_id"],receipt["payload_hash"]).result()
-        self.assertEqual(status["status"],"EXECUTING")
+        self.assertEqual(status["status"],"NEEDS_RECONCILIATION")
+        row=self.kernel.ledger.query("SELECT receipt_revision,updated_event_seq,result_json FROM operator_commands WHERE command_id=?",
+                                     (receipt["command_id"],))[0]
+        self.assertEqual(status["receipt_revision"],str(row["receipt_revision"]))
+        self.assertEqual(status["event_seq"],str(row["updated_event_seq"]))
+        self.assertEqual(status,json.loads(row["result_json"]))
         self.assertEqual(self.kernel.control.states[body["command_id"]]["metadata"]["order_ids"],[child])
         self.assertEqual(self.port.orders,[])
+
+    def test_restart_repairs_legacy_mismatched_receipt_revision(self):
+        from contextlib import closing
+        import sqlite3
+
+        self.open()
+        row=self.kernel.ledger.query("SELECT command_id,payload_hash,result_json FROM operator_commands WHERE operation='MANUAL_OPEN'")[0]
+        old=json.loads(row['result_json'])
+        self.kernel.close()
+        # Older boots updated the row without advancing its published JSON.
+        with closing(sqlite3.connect(self.path)) as conn, conn:
+            conn.execute("UPDATE operator_commands SET status='NEEDS_RECONCILIATION',receipt_revision=receipt_revision+1 WHERE command_id=?",
+                         (row['command_id'],))
+        self.port=RecordingPort()
+        self.kernel=Kernel(self.path,self.account,development=True,port=self.port,risk_budget="1000")
+        self.kernel.wait_idle()
+        receipt=self.kernel.control.get_status(row['command_id'],row['payload_hash']).result()
+        self.assertEqual(receipt['status'],'NEEDS_RECONCILIATION')
+        self.assertEqual(int(receipt['receipt_revision']),int(old['receipt_revision'])+2)
+        self.assertEqual(self.port.orders,[])
+        self.assertFalse(self.kernel._failed)
 
     def test_restart_invalidates_old_safe_window_until_fresh_proof(self):
         receipt=self.run_command("ENTER_MAINTENANCE",{"maintenance_id":"reboot-safe","handover_record_id":None})

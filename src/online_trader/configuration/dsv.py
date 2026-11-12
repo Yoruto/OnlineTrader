@@ -265,6 +265,9 @@ class DsvProfile:
         """Explicitly strip known private/non-business sections from a DSV file."""
         source = _source_loads(raw)
         _object(source, SECTIONS, EXCLUDED_SOURCE_SECTIONS)
+        trade = source["trade"]
+        if type(trade) is dict and trade.get("max_quote_age_seconds") == 120:
+            trade["max_quote_age_seconds"] = 0
         return cls.from_settings({key: source[key] for key in SECTIONS})
 
     @classmethod
