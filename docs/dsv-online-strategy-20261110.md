@@ -74,7 +74,7 @@ UNKNOWN找回为原生ALIVE时，先核对完整当前快照、精确原ID、价
 | 在线交易 | 未连接真实/模拟账户，未执行任何在线订单，未复用旧额度 | dev15历史结果独立保留 |
 | 界面验收 | 离线桌面回归保留；本轮未做可见GUI或在线持仓界面验收 | 完整工作台/实机行为仍待验 |
 
-[最终开发wheel](../dist/20261110T080156Z-dev17-final-c9fd8967/online_trader-0.1.0.dev17-py3-none-any.whl) SHA-256：`73bbd842df8de998e87cfaa6cd5d06afa8e56dd58e2937d643ab893a55e208b6`。未发布、未安装服务或创建定时任务。
+最终开发wheel SHA-256：`73bbd842df8de998e87cfaa6cd5d06afa8e56dd58e2937d643ab893a55e208b6`。未发布、未安装服务或创建定时任务。
 
 开发前的[dev16源码基线](../output/baselines/20261110T065129Z-dev16-before-dsv-ed8c8920/manifest.json)保留。本轮中间1116/1119/1120项检查及早期源演练也保留在原目录，不作为最终1121项源码的替代证据。dev15在线一手结果、dev16的1065项均不沿用为dev17通过。
 

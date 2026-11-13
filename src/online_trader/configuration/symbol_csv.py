@@ -52,6 +52,7 @@ _GROUPS = (
  ("GFEX", "si", "工业硅", "SI"), ("GFEX", "lc", "碳酸锂", "LC"), ("GFEX", "ps", "多晶硅", "PS"),
 )
 ALIASES = MappingProxyType({name.casefold(): (exchange, product) for exchange, product, *names in _GROUPS for name in names})
+PRODUCT_NAMES = MappingProxyType({f"{exchange}.{product}": names[0] for exchange, product, *names in _GROUPS})
 
 
 class SymbolCsvError(TraderError):

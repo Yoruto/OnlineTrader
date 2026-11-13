@@ -1,6 +1,6 @@
 """Trading workbench over the original owner IPC. Closing is local only."""
 from pathlib import Path
-from PySide6.QtCore import QItemSelectionModel,QSettings,Qt,QThread,QTimer,Signal
+from PySide6.QtCore import QItemSelectionModel,QSettings,QStandardPaths,Qt,QThread,QTimer,Signal
 from PySide6.QtWidgets import (QApplication,QLabel,QLineEdit,QPushButton,QTableWidget,
     QTableWidgetItem,QInputDialog,QFileDialog,QMessageBox)
 
@@ -68,7 +68,8 @@ def display_cell(key,value):
 
 
 class WorkbenchWindow(StatusWindow):
-    def __init__(self,pipe_name,*,store=None,account_id=None,client_factory=StatusClient,paired_launcher=None):
+    def __init__(self,pipe_name,*,store=None,account_id=None,client_factory=StatusClient,paired_launcher=None,
+                 dsv_config=None, use_desktop_dsv=False):
         super().__init__(pipe_name,client_factory=client_factory)
         self.store=store;self.selected_account=store.get(account_id) if store is not None and account_id is not None else None
         self.paired_launcher=paired_launcher
@@ -76,7 +77,11 @@ class WorkbenchWindow(StatusWindow):
         if paired_launcher is not None:
             self.paired_account_key=paired_launcher.review()['account_key']
         self.view=None;self.receipt_identity=None;self._boot=None;self._account_dialog=None
+        self._startup_in_progress = False
         self._deferred_request=None;self._control_notice=None
+        self.home_feedback = ''
+        self.home_issue = ''
+        self._account_login = self._read_account_login()
         preferences = QSettings('OnlineTrader','Workbench')
         self._sounds=WorkbenchSounds(preferences, log=self._notification_log)
         self._tray = WorkbenchTray(self, preferences)
@@ -98,9 +103,10 @@ class WorkbenchWindow(StatusWindow):
         self.attach_button.clicked.connect(self.attach_selected)
         self.data_button=QPushButton('历史与交易日历')
         self.data_button.clicked.connect(self.open_data)
-        self.session_button=QPushButton('连接 SimNow 模拟盘' if paired_launcher else '模拟连接设置')
+        self.session_button=QPushButton('连接 SimNow 模拟盘' if paired_launcher else '启动模拟策略')
         self.session_button.clicked.connect(self.open_session)
         self._session_dialog=None
+        self._strategy_starter=None
         self.command_buttons={}
         for name,text,callback in (
             ('arm','启动策略 (F5)',self.start_strategy),('close','平选定自有仓',self.close_selected),
@@ -120,17 +126,58 @@ class WorkbenchWindow(StatusWindow):
         if paired_launcher:
             self.setWindowTitle('OnlineTrader · SimNow 交易工作台')
         self.pause_button.setText('停止策略 (F6)')
-        self.dashboard=WorkbenchLayout(self)
+        if use_desktop_dsv and paired_launcher is None and dsv_config is None:
+            saved = preferences.value('dsv_config_path', '', str)
+            desktop = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+            if saved:
+                dsv_config = Path(saved)
+            elif desktop:
+                candidate = Path(desktop) / 'trading' / 'config.json'
+                if candidate.parent.is_dir():
+                    dsv_config = candidate
+        self.dashboard=WorkbenchLayout(self, dsv_config=dsv_config, require_reviewed_profile=use_desktop_dsv)
         self._tray.restore_geometry()
         self._tray.sync_icon()
         self.timer=QTimer(self);self.timer.setInterval(2500);self.timer.timeout.connect(self.refresh);self.timer.start()
         self._enable_commands(False)
 
+    def _read_account_login(self):
+        account = self.selected_account
+        try:
+            if account is not None:
+                value = self.store.credential_reference(account['account_id']).resolve()
+                return value.get('simnow_username') or value['username']
+            packet = getattr(self.paired_launcher, 'packet', None)
+            if packet is not None:
+                from online_trader.gateway.simnow import account_fingerprint, credentials
+                username = credentials(packet / 'simnow-credentials.json')['simnow_username']
+                if self.paired_account_key == 'SIM:SIMNOW:' + account_fingerprint(username):
+                    return username
+        except (TraderError, OSError):
+            pass
+        return account['masked_login'] if account is not None else None
+
+    def display_account(self):
+        key = self.view['account_key'] if self.view else self.paired_account_key
+        account = self.selected_account
+        if account and key in (None, account['account_key']):
+            environment = account['environment']
+            return {'ONLINE_SIM': '模拟账户', 'LIVE': '正常账户'}.get(environment, '账户类型未知'), self._account_login or account['masked_login']
+        if key:
+            account_type = '模拟账户' if key.startswith('SIM:') else '正常账户' if key.startswith('LIVE:') else '账户类型未知'
+            login = self._account_login if key == self.paired_account_key else None
+            return account_type, login or '未提供'
+        return '', '未选择'
+
+    def show_home_feedback(self, message):
+        self.home_feedback = message
+        self.dashboard.render_home()
+
     def _enable_commands(self,enabled):
         for button in self.command_buttons.values():button.setEnabled(enabled)
-        self.command_buttons['arm'].setEnabled((enabled and self.view['entry_authority']!='ARMED'
+        self.command_buttons['arm'].setEnabled(not self._startup_in_progress and ((enabled and self.view['entry_authority']!='ARMED'
             and not self.view['configuration'].get('stop_cancel_pending')) or
-            (self.view is None and not self._closing))
+            (self.view is None and not self._closing)))
         self.pause_button.setEnabled(enabled and self.view['entry_authority']=='ARMED')
         self.dashboard.update_manual_controls(enabled)
         self.command_buttons['receipt'].setEnabled(enabled and self.receipt_identity is not None)
@@ -143,6 +190,7 @@ class WorkbenchWindow(StatusWindow):
                     self._deferred_request=(self._command_binding(),action,args)
                     self.notice_label.setText('请求已接收，等待当前刷新完成。')
                 else:self.notice_label.setText('当前请求仍在处理，请等待回执。')
+                self.show_home_feedback(self.notice_label.text())
             return
         if self.pipe_name is None:
             self.notice_label.setText('请在账户管理中新增并选择账户，再查看所选账户；账户选择不启动连接。')
@@ -180,6 +228,7 @@ class WorkbenchWindow(StatusWindow):
             confirm=QMessageBox.question(self,'停止策略并撤单',message,QMessageBox.Yes | QMessageBox.No,QMessageBox.No)
             if self._stale or self.view is None or identity!=self._command_binding():
                 self.notice_label.setText('停止请求未发送。请刷新并核对当前账户。')
+                self.show_home_feedback(self.notice_label.text())
                 return
             if confirm==QMessageBox.Yes:
                 params['evidence_hash']=review['evidence_hash']
@@ -192,13 +241,19 @@ class WorkbenchWindow(StatusWindow):
             self.dashboard.add_activity(notice,category='error' if error else None)
         self._control_notice=notice
         self.notice_label.setText(notice)
+        status = receipt['status']
+        self.home_issue = '命令结果待核对，请查看交易详情中的命令回执' if status == 'NEEDS_RECONCILIATION' else ''
+        self.home_feedback = f"命令回执 · {receipt['reason']}"
 
     def _job_result(self,result):
         if self._closing:return
         if result['action']=='refresh':
             value=result['value']
+            if self._stale and self.receipt_identity is None:
+                self.home_feedback = ''
             if self._boot is not None and self._boot!=value['view']['kernel_boot_id']:
                 self.receipt_identity=None;self._control_notice=None
+                self.home_feedback = self.home_issue = ''
             selected=(self._selected_identities() if self._boot==value['view']['kernel_boot_id']
                       and self.view is not None and self.view['account_key']==value['view']['account_key'] else {})
             self._last_account_record=next(row for row in value['base']['records'] if row['record_type']=='ACCOUNT')
@@ -215,6 +270,7 @@ class WorkbenchWindow(StatusWindow):
             receipt=result['value'];self.receipt_identity={k:receipt[k] for k in ('command_id','payload_hash')}
             self._stale=True
             self._show_receipt(receipt)
+            self.dashboard.render_home()
 
     def _selectable_rows(self):
         if self.view is None:return {}
@@ -242,7 +298,8 @@ class WorkbenchWindow(StatusWindow):
                     if name in {'cycles','external_positions'}:break
 
     def _job_failed(self,error):
-        self._sounds.observe_request_error()
+        if self.view is not None or error['identity'] is not None:
+            self._sounds.observe_request_error()
         if self.view is not None:self._tray.set_status('error')
         if error['identity'] is not None:self.receipt_identity=error['identity']
         self._failed(error['code'])
@@ -256,6 +313,18 @@ class WorkbenchWindow(StatusWindow):
         if error['identity'] is not None:
             self._control_notice='请求结果未知，已保留原命令身份。请查询上次回执。'
             self.notice_label.setText(self._control_notice)
+            self.home_issue = '命令结果待核对，请查看交易详情中的命令回执'
+        if self.view is None and error['identity'] is None and error['code'] in {'E_TIMEOUT', 'E_PIPE'}:
+            self.connection_label.setText('尚未连接模拟盘')
+            self.notice_label.setText('点击「启动策略」后，程序会按所选账号和当前参数准备连接。')
+            if self._strategy_starter is not None and self._strategy_starter.status_text:
+                self.show_home_feedback(self._strategy_starter.status_text)
+            elif self._session_dialog is not None and hasattr(self._session_dialog, 'status'):
+                self.show_home_feedback(self._session_dialog.status.text())
+            else:
+                self.show_home_feedback('尚未连接模拟盘')
+        else:
+            self.show_home_feedback(f"未取得最新状态 · {error['code']}")
 
     def _finished(self):
         action=self._worker.action if self._worker is not None else None
@@ -272,6 +341,7 @@ class WorkbenchWindow(StatusWindow):
                 (action=='command' and (self._stale or self.view['truncated']))):
             self._control_notice='请求未发送。请核对当前账户、执行器与参数状态。'
             self.notice_label.setText(self._control_notice)
+            self.show_home_feedback(self._control_notice)
         elif not (action=='command' and args[0]=='ARM_ENTRIES' and args[1]['scope_type']=='ACCOUNT'
                   and self.view['entry_authority']=='ARMED'):
             self._control_notice=None
@@ -311,18 +381,29 @@ class WorkbenchWindow(StatusWindow):
 
     def send(self,operation,scope,parameters):
         if self._stale or self.view is None or self.view['truncated']:
-            self.notice_label.setText('状态未知或已过期，请先刷新。');return
+            self.notice_label.setText('状态未知或已过期，请先刷新。')
+            self.show_home_feedback(self.notice_label.text())
+            return
         self._control_notice=None
+        self.show_home_feedback('等待命令回执')
         self._start_job('command',(operation,scope,parameters))
 
     def _action(self,callback):
         try:callback()
-        except TraderError as error:self.notice_label.setText(str(error)+' · '+error.code)
-        except (OSError,KeyError,ValueError,TypeError):self.notice_label.setText('输入文件或当前选中记录不完整，请重新核对。')
+        except TraderError as error:
+            self.notice_label.setText(str(error)+' · '+error.code)
+            self.show_home_feedback(self.notice_label.text())
+        except (OSError,KeyError,ValueError,TypeError):
+            self.notice_label.setText('输入文件或当前选中记录不完整，请重新核对。')
+            self.show_home_feedback(self.notice_label.text())
 
     def start_strategy(self):
         if self.view is None:
-            self.open_session()
+            if self.selected_account is None and self.paired_launcher is None:
+                self.dashboard.show_account_settings()
+                self.notice_label.setText('请先在账户管理中选择账户，再点击「查看所选账户」。')
+            else:
+                self.open_session()
         elif not self._stale:
             self.arm()
 
@@ -333,13 +414,19 @@ class WorkbenchWindow(StatusWindow):
     def arm(self):
         def action():
             identity=self._command_binding();policy=self.policy('AUTHORITY')
-            if QMessageBox.question(self,'启动策略','向当前已显示账户请求启动策略？原范围、时窗和核对门禁仍由内核复核。')==QMessageBox.Yes:
-                if self._stale or self.view is None or identity!=self._command_binding():
-                    self.notice_label.setText('启动请求未发送。请刷新并重新核对账户与参数。')
-                    return
-                if self.view['entry_authority']=='ARMED':return
-                self.send('ARM_ENTRIES',{'scope_type':'ACCOUNT','scope_ids':[]},
-                    {'authority_policy_id':policy,'rule_set_id':identity[-2],'config_revision':identity[-1]})
+            if self._stale or self.view is None or identity!=self._command_binding():
+                self.notice_label.setText('启动请求未发送。请刷新并重新核对账户与参数。')
+                self.show_home_feedback(self.notice_label.text())
+                return
+            if self.view['entry_authority']=='ARMED':return
+            config = self.view['configuration']
+            if self.dashboard.dsv_config is not None and config.get('scoped_contracts') and not config.get('manual_workbench'):
+                from online_trader.configuration.offsets import dsv_startup_profile
+                expected = dsv_startup_profile(self.current_start_profile()).content_hash
+                if config.get('strategy_profile_hash') != expected:
+                    raise TraderError('E_COMPARISON_SETTINGS', '原执行器绑定的参数无法确认为当前参数，请查看执行参数并按原账本恢复流程处理。')
+            self.send('ARM_ENTRIES',{'scope_type':'ACCOUNT','scope_ids':[]},
+                {'authority_policy_id':policy,'rule_set_id':identity[-2],'config_revision':identity[-1]})
         self._action(action)
 
     def close_selected(self):
@@ -554,15 +641,62 @@ class WorkbenchWindow(StatusWindow):
         if self.store is None:self.notice_label.setText('请通过 --account-store 指定本产品账户目录。');return
         from online_trader.desktop.accounts import AccountDialog
         self._account_dialog=AccountDialog(self.store,self);self._account_dialog.exec()
+        self.dashboard.reload_accounts()
+
+    def select_account(self):
+        if self.store is None or self.paired_launcher is not None:
+            return
+        if (self._worker is not None or self._startup_in_progress or
+                (self._strategy_starter is not None and self._strategy_starter.is_preparing())):
+            self.notice_label.setText('正在刷新账号状态，请稍后切换。')
+            self.dashboard.reload_accounts()
+            return
+        account_id = self.dashboard.account_picker.currentData()
+        if account_id is None:
+            return
+        try:
+            state = self.store.read()
+            if state['selected_id'] != account_id:
+                self.store.change('select', expected_revision=state['revision'], account_id=account_id)
+            self.attach_selected()
+        except TraderError as error:
+            self.notice_label.setText('账号未切换：' + error.code)
+        finally:
+            self.dashboard.reload_accounts()
 
     def attach_selected(self):
         if self.store is None:return
-        if self._worker is not None:return
+        if (self._worker is not None or self._startup_in_progress or
+                (self._strategy_starter is not None and self._strategy_starter.is_preparing())):return
         state=self.store.read()
         if state['selected_id'] is None:self.notice_label.setText('请先在账户管理中选择账户。');return
         self.selected_account=self.store.get(state['selected_id']);self.pipe_name=self.store.pipe_name(self.selected_account)
+        if self._strategy_starter is not None:
+            self._strategy_starter.status_timer.stop()
+            self._strategy_starter.deleteLater()
+            self._strategy_starter = None
+        if self._session_dialog is not None:
+            self._session_dialog.status_timer.stop()
+            self._session_dialog.close()
+            self._session_dialog.deleteLater()
+            self._session_dialog = None
+        self._account_login = self._read_account_login()
         self._boot=None;self.view=None;self.receipt_identity=None;self._stale=True;self._account_key=None
         self._control_notice=None
+        self.home_feedback = self.home_issue = ''
+        self._last_account_record = {}
+        self._base_cycle_ids = []
+        self.dashboard.rendered_view = None
+        for grid in (*self.tables.values(), self.cycles, *self.dashboard.manual_tables.values()):
+            grid.setRowCount(0)
+        self.account_label.setText('账户 · ' + self.display_account()[1])
+        self.funds_label.setText('资金未知 · 等待所选账号同步')
+        self.connection_label.setText('等待所选账户同步')
+        self.connection_detail.setText('尚未连接 · 等待柜台同步')
+        self.kernel_label.setText('内核：未知 · 新仓权限：未知')
+        self.dashboard.reload_accounts()
+        self.dashboard.reset_account_view()
+        self._enable_commands(False)
         self._tray.set_status('idle')
         # Child report windows are account-bound and must not silently follow.
         if self._reports_window is not None:self._reports_window.close();self._reports_window=None
@@ -586,24 +720,49 @@ class WorkbenchWindow(StatusWindow):
             return
         if self.store is None or self.selected_account is None:
             self.notice_label.setText('请先通过本产品账户管理选择模拟账户。');return
-        from online_trader.desktop.session import SessionDialog
-        self._session_dialog=SessionDialog(self.store,self.selected_account['account_id'],self);self._session_dialog.show()
+        if self.view is not None:
+            self.start_strategy()
+            return
+        def start_current():
+            from online_trader.desktop.startup import StrategyStarter
+            if self._strategy_starter is None:
+                self._strategy_starter = StrategyStarter(self.store, self.selected_account['account_id'],
+                                                        self.dashboard.profile, self)
+            self._strategy_starter.start()
+        self._action(start_current)
+
+    def current_start_profile(self):
+        return self.dashboard.checked_start_profile()
 
     def _result(self,result):super()._result(result)
 
     def closeEvent(self,event):
+        if self._strategy_starter is not None and self._strategy_starter.is_preparing():
+            self._closing = True
+            self.hide()
+            event.ignore()
+            return
+        if self._session_dialog is not None and getattr(self._session_dialog, 'is_preparing', lambda: False)():
+            self._closing = True
+            self.hide()
+            self._session_dialog.hide()
+            event.ignore()
+            return
         self._tray.save_geometry()
         if not self._closing and self._tray.minimize_on_close():
             event.ignore()
             return
         if self._session_dialog is not None:
             self._session_dialog.clear_scheduled_start()
+        if self._strategy_starter is not None:
+            self._strategy_starter.status_timer.stop()
         self.timer.stop();super().closeEvent(event)
 
 
-def run(pipe_name,*,store=None,account_id=None,paired_launcher=None):
+def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None):
     app=QApplication.instance() or QApplication([])
-    window=WorkbenchWindow(pipe_name,store=store,account_id=account_id,paired_launcher=paired_launcher)
+    window=WorkbenchWindow(pipe_name,store=store,account_id=account_id,paired_launcher=paired_launcher,
+                           dsv_config=dsv_config,use_desktop_dsv=True)
     window.setAttribute(Qt.WA_DeleteOnClose)
     window.destroyed.connect(app.quit)
     window.show();QTimer.singleShot(0,window.refresh)

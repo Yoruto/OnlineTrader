@@ -36,9 +36,12 @@ def main():
             modules=[a.name for a in node.names] if isinstance(node,ast.Import) else [node.module or ""] if isinstance(node,ast.ImportFrom) else []
             for module in modules:
                 optional_sdk=(module=='tqsdk' and isinstance(node,ast.ImportFrom)
-                    and ((path.relative_to(ROOT).as_posix()=='src/online_trader/gateway/tqkq.py' and {a.name for a in node.names}=={'TqApi','TqKq','TqAuth'})
-                         or (path.relative_to(ROOT).as_posix()=='src/online_trader/gateway/simnow.py' and {a.name for a in node.names}=={'TqApi','TqAccount','TqAuth'}))
-                    and any(isinstance(parent,(ast.FunctionDef,ast.AsyncFunctionDef)) and parent.name=='connect' and node in ast.walk(parent) for parent in ast.walk(tree)))
+                    and ((((path.relative_to(ROOT).as_posix()=='src/online_trader/gateway/tqkq.py' and {a.name for a in node.names}=={'TqApi','TqKq','TqAuth'})
+                           or (path.relative_to(ROOT).as_posix()=='src/online_trader/gateway/simnow.py' and {a.name for a in node.names}=={'TqApi','TqAccount','TqAuth'}))
+                          and any(isinstance(parent,(ast.FunctionDef,ast.AsyncFunctionDef)) and parent.name=='connect' and node in ast.walk(parent) for parent in ast.walk(tree)))
+                         or (path.relative_to(ROOT).as_posix()=='src/online_trader/runtime/startup_metadata.py'
+                             and node.level==0 and {a.name for a in node.names}=={'TqApi','TqAuth','TqSim'}
+                             and any(isinstance(parent,(ast.FunctionDef,ast.AsyncFunctionDef)) and parent.name=='_sdk_factory' and node in ast.walk(parent) for parent in ast.walk(tree)))))
                 if module.split(".")[0] in prohibited and not optional_sdk:violations.append(str(path.relative_to(ROOT))+":"+module)
     manifest=json.loads((ROOT/"docs/spec-source.json").read_text(encoding="utf-8"))
     workbench=json.loads((ROOT/"docs/spec-extension-workbench.json").read_text(encoding="utf-8"))

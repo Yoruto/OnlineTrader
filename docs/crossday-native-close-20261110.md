@@ -57,4 +57,4 @@ SHFE/INE按原成交offset扣对应桶；CLOSE/CLOSETODAY分开占量。DCE/CZCE
 | 在线交易 | 账户连接0、网络校时0、在线报撤单0，未使用任何历史额度 | dev15原结案保持历史身份 |
 | 界面验收 | 既有全量Qt/状态窗口回归通过；未新增专门工作台可见实操或在线GUI验收，干净核心安装未验GUI | 不引用dev18截图证明本轮界面通过 |
 
-[dev19开发wheel](../dist/20261110T095349Z-dev19-62ed467b/online_trader-0.1.0.dev19-py3-none-any.whl) SHA-256：`a4e0e7ef31274664d56fab06a8962dcf57c5681a37977127f07f23ff20232045`。制品未发布，独立SDK环境没有安装本轮wheel。最终检查、制品/安装与IPC、改动补丁、开发前归档及历史账本/SDK哈希保持情况统一绑定在[最终审计](../output/crossday/dev19-final-audit.json)。
+dev19开发wheel SHA-256：`a4e0e7ef31274664d56fab06a8962dcf57c5681a37977127f07f23ff20232045`。制品未发布，独立SDK环境没有安装本轮wheel。最终检查、制品/安装与IPC、改动补丁、开发前归档及历史账本/SDK哈希保持情况统一绑定在[最终审计](../output/crossday/dev19-final-audit.json)。

@@ -225,6 +225,13 @@ class SettingsDialog(QDialog):
     @property
     def profile(self): return self._profile
 
+    def set_reference_profile(self, profile, source):
+        self._baseline = self._profile = profile
+        self._manifest = {'rule_set_id': source}
+        self.reference_label.setText('参数来源：' + source)
+        self.error_label.clear()
+        self._render()
+
     def _render(self):
         current = self._profile.to_record()["settings"]
         baseline = self._baseline.to_record()["settings"]
@@ -322,17 +329,17 @@ class SettingsDialog(QDialog):
         self.edit_preview()
 
     def edit_preview(self, *, symbol_row=None, add_symbol=False):
-        from online_trader.desktop.editor import ParameterEditorDialog
-        dialog = ParameterEditorDialog(self._profile, self)
+        if add_symbol or symbol_row is not None:
+            from online_trader.desktop.symbol_editor import SymbolEditorDialog
+            dialog = SymbolEditorDialog(self._profile, self if self.isVisible() else self.parentWidget(),
+                                        symbol_row=None if add_symbol else symbol_row)
+        else:
+            from online_trader.desktop.editor import ParameterEditorDialog
+            dialog = ParameterEditorDialog(self._profile, self)
         try:
-            if add_symbol or symbol_row is not None:
-                dialog.tabs.setCurrentIndex(3)
-                if add_symbol:
-                    dialog.add_symbol()
-                elif 0 <= symbol_row < dialog.symbols_table.rowCount():
-                    dialog.symbols_table.selectRow(symbol_row)
             if dialog.exec() == QDialog.Accepted:
-                self.apply_edited_preview(dialog.result_profile, expected_hash=dialog.base_hash)
+                return self.apply_edited_preview(dialog.result_profile, expected_hash=dialog.base_hash)
+            return False
         finally: dialog.deleteLater()
 
     def _choose_calculator(self):

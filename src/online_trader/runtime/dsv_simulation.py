@@ -344,7 +344,8 @@ class DsvSimulationSession(SimulationSession):
         finally:self._comparison('poll')
 
 
-def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=False,dsv_config=None,dsv_log_dir=None):
+def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=False,dsv_config=None,dsv_log_dir=None,
+        _execution_lock=None):
     """Future explicitly scoped connection path. Offline tests never call it."""
     grant,profile,calendar=load_inputs(scope,profile_path,calendar_path)
     if grant.manual_workbench and (arm or not pipe):
@@ -355,7 +356,11 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
     # Claim the original account before even reading credentials or connecting.
     # The same lease is adopted by Kernel; a second GUI/CLI cannot briefly log
     # in and only then discover that an execution owner already exists.
-    lease=AccountLock(grant.account_key);port=None;kernel=None;session=None
+    if _execution_lock is not None and (not isinstance(_execution_lock,AccountLock)
+            or not _execution_lock.matches(grant.account_key)):
+        raise TraderError('E_INSTANCE_LOCK','The desktop startup lease must still own this exact account on this thread')
+    lease=_execution_lock if _execution_lock is not None else AccountLock(grant.account_key)
+    port=None;kernel=None;session=None
     try:
         if automatic:
             from online_trader.runtime.auto_offsets import load_preparation,prepare_connected

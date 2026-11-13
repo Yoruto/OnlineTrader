@@ -8,7 +8,7 @@
 
 上一轮 dev1 的[121项基线报告](../output/checks/20261109T052309Z-cf2cc492/result.json)、wheel 和本轮开始前的源码归档均保留；本轮没有覆盖旧版本制品或原始故障证据。
 
-开发制品为 [online_trader-0.1.0.dev2-py3-none-any.whl](../dist/online_trader-0.1.0.dev2-py3-none-any.whl)，SHA-256 `720eb795d18ab88cc551b9db693d9f12842d2f34ad59c48236b6499bddc9f222`。36份产品Python源码和3份资源均与包内及干净安装内容逐字节一致，未含QA/测试夹具/旧产品。新的干净虚拟环境从本地wheelhouse离线安装，`-I`下默认无适配器启动、DISARMED快照、关闭通过，且没有安装Qt或柜台SDK，见[制品审计与安装报告](../output/artifacts/20261109T055203Z-c7e80759-f88f-425d-83e0-0a7dac0a4505/wheel-audit-final.json)。这是开发wheel，不是Windows安装包或在线发布放行。
+开发制品为 `online_trader-0.1.0.dev2-py3-none-any.whl`，SHA-256 `720eb795d18ab88cc551b9db693d9f12842d2f34ad59c48236b6499bddc9f222`。36份产品Python源码和3份资源均与包内及干净安装内容逐字节一致，未含QA/测试夹具/旧产品。新的干净虚拟环境从本地wheelhouse离线安装，`-I`下默认无适配器启动、DISARMED快照、关闭通过，且没有安装Qt或柜台SDK，见[制品审计与安装报告](../output/artifacts/20261109T055203Z-c7e80759-f88f-425d-83e0-0a7dac0a4505/wheel-audit-final.json)。这是开发wheel，不是Windows安装包或在线发布放行。
 
 ## 已交付范围
 

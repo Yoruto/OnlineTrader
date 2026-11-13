@@ -16,9 +16,12 @@ def main(argv=None):
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--simnow-packet', type=Path)
     source.add_argument('--account-store', type=Path)
+    parser.add_argument('--dsv-config', type=Path, help='读取原 DSV 已保存的业务参数')
     parser.add_argument('--compare-fills', nargs='?', const='', metavar='CSV',
                         help='打开本地成交对照，或预填指定 CSV')
     args = parser.parse_args(argv)
+    if args.dsv_config is not None and args.simnow_packet is not None:
+        parser.error('--dsv-config and --simnow-packet cannot be combined')
     if args.compare_fills is not None and args.simnow_packet is not None:
         parser.error('--compare-fills and --simnow-packet cannot be combined')
     app = QApplication.instance() or QApplication([])
@@ -36,7 +39,7 @@ def main(argv=None):
                                   account['account_key'] if account else None,
                                   statement_path=Path(args.compare_fills) if args.compare_fills else None)
         pipe = store.pipe_name(account) if account else None
-        return run(pipe, store=store, account_id=account_id)
+        return run(pipe, store=store, account_id=account_id, dsv_config=args.dsv_config)
     except (TraderError, OSError) as error:
         QMessageBox.critical(None, 'OnlineTrader 启动失败', str(error))
         return 2

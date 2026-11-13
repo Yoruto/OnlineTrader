@@ -15,8 +15,9 @@ def number(value):
     return decimal_text(Decimal(str(value)))
 
 def credentials(path):
-    from online_trader.accounts import StoredCredential
+    from online_trader.accounts import StoredCredential,StoredSimNowCredential
     if type(path) is StoredCredential:return path.resolve()
+    if type(path) is StoredSimNowCredential:raise TraderError('E_CREDENTIALS','A SimNow credential reference cannot connect to KQ')
     try:
         raw=Path(path).read_bytes()
         if len(raw)>16384:raise ValueError()

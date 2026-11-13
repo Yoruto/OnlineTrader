@@ -91,7 +91,7 @@ E:\online-trader\.venv\Scripts\python.exe -m online_trader reports desktop --dat
 
 新增104项检查为纯资金域33项、资金owner25项、只读报表/导出24项、报表桌面18项、实际CLI4项。覆盖真实价量/FIFO、多空分笔半仓、费用确认/估算/0/未知、修订替代、跨日归属、回滚/错Ack、重启/重复、资金过期修订、旧boot报价、时钟屏障、坏财务扩展隔离、读取一致性/原boot水印、CSV公式注入、脱敏白名单、不覆盖和窗口异步/过期/本地关闭。原597项共同纳入上述701项最终完整检查。
 
-交付[dev9离线开发wheel](../dist/20261109T162951Z-37e67a76474a/online_trader-0.1.0.dev9-py3-none-any.whl)，SHA-256为`4594da94e9fbf638f241dd435f90e38d3370970d90dfcbbc4214b22c6c96e109`。[构建与干净安装审计](../output/artifacts/20261109T162951Z-37e67a76474a/wheel-audit.json)通过，报告SHA-256为`ba92f0ef2feffc5648a55a3438c3bbdffe5ed9ab079ca3782ba4b35309529cc0`。63份Python源码和6份资源在701项报告、wheel与全新安装中逐字节一致；构建期间源码未变，旧wheel与报告未覆盖。
+交付dev9离线开发wheel，SHA-256为`4594da94e9fbf638f241dd435f90e38d3370970d90dfcbbc4214b22c6c96e109`。[构建与干净安装审计](../output/artifacts/20261109T162951Z-37e67a76474a/wheel-audit.json)通过，报告SHA-256为`ba92f0ef2feffc5648a55a3438c3bbdffe5ed9ab079ca3782ba4b35309529cc0`。63份Python源码和6份资源在701项报告、wheel与全新安装中逐字节一致；构建期间源码未变，旧wheel与报告未覆盖。
 
 全新core环境以`-I`、本地wheelhouse和`--no-index`安装，无Qt/QA/测试夹具或交易SDK。默认激活拒绝、UnavailablePort和DISARMED继续通过。安装后原生周期分笔1+2手首次入场只计一次，3手退出实际资金毛收益−630、费用1+2+6=9、净收益−639，与名义−20/S16分账；原boot水印只读重建、API/CLI CSV+JSON导出及不覆盖、重启费用证据/原成交幂等、估算替代确认0均通过。手续费或昨结未知的账户字段没有填0；原策略、非默认保护、撤改追单、调度与名义统计smoke继续通过。
 

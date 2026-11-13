@@ -69,7 +69,7 @@ UTF-8，可带BOM；输出为BOM+CRLF。整份最大262144字节，最多64个�
 
 新增68项包含CSV26项、模板23项、Qt/CLI工作流19项，既有810项同时通过。重点包括144个别名和原33字段与独立静态取证一致；精确小数/0值/候选保留；整批拒绝、重复、范围、编码与文件容量；两写入者争抢同一版本只成功一个；发布失败不破坏旧版本；坏历史/缺号不当作空目录；过期界面必须重载；取消确认不修改；凭据剥离及公式名称转义。实际已入场且有3手自有成交的开发周期中，执行CSV/模板/恢复预览后，已提交计划、保护剩量、authority、账本序号及记录端口发送列表逐项保持一致。成交由QA明确注入，端口只记录请求，没有撮合或柜台订单。
 
-开发wheel见[dev11制品](../dist/20261110T014138Z-b6ff584cdeaf/online_trader-0.1.0.dev11-py3-none-any.whl)，SHA-256 `0ac5f1bd8b383d9ed42826b19c9810784fe5e19dfc59acf5afb43ef5ddfe596c`。[构建审计](../output/artifacts/20261110T014138Z-b6ff584cdeaf/wheel-audit.json)核对69份Python源码、6份冻结资源与最终检查、wheel、全新核心安装逐字节相同；QA/测试、原软件代码、凭据和柜台SDK均不在wheel内。全新venv从本地wheelhouse离线安装，以`-I`运行，确认无Qt/QA/柜台SDK；既有策略、保护、调度、报表与费用登记冒烟，以及新模板保存/覆盖/应用/删除、CSV往返、别名及CLI冒烟通过。未发布或部署该开发制品。
+开发wheel见dev11制品，SHA-256 `0ac5f1bd8b383d9ed42826b19c9810784fe5e19dfc59acf5afb43ef5ddfe596c`。[构建审计](../output/artifacts/20261110T014138Z-b6ff584cdeaf/wheel-audit.json)核对69份Python源码、6份冻结资源与最终检查、wheel、全新核心安装逐字节相同；QA/测试、原软件代码、凭据和柜台SDK均不在wheel内。全新venv从本地wheelhouse离线安装，以`-I`运行，确认无Qt/QA/柜台SDK；既有策略、保护、调度、报表与费用登记冒烟，以及新模板保存/覆盖/应用/删除、CSV往返、别名及CLI冒烟通过。未发布或部署该开发制品。
 
 实际Qt离屏渲染见[基准界面](../output/previews/20261110T014048Z-652ecf3acf-parameters/baseline.png)、[品种与模板预览](../output/previews/20261110T014048Z-652ecf3acf-parameters/symbols-and-template.png)、[坏行整批拒绝](../output/previews/20261110T014048Z-652ecf3acf-parameters/rejected-batch.png)、[差异页](../output/previews/20261110T014048Z-652ecf3acf-parameters/differences.png)。截图、样例CSV与本地模板历史使用匿名QA数据；现有Windows字体只在QA进程中加载。全部75份产品文件与最终检查及当前源码一致，见[哈希核对](../output/previews/20261110T014048Z-652ecf3acf-parameters/final-source-match.json)和[视觉检查](../output/previews/20261110T014048Z-652ecf3acf-parameters/visual-review.json)。这是实际Qt布局证据，不代替已安装交互式桌面、在线或耐久验收。
 

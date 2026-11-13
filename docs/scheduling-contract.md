@@ -6,7 +6,7 @@
 
 当前版本`0.1.0.dev7`。最终完整检查 **531项通过，0失败、0错误、0跳过**，比dev6新增73项；见[确切结果](../output/checks/20261109T141850Z-c791ed6d/result.json)及[逐项日志](../output/checks/20261109T141850Z-c791ed6d/check.log)。编译、导入边界、冻结G0/1.1/1.2资源完整性和检查期间源码稳定性均通过，`pip check`无冲突。dev6的57份产品文件事先与458项报告逐字节核对后归档于`output/baselines/20261109T135300Z-d3a7a5fb/dev6-product.zip`，SHA-256为`5f0121adfee28b539f474ae0a7eecccf6a6f1e3770a12cd9415113597d7b638c`。
 
-交付[dev7离线wheel](../dist/20261109T141442Z-3025eafacc6c/online_trader-0.1.0.dev7-py3-none-any.whl)，SHA-256为`77a483de01cfb0aa8cea6dc62d49e5c1c837a67c6be7a01629f1ab6e16ee476b`。[构建/干净安装审计](../output/artifacts/20261109T141442Z-3025eafacc6c/wheel-audit.json)确认55份Python源码与6份资源共61份产品文件，在最终检查、wheel及全新安装中逐字节一致。无Qt/QA/交易SDK的独立core环境以`-I`、`--no-index`安装；默认激活拒绝，显式日历/开发钟激活仍禁开，授权后只记录1次OPEN、确认成交0；无新报价再经过60001ms只记录1次撤单，原arrival不变、5手潜在量仍保留。没有撮合或生成柜台成交。
+交付dev7离线wheel，SHA-256为`77a483de01cfb0aa8cea6dc62d49e5c1c837a67c6be7a01629f1ab6e16ee476b`。[构建/干净安装审计](../output/artifacts/20261109T141442Z-3025eafacc6c/wheel-audit.json)确认55份Python源码与6份资源共61份产品文件，在最终检查、wheel及全新安装中逐字节一致。无Qt/QA/交易SDK的独立core环境以`-I`、`--no-index`安装；默认激活拒绝，显式日历/开发钟激活仍禁开，授权后只记录1次OPEN、确认成交0；无新报价再经过60001ms只记录1次撤单，原arrival不变、5手潜在量仍保留。没有撮合或生成柜台成交。
 
 ## 模块、版本与所有权
 

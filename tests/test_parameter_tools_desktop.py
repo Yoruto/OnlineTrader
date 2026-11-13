@@ -12,6 +12,7 @@ from online_trader.configuration.editor import form_values, profile_from_form
 from online_trader.configuration.offsets import DailyDataset
 from online_trader.desktop.settings import SettingsDialog
 from online_trader.desktop.editor import ParameterEditorDialog
+from online_trader.desktop.symbol_editor import SymbolEditorDialog
 from online_trader.desktop.calculator import OffsetCalculatorDialog
 from tests.test_offset_calculator import daily_csv
 
@@ -84,9 +85,13 @@ class ParameterToolsDesktopTests(unittest.TestCase):
         self.assertEqual(dialog.result_profile.content_hash, self.profile.content_hash)
 
     def test_editor_add_and_remove_row_then_validate(self):
-        dialog = self.editor(); self.assertTrue(dialog.add_symbol())
+        dialog = self.editor()
+        def accept(symbol):
+            symbol.fields['code'].setText('cu2701')
+            self.assertTrue(symbol.validate_symbol())
+            return QDialog.Accepted
+        with patch.object(SymbolEditorDialog, 'exec', accept): self.assertTrue(dialog.add_symbol())
         row = dialog.symbols_table.rowCount() - 1
-        dialog.symbols_table.item(row, 0).setText("铜"); dialog.symbols_table.item(row, 1).setText("cu2701")
         self.assertTrue(dialog.validate_preview())
         self.assertEqual(len(dialog.result_profile.to_record()["settings"]["symbols"]), 6)
         dialog.symbols_table.selectRow(row); dialog.remove_selected()

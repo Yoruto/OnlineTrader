@@ -1,32 +1,10 @@
 # OnlineTrader
 
-2026-11-12 托盘验收后的源码更新补齐 DSV 工作台日志分类、品种建议手数、柜台交易日时段和未完成平仓告警。全量离线源码检查 1,391 项通过。便携包实机验收记录对应此前交付的 dev28 ZIP。[功能状态与剩余验证](docs/功能实现与待办清单_20261110.md) · [开发与验证技能参考](docs/skills/online-trader.md)
+当前桌面交付为 **0.1.0.dev28 · DSV 参数同步版（2026-11-13）**。在桌面 `OnlineTrader` 文件夹双击 `OnlineTrader.exe`。独立验收从资源管理器双击桌面 EXE，并用工作台导出的业务参数对照本机 DSV，117 项逐字段一致。验收期间工作台未连接模拟盘。[便携 ZIP](dist/OnlineTrader-0.1.0.dev28-Windows-x64-Portable-20261113-DSV-Parameters.zip) · [独立测试报告](output/portable-acceptance/20261113-dsv-parameters/qa/test-report.md)
 
-2026-11-12 dev28 修复午休重启后的下午行情观察恢复。首批原生行情能证明下午盘次边界时，沿原账本重建观察，保留当日停开状态，历史信号执行数为零。[全量源码检查](output/checks/20261112T044608Z-5b27d564/result.json) · [制品审计](output/artifacts/20261112T044922Z-dev28-e69130cd/wheel-audit.json)
-
-2026-11-12 dev27 调整交易工作台按钮行为。后台刷新期间保持已确认的按钮状态，策略启停以原内核状态为准。[按钮验证记录](docs/dev27-workbench-buttons-20261112.md)
-
-2026-11-12 dev26 修复桌面启动请求、同日空仓恢复入口和 DSV 夜盘日志日期，使用原夜盘输入复算棕榈油风控与沥青日志。[新包与验证记录](docs/dev26-night-regressions-20261112.md)
-
-2026-11-11 夜盘对照已结案。五个同参数合约分两批收盘，快期回查取得 6 笔开仓和 6 笔平仓成交，SimNow 无委托和成交。修复版在原账本上续接白银行情，显式恢复入场后运行至 02:30。两边柜台均确认测试合约空仓、无活动委托。[夜盘逐笔对照与恢复记录](docs/paired-night-simulation-20261111.md)
-
-2026-11-11 午盘完成 DSV 快期与 OnlineTrader SimNow 同参数过滤对照。SimNow 收盘独立重登确认零委托、零成交和测试合约空仓。当前开发候选已安装 Windows 工作台，桌面「OnlineTrader 夜盘对照」预填当晚 SimNow 范围，打开窗口只做离线核对。[午盘结案与夜盘桌面操作](docs/paired-simulation-desktop-20261111.md)
-
-2026-11-11 12:56 完成快期与 SimNow 的历史查询只读核验。快期未取回 11 月 10 日已知原单和成交，SimNow 返回两条昨仓汇总。两次 SDK 连接已关闭，线上报撤单与结算确认发送均为 0。[只读核验记录](docs/broker-history-readonly-online-20261111.md)
-
-2026-11-11 上午完成五合约双通道行情核对与快期模拟试跑。OnlineTrader 修复了盘中启动时历史回放与新报价登记的衔接，复测记录 387 次振幅过滤判定。退出后独立重登确认委托、成交、持仓均为 0，两次连接已关闭。完整成交与保护验收仍待完成。[上午验证记录](docs/kq-readonly-runtime-20261111.md)
-
-96 项功能的当前状态统一维护在功能清单。dev25 增加本机快期专业版历史成交查询、原单留档恢复和等量换仓原批次核对。本轮使用离线验证。11 月 10 日真实取数、DSV 原函数复算及参数应用保留各自记录。夜盘准备包和上午临时试跑范围均已结束。[功能实现与待办清单](docs/功能实现与待办清单_20261110.md) · [柜台历史查询与批次核对](docs/broker-history-and-lots-20261111.md) · [混合仓和历史回补](docs/external-allocation-history-20261111.md) · [人工交易与恢复](docs/manual-workbench-recovery-20261111.md) · [真实日线](docs/simnow-readonly-calculation-20261110.md) · [同输入复算](docs/dsv-same-input-calculation-20261110.md) · [参数应用](docs/matched-parameters-applied-20261110.md)
-
-文档中的 `output/` 和 `dist/` 链接指向本机运行证据和开发包。源码仓库通过 `.gitignore` 排除这些目录、环境和账本。
-
-2026-11-12 的 DSV 源码对齐补上主力／到期／换月预览、品种规则表、钉钉、托盘及手动平仓等候报价。原命令回执重启和 F6 余单流程也已复查。结果为离线源码验收。[当前功能清单](docs/功能实现与待办清单_20261110.md) · [1,365 项源码检查](output/checks/20261112T034009Z-9ac70e9f/result.json)
+工程状态见[功能实现与待办清单](docs/功能实现与待办清单_20261110.md)。旧版桌面交付见[历史记录](docs/history/releases/README.md)。`output/` 和 `dist/` 的链接指向本机生成的验收证据和制品。
 
 ## Windows 便携发行目录
-
-2026-11-12 首次构建 dev28 Windows x64 便携 ZIP。解压到包含中文及空格的目录后，验证了工作台启动、关闭到托盘、本地离线内核、成交对照入口和 XLSX 导出、时钟与网络报告。可选守护只检查了文件和语法。[便携 ZIP](dist/OnlineTrader-0.1.0.dev28-Windows-x64-Portable-20261112.zip) · [解压验收与 SHA-256](output/portable-acceptance/20261112082123/revised/acceptance-result.json)
-
-同一份 ZIP 重新解压后，通过 Windows 桌面实际双击托盘图标恢复原窗口，并通过右键菜单退出原工作台进程。[托盘复测](output/portable-tray/20261112084726/tray-acceptance.json)
 
 便携发行使用 `release/OnlineTrader.spec` 和 `release/portable/`。工作台与控制台执行器共享 `_internal`，把整个目录一起移动。双击主程序打开工作台。启用关闭到托盘后，图标立即显示，并提示策略未启用、已启用或状态待核对。双击恢复窗口，右键可退出工作台。
 
@@ -60,10 +38,16 @@ OnlineTrader/
 ## 打开账户管理与交易工作台
 
 ```powershell
-E:\online-trader\.venv\Scripts\python.exe -m online_trader workbench --account-store E:\online-trader\output\local-accounts
+E:\online-trader\.venv\Scripts\python.exe -m online_trader workbench --account-store "$env:LOCALAPPDATA\OnlineTrader\accounts"
 ```
 
-空目录也可打开；从“账户管理”新增并选择快期模拟档案，再查看原owner。账户选择不登录，关闭工作台不停止内核或删除保护。“模拟连接设置”的核对完全离线，启动仍需明确的新scope及当前版本/SDK独立环境；旧一手范围不能复用。账户凭据只存Windows当前用户凭据库，不进入参数或命令行。行情、持仓、委托成交、保护、阻挡和命令回执分开查看；超时查询原回执，不自动重新发送。
+主控显示品种列表和策略持仓。账号、资金与连接设置在「账号信息」，参数模板、交易与定时参数在「交易参数」。主控品种表显示待启动的配置，执行器已绑定的参数在「实时监控 → 执行参数」查看。[当前桌面主控](output/portable-acceptance/20261113-dsv-parameters/qa/main.png) · [当前交易参数页](output/portable-acceptance/20261113-dsv-parameters/qa/trade.png)
+
+「账号信息」支持 SimNow 和快期模拟两个提供者。本机默认账户目录 `%LOCALAPPDATA%\OnlineTrader\accounts` 已从用户提供的资料保存两份档案，初次选择 SimNow；后续保留用户手动选择。当前源码和便携版使用同一账户目录。自定义空目录仍可从「账户管理」新增档案。SimNow 同时使用独立交易凭据和快期行情凭据，均只保存在 Windows 当前用户凭据库，账户与凭据不包含在 ZIP 中。切换账号会清空上一账号的资金、行情和曲线显示，原持仓、委托或运行锁仍阻止不安全切换。账户选择不登录。关闭工作台不停止内核或删除保护。
+
+当前工作台默认读取 Windows 桌面 `trading\config.json` 中的交易、定时、偏移计算及品种设置。也可在「策略主控」选择其他 DSV 配置路径并重读。F5 启动前核对源文件，发现业务参数变化会提示核对后重试。找不到配置时，历史基准仅供查看，可选择 DSV 文件或导入已核对的业务参数。主控的「查看执行参数」显示原执行器绑定的品种与偏移。
+
+普通工作台点击「启动策略」或 F5，直接使用当前账号、品种和交易参数启动，不再弹出二次确认。启动进度及错误在主界面显示，准备期间阻止重复点击；已连接的策略也直接沿原内核启用。源码入口自动复用已有 SDK 环境和当前源码，无需填写 scope/profile/calendar/Python 路径。启动前读取原生交易日历、合约时段与乘数，仅绑定一个柜台交易日；不能证明的节假日时段拒绝推断。已有持仓周期记录仍要求沿原账本恢复，不自动创建新账本绕过恢复，也不提供跨日自动续启。仅打开软件不会连接模拟盘；在线登录与策略成交仍需单独验证。
 
 “历史与交易日历”支持本地日线缓存/导出及带来源日历核对，不更改执行行情或旧计划。10000条原生窗口、跨日屏障和今昨仓核对均已有离线检查；dev20已接多日范围的今昨混合子单、旧单撤改和原周期恢复；更长历史、权威日历及缺失原单查询源仍待补，详见[当前边界](docs/dsv-runtime-completion-20261110.md)。
 
@@ -86,6 +70,8 @@ E:\online-trader\.venv\Scripts\python.exe -m online_trader parameters desktop
 参数窗口现支持品种CSV整批替换/合并预览、导出，以及选择本地目录后保存、应用、覆盖和删除DSV交易参数模板。模板按原软件保存33项交易参数，应用保留当前品种清单及未收录参数。CSV兼容原8列，并扩展候选换月列；错误显示行号，整批拒绝，保留上一份预览。模板操作追加本地历史，覆盖和删除需要明确选择；预览和文件保存均不会切换运行配置。操作示例及DSV兼容差异见[模板与CSV合同](docs/parameter-workspace-contract.md)。
 
 “编辑全部业务参数”覆盖69项交易/风控、4项计算设置、4项定时设置和每个品种的9列，可筛选、增删品种、对选中行批量设置。校验通过后才更新参数中心预览，取消编辑保持原预览。“离线偏移计算器”支持DSV的6种公式、品种系数、振幅上限/下限、当前值对比、缓存重算和结果复制/导出；输入明确交易日和本地日线，选择成功结果后才填入预览。用完整业务JSON保存全部修改；DSV模板仍只保存原33项交易参数。格式和口径见[编辑与计算合同](docs/parameter-editing-offset-contract.md)。
+
+主控「添加品种」使用独立单品种窗口，输入带月份的合约代码可补全名称，确认和取消固定在底部。选中编辑或双击品种均打开相同表单；高级参数编辑器的新增、编辑也复用该表单。确认后更新当前列表，取消不产生空行或部分修改；「保存预览参数」另存为新的业务 JSON。窗口按可用屏幕大小定位，内容超出时只滚动表单，操作按钮保持可见。
 
 ## 运行最小状态台
 

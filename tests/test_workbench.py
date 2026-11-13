@@ -139,6 +139,8 @@ class WorkbenchOwnerTests(unittest.TestCase):
         before=x.kernel._durable_seq;calls=len(x.api.inserted)
         result=workbench_view(x.kernel)
         self.assertEqual(result['cycles'][0]['remaining_quantity'],5);self.assertEqual(len(result['trades']),1)
+        self.assertEqual(result['configuration']['strategy_symbols'][0]['code'], 'SHFE.bu2701')
+        self.assertIn('float_profit', result['account_metrics'])
         self.assertFalse(result['connection']['broker_connected']);self.assertTrue(result['connection']['synchronized'])
         self.assertEqual(result['cycles'][0]['close_route_review']['routes'],[{'native_offset':'CLOSETODAY','quantity':5}])
         self.assertEqual(x.kernel._durable_seq,before);self.assertEqual(len(x.api.inserted),calls)
@@ -168,7 +170,7 @@ class WorkbenchDesktopTests(unittest.TestCase):
         while window._worker is not None and time.monotonic()<deadline:self.app.processEvents();QTest.qWait(5)
         self.assertIsNone(window._worker)
 
-    def test_confirmed_arm_waits_for_refresh_and_keeps_the_receipt(self):
+    def test_arm_without_confirmation_waits_for_refresh_and_keeps_the_receipt(self):
         calls=[];release=Event();release.set()
         class Client:
             last_command=None;last_metadata={'kernel_boot_id':'boot-test'};revision='1'
@@ -187,18 +189,21 @@ class WorkbenchDesktopTests(unittest.TestCase):
         window=WorkbenchWindow('pipe',client_factory=Client)
         try:
             window.timer.stop();window.refresh();self.idle(window)
-            def confirm(*args):
+            def begin_refresh():
                 release.clear();window.refresh()
                 self.assertTrue(window.command_buttons['arm'].isEnabled())
                 self.assertFalse(window.pause_button.isEnabled())
-                return QMessageBox.Yes
-            with patch.object(QMessageBox,'question',side_effect=confirm):window.arm()
+            begin_refresh()
+            with patch.object(QMessageBox,'question') as confirm:
+                window.arm();confirm.assert_not_called()
             self.assertEqual(calls,[])
             release.set();self.idle(window)
             self.assertEqual(len(calls),1);self.assertEqual(calls[0][0],'ARM_ENTRIES')
             window.refresh();self.idle(window)
             self.assertIn('SUCCEEDED',window.notice_label.text())
-            with patch.object(QMessageBox,'question',side_effect=confirm):window.arm()
+            begin_refresh()
+            with patch.object(QMessageBox,'question') as confirm:
+                window.arm();confirm.assert_not_called()
             Client.revision='2';release.set();self.idle(window)
             self.assertEqual(len(calls),1)
             self.assertIn('未发送',window.notice_label.text())
@@ -213,13 +218,150 @@ class WorkbenchDesktopTests(unittest.TestCase):
         window=WorkbenchWindow('pipe',client_factory=Client)
         try:
             window.timer.stop();window.refresh();self.idle(window)
-            self.assertFalse(window._stale);self.assertIn('未连接',window.connection_detail.text());self.assertEqual(window.tabs.count(),8)
-            self.assertEqual([window.tabs.tabText(index) for index in range(8)],
-                ['策略主控','实时监控','挂单汇总','手动下单','运行日志','品种信息','偏移计算','系统设置'])
+            self.assertFalse(window._stale)
+            self.assertIn('未连接', window.connection_detail.text())
+            self.assertEqual([window.tabs.tabText(index) for index in range(window.tabs.count())],
+                             ['策略主控', '实时监控', '挂单汇总', '手动下单', '运行日志',
+                              '品种信息', '偏移计算', '系统设置', '账号信息', '交易参数'])
+            dashboard = window.dashboard
+            window.show()
+            self.app.processEvents()
+            self.assertTrue(dashboard.symbol_grid.isVisible())
+            self.assertTrue(window.command_buttons['arm'].isVisible())
+            self.assertFalse(dashboard.home_account.isVisible())
+            self.assertFalse(dashboard.parameter_fields['max_volume'].isVisible())
+            dashboard.show_account_settings()
+            self.assertTrue(dashboard.home_account.isVisible())
+            self.assertTrue(window.command_buttons['arm'].isVisible())
+            window.tabs.setCurrentWidget(dashboard.parameter_tab)
+            self.assertTrue(dashboard.parameter_fields['max_volume'].isVisible())
+            self.assertFalse(dashboard.home_account.isVisible())
             self.assertFalse(window.dashboard.submit_button.isEnabled())
             self.assertIn('未知',window.funds_label.text());window.filter_input.setText('p2701');self.assertFalse(window.tables['markets'].isRowHidden(0))
             window.filter_input.setText('铜');self.assertTrue(window.tables['markets'].isRowHidden(0))
         finally:window.close();self.app.processEvents()
+    def test_home_reads_bound_account_and_runtime_symbols_and_hides_resolved_items(self):
+        account = {'account_id': 'account-local', 'account_key': 'account-test',
+                   'masked_login': '****82', 'environment': 'ONLINE_SIM'}
+        snapshot = view()
+        snapshot['entry_authority'] = 'ARMED'
+        snapshot['connection'].update(broker_connected=True, synchronized=True)
+        snapshot['account_metrics'] = {'balance': '200000', 'pre_balance': '198740',
+                                       'available': '185420', 'margin': '14580',
+                                       'float_profit': '-340', 'position_profit': '-999'}
+        snapshot['configuration']['strategy_symbols'] = [
+            {'name': '棕榈油', 'code': 'DCE.p2701', 'open_offset': '57', 'stop_offset': '16',
+             'profit_offset': '50', 'order_volume': 0, 'half_close_ratio': '0.4', 'hysteresis_points': '0'}
+        ]
+        snapshot['cycles'] = [{'position_cycle_id': 'owned', 'contract_id': 'DCE.p2701',
+                               'direction': 'LONG', 'remaining_quantity': 1,
+                               'floating_profit': '-340', 'quality': 'CONTIGUOUS', 'exit_pending': True}]
+        snapshot['orders'] = [{'child_order_id': 'close', 'position_cycle_id': 'owned',
+                               'contract_id': 'DCE.p2701', 'effect': 'REDUCE', 'broker_state': 'ALIVE',
+                               'potential_remaining': 1}]
+
+        class Client:
+            last_command = None
+            last_metadata = {'kernel_boot_id': 'boot-test'}
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def snapshot(self):
+                return desktop_fixtures.projection()
+
+            def workbench(self):
+                return copy.deepcopy(snapshot)
+
+        from unittest.mock import Mock
+        store = Mock()
+        store.get.return_value = account
+        store.credential_reference.return_value.resolve.return_value = {'username': '1000382'}
+        window = WorkbenchWindow('pipe', store=store, account_id='account-local', client_factory=Client)
+        self.addCleanup(window.close)
+        window.timer.stop()
+        dashboard = window.dashboard
+        self.assertTrue(dashboard.home_pending.isHidden())
+        window.refresh()
+        self.idle(window)
+        self.assertEqual(dashboard.home_account.text(), '当前账号 1000382')
+        self.assertEqual(dashboard.home_account_type.text(), '模拟账户')
+        self.assertEqual(dashboard.home_money['today_pnl'][0].text(), '+¥1,260.00')
+        self.assertEqual(dashboard.home_money['float_profit'][0].text(), '-¥340.00')
+        self.assertEqual(dashboard.home_money['available'][1].text(), '保证金占用 ¥14,580.00')
+        self.assertEqual([dashboard.home_symbols.horizontalHeaderItem(index).text() for index in range(8)],
+                         ['品种名', '合约代码', '开仓偏移', '止损偏移', '止盈偏移', '下单手数', '半仓参数', '滞回点'])
+        self.assertEqual(dashboard.home_symbols.columnCount(), 8)
+        self.assertEqual(dashboard.home_symbols.item(0, 2).text(), '57')
+        self.assertEqual(dashboard.home_positions.item(0, 3).text(), '-¥340.00')
+        self.assertIn('平仓委托 1 手待成交', dashboard.home_pending.text())
+
+        snapshot['orders'].clear()
+        snapshot['cycles'][0]['exit_pending'] = False
+        snapshot['entry_authority'] = 'DISARMED'
+        window.refresh()
+        self.idle(window)
+        self.assertTrue(dashboard.home_pending.isHidden())
+        self.assertEqual(dashboard.home_state.text(), '已停止新开仓')
+        self.assertEqual(dashboard.home_positions.item(0, 4).text(), '保护中')
+
+        window._job_failed({'code': 'E_TIMEOUT', 'identity': None})
+        self.assertEqual(dashboard.home_money['available'][0].text(), '—')
+        self.assertEqual(dashboard.home_positions.item(0, 3).text(), '—')
+        self.assertEqual(dashboard.home_positions.item(0, 4).text(), '待核对')
+
+    def test_switching_accounts_clears_old_facts_even_when_new_account_is_unavailable(self):
+        from online_trader.accounts import AccountStore
+        from tests.test_accounts import MemoryVault
+        with tempfile.TemporaryDirectory() as directory:
+            store = AccountStore(directory, vault=MemoryVault())
+            state = store.initialize_simulation_accounts({
+                'simnow_username': 'offline-sn', 'simnow_password': 'offline-sn-password',
+                'kq_username': 'offline-kq', 'kq_password': 'offline-kq-password'})
+            accounts = {item['provider']: item for item in state['accounts']}
+            snapshot = view()
+            snapshot['account_key'] = accounts['TQ_SIMNOW']['account_key']
+            snapshot['connection'].update(broker_connected=True, synchronized=True)
+            snapshot['account_metrics'] = {'balance': '200000', 'available': '180000',
+                                           'trading_day': '2026-11-12'}
+            snapshot['markets'] = [{'contract_id': 'DCE.p2701', 'last': '9000', 'fresh': False}]
+            snapshot['minute_bars'] = {'DCE.p2701': [[29000000, '1', '2', '1', '2']]}
+
+            class Client:
+                fail = False
+                last_command = None
+                last_metadata = {'kernel_boot_id': 'boot-test'}
+                def __init__(self, *_args, **_kwargs): pass
+                def snapshot(self):
+                    if self.fail: raise TraderError('E_PIPE', 'Offline test: selected account unavailable')
+                    return desktop_fixtures.projection()
+                def workbench(self): return copy.deepcopy(snapshot)
+
+            window = WorkbenchWindow('pipe', store=store, account_id=state['selected_id'], client_factory=Client)
+            try:
+                window.timer.stop()
+                window.refresh()
+                self.idle(window)
+                dashboard = window.dashboard
+                self.assertIn('200,000', dashboard.fund_metrics['equity'][0].text())
+                self.assertTrue(dashboard.candles.native_series)
+                dashboard.account_picker.setCurrentIndex(dashboard.account_picker.findData(accounts['TQKQ']['account_id']))
+                Client.fail = True
+                window.select_account()
+                self.idle(window)
+                self.assertEqual(window.selected_account['provider'], 'TQKQ')
+                self.assertIn('offline-kq', dashboard.home_account.text())
+                self.assertIsNone(window.view)
+                self.assertEqual(dashboard.fund_metrics['equity'][0].text(), '账户权益   —')
+                self.assertEqual(dashboard.instrument_grid.rowCount(), 0)
+                self.assertFalse(dashboard.candles.native_series)
+                self.assertFalse(dashboard.equity.rows)
+                self.assertTrue(all(label.text() == '等待同步' for label in dashboard.status_labels))
+                self.assertFalse(dashboard.submit_button.isEnabled())
+            finally:
+                window.close()
+                self.app.processEvents()
+
     def test_order_selection_follows_original_id_when_refresh_reorders_rows(self):
         class Client:
             last_command=None;last_metadata={'kernel_boot_id':'boot-test'};reverse=False

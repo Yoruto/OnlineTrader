@@ -1,9 +1,11 @@
 # OnlineTrader dev27 工作台按钮
 
+此页记录已归档版本的交付与验收。当前便携版见[项目首页](../../../README.md)。
+
 工作台的普通后台刷新保留已确认的按钮状态。策略启用时 F5 禁用、F6 可用。暂停后 F5 可用、F6 禁用。刷新期间点击的交易命令按原账户、执行器和参数绑定发给内核。快照过期、视图截断或绑定变化时，界面显示相应结果。风控、账户、账本、委托与持仓保护使用原执行器。
 
 离线回归通过受控的慢刷新验证 F5 和 F6 状态。刷新期间点击 F6 只提交一次请求，下一次快照确认暂停后切换按钮。F5 确认后参数变化时请求未发送。
 
 全量 1,297 项通过。安装后的工作台、桌面和启动相关 34 项通过。10:08 在原 SimNow 日盘执行器上连续读取多次实际刷新状态，F5 灰、F6 可用。关闭旧界面后，原执行器的启动身份、开仓权限和命令集合均保持一致，账本持续推进。DSV 原进程继续运行。
 
-[全量结果](../output/checks/20261112T020414Z-884f8889/result.json) · [安装核对](../output/windows-app/dev27-20261112/installation.json) · [安装后回归](../output/windows-app/dev27-20261112/installed-buttons.json) · [日盘界面核对](../output/windows-app/dev27-20261112/live-window-attach.json)
+[全量结果](../../../output/checks/20261112T020414Z-884f8889/result.json) · [安装核对](../../../output/windows-app/dev27-20261112/installation.json) · [安装后回归](../../../output/windows-app/dev27-20261112/installed-buttons.json) · [日盘界面核对](../../../output/windows-app/dev27-20261112/live-window-attach.json)

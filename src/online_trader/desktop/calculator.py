@@ -63,6 +63,19 @@ class OffsetCalculatorDialog(QDialog):
         self.formula_combo.currentIndexChanged.connect(self._formula_changed)
         self.invalidate()
 
+    def set_base_profile(self, profile):
+        self.base_profile, self.result_profile = profile, None
+        self.base_hash = profile.content_hash
+        auto = profile.to_record()['settings']['auto_offset']
+        self.formula_combo.blockSignals(True)
+        self.formula_combo.setCurrentIndex(self.formula_combo.findData(auto['formula']))
+        self.formula_combo.blockSignals(False)
+        self._render_initial()
+        self.ceiling_input.setText(auto['ceiling'])
+        self.floor_input.setText(auto['floor'])
+        self.error_label.clear()
+        self.invalidate()
+
     def _render_initial(self):
         self._rendering = True
         symbols = self.base_profile.to_record()["settings"]["symbols"]

@@ -8,7 +8,7 @@ dev19在原owner/OMS链新增[原生日证明、逐周期目标/桶预占与最�
 
 当前版本`0.1.0.dev6`。最终完整检查 **458项通过，0失败/错误/跳过**，比dev5新增73项；见[确切结果](../output/checks/20261109T133923Z-2c637c60/result.json)及[逐项日志](../output/checks/20261109T133923Z-2c637c60/check.log)。编译、冻结G0/1.1及新1.2资源完整性、导入边界、源码稳定性均通过，`pip check`无冲突。旧dev5源码先归档于`output/baselines/20261109T131054Z-8f4d8650/dev5-source.zip`，SHA-256为`55d70846e32d65025fa686c12a5056230ce98ea199e13e95b095e17f1f9f2bfb`。
 
-交付[dev6离线wheel](../dist/20261109T133433Z-e5e9e4f9b32b/online_trader-0.1.0.dev6-py3-none-any.whl)，SHA-256为`027d7d95bcd2bba68219a40bb382be71fcca245064786e0deac0d0443db9efd1`。[构建/干净安装审计](../output/artifacts/20261109T133433Z-e5e9e4f9b32b/wheel-audit.json)确认51份Python源码与6份资源共57份产品文件，在最终检查、wheel及全新安装中逐字节一致。独立core环境以`-I`、`--no-index`安装，无Qt/QA/交易SDK；默认激活被拒绝，显式开发激活仍禁开，授权后只记录1次STRATEGY请求、确认成交为0。纯规则另验CAP1057、恶化撤单、终态残量重挂、收盘阶梯及1.2半仓保护，没有撮合或生成柜台成交。
+交付dev6离线wheel，SHA-256为`027d7d95bcd2bba68219a40bb382be71fcca245064786e0deac0d0443db9efd1`。[构建/干净安装审计](../output/artifacts/20261109T133433Z-e5e9e4f9b32b/wheel-audit.json)确认51份Python源码与6份资源共57份产品文件，在最终检查、wheel及全新安装中逐字节一致。独立core环境以`-I`、`--no-index`安装，无Qt/QA/交易SDK；默认激活被拒绝，显式开发激活仍禁开，授权后只记录1次STRATEGY请求、确认成交为0。纯规则另验CAP1057、恶化撤单、终态残量重挂、收盘阶梯及1.2半仓保护，没有撮合或生成柜台成交。
 
 ## 版本与职责
 

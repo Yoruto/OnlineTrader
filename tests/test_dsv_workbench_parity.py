@@ -87,7 +87,8 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             window = WorkbenchWindow(None)
             window.timer.stop()
             try:
-                window.selected_account = {'account_id':'this-account'}
+                window.selected_account = {'account_id': 'this-account', 'account_key': 'account-test',
+                                           'environment': 'ONLINE_SIM', 'masked_login': '****82'}
                 window._session_dialog = SimpleNamespace(account_id='this-account',run_directory=run,
                                                          clear_scheduled_start=Mock())
                 dashboard = window.dashboard
@@ -115,7 +116,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                 self.assertIn('当日行情已跑过多头激活位',detail)
                 self.assertIn('当日行情已跑过多头激活位',dashboard.status_labels[0].text())
                 dashboard.add_activity('本地连接诊断')
-                window.tabs.setCurrentIndex(4)
+                dashboard.show_details(dashboard.log_tab)
                 dashboard.log_filter.setCurrentText('工作台')
                 self.assertIn('本地连接诊断',dashboard.log_text.toPlainText())
                 self.assertIn('RECONCILIATION_REQUIRED',dashboard.log_text.toPlainText())
@@ -149,7 +150,8 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                                                   'message':'棕榈油(DCE.p2701) 距收盘不足 10 分钟，不再开新仓'})+b'\n')
                 dashboard.update_logs()
                 self.assertEqual(dashboard.visible_log_lines,['[14:50:00] [执行] 棕榈油(DCE.p2701) 距收盘不足 10 分钟，不再开新仓'])
-                window.selected_account = {'account_id':'different-account'}
+                window.selected_account = {'account_id': 'different-account', 'account_key': 'different-account-key',
+                                           'environment': 'ONLINE_SIM', 'masked_login': '****16'}
                 dashboard.update_logs()
                 self.assertEqual(dashboard.visible_log_lines,[])
             finally:
@@ -161,7 +163,8 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         window.timer.stop()
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
-            window.selected_account = {'account_id':'this-account'}
+            window.selected_account = {'account_id': 'this-account', 'account_key': 'account-test',
+                                           'environment': 'ONLINE_SIM', 'masked_login': '****82'}
             window._session_dialog = SimpleNamespace(account_id='this-account',run_directory=run,
                                                      clear_scheduled_start=Mock())
             comparison = run/'comparison-example'
@@ -170,8 +173,8 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                                             'source_time_utc':'2026-11-12T05:30:00Z'}}
                     for kind,tag,code in [('EXIT_DECISION','auto','DCE.p2701'),('EXIT_DECISION','manual','SHFE.bu2701')]]
             (comparison/'events.jsonl').write_bytes(b''.join(canonical_bytes(row)+b'\n' for row in rows))
-            window.tabs.setCurrentIndex(4)
             dashboard = window.dashboard
+            dashboard.show_details(dashboard.log_tab)
             dashboard.log_filter.setCurrentText('DSV 对照')
             for category in ('开仓','平仓','手动'):
                 dashboard.log_event_filter.setCurrentText(category)
@@ -325,7 +328,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         dashboard.equity_to.setCurrentText('2026-11-12')
         dashboard.equity_mode.setCurrentText('收益曲线')
         self.assertEqual([item['balance'] for item in dashboard.equity.rows],['200','300'])
-        window.tabs.setCurrentIndex(1)
+        window.dashboard.show_details(window.dashboard.monitor_tab)
         window.show()
         self.app.processEvents()
         with tempfile.TemporaryDirectory() as directory:

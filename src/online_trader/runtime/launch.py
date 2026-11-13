@@ -54,7 +54,8 @@ class SessionLauncher:
             row=self.store.get(self.account_id)
             if self.store.read()['selected_id']!=self.account_id:
                 raise TraderError('E_SCOPE','Only the selected account can be launched from this workbench')
-            if row['account_key']!=grant.account_key or self.store.ledger_path(row)!=Path(grant.value['ledger_path']).resolve():
+            if (row['provider']!=grant.provider or row['account_key']!=grant.account_key
+                    or self.store.ledger_path(row)!=Path(grant.value['ledger_path']).resolve()):
                 raise TraderError('E_SCOPE','Account/ledger differs from the exact finite scope')
             binding={'pipe':self.store.pipe_name(row)}
         value=grant.value
@@ -147,7 +148,9 @@ class SessionLauncher:
             reference={'schema_version':'SIMNOW_CREDENTIAL_REFERENCE/1','account_fingerprint':grant.value['account_fingerprint']}
             credentials=publish_new_bytes(canonical_bytes(reference),directory/'reviewed-credential-reference.json')
             connection=['simnow','run','--credentials',str(credentials),'--dsv-config',review['dsv_config'],'--dsv-log-dir',review['dsv_log_dir']]
-        else:connection=['dsv','run','--account-store',str(self.store.directory),'--account-id',self.account_id]
+        else:
+            provider='simnow' if grant.provider=='TQ_SIMNOW' else 'dsv'
+            connection=[provider,'run','--account-store',str(self.store.directory),'--account-id',self.account_id]
         argv=prefix+([] if use_bundled else ['-I','-X','utf8','-m','online_trader'])+[*connection,
             '--scope',str(frozen[0]),'--profile',str(frozen[1]),'--calendar',str(frozen[2]),
             '--output',str(directory),'--pipe',review['pipe']]

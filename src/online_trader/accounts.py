@@ -29,11 +29,20 @@ def _label(value):
     return value.strip()
 
 
-def account_identity(username):
+def account_identity(username, provider='TQKQ'):
     if type(username) is not str or not username or username != username.strip() or len(username) > 256 or any(ord(c)<32 for c in username):
         _error('Expected an explicit account login identity')
-    digest = hashlib.sha256(username.encode('utf-8')).hexdigest()[:16]
-    return 'SIM:KQ:' + digest, '*' * max(4, len(username)-2) + username[-2:]
+    if provider not in {'TQKQ','TQ_SIMNOW'}:_error('Unsupported simulation account provider')
+    source = 'simnow\0' + username if provider == 'TQ_SIMNOW' else username
+    digest = hashlib.sha256(source.encode('utf-8')).hexdigest()[:16]
+    prefix = 'SIM:SIMNOW:' if provider == 'TQ_SIMNOW' else 'SIM:KQ:'
+    return prefix + digest, '*' * max(4, len(username)-2) + username[-2:]
+
+
+def _password(value):
+    if type(value) is not str or not 1 <= len(value) <= 1024:
+        _error('A nonempty bounded password is required','E_CREDENTIALS')
+    return value
 
 
 class WindowsVault:
@@ -87,11 +96,35 @@ class StoredCredential:
 
     def resolve(self):
         row=self.store.get(self.account_id)
+        if row['provider']!='TQKQ':_error('A KQ credential reference cannot read another provider','E_CREDENTIALS')
         value=self.store.vault.get(self.store.target(row))
         if (type(value) is not dict or set(value)!={'username','password'} or type(value['password']) is not str
                 or not 1<=len(value['password'])<=1024 or account_identity(value['username'])[0]!=row['account_key']):
             _error('Saved credentials do not match the selected account','E_CREDENTIALS')
         return value
+
+
+@dataclass(frozen=True,repr=False)
+class StoredSimNowCredential:
+    store: object
+    account_id: str
+
+    def __repr__(self):return 'StoredSimNowCredential(<masked>)'
+
+    def resolve(self):
+        row=self.store.get(self.account_id)
+        if row['provider']!='TQ_SIMNOW':_error('A SimNow credential reference cannot read another provider','E_CREDENTIALS')
+        try:
+            trade=self.store.vault.get(self.store.target(row)+':trade')
+            market=self.store.vault.get(self.store.target(row)+':market')
+            for item in (trade,market):
+                if type(item) is not dict or set(item)!={'username','password'}:raise ValueError()
+                account_identity(item['username']);_password(item['password'])
+            if account_identity(trade['username'],'TQ_SIMNOW')[0]!=row['account_key']:raise ValueError()
+            return {'simnow_username':trade['username'],'simnow_password':trade['password'],
+                    'kq_username':market['username'],'kq_password':market['password']}
+        except (KeyError,TypeError,ValueError,TraderError):
+            _error('Saved SimNow credentials do not match the selected account','E_CREDENTIALS')
 
 
 class AccountStore:
@@ -128,8 +161,8 @@ class AccountStore:
             if (type(row) is not dict or set(row)!={'account_id','alias','provider','environment','account_key','masked_login','broker','line'}
                     or any(type(v) is not str for v in row.values())
                     or not re.fullmatch(r'account-[0-9a-f]{32}',row.get('account_id',''))
-                    or row['provider']!='TQKQ' or row['environment']!='ONLINE_SIM'
-                    or not re.fullmatch(r'SIM:KQ:[0-9a-f]{16}',row['account_key'])
+                    or row['provider'] not in {'TQKQ','TQ_SIMNOW'} or row['environment']!='ONLINE_SIM'
+                    or not re.fullmatch(r'SIM:' + ('SIMNOW' if row['provider']=='TQ_SIMNOW' else 'KQ') + r':[0-9a-f]{16}',row['account_key'])
                     or not re.fullmatch(r'\*{4,254}.{1,2}',row['masked_login'])):_error('Invalid account profile')
             for name in ('alias','broker','line'):_label(row[name])
             if row['account_id'] in ids or row['account_key'] in keys:_error('Duplicate account identity')
@@ -142,10 +175,14 @@ class AccountStore:
         return row
 
     def target(self,row):
+        if row['provider']=='TQ_SIMNOW':return 'OnlineTrader:SimNow:'+row['account_key'].split(':')[-1]
         namespace=hashlib.sha256(str(self.directory).casefold().encode()).hexdigest()[:24]
         return 'OnlineTrader/'+namespace+'/'+row['account_id']
 
-    def ledger_path(self,row):return self.directory/'data'/row['account_key'].split(':')[-1]/'ledger.db'
+    def ledger_path(self,row):
+        base=self.directory/'data'
+        if row['provider']=='TQ_SIMNOW':base=base/'simnow'
+        return base/row['account_key'].split(':')[-1]/'ledger.db'
     def pipe_name(self,row):return 'OnlineTrader.Account.'+hashlib.sha256(str(self.ledger_path(row)).casefold().encode()).hexdigest()[:24]
 
     def _settled(self,row):
@@ -164,7 +201,7 @@ class AccountStore:
             finally:connection.close()
         except sqlite3.Error:_error('Account ledger cannot prove a safe switch','E_FACT_BARRIER')
 
-    def change(self,operation,*,expected_revision,account_id=None,alias=None,username=None,broker='快期模拟',line='TqKq'):
+    def change(self,operation,*,expected_revision,account_id=None,alias=None,username=None,broker=None,line=None,provider='TQKQ'):
         # Catalogue mutex serializes profile and vault operations; each account
         # mutex additionally excludes its current execution owner across sessions.
         if operation=='edit' and username is not None:_error('Account identity is immutable; create a separate profile')
@@ -174,9 +211,11 @@ class AccountStore:
                 _error('Account catalogue changed; reload before applying','E_REVISION_CONFLICT')
             rows=current['accounts'];selected=current['selected_id'];row=None
             if operation=='add':
-                key,masked=account_identity(username)
-                row={'account_id':'account-'+uuid.uuid4().hex,'alias':_label(alias),'provider':'TQKQ','environment':'ONLINE_SIM',
-                     'account_key':key,'masked_login':masked,'broker':_label(broker),'line':_label(line)}
+                key,masked=account_identity(username,provider)
+                row={'account_id':'account-'+uuid.uuid4().hex,'alias':_label(alias),'provider':provider,'environment':'ONLINE_SIM',
+                     'account_key':key,'masked_login':masked,
+                     'broker':_label(broker if broker is not None else ('SimNow' if provider=='TQ_SIMNOW' else '快期模拟')),
+                     'line':_label(line if line is not None else ('TqAccount / SimNow' if provider=='TQ_SIMNOW' else 'TqKq'))}
                 locks.enter_context(AccountLock(key));rows.append(row)
             else:
                 row=next((r for r in rows if r['account_id']==account_id),None)
@@ -187,10 +226,11 @@ class AccountStore:
                     if old is not None and old['account_key']!=row['account_key']:
                         locks.enter_context(AccountLock(old['account_key']));self._settled(old)
                     selected=account_id
-                elif operation=='edit':row.update(alias=_label(alias),broker=_label(broker),line=_label(line))
+                elif operation=='edit':row.update(alias=_label(alias),broker=_label(broker if broker is not None else row['broker']),line=_label(line if line is not None else row['line']))
                 elif operation=='delete':
                     self._settled(row)
-                    self.vault.delete(self.target(row));rows.remove(row)
+                    for target in self._credential_targets(row):self.vault.delete(target)
+                    rows.remove(row)
                     if selected==account_id:selected=None
                 else:_error('Unsupported account catalogue operation')
             record={'revision':current['revision']+1,'previous_hash':current['journal_hash'],'accounts':rows,'selected_id':selected}
@@ -198,18 +238,86 @@ class AccountStore:
             publish_new_bytes(canonical_bytes(record),self.directory/'catalogue'/f"{record['revision']:08}.json")
             return self.read()
 
-    def save_credentials(self,account_id,username,password):
+    def _credential_targets(self,row):
+        target=self.target(row)
+        return (target+':trade',target+':market') if row['provider']=='TQ_SIMNOW' else (target,)
+
+    def _credential_values(self,row,username,password,market_username=None,market_password=None):
+        if account_identity(username,row['provider'])[0]!=row['account_key']:_error('Credentials belong to another account','E_CREDENTIALS')
+        _password(password)
+        if row['provider']=='TQ_SIMNOW':
+            account_identity(market_username);_password(market_password)
+            return [(self.target(row)+':trade',username,password),(self.target(row)+':market',market_username,market_password)]
+        if market_username is not None or market_password is not None:_error('KQ credentials cannot include another account','E_CREDENTIALS')
+        return [(self.target(row),username,password)]
+
+    def _save_vault_values(self,values):
+        """Validate before writing; restore existing entries on a partial failure."""
+        original={};changed=[]
+        for target,_,_ in values:
+            try:original[target]=self.vault.get(target)
+            except TraderError as error:
+                if error.code!='E_CREDENTIALS':raise
+                original[target]=None
+        try:
+            for target,username,password in values:
+                if original[target]=={'username':username,'password':password}:continue
+                self.vault.put(target,username,password);changed.append(target)
+        except Exception:
+            for target in reversed(changed):
+                before=original[target]
+                if before is None:self.vault.delete(target)
+                else:self.vault.put(target,before['username'],before['password'])
+            raise
+
+    def save_credentials(self,account_id,username,password,*,market_username=None,market_password=None):
         with AccountLock('CATALOGUE:'+str(self.directory).casefold()):
             row=self.get(account_id)
             with AccountLock(row['account_key']):
-                if account_identity(username)[0]!=row['account_key']:_error('Credentials belong to another account','E_CREDENTIALS')
-                self.vault.put(self.target(row),username,password)
+                self._save_vault_values(self._credential_values(row,username,password,market_username,market_password))
 
     def forget_credentials(self,account_id):
         with AccountLock('CATALOGUE:'+str(self.directory).casefold()):
             row=self.get(account_id)
-            with AccountLock(row['account_key']):self.vault.delete(self.target(row))
+            with AccountLock(row['account_key']):
+                for target in self._credential_targets(row):self.vault.delete(target)
 
     def credential_reference(self,account_id):
-        self.get(account_id)
-        return StoredCredential(self,account_id)
+        row=self.get(account_id)
+        reference=StoredSimNowCredential if row['provider']=='TQ_SIMNOW' else StoredCredential
+        return reference(self,account_id)
+
+    def initialize_simulation_accounts(self,values):
+        """Explicit local import of two identities; never reads files or connects.
+
+        Existing profiles and selection are retained. Only a catalogue without
+        a selected account chooses SimNow; repeated imports append no revision.
+        """
+        fields={'simnow_username','simnow_password','kq_username','kq_password'}
+        if type(values) is not dict or set(values)!=fields:_error('Expected explicit SimNow and KQ credential fields','E_CREDENTIALS')
+        for field in ('simnow','kq'):
+            account_identity(values[field+'_username'],'TQ_SIMNOW' if field=='simnow' else 'TQKQ')
+            _password(values[field+'_password'])
+        with AccountLock('CATALOGUE:'+str(self.directory).casefold()),ExitStack() as locks:
+            current=self.read();rows=list(current['accounts']);imported=[];writes=[]
+            for provider,prefix,alias,broker,line in (
+                    ('TQ_SIMNOW','simnow','SimNow 模拟账号','SimNow','TqAccount / SimNow'),
+                    ('TQKQ','kq','快期模拟账号','快期模拟','TqKq')):
+                username=values[prefix+'_username'];key,masked=account_identity(username,provider)
+                locks.enter_context(AccountLock(key))
+                row=next((item for item in rows if item['account_key']==key),None)
+                if row is None:
+                    row={'account_id':'account-'+uuid.uuid4().hex,'alias':alias,'provider':provider,'environment':'ONLINE_SIM',
+                         'account_key':key,'masked_login':masked,'broker':broker,'line':line}
+                    rows.append(row)
+                imported.append(row)
+                writes.extend(self._credential_values(row,username,values[prefix+'_password'],
+                    values['kq_username'] if provider=='TQ_SIMNOW' else None,
+                    values['kq_password'] if provider=='TQ_SIMNOW' else None))
+            selected=current['selected_id'] or imported[0]['account_id']
+            record={'revision':current['revision']+1,'previous_hash':current['journal_hash'],'accounts':rows,'selected_id':selected}
+            self._validate(record)
+            self._save_vault_values(writes)
+            if rows!=current['accounts'] or selected!=current['selected_id']:
+                publish_new_bytes(canonical_bytes(record),self.directory/'catalogue'/f"{record['revision']:08}.json")
+            return self.read()

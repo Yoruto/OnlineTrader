@@ -99,7 +99,7 @@ owner恢复的完整历史receipt与纯域receipt执行相同内容冲突检查�
 
 本版本仅使用匿名、显式development事实；本地记录器只记录请求，不生成成交或柜台结果。默认内核保持`UnavailablePort`、DISARMED，确认DSV参考配置不激活交易。本合同不覆盖在线柜台接入、真实账户资金对账、手续费、税费、资金曲线或财务盈亏报表；snapshot的`currency_pnl=None`，不能将名义点数乘一个乘数后称为已验证人民币收益。
 
-交付[dev8离线开发wheel](../dist/20261109T153510Z-32ab9701045c/online_trader-0.1.0.dev8-py3-none-any.whl)，SHA-256为`cefba85b687796fae00844b25364fcf10a09d8ddf496ebdf26643837cac27932`。[构建与干净安装审计](../output/artifacts/20261109T153510Z-32ab9701045c/wheel-audit.json)通过，报告SHA-256为`a886cc08504eb8867c297f131f4a89ad0c394ef6e3995e6a1bb29f41e24a0199`。57份Python源码及6份资源在最终597项报告、wheel和全新安装中逐字节一致，构建期间源码保持不变；未覆盖旧wheel或报告。
+交付dev8离线开发wheel，SHA-256为`cefba85b687796fae00844b25364fcf10a09d8ddf496ebdf26643837cac27932`。[构建与干净安装审计](../output/artifacts/20261109T153510Z-32ab9701045c/wheel-audit.json)通过，报告SHA-256为`a886cc08504eb8867c297f131f4a89ad0c394ef6e3995e6a1bb29f41e24a0199`。57份Python源码及6份资源在最终597项报告、wheel和全新安装中逐字节一致，构建期间源码保持不变；未覆盖旧wheel或报告。
 
 全新core环境使用`-I`和本地wheelhouse以`--no-index`安装，无Qt、QA、测试夹具或交易SDK。默认`UnavailablePort`、DSV激活拒绝和DISARMED检查通过，原dev7显式日历/单调调度边界继续通过。新增安装后真实内核检查使用匿名显式开发事件：入场分笔1+2手只计一次，源请求量3手与实际量分别显示；STOP触发参考价1035、实际平仓1034，在flat未核对时stop仍0，核对后stop为1、当日名义点数−20、净亏16；2份持久回执在重启和重复原成交后不变，`currency_pnl=None`。记录器没有生成成交；全部成交均由检查显式给出。
 

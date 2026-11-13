@@ -119,7 +119,7 @@ E:\online-trader\.venv\Scripts\python.exe -m online_trader reconcile desktop --d
 
 新增109项为CSV/纯对照40项、三格式导出21项、对照桌面19项、真实费用工作流23项及CLI6项。原701项共同纳入上述810项全量。测试覆盖行级坏值、编码与别名、价量scope/身份、重复与歧义、缺费/0/估算替代/已确认冲突、前像与源文件改变、全表回滚、三类错误Ack、冷恢复、活动/未知风险阻挡、LIVE只读、只用既有schema/scope及CSV公式/JSON脱敏/XLSX包关系和精确文本。
 
-交付[dev10离线开发wheel](../dist/20261109T173101Z-029da8818ecd/online_trader-0.1.0.dev10-py3-none-any.whl)，SHA-256为`3fa8e119bb2f5315b6979bafe8d1f9a3425595e7fdea6423a0a0555da750617c`。[构建与干净安装审计](../output/artifacts/20261109T173101Z-029da8818ecd/wheel-audit.json)通过，报告SHA-256为`4e5bc825ffc65cf2b0b65b051de8471582daf28579e28bde742bbb80fd4e645a`。67份Python源码和6份资源在810项最终报告、wheel与全新安装中逐字节一致，源码保持稳定；未覆盖旧制品。
+交付dev10离线开发wheel，SHA-256为`3fa8e119bb2f5315b6979bafe8d1f9a3425595e7fdea6423a0a0555da750617c`。[构建与干净安装审计](../output/artifacts/20261109T173101Z-029da8818ecd/wheel-audit.json)通过，报告SHA-256为`4e5bc825ffc65cf2b0b65b051de8471582daf28579e28bde742bbb80fd4e645a`。67份Python源码和6份资源在810项最终报告、wheel与全新安装中逐字节一致，源码保持稳定；未覆盖旧制品。
 
 全新core环境以`-I`、本地wheelhouse及`--no-index`安装，不含Qt、QA、测试夹具或交易SDK。原默认禁开/激活拒绝、策略/保护/撤改/调度/名义/资金smoke继续通过。新增原生未知费用样本在关闭内核后精确登记3/6元：单事件、1份维护boot、2笔STATEMENT fee_observations及1份费用回执，净收益−639，原成交/分配未变、DISARMED；同文件、改名及GB18030同义文件重复不追加事件或费用，外部多余行不生成fill。API/CLI三格式导出、不覆盖、旧hash/错scope/LIVE拒绝、展示JSON不可登记等检查均通过。
 

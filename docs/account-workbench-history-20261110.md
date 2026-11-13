@@ -60,6 +60,6 @@
 
 [本轮最终审计](../output/workbench/dev18-final-audit.json)绑定当前源码、测试、制品与桌面证据，同时复核原dev15实际账本/重新登录哈希及[开发前dev17归档](../output/baselines/20261110T083012Z-dev17-before-workbench-75a63d54/manifest.json)均未变化。
 
-[开发wheel](../dist/20261110T091807Z-dev18-2f2dc48a/online_trader-0.1.0.dev18-py3-none-any.whl) SHA-256：`cee02a0fff9b160a74eaa32e81a61b8fd81c6f12e2e1c242bf0c7750ae16dddd`。没有发布、安装服务、添加定时任务或修改独立SDK环境。早期1176/1177项检查及中间dev18制品继续保留，不能作为本次最终源码/验证输入的替代报告。
+开发wheel SHA-256：`cee02a0fff9b160a74eaa32e81a61b8fd81c6f12e2e1c242bf0c7750ae16dddd`。没有发布、安装服务、添加定时任务或修改独立SDK环境。早期1176/1177项检查及中间dev18制品继续保留，不能作为本次最终源码/验证输入的替代报告。
 
 真实自动入场、实际保护成交、在线故障/带仓重启、账户切换实机行为及在线持仓GUI尚未验收。完整工作台还缺运行中逐品种启停、通用双向人工计划授权、外部活动分类/初始接管、完整日志检索和K线展示；通知、服务、更新、Windows发行及耐久/性能验收仍保留在96项清单。

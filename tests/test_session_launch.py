@@ -5,6 +5,8 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
@@ -13,10 +15,12 @@ from online_trader.accounts import AccountStore
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes
+from online_trader.cli import main as cli_main
 from online_trader.desktop.session import SessionDialog
 from online_trader.desktop.accounts import AccountDialog
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq_dsv import TqKqDsvPort
+from online_trader.gateway.simnow import SimNowDsvPort
 from online_trader.runtime.instance import AccountLock
 from online_trader.runtime.launch import SessionLauncher
 from online_trader.runtime.dsv_simulation import run
@@ -61,6 +65,91 @@ class SessionLaunchTests(unittest.TestCase):
         self.assertEqual(result['status'],'PROCESS_LAUNCHED_NOT_CONNECTED');self.assertFalse(result['broker_connected'])
         scope=Path(argv[argv.index('--scope')+1]);self.assertEqual(scope.parent,self.root/'offline-mocked-run')
         self.assertEqual(scope.read_bytes(),canonical_bytes(self.grant.value))
+
+    def saved_simnow_launcher(self):
+        state=self.store.change('add',expected_revision=self.store.read()['revision'],alias='SimNow 离线档案',
+            username='offline-simnow-launch',provider='TQ_SIMNOW',broker='SimNow',line='TqAccount')
+        row=next(account for account in state['accounts'] if account['provider']=='TQ_SIMNOW')
+        self.store.change('select',expected_revision=state['revision'],account_id=row['account_id'])
+        grant=fixtures.scope_for(self.store.ledger_path(row),self.profile,self.calendar,
+            schema_version='SIMNOW_DSV_SIM/1',trading_days=['2026-11-10'],resume_entries_on_day_change=False,
+            account_fingerprint=row['account_key'].split(':')[-1])
+        self.paths[0].write_bytes(canonical_bytes(grant.value))
+        return SessionLauncher(self.store,row['account_id'],*self.paths),row,grant
+
+    def test_saved_simnow_review_and_dialog_remain_offline(self):
+        launcher,row,grant=self.saved_simnow_launcher()
+        with (patch.object(self.vault,'get') as get,patch.object(SimNowDsvPort,'connect') as connect,
+              patch('subprocess.Popen') as spawn):
+            review=launcher.review()
+            dialog=SessionDialog(self.store,row['account_id'])
+            try:
+                for key,path in zip(('scope','profile','calendar'),self.paths):dialog.fields[key].setText(str(path))
+                dialog.prepare();self.assertEqual(dialog.review_result,review)
+            finally:dialog.close()
+            get.assert_not_called();connect.assert_not_called();spawn.assert_not_called()
+        self.assertEqual(review['account_key'],grant.account_key)
+        self.assertEqual(review['entry_authority'],'DISARMED')
+        self.assertFalse(self.store.ledger_path(row).exists())
+
+    def test_saved_simnow_launch_routes_provider_without_exporting_credentials(self):
+        launcher,row,grant=self.saved_simnow_launcher()
+        review=launcher.review()
+        with (patch.object(self.vault,'get') as get,
+              patch('subprocess.run',return_value=SimpleNamespace(returncode=0)),
+              patch('subprocess.Popen',return_value=SimpleNamespace(pid=123)) as spawn):
+            launcher.launch(sys.executable,self.root/'simnow-mocked-run',expected_review_hash=review['review_hash'],
+                now=datetime.fromisoformat('2026-11-10T02:00:00Z'))
+            get.assert_not_called()
+        argv=spawn.call_args.args[0]
+        self.assertEqual(argv[argv.index('online_trader')+1:argv.index('online_trader')+3],['simnow','run'])
+        self.assertIn('--account-store',argv);self.assertNotIn('--credentials',argv);self.assertNotIn('--arm',argv)
+        self.assertNotIn('offline-simnow-launch',' '.join(argv))
+        self.assertEqual(argv[argv.index('--account-id')+1],row['account_id'])
+
+    def test_saved_simnow_review_rejects_provider_mismatch_even_with_same_key(self):
+        launcher,row,grant=self.saved_simnow_launcher()
+        with patch.object(self.store,'get',return_value=row|{'provider':'TQKQ'}),self.assertRaises(TraderError):
+            launcher.review()
+
+    def test_cli_saved_simnow_run_passes_only_bound_credential_reference(self):
+        launcher,row,grant=self.saved_simnow_launcher()
+        argv=['simnow','run','--account-store',str(self.store.directory),'--account-id',row['account_id'],
+              '--output',str(self.root/'not-created')]
+        for key,path in zip(('scope','profile','calendar'),self.paths):argv.extend(['--'+key,str(path)])
+        with (patch('online_trader.accounts.AccountStore',return_value=self.store),
+              patch.object(self.vault,'get') as get,
+              patch('online_trader.runtime.dsv_simulation.run',return_value=0) as execute):
+            self.assertEqual(cli_main(argv),0)
+            get.assert_not_called()
+        reference=execute.call_args.args[1]
+        self.assertEqual(reference.account_id,row['account_id'])
+        self.assertEqual(reference.store,self.store)
+        self.assertFalse((self.root/'not-created').exists())
+
+    def test_cli_saved_simnow_scope_is_offline_and_rejects_other_provider(self):
+        launcher,row,grant=self.saved_simnow_launcher()
+        output=self.root/'saved-simnow-scope.json'
+        argv=['simnow','scope','--account-store',str(self.store.directory),
+              '--ledger',str(self.store.ledger_path(row)),'--output',str(output),
+              '--profile',str(self.paths[1]),'--calendar',str(self.paths[2]),'--contract','DCE.p2701',
+              '--trading-day','2026-11-10','--not-before-utc','2026-11-10T01:00:00Z',
+              '--not-after-utc','2026-11-10T07:00:00Z','--max-order-quantity','10',
+              '--opening-attempts','20','--risk-budget','1000000','--authorization-reference','OFFLINE_TEST']
+        with (patch('online_trader.accounts.AccountStore',return_value=self.store),
+              patch.object(self.vault,'get') as get,patch.object(SimNowDsvPort,'connect') as connect,
+              redirect_stdout(StringIO())):
+            self.assertEqual(cli_main(argv),0)
+            get.assert_not_called();connect.assert_not_called()
+        from online_trader.contracts.codec import strict_loads
+        value=strict_loads(output.read_bytes())
+        self.assertEqual(value['schema_version'],'SIMNOW_DSV_SIM/1')
+        self.assertEqual(value['account_fingerprint'],row['account_key'].split(':')[-1])
+        output.unlink()
+        with (patch('online_trader.accounts.AccountStore',return_value=self.store),
+              patch.object(self.store,'get',return_value=self.row),redirect_stderr(StringIO())):
+            self.assertEqual(cli_main(argv),2)
+        self.assertFalse(output.exists())
 
     def test_portable_launch_probes_sibling_cli_and_keeps_original_scope_arguments(self):
         executable=self.root/'OnlineTraderCLI.exe'

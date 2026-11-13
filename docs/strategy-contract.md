@@ -6,7 +6,7 @@
 
 完整独立检查 **316项通过，0失败/错误/跳过**，见[确切报告](../output/checks/20261109T101120Z-4ef7befd/result.json)及[逐项日志](../output/checks/20261109T101120Z-4ef7befd/check.log)。产品源码在检查期间未变，编译、G0资源完整性、导入边界和pip check通过。新增83项包括信号28、风控17、停开7、计划编译10及真实内核/SQLite整合21，原233项同时通过。
 
-交付[dev4离线wheel](../dist/20261109T101420Z-2d7115ba58b2/online_trader-0.1.0.dev4-py3-none-any.whl)，SHA-256为`7bd67ebe42d38507a3ca1a9ead43f4ab1ca644c938d66232174294fa287be080`。[构建与干净安装审计](../output/artifacts/20261109T101420Z-2d7115ba58b2/wheel-audit.json)确认48份Python源码和4份资源在最终检查、wheel及全新安装中逐字节一致，包内无QA、测试或DSV业务字节码。独立core环境以`-I`和`--no-index`安装，无Qt或交易SDK；默认策略激活被拒绝，显式开发激活仍禁开，再明确授权后只记录1次STRATEGY请求，计划为DEVELOPMENT、确认成交量为0。
+交付dev4离线wheel，SHA-256为`7bd67ebe42d38507a3ca1a9ead43f4ab1ca644c938d66232174294fa287be080`。[构建与干净安装审计](../output/artifacts/20261109T101420Z-2d7115ba58b2/wheel-audit.json)确认48份Python源码和4份资源在最终检查、wheel及全新安装中逐字节一致，包内无QA、测试或DSV业务字节码。独立core环境以`-I`和`--no-index`安装，无Qt或交易SDK；默认策略激活被拒绝，显式开发激活仍禁开，再明确授权后只记录1次STRATEGY请求，计划为DEVELOPMENT、确认成交量为0。
 
 ## DSV规则证据
 

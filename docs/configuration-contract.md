@@ -8,7 +8,7 @@
 
 新增45项包含配置域18、账本12、Qt参数中心7、CLI/文件工作流8；原188项同时通过。参数域和CLI覆盖非法输入、凭据过滤、零值/关闭值保留、大数精度、导出失败无半文件；新窗口通过Qt专项并留有原生Windows截图。本轮不宣称完整产品桌面、在线交易或长稳验收。
 
-开发制品为 [online_trader-0.1.0.dev3-py3-none-any.whl](../dist/20261109T083947Z-f3be4dcbf492/online_trader-0.1.0.dev3-py3-none-any.whl)，SHA-256 `c81767b2d55348ad51fce24b326daf00b04917ffe27060d1dd63bdec2470a876`。[构建审计报告](../output/artifacts/20261109T083947Z-f3be4dcbf492/wheel-audit.json)核对43份Python源码及4份资源与最终检查、wheel、全新安装内容逐字节一致；本地wheelhouse离线安装及无Qt/柜台SDK的核心基准查看、参考登记、只读历史通过。登记后authority仍为DISARMED/config1。旧候选与旧检查证据保留；本段链接才是本轮最终制品。
+开发制品为 `online_trader-0.1.0.dev3-py3-none-any.whl`，SHA-256 `c81767b2d55348ad51fce24b326daf00b04917ffe27060d1dd63bdec2470a876`。[构建审计报告](../output/artifacts/20261109T083947Z-f3be4dcbf492/wheel-audit.json)核对43份Python源码及4份资源与最终检查、wheel、全新安装内容逐字节一致；本地wheelhouse离线安装及无Qt/柜台SDK的核心基准查看、参考登记、只读历史通过。登记后authority仍为DISARMED/config1。旧候选与旧检查证据保留；本段链接才是本轮最终制品。
 
 ## 业务确认与执行配置分开
 

@@ -40,7 +40,7 @@ DSV 截图累计报单 6，夜盘柜台逐笔合计是 6 笔开仓和 6 笔平�
 
 11 月 11 日上午只读双通道对比有 33,139 条共同 Tick，已对齐样本的盘口和日高低一致。这个样本支持比较具体触发，无法覆盖所有推送到达时间、取事实耗时和柜台返回。五合约偏移用同一份真实日线、振幅和设置调用 DSV 原函数，三个偏移逐项一致。早先白银 `100／15／60` 是旧保存零值被 DSV 启动分支修正的结果。统一计算的结果是 `96／15／139`，两边都已用该值。
 
-证据：[夜盘实盘式模拟逐笔和收盘档案](paired-night-simulation-20261111.md) · [dev26 修复、原样本复算和剩余证据](dev26-night-regressions-20261112.md) · [同输入 DSV 原函数复算](dsv-same-input-calculation-20261110.md) · [统一参数回读](matched-parameters-applied-20261110.md)
+证据：[夜盘实盘式模拟逐笔和收盘档案](paired-night-simulation-20261111.md) · [dev26 修复、原样本复算和剩余证据](history/releases/dev26-night-regressions-20261112.md) · [同输入 DSV 原函数复算](dsv-same-input-calculation-20261110.md) · [统一参数回读](matched-parameters-applied-20261110.md)
 
 ## 2. 当时为什么做出了这些差异
 
@@ -53,7 +53,7 @@ DSV 截图累计报单 6，夜盘柜台逐笔合计是 6 笔开仓和 6 笔平�
 | 夜盘真实对跑 | 才出现两个柜台的缺省字段、迟到 Tick、首个可入场分钟、交易日归属、重连回补和真实状态读取问题 | 本应在上线前用同样的事件流、账户事实和逐笔比对覆盖这些边界。已有离线和无订单对照不能给这几项放行 |
 | 其余未完成项 | 通知、Excel、原生图表、资料导入、换月、无人值守、发行等在原清单仍是部分或待办 | 早期阶段侧重内核、模拟交易和恢复，界面移植后保留了能力缺口。各个缺口没有单独决策记录的，本文不推定当时的动机 |
 
-证据：[历史规格 v0.3](<E:/Futures Trading Assistant/Futures Trading Assistant/docs/在线量化交易软件_全功能覆盖与实施计划_v0.3.md:8>) · [B01–B20 确认记录](decisions/dsv-confirmation-20261109.json) · [dev17 执行链](dsv-online-strategy-20261110.md) · [dev18 工作台](account-workbench-history-20261110.md) · [八页桌面交付记录](paired-simulation-desktop-20261111.md) · [八页烟测原档](../output/windows-app/dsv-layout-20261111/ui-smoke.json) · [dev27 按钮结果](dev27-workbench-buttons-20261112.md)
+证据：[历史规格 v0.3](<E:/Futures Trading Assistant/Futures Trading Assistant/docs/在线量化交易软件_全功能覆盖与实施计划_v0.3.md:8>) · [B01–B20 确认记录](decisions/dsv-confirmation-20261109.json) · [dev17 执行链](dsv-online-strategy-20261110.md) · [dev18 工作台](account-workbench-history-20261110.md) · [八页桌面交付记录](paired-simulation-desktop-20261111.md) · [八页烟测原档](../output/windows-app/dsv-layout-20261111/ui-smoke.json) · [dev27 按钮结果](history/releases/dev27-workbench-buttons-20261112.md)
 
 
 ## 3. 八页桌面逐页对照
@@ -70,7 +70,7 @@ DSV 截图累计报单 6，夜盘柜台逐笔合计是 6 笔开仓和 6 笔平�
 | 偏移计算 | 公式、上下限，一键联网、离线重算、复制文本，可应用到主控品种 | 有公式、上下限、系数、离线输入／缓存、复制、依据导出和预览应用。桌面缺同样的一键联网取数和直接更新主控配置，主连、基准、振幅、天花板和历史 MAE 等列也未逐列展开。单独的真实取数加 DSV 原函数对比已证五合约结果一致 |
 | 系统设置 | 声音测试、事件开关、钉钉地址、通知人、节流、密钥、测试推送，多账号管理，停止时撤单、关闭进托盘、两图分别开关 | 配对模式显示 SimNow 设置与 DSV 对照日志。快期档案管理及 Windows 凭据入口在独立模式。缺声音、钉钉、按事件提醒、停止时自动撤全部挂单及托盘，两图用统一开关。关闭窗口保留后台的行为有别 |
 
-证据：[八页界面源码](../src/online_trader/desktop/workbench_layout.py) · [桌面操作命令](../src/online_trader/desktop/workbench.py) · [参数和模板源码](../src/online_trader/desktop/settings.py) · [报表源码](../src/online_trader/desktop/reports.py) · [DSV 手工报撤和停止静态证据](strategy-dsv-evidence.md#手工通道的不同语义) · [已安装 dev27 按钮核验](dev27-workbench-buttons-20261112.md)
+证据：[八页界面源码](../src/online_trader/desktop/workbench_layout.py) · [桌面操作命令](../src/online_trader/desktop/workbench.py) · [参数和模板源码](../src/online_trader/desktop/settings.py) · [报表源码](../src/online_trader/desktop/reports.py) · [DSV 手工报撤和停止静态证据](strategy-dsv-evidence.md#手工通道的不同语义) · [已安装 dev27 按钮核验](history/releases/dev27-workbench-buttons-20261112.md)
 
 ## 4. 原 96 项逐项审计
 

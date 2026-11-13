@@ -248,6 +248,7 @@ def workbench_view(kernel):
     if scoped:
         if runtime is not None:
             trade=runtime.profile.to_record()['settings']['trade']
+            result['configuration']['strategy_profile_hash']=runtime.profile.content_hash
             result['configuration']['cancel_on_stop']=trade['cancel_on_stop']
             result['configuration']['manual_close_price_mode']=trade['close_price_mode']
             result['configuration']['stop_cancel_pending']=kernel.control.stop_cancel_pending()
@@ -256,7 +257,14 @@ def workbench_view(kernel):
                 try:result['configuration']['margin_alert_grace']=(port.clock.now()-port.started_at).total_seconds()<60
                 except TraderError:pass
         result['configuration']['manual_workbench']=kernel.simulation.grant.manual_workbench
-        result['configuration']['scoped_contracts']=kernel.simulation.grant.value['contracts']
+        contracts = kernel.simulation.grant.value['contracts']
+        result['configuration']['scoped_contracts'] = contracts
+        if runtime is not None:
+            fields = ('name', 'code', 'open_offset', 'stop_offset', 'profit_offset',
+                      'order_volume', 'half_close_ratio', 'hysteresis_points')
+            result['configuration']['strategy_symbols'] = [
+                {key: symbol[key] for key in fields} for code, symbol in symbols.items() if code in contracts
+            ]
         result['configuration']['gateway_identity']=port.gateway_identity
         result['configuration']['calendar_hash']=kernel.simulation.grant.value['calendar_hash']
         result['external_positions']=external_positions
@@ -278,7 +286,7 @@ def workbench_view(kernel):
             opening_orders=sum(order['effect']=='OPEN' and order['native_trading_day']==day and
                 order['native_order_id'] in native_ids for order in orders)
             result['account_metrics']={key:funds.get(key) for key in
-                ('balance','available','margin','risk_ratio','pre_balance','close_profit','position_profit','commission')}
+                ('balance','available','margin','risk_ratio','pre_balance','close_profit','position_profit','float_profit','commission')}
             result['account_metrics'].update(trading_day=day,opening_orders=opening_orders)
     # Every table has an explicit cap. Keep the last records; state that the view
     # is incomplete and disable bulk actions at the desktop when it is truncated.

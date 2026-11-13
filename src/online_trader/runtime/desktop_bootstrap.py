@@ -1,0 +1,273 @@
+"""User-confirmed desktop startup over the existing finite simulation owner.
+
+The GUI snapshots business parameters and a selected account only. This child
+process acquires read-only market metadata, closes that reader, and derives the
+bounded internal files before entering the original strategy execution path.
+Request construction is entirely offline and does not read the credential vault.
+"""
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+import sqlite3
+import uuid
+
+from online_trader.accounts import AccountStore
+from online_trader.configuration.dsv import DsvProfile
+from online_trader.configuration.files import publish_new_bytes
+from online_trader.configuration.offsets import dsv_startup_profile
+from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
+from online_trader.domain.values import decimal_text, decimal_value, identifier
+from online_trader.errors import TraderError
+from online_trader.online_scope import DsvSimulationGrant
+from online_trader.runtime import dsv_simulation
+from online_trader.runtime.instance import AccountLock
+from online_trader.scheduling.calendar import TradingCalendar, _utc
+
+
+REQUEST_SCHEMA = 'DESKTOP_START/1'
+REQUEST_LIFETIME = timedelta(minutes=10)
+MAX_REQUEST_BYTES = 1024 * 1024
+_REQUEST_KEYS = {'schema_version', 'request_id', 'created_at_utc', 'expires_at_utc',
+    'account_store', 'account_id', 'account_key', 'provider', 'profile', 'profile_hash',
+    'arm', 'confirmed'}
+_PHASE_MESSAGES = {
+    'STARTUP_CHECKING': '正在核对账号与本次启动请求',
+    'STARTUP_READING_MARKET': '正在连接行情并核对交易日、交易时段和合约信息',
+    'STARTUP_PREPARED': '交易时段已核对，正在启动所选模拟盘策略',
+}
+ERROR_MESSAGES = {
+    'E_DESKTOP_START_REQUEST': '启动请求已过期或内容发生变化，请重新点击启动策略。',
+    'E_DESKTOP_START_REPLAY': '本次启动请求已经执行，请查看原运行状态，避免重复启动。',
+    'E_DESKTOP_START_LIMITS': '请在交易参数中设置有效的最大手数和每品种最大报单数。',
+    'E_DESKTOP_START_RECOVERY': '该账号已有策略运行记录，请恢复原运行并核对持仓；不会创建新账本覆盖历史。',
+    'E_INSTANCE_EXISTS': '该账号的策略执行器已在运行，请刷新工作台查看。',
+    'E_FACT_BARRIER': '该账号有持仓、委托或未知结果需要核对，请先恢复原策略运行。',
+    'E_SCOPE': '所选账号或运行范围已变化，请重新确认。',
+    'E_CALENDAR_INCOMPLETE': '当前交易日或合约时段未能完整核对，策略尚未启动。',
+    'E_CREDENTIALS': '账号凭据不完整或不可用，请在账号信息中重新保存。',
+    'E_GATEWAY_CONNECT': '模拟账号或行情连接未成功，请检查账号和网络后重新启动。',
+    'E_STARTUP_METADATA': '未能取得完整的交易日历或合约资料，请检查行情连接和品种代码。',
+    'E_STARTUP_METADATA_TIMEOUT': '读取交易日历或合约资料超时，请检查行情网络后重新启动。',
+    'E_STARTUP_METADATA_CLOSE': '行情资料连接未正常关闭，策略启动已停止。',
+    'E_DEPENDENCY': '模拟运行组件不可用，请检查已安装的程序环境。',
+    'E_CLOCK': '本机时间与参考时钟偏差超过允许范围，请先核对系统时间。',
+}
+
+
+def _now(value=None):
+    value = value or datetime.now(timezone.utc)
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise TraderError('E_DESKTOP_START_REQUEST', 'An explicit aware startup time is required')
+    return value.astimezone(timezone.utc)
+
+
+def _stamp(value):
+    return value.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def _selected(store, account_id):
+    row = store.get(account_id)
+    if store.read()['selected_id'] != account_id or row['environment'] != 'ONLINE_SIM' or row['provider'] not in {'TQKQ', 'TQ_SIMNOW'}:
+        raise TraderError('E_SCOPE', 'Only the selected simulation account may start')
+    return row
+
+
+def _limits(profile):
+    settings = profile.to_record()['settings']
+    maximum = settings['trade']['max_volume']
+    per_contract = settings['trade']['max_daily_orders']
+    count = len(settings['symbols'])
+    if not 1 <= count <= 11 or maximum <= 0 or per_contract <= 0 or per_contract * count > 2147483647:
+        raise TraderError('E_DESKTOP_START_LIMITS', ERROR_MESSAGES['E_DESKTOP_START_LIMITS'])
+    return maximum, per_contract * count
+
+
+def build_start_request(store, account_id, profile, *, arm=True, now=None):
+    """Called after the user's start confirmation. Never connects or reads secrets."""
+    if not isinstance(profile, DsvProfile) or type(arm) is not bool:
+        raise TraderError('E_DESKTOP_START_REQUEST', 'Expected a business profile and explicit startup intent')
+    row = _selected(store, account_id)
+    _limits(profile)
+    instant = _now(now)
+    return {'schema_version': REQUEST_SCHEMA, 'request_id': 'desktop-' + uuid.uuid4().hex,
+        'created_at_utc': _stamp(instant), 'expires_at_utc': _stamp(instant + REQUEST_LIFETIME),
+        'account_store': str(store.directory.resolve()), 'account_id': account_id,
+        'account_key': row['account_key'], 'provider': row['provider'],
+        'profile': profile.to_record(), 'profile_hash': profile.content_hash,
+        'arm': arm, 'confirmed': True}
+
+
+def _request(path, instant):
+    try:
+        with Path(path).open('rb') as stream:
+            raw = stream.read(MAX_REQUEST_BYTES + 1)
+        value = strict_loads(raw)
+        if len(raw) > MAX_REQUEST_BYTES or type(value) is not dict or set(value) != _REQUEST_KEYS:
+            raise ValueError()
+        if value['schema_version'] != REQUEST_SCHEMA or value['confirmed'] is not True or type(value['arm']) is not bool:
+            raise ValueError()
+        identifier(value['request_id'])
+        created, expiry = _utc(value['created_at_utc']), _utc(value['expires_at_utc'])
+        if not created <= instant < expiry or expiry - created != REQUEST_LIFETIME:
+            raise ValueError()
+        directory = Path(value['account_store'])
+        if not directory.is_absolute():
+            raise ValueError()
+        profile = DsvProfile.from_record(value['profile'])
+        if value['profile_hash'] != profile.content_hash:
+            raise ValueError()
+        _limits(profile)
+        return value, profile
+    except (OSError, ValueError, TypeError, KeyError, TraderError) as error:
+        if isinstance(error, TraderError) and error.code == 'E_DESKTOP_START_LIMITS':
+            raise
+        raise TraderError('E_DESKTOP_START_REQUEST', ERROR_MESSAGES['E_DESKTOP_START_REQUEST']) from None
+
+
+def _check_existing_ledger(store, row):
+    # Existing unresolved state must be managed by its original immutable grant.
+    # Even closed cycles remain in _staged and bind that owner to its original
+    # grant; do not make a fresh scope that will only fail after account login.
+    store._settled(row)
+    ledger = store.ledger_path(row)
+    if not ledger.exists():
+        return
+    try:
+        connection = sqlite3.connect(ledger.as_uri() + '?mode=ro', uri=True, timeout=1)
+        try:
+            connection.execute('PRAGMA query_only=ON')
+            if connection.execute('SELECT 1 FROM position_cycles LIMIT 1').fetchone():
+                raise TraderError('E_DESKTOP_START_RECOVERY', ERROR_MESSAGES['E_DESKTOP_START_RECOVERY'])
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        raise TraderError('E_DESKTOP_START_RECOVERY', ERROR_MESSAGES['E_DESKTOP_START_RECOVERY']) from None
+
+
+def compile_start_scope(request, store, metadata, *, now=None):
+    """Compile supplied native facts; no connection, time guesses, or writes."""
+    instant = _now(now)
+    source_profile = DsvProfile.from_record(request['profile'])
+    if source_profile.content_hash != request['profile_hash']:
+        raise TraderError('E_DESKTOP_START_REQUEST', ERROR_MESSAGES['E_DESKTOP_START_REQUEST'])
+    row = _selected(store, request['account_id'])
+    if row['account_key'] != request['account_key'] or row['provider'] != request['provider']:
+        raise TraderError('E_SCOPE', ERROR_MESSAGES['E_SCOPE'])
+    codes = [symbol['code'] for symbol in source_profile.to_record()['settings']['symbols']]
+    try:
+        if metadata['provider'] != row['provider'] or set(metadata['instruments']) != set(codes):
+            raise ValueError()
+        observed = _utc(metadata['observed_at_utc'])
+        if not timedelta(0) <= instant - observed <= timedelta(minutes=2):
+            raise ValueError()
+        calendar = TradingCalendar.from_record(metadata['calendar'])
+        record = calendar.to_record()
+        day = metadata['trading_day']
+        if not record['complete'] or {item['contract_id'] for item in record['contracts']} != set(codes):
+            raise ValueError()
+        ends = []
+        for item in record['contracts']:
+            sessions = item['sessions']
+            if not sessions or any(session['trading_day'] != day for session in sessions):
+                raise ValueError()
+            closes = [_utc(s['close_utc']) for s in sessions if s['force_close_at_end']]
+            if not closes or max(closes) <= instant:
+                raise ValueError()
+            ends.extend(closes)
+        end = max(ends)
+        # A single cabinet day can begin on Friday night and finish on Monday.
+        # The metadata reader proves the intervening trading-date flags and
+        # rejects unconfirmed holiday-night gaps; do not truncate that day at
+        # an arbitrary 36-hour wall-clock boundary.
+        if end - instant > timedelta(days=4):
+            raise ValueError()
+        if not _utc(record['coverage_from_utc']) <= instant < end <= _utc(record['coverage_to_utc']):
+            raise ValueError()
+        effective = dsv_startup_profile(source_profile)
+        maximum, attempts = _limits(effective)
+        components = []
+        for symbol in effective.to_record()['settings']['symbols']:
+            multiplier = decimal_value(metadata['instruments'][symbol['code']]['multiplier'], positive=True)
+            exposure = decimal_value(symbol['stop_offset'], positive=True) * multiplier * maximum
+            components.append({'contract_id': symbol['code'], 'stop_distance': symbol['stop_offset'],
+                'multiplier': decimal_text(multiplier), 'maximum_lots': maximum,
+                'nominal_stop_exposure': decimal_text(exposure)})
+        risk_budget = decimal_text(sum((Decimal(item['nominal_stop_exposure']) for item in components), Decimal(0)))
+        decimal_value(risk_budget, positive=True)
+    except (KeyError, TypeError, ValueError, TraderError):
+        raise TraderError('E_CALENDAR_INCOMPLETE', ERROR_MESSAGES['E_CALENDAR_INCOMPLETE']) from None
+    value = {'schema_version': 'SIMNOW_DSV_SIM/1' if row['provider'] == 'TQ_SIMNOW' else 'KQ_DSV_SIM/2',
+        'grant_id': request['request_id'], 'account_fingerprint': row['account_key'].split(':')[-1],
+        'ledger_path': str(store.ledger_path(row)), 'contracts': codes, 'trading_day': day,
+        'trading_days': [day], 'resume_entries_on_day_change': False,
+        'not_before_utc': _stamp(instant), 'not_after_utc': _stamp(end),
+        'max_order_quantity': maximum, 'opening_attempts': attempts, 'risk_budget': risk_budget,
+        'profile_hash': effective.content_hash, 'calendar_hash': calendar.content_hash,
+        'authorization_reference': 'DESKTOP_CONFIRM:' + content_hash(request)}
+    grant = DsvSimulationGrant.parse(canonical_bytes(value))
+    dsv_simulation.validate_inputs(grant, effective, calendar)
+    details = {'request_hash': content_hash(request), 'source_profile_hash': source_profile.content_hash,
+        'effective_profile_hash': effective.content_hash, 'calendar_hash': calendar.content_hash,
+        'trading_day': day, 'provider': row['provider'], 'nominal_risk_ceiling': risk_budget,
+        'nominal_risk_components': components, 'max_order_quantity_source': 'DSV max_volume',
+        'opening_attempts_source': 'DSV max_daily_orders per contract times configured contract count',
+        'startup_offset_policy': 'DSV original integer conversion and zero repair 100/15/60',
+        'metadata_observed_at_utc': metadata['observed_at_utc'],
+        'calendar_source': metadata.get('source', 'Injected metadata for offline verification'),
+        'existing_plans_changed': False,
+        'source_parameters_changed': False, 'entry_authority': 'DISARMED'}
+    return grant, effective, calendar, details
+
+
+def run_desktop_start(request_path, output, *, now=None):
+    """Explicit child entry; called only after desktop confirmation, never by preview."""
+    directory = Path(output).resolve()
+    directory.mkdir(parents=True, exist_ok=False)
+    instant = _now(now)
+    try:
+        request, source_profile = _request(request_path, instant)
+        store = AccountStore(request['account_store'])
+        row = _selected(store, request['account_id'])
+        if row['account_key'] != request['account_key'] or row['provider'] != request['provider']:
+            raise TraderError('E_SCOPE', ERROR_MESSAGES['E_SCOPE'])
+        def phase(index, name, **extra):
+            publish_new_bytes(canonical_bytes({'phase': name, 'message': _PHASE_MESSAGES[name],
+                'entry_authority': 'DISARMED', **extra}), directory / f'phase-{index:03}-bootstrap.json')
+        phase(0, 'STARTUP_CHECKING')
+        with AccountLock(row['account_key']) as lease:
+            _check_existing_ledger(store, row)
+            claim = store.directory / 'desktop-start-claims' / (request['request_id'] + '.json')
+            if claim.exists():
+                raise TraderError('E_DESKTOP_START_REPLAY', ERROR_MESSAGES['E_DESKTOP_START_REPLAY'])
+            publish_new_bytes(canonical_bytes({'request_hash': content_hash(request),
+                'output': str(directory), 'created_at_utc': _stamp(instant)}), claim)
+            publish_new_bytes(canonical_bytes(request), directory / 'confirmed-request.json')
+            phase(1, 'STARTUP_READING_MARKET')
+            from online_trader.runtime.startup_metadata import read_metadata
+            codes = [symbol['code'] for symbol in source_profile.to_record()['settings']['symbols']]
+            reference = store.credential_reference(row['account_id'])
+            metadata = read_metadata(reference, codes, now=instant)
+            current = _now(now)
+            if current >= _utc(request['expires_at_utc']):
+                raise TraderError('E_DESKTOP_START_REQUEST', ERROR_MESSAGES['E_DESKTOP_START_REQUEST'])
+            grant, effective, calendar, details = compile_start_scope(request, store, metadata, now=current)
+            for name, record in (('scope.json', grant.value), ('profile.json', effective.to_record()),
+                                 ('calendar.json', calendar.to_record()), ('startup-preparation.json', details)):
+                publish_new_bytes(canonical_bytes(record), directory / name)
+            phase(2, 'STARTUP_PREPARED', account_key=row['account_key'],
+                  trading_day=grant.value['trading_day'], pipe=store.pipe_name(row))
+            # The metadata connection has closed. Transfer the still-held
+            # account lease to the original owner so another window cannot
+            # switch accounts or race a second login between these phases.
+            row = _selected(store, request['account_id'])
+            return dsv_simulation.run(directory / 'scope.json', reference, directory / 'profile.json',
+                directory / 'calendar.json', directory, pipe=store.pipe_name(row), arm=request['arm'],
+                _execution_lock=lease)
+    except Exception as error:
+        code = error.code if isinstance(error, TraderError) else 'E_DESKTOP_START'
+        failure = {'status': 'STARTUP_FAILED', 'error_code': code, 'entry_authority': 'DISARMED',
+            'message': ERROR_MESSAGES.get(code, '启动未完成，请检查网络与模拟连接状态后重试。')}
+        path = directory / 'startup-failure.json'
+        if not path.exists():
+            publish_new_bytes(canonical_bytes(failure), path)
+        return 2

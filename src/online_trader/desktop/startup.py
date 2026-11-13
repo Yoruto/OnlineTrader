@@ -1,0 +1,200 @@
+"""Start the selected simulation directly and report progress in the workbench."""
+from pathlib import Path
+
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
+
+from online_trader.contracts.codec import canonical_bytes, strict_loads
+from online_trader.configuration.files import publish_new_bytes
+from online_trader.errors import TraderError
+
+
+START_ERRORS = {
+    'E_DSV_PROFILE': '无法核对 DSV 参数，请在策略主控选择 DSV 配置。',
+    'E_DSV_PROFILE_CHANGED': 'DSV 参数已变化，请核对列表后重新启动。若保留着本地编辑，请先重读 DSV 参数。',
+    'E_DEPENDENCY': '交易连接组件不可用，请检查本机已配置的交易环境。',
+    'E_CREDENTIALS': '账号或密码未保存完整，请到「账号信息 → 账户管理」核对。',
+    'E_GATEWAY_CONNECT': '模拟盘连接失败，请核对账号、密码及网络后重试。',
+    'E_CLOCK': '本机时间与交易参考时间不一致，请先校准 Windows 时间。',
+    'E_ACCOUNT_LOCKED': '该账号已有运行程序，请先查看原来的运行状态。',
+    'E_INSTANCE_EXISTS': '该账号已有运行程序，请先查看原来的运行状态。',
+    'E_INSTANCE_LOCK': '账号状态暂时无法锁定，请稍后重试。',
+    'E_ALREADY_RUNNING': '该账号已有运行程序，请先查看原来的运行状态。',
+    'E_SCOPE': '账号或运行设置已变化，请重新核对后启动。',
+    'E_REVISION_CONFLICT': '账号或参数已变化，请重新点击启动策略。',
+    'E_CALENDAR_INPUT': '没有取得完整交易时段，策略尚未启动，请稍后重试。',
+    'E_CALENDAR_INCOMPLETE': '没有取得完整交易时段，策略尚未启动，请稍后重试。',
+    'E_ONLINE_SCOPE': '本次启动已过期或不在可用交易时段，请重新启动。',
+    'E_FACT_BARRIER': '该账号有原运行记录需要恢复或核对，未开启新策略。',
+    'E_CONFIG': '交易参数不完整，请到「交易参数」中核对。',
+    'E_METADATA': '没有取得完整的合约资料和交易时段，请检查网络后重试。',
+    'E_STARTUP_EXITED': '启动进程已退出，策略未能启动，请查看运行日志后重试。',
+}
+
+
+class _StartWorker(QThread):
+    started_run = Signal(object)
+    failed = Signal(object)
+
+    def __init__(self, store, account_id, profile, parent):
+        super().__init__(parent)
+        self.store, self.account_id, self.profile = store, account_id, profile
+
+    def run(self):
+        try:
+            from online_trader.runtime.desktop_bootstrap import build_start_request
+            from online_trader.runtime.startup_environment import launch_bootstrap
+            request = build_start_request(self.store, self.account_id, self.profile, arm=True)
+            directory = self.store.directory / 'desktop-starts' / request['request_id']
+            request_path = publish_new_bytes(canonical_bytes(request), directory / 'request.json')
+            output = directory / 'run'
+            result = launch_bootstrap(request_path, output)
+            self.started_run.emit({'run_directory': str(output), 'launch': result})
+        except (TraderError, OSError, ValueError) as error:
+            self.failed.emit({'code': getattr(error, 'code', 'E_DEPENDENCY')})
+        except Exception:
+            self.failed.emit({'code': 'E_STARTUP'})
+
+
+class StrategyStarter(QObject):
+    """No window or startup side effects until the user clicks Start/F5."""
+
+    status_changed = Signal(str)
+
+    def __init__(self, store, account_id, profile, parent=None):
+        super().__init__(parent)
+        self.store, self.account_id, self.profile = store, account_id, profile
+        self.account = store.get(account_id)
+        self.run_directory = None
+        self._worker = None
+        self._launched = False
+        self._process_id = None
+        self.status_text = ''
+        self.status_timer = QTimer(self)
+        self.status_timer.setInterval(1000)
+        self.status_timer.timeout.connect(self.update_launch_status)
+
+    def _set_status(self, message):
+        self.status_text = message
+        self.status_changed.emit(message)
+        if self.parent() is not None:
+            self.parent().show_home_feedback(message)
+
+    def is_preparing(self):
+        return self._worker is not None and self._worker.isRunning()
+
+    def _set_busy(self, busy):
+        parent = self.parent()
+        if parent is not None:
+            parent._startup_in_progress = busy
+            parent._enable_commands(not parent._stale and parent.view is not None and not parent.view['truncated'])
+            parent.dashboard.reload_accounts()
+
+    def start(self):
+        try:
+            self._start_current()
+        except (TraderError, OSError, ValueError) as error:
+            self._failed({'code': getattr(error, 'code', 'E_STARTUP')})
+
+    def _start_current(self):
+        if self._worker is not None or self._launched:
+            return
+        parent = self.parent()
+        state = self.store.read()
+        if state['selected_id'] != self.account_id:
+            self._set_status('已切换账号，请重新选择当前账号后启动。')
+            return
+        if parent is not None:
+            if parent.selected_account is None or parent.selected_account['account_id'] != self.account_id:
+                self._set_status('已切换账号，请重新选择当前账号后启动。')
+                return
+            self.profile = parent.current_start_profile()
+            if parent.view is not None:
+                self._set_status('已取得原执行器状态，请在主控页启动原策略。')
+                return
+        self.status_timer.stop()
+        self.run_directory = None
+        self._process_id = None
+        self._set_status('正在准备交易连接环境…')
+        self._set_busy(True)
+        worker = _StartWorker(self.store, self.account_id, self.profile, self)
+        self._worker = worker
+        worker.started_run.connect(self._started)
+        worker.failed.connect(self._failed)
+        worker.finished.connect(self._finished)
+        worker.start()
+
+    def _started(self, result):
+        self._launched = True
+        self.run_directory = Path(result['run_directory'])
+        self._process_id = result['launch']['pid']
+        self._set_status('正在连接行情并核对交易时段…')
+        self.status_timer.start()
+
+    def _failed(self, result):
+        code = result['code']
+        from online_trader.runtime.desktop_bootstrap import ERROR_MESSAGES
+        message = ERROR_MESSAGES.get(code) or START_ERRORS.get(code, '启动未完成，请查看运行日志或检查账号设置。')
+        self.status_timer.stop()
+        self._set_status(message + f'（{code}）')
+        self._launched = False
+        self._set_busy(False)
+
+    def _finished(self):
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.deleteLater()
+        parent = self.parent()
+        if parent is not None and parent._closing:
+            QTimer.singleShot(0, parent.close)
+
+    def update_launch_status(self):
+        if self.run_directory is None:
+            return
+        failure = self.run_directory / 'startup-failure.json'
+        paths = list(self.run_directory.glob('phase-*.json'))
+        path = failure if failure.is_file() else max(paths, key=lambda item: item.stat().st_mtime_ns, default=None)
+        if path is not None:
+            try:
+                if path.stat().st_size > 65536:
+                    return
+                record = strict_loads(path.read_bytes())
+            except (OSError, TraderError, ValueError):
+                return
+            if failure.is_file():
+                self.status_timer.stop()
+                self._failed({'code': record.get('error_code', 'E_STARTUP')})
+                return
+            phase = record.get('phase') or record.get('status')
+            message = {
+                'STARTUP_CHECKING': '正在核对账号与当前交易参数…',
+                'STARTUP_READING_MARKET': '正在连接行情并核对交易日、交易时段和合约信息…',
+                'STARTUP_PREPARED': '交易时段已核对，正在启动策略并同步柜台持仓…',
+                'DSV_OBSERVING': '已连接模拟盘，正在同步行情并等待策略信号。',
+                'DSV_MANAGING_OWNED': '原持仓已恢复，继续管理已有持仓。',
+            }.get(phase)
+            if message:
+                self._set_status(message)
+        if (self.run_directory / 'result.json').is_file():
+            self._set_status('本次策略运行已结束。')
+            self._launched = False
+            self.status_timer.stop()
+            self._set_busy(False)
+            return
+        elif self._process_id is not None:
+            from online_trader.runtime.startup_environment import process_running
+            if process_running(self._process_id) is False:
+                self.status_timer.stop()
+                self._failed({'code': 'E_STARTUP_EXITED'})
+                return
+        parent = self.parent()
+        if parent is not None:
+            view = parent.view
+            if view is not None and view['account_key'] == self.account['account_key'] and not parent._stale:
+                if view['entry_authority'] == 'ARMED':
+                    self._set_status('策略已启动，正在监控所选合约。')
+                    self._set_busy(False)
+                    self.status_timer.stop()
+                else:
+                    self._set_status('已连接模拟盘，正在核对行情、持仓及开仓条件。')
+                    self._set_busy(False)
+            parent.show_home_feedback(self.status_text)

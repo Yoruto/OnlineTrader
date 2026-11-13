@@ -24,6 +24,10 @@ def main(argv=None):
         command=commands.add_parser(action);command.add_argument("--pipe",required=True)
     workbench=commands.add_parser('workbench',help='完整工作台；只附着原内核，不建立交易连接')
     workbench.add_argument('--pipe');workbench.add_argument('--account-store',type=Path);workbench.add_argument('--account-id')
+    workbench.add_argument('--dsv-config',type=Path,help='读取原 DSV 已保存的业务参数')
+    desktop_start=commands.add_parser('desktop-start',help='执行桌面确认的本次模拟策略启动')
+    desktop_start.add_argument('--request',type=Path,required=True)
+    desktop_start.add_argument('--output',type=Path,required=True)
     qpro=commands.add_parser('qpro-history',help='从本机快期专业版查询历史成交，仅用于对照')
     for field in ('company','client-id','start-day','end-day'):qpro.add_argument('--'+field,required=True)
     qpro.add_argument('--port',type=int,default=8815)
@@ -35,8 +39,12 @@ def main(argv=None):
         if name not in {'list','desktop'}:command.add_argument('--expected-revision',type=int,required=True)
         if name in {'edit','select','delete'}:command.add_argument('--account-id',required=True)
         if name in {'add','edit'}:
-            command.add_argument('--alias',required=True);command.add_argument('--broker',default='快期模拟');command.add_argument('--line',default='TqKq')
-        if name=='add':command.add_argument('--username',required=True)
+            command.add_argument('--alias',required=True)
+            command.add_argument('--broker',default=None if name=='add' else '快期模拟')
+            command.add_argument('--line',default=None if name=='add' else 'TqKq')
+        if name=='add':
+            command.add_argument('--username',required=True)
+            command.add_argument('--provider',choices=('TQKQ','TQ_SIMNOW'),default='TQKQ')
     data=commands.add_parser('data',help='本地参考历史/日历导入，不改变当前执行源')
     data_actions=data.add_subparsers(dest='data_action',required=True)
     for name in ('daily-import','daily-export','calendar-import','calendar-review','desktop'):
@@ -77,7 +85,10 @@ def main(argv=None):
             command.add_argument('--account-id',required=True)
             command.add_argument('--resume-entries-on-day-change',action='store_true')
         else:
-            command.add_argument('--credential-reference',type=Path,required=True)
+            account_source=command.add_mutually_exclusive_group(required=True)
+            account_source.add_argument('--credential-reference',type=Path)
+            account_source.add_argument('--account-store',type=Path)
+            command.add_argument('--account-id')
             command.add_argument('--resume-entries-on-day-change',action='store_true')
             command.add_argument('--automatic-offsets',action='store_true',help='按已绑定DSV公式在首次开仓前自动计算；当前仅支持一个明确柜台日')
             command.add_argument('--last-completed-day',help='自动计算明确使用的最后完整日线交易日')
@@ -91,7 +102,7 @@ def main(argv=None):
             if name=='run':
                 credential_source=command.add_mutually_exclusive_group(required=True)
                 credential_source.add_argument('--credentials',type=Path)
-                if provider=='dsv':credential_source.add_argument('--account-store',type=Path)
+                credential_source.add_argument('--account-store',type=Path)
                 command.add_argument('--account-id')
                 command.add_argument('--pipe')
                 command.add_argument('--arm',action='store_true',help='仅首次新范围显式开启策略；重启只管理原退出')
@@ -136,6 +147,9 @@ def main(argv=None):
             command.add_argument('--format',choices=('csv','json','xlsx'))
     args=parser.parse_args(argv)
     try:
+        if args.action=='desktop-start':
+            from online_trader.runtime.desktop_bootstrap import run_desktop_start
+            return run_desktop_start(args.request,args.output)
         if args.action=='qpro-history':
             from online_trader.configuration.files import publish_new_bytes
             from online_trader.gateway.qpro_history import query_trades
@@ -150,8 +164,12 @@ def main(argv=None):
                 from online_trader.desktop.accounts import AccountDialog
                 app=QApplication.instance() or QApplication([]);window=AccountDialog(store);window.show();return app.exec()
             if args.account_action=='list':result=store.read()
-            else:result=store.change(args.account_action,expected_revision=args.expected_revision,**{
-                key:getattr(args,key) for key in ('account_id','alias','username','broker','line') if hasattr(args,key)})
+            else:
+                fields={key:getattr(args,key) for key in ('account_id','alias','username','broker','line','provider') if hasattr(args,key)}
+                if args.account_action=='add':
+                    fields['broker']=fields['broker'] or ('SimNow' if args.provider=='TQ_SIMNOW' else '快期模拟')
+                    fields['line']=fields['line'] or ('TqAccount' if args.provider=='TQ_SIMNOW' else 'TqKq')
+                result=store.change(args.account_action,expected_revision=args.expected_revision,**fields)
             print(json.dumps(result,ensure_ascii=False,indent=2));return 0
         elif args.action=='data':
             from online_trader.marketdata import ReferenceStore,bounded_json,review_calendar
@@ -172,7 +190,7 @@ def main(argv=None):
                 if account_id is not None:pipe=pipe or store.pipe_name(store.get(account_id))
             if pipe is None and store is None:raise TraderError('E_ACCOUNT','Select an account store or supply an existing owner pipe')
             from online_trader.desktop.workbench import run
-            return run(pipe,store=store,account_id=account_id)
+            return run(pipe,store=store,account_id=account_id,dsv_config=args.dsv_config)
         elif args.action=='compare':
             if args.compare_action=='report':
                 from online_trader.runtime.comparison import build_report
@@ -197,7 +215,7 @@ def main(argv=None):
                 from online_trader.scheduling.calendar import TradingCalendar
                 from online_trader.contracts.codec import canonical_bytes,strict_loads
                 from online_trader.configuration.files import publish_new_bytes
-                if args.action=='simnow':
+                if args.action=='simnow' and args.account_store is None:
                     reference=strict_loads(args.credential_reference.read_bytes())
                     if (type(reference) is not dict or reference.keys()!={'schema_version','account_fingerprint'}
                             or reference['schema_version']!='SIMNOW_CREDENTIAL_REFERENCE/1'):
@@ -206,11 +224,15 @@ def main(argv=None):
                     schema='SIMNOW_WORKBENCH_SIM/1' if args.manual_workbench else 'SIMNOW_DSV_SIM/1'
                 else:
                     from online_trader.accounts import AccountStore
-                    store=AccountStore(args.account_store);account=store.get(args.account_id)
-                    if store.ledger_path(account)!=args.ledger.resolve():
+                    store=AccountStore(args.account_store)
+                    account=store.get(args.account_id or store.read()['selected_id'])
+                    expected_provider='TQ_SIMNOW' if args.action=='simnow' else 'TQKQ'
+                    if account['provider']!=expected_provider or store.ledger_path(account)!=args.ledger.resolve():
                         raise TraderError('E_SCOPE','The scope ledger must be the selected account archive ledger')
-                    fingerprint=account['account_key'].removeprefix('SIM:KQ:')
-                    schema='KQ_WORKBENCH_SIM/1' if args.manual_workbench else 'KQ_DSV_SIM/2'
+                    fingerprint=account['account_key'].split(':')[-1]
+                    if args.action=='simnow':
+                        schema='SIMNOW_WORKBENCH_SIM/1' if args.manual_workbench else 'SIMNOW_DSV_SIM/1'
+                    else:schema='KQ_WORKBENCH_SIM/1' if args.manual_workbench else 'KQ_DSV_SIM/2'
                 profile=DsvProfile.from_record(strict_loads(args.profile.read_bytes()))
                 calendar=TradingCalendar.from_record(strict_loads(args.calendar.read_bytes()))
                 value={'schema_version':schema,'grant_id':args.action+'-'+uuid.uuid4().hex,
@@ -255,7 +277,8 @@ def main(argv=None):
                 account_id=args.account_id or store.read()['selected_id']
                 if store.read()['selected_id']!=account_id:raise TraderError('E_SCOPE','Only the selected account may use this saved-account connection entry')
                 row=store.get(account_id);grant,_,_=dsv_simulation.load_inputs(args.scope,args.profile,args.calendar)
-                if row['account_key']!=grant.account_key or store.ledger_path(row)!=Path(grant.value['ledger_path']).resolve():
+                if (row['provider']!=grant.provider or row['account_key']!=grant.account_key
+                        or store.ledger_path(row)!=Path(grant.value['ledger_path']).resolve()):
                     raise TraderError('E_SCOPE','Selected account and original ledger differ from the explicit scope')
                 credential=store.credential_reference(account_id)
                 if grant.manual_workbench and pipe is None:pipe=store.pipe_name(row)

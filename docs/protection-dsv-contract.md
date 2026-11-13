@@ -6,7 +6,7 @@
 
 当前版本为 `0.1.0.dev5`。最终完整检查 **385项通过，0失败、0错误、0跳过**，比dev4新增69项；确切证据见[结果](../output/checks/20261109T122558Z-95b49b6d/result.json)及[逐项日志](../output/checks/20261109T122558Z-95b49b6d/check.log)。检查期间产品源码稳定，编译、导入边界、冻结G0资源与1.1扩展资源完整性均通过，`pip check`无依赖冲突。dev4源码事先归档于`output/baselines/20261109T102218Z-fd88ab0a/dev4-source.zip`，SHA-256为`d3a451bc4a43b49595b82f9901bb5f1bc7e19c0f5730f4ac3850902ce4dde492`。
 
-交付[dev5离线wheel](../dist/20261109T122640Z-e4d3b7c5801d/online_trader-0.1.0.dev5-py3-none-any.whl)，SHA-256为`1b946728240fb01092a1e013c3fb54ec99c651bd45943bf926ba8888cd9e5637`。[构建及干净安装审计](../output/artifacts/20261109T122640Z-e4d3b7c5801d/wheel-audit.json)确认48份Python源码与5份资源在最终检查、wheel及全新安装中逐字节一致。无Qt、QA或交易SDK的独立core环境以`-I`、`--no-index`安装；默认策略激活被拒绝，显式开发变体激活仍禁开，授权后仅记录1次STRATEGY请求、确认成交为0。纯解释器以独立匿名事件验证5手两档剩余目标`3→1`及真实减仓后保本，没有撮合或生成柜台成交。
+交付dev5离线wheel，SHA-256为`1b946728240fb01092a1e013c3fb54ec99c651bd45943bf926ba8888cd9e5637`。[构建及干净安装审计](../output/artifacts/20261109T122640Z-e4d3b7c5801d/wheel-audit.json)确认48份Python源码与5份资源在最终检查、wheel及全新安装中逐字节一致。无Qt、QA或交易SDK的独立core环境以`-I`、`--no-index`安装；默认策略激活被拒绝，显式开发变体激活仍禁开，授权后仅记录1次STRATEGY请求、确认成交为0。纯解释器以独立匿名事件验证5手两档剩余目标`3→1`及真实减仓后保本，没有撮合或生成柜台成交。
 
 ## 版本、身份与批准边界
 

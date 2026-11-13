@@ -45,6 +45,6 @@ G2 开发准备已有代码和离线反例；零成交撤单、部分成交、�
 
 已安装 dev16 持仓演练三次CLI请求各约0.59、0.63、0.59秒，均在6.2秒的取时注入结束前返回；dev15同场景首个状态请求约5.36秒后超时。这是本次故障注入的单次结果，不是性能或在线SLA承诺。源代码同样通过[持仓演练](../output/status-recovery/dev16-final-source/result.json)及[关闭演练](../output/status-recovery/dev16-final-source-closing/result.json)。
 
-[最终开发wheel](../dist/20261110T062045Z-dev16-final-ebbdaf02/online_trader-0.1.0.dev16-py3-none-any.whl) SHA-256：`35bfaadfad49f9eb31583eaed81b207e15f703ff1028ace99d13b3e89a45f98c`。未发布、未安装服务、未修改独立SDK环境。中间1063项与早期dev16构建保留在原目录，不充当最终1065项对应源码的验证结果。
+最终开发wheel SHA-256：`35bfaadfad49f9eb31583eaed81b207e15f703ff1028ace99d13b3e89a45f98c`。未发布、未安装服务、未修改独立SDK环境。中间1063项与早期dev16构建保留在原目录，不充当最终1065项对应源码的验证结果。
 
 当前96项状态与后续缺口已更新至[功能清单](功能实现与待办清单_20261110.md)，G2仍为部分完成，G3–G6未被本轮离线结果提升为在线或发行完成。

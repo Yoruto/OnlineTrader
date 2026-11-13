@@ -24,9 +24,12 @@ def account_fingerprint(username):
 def credentials(path):
     """Explicit external JSON only. Never include its values in errors/reports."""
     try:
-        with Path(path).open('rb') as stream:raw=stream.read(16385)
-        if len(raw)>16384:raise ValueError()
-        value=strict_loads(raw)
+        from online_trader.accounts import StoredSimNowCredential
+        if type(path) is StoredSimNowCredential:value=path.resolve()
+        else:
+            with Path(path).open('rb') as stream:raw=stream.read(16385)
+            if len(raw)>16384:raise ValueError()
+            value=strict_loads(raw)
         if type(value) is dict and value.get('schema_version')=='SIMNOW_CREDENTIAL_REFERENCE/1':
             if value.keys()!={'schema_version','account_fingerprint'}:raise ValueError()
             from online_trader.accounts import WindowsVault
