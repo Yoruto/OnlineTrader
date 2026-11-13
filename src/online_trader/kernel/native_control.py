@@ -54,6 +54,7 @@ def prepare_strategy_stop(control,binding):
         raise TraderError('E_SCOPE','Current owner has no active DSV profile')
 
     k._armed=False;k.contexts.revoke_all();k._authority_revision+=1
+    binding['metadata']['strategy_stop_grant_id'] = owner.grant.value['grant_id']
     cancel=runtime.profile.to_settings()['trade']['cancel_on_stop']
     held=sum(c['protection']['owned_qty'] for c in k._staged.values() if c.get('management_state')!='TAKEN_OVER')
     message='策略已停止新增'

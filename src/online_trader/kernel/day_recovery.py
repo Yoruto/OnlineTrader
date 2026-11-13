@@ -51,6 +51,7 @@ class DayRecovery:
         native={item['order_id']:item for item in result['orders']}
         trades={item['trade_id']:item for item in result['trades']};sources=[]
         for cycle in self.kernel._staged.values():
+            if self.owner.archived_cycle(cycle):continue
             for order in cycle['orders']:
                 child=order['child_order_id'];oid=self.owner.port.order_id(child)
                 proof=self.history.get(child)
@@ -112,6 +113,7 @@ class DayRecovery:
         by_id={item['order_id']:item for item in raw['orders']}
         waiting=False
         for original in tuple(k._staged.values()):
+            if o.archived_cycle(original):continue
             cycle=copy.deepcopy(k._staged[original['position_cycle_id']]);changed=False
             if cycle['plan']['trading_day']!=day and not cycle.get('cancel_entries'):
                 if 'execution' in cycle:cycle['execution']['entry_stopped']=True
@@ -145,6 +147,7 @@ class DayRecovery:
         from online_trader.execution.close_routes import preview_owned_routes
         for cid in tuple(k._staged):
             cycle=k._staged[cid]
+            if o.archived_cycle(cycle):continue
             if cycle['lifecycle']=='CLOSED' and cid not in k._recovery_pending:continue
             if cycle.get('management_state')=='TAKEN_OVER':
                 raise TraderError('E_OWNERSHIP','A transferred cycle cannot be implicitly recovered on a new day')

@@ -66,6 +66,10 @@ def _floor(value):
     return min(MAX_QUANTITY, max(0, int(value.to_integral_value(rounding=ROUND_FLOOR))))
 
 
+def _dsv_lots(budget, per_lot):
+    return min(MAX_QUANTITY, max(0, int(budget / per_lot)))
+
+
 def calculate_daily_loss(*, balance, pre_balance, close_profit, float_profit, commission):
     """Return DSV's nonnegative daily loss amount, or None for missing source facts.
 
@@ -200,7 +204,13 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
         total_budget = equity * cap - used
         risk_per_lot = stop * metadata["multiplier"]
         risk_budget = equity * Decimal(trade["risk_per_trade_ratio"])
-        risk_volume = _floor(risk_budget / risk_per_lot)
+        # DSV performs the arithmetic in binary64 before converting to whole lots.
+        # Converting the already-computed Decimal budgets would change that boundary.
+        dsv_equity, dsv_available, dsv_cap = map(float, (equity, available, cap))
+        multiplier = float(metadata["multiplier"])
+        dsv_per_lot = (float(margin_amount) if margin_amount is not None and margin_amount > 0
+                       else float(last) * multiplier * 0.15)
+        risk_volume = _dsv_lots(dsv_equity * float(trade["risk_per_trade_ratio"]), float(stop) * multiplier)
         metrics.update({"effective_risk_cap": decimal_text(cap), "used_margin": decimal_text(used),
             "margin_per_lot": decimal_text(per_lot), "margin_source": "QUOTE_MARGIN" if margin_amount is not None and margin_amount > 0 else "PRICE_MULTIPLIER_15_PERCENT",
             "participating_configured_symbols": participating, "symbol_margin_budget": decimal_text(symbol_budget),
@@ -209,7 +219,8 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
             "min_one_lot_used": False})
         if requested_qty > 0:
             # DSV's fixed branch intentionally precedes the automatic risk gates.
-            quantity = max(0, min(requested_qty, trade["max_volume"], _floor(available / per_lot)))
+            quantity = min(requested_qty, trade["max_volume"], _floor(available / per_lot),
+                           _dsv_lots(dsv_available, dsv_per_lot))
             metrics["sizing_branch"] = "FIXED"
         else:
             metrics["sizing_branch"] = "AUTO"
@@ -218,14 +229,21 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
                 quantity = 0
             else:
                 budget = symbol_budget if trade["aggressive_mode"] else min(symbol_budget, total_budget)
-                margin_quantity = _floor(min(available, budget) / per_lot)
+                dsv_used = float(values["margin"]) + float(values["frozen_margin"]) + float(values["pending_margin"])
+                dsv_total_budget = dsv_equity * dsv_cap - dsv_used
+                dsv_symbol_budget = dsv_equity * (dsv_cap / participating) - float(values["symbol_margin"])
+                dsv_budget = dsv_symbol_budget if trade["aggressive_mode"] else min(dsv_symbol_budget, dsv_total_budget)
+                # Exact monetary bounds still cap the compatible proposal and back its reservation.
+                margin_quantity = min(_floor(min(available, budget) / per_lot),
+                                      _dsv_lots(min(dsv_available, dsv_budget), dsv_per_lot))
                 metrics["margin_based_quantity"] = margin_quantity
                 quantity = min(margin_quantity, trade["max_volume"])
                 if not trade["aggressive_mode"] and Decimal(trade["risk_per_trade_ratio"]) > 0 and 0 < risk_volume < quantity:
                     quantity = risk_volume
                 # A zero risk_volume does not shrink a positive margin quantity in
                 # the DSV implementation.  The fallback is a separate margin path.
-                if quantity <= 0 and trade["min_one_lot_fallback"] and available >= per_lot and total_budget >= per_lot:
+                if (quantity <= 0 and trade["min_one_lot_fallback"] and min(available, total_budget) >= per_lot
+                        and min(dsv_available, dsv_total_budget) >= dsv_per_lot):
                     quantity = 1; metrics["min_one_lot_used"] = True
                 if live_protection:
                     live_cap = 1 if trade["live_first_one_lot"] else max(trade["live_max_lots"], 1)

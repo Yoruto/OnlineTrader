@@ -15,6 +15,7 @@ import time
 from uuid import uuid4
 
 from online_trader.configuration.baseline import load_confirmed_baseline
+from online_trader.kernel.statistics import strategy_open_counts
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.domain.orders import OrderState
@@ -240,20 +241,17 @@ class DsvStrategyRuntime:
         self._latest[key]={"event":copy.deepcopy(event),"account":copy.deepcopy(account),
                            "instrument":copy.deepcopy(instrument),"received_ns":arrival,"stop_result":self._stop_decision(event,account)}
 
-    def _risk(self,candidate,facts,*,exclude_decision=None,exclude_attempt=None,previous_attempt=None):
+    def _risk(self,candidate,facts,*,exclude_decision=None,exclude_attempt=None,counted_target=None,previous_attempt=None):
         account=copy.deepcopy(facts["account"])
         instrument=facts["instrument"]
-        pending=Decimal(0);symbol_extra=Decimal(0);attempts=0;active=set(account["active_symbols"])
-        covered=set(account.get("covered_local_cycle_ids",[]));covered_attempts=set(account.get("covered_local_attempt_ids",[]))
+        pending=Decimal(0);symbol_extra=Decimal(0);active=set(account["active_symbols"])
+        covered=set(account.get("covered_local_cycle_ids",[]))
         for cycle in self.kernel._staged.values():
             if cycle["decision_key"]==exclude_decision:continue
-            same_day=cycle["plan"]["trading_day"]==account["trading_day"]
             if cycle["protection"]["owned_qty"]:active.add(cycle["plan"]["contract_id"])
             local_remaining=0
             for order in cycle["orders"]:
                 if order['attempt_id']==exclude_attempt:continue
-                if (same_day and cycle["plan"]["contract_id"]==candidate["contract_id"] and order["send_state"]!="DEFINITELY_NOT_SENT"
-                        and order["attempt_id"] not in covered_attempts):attempts+=1
                 if order["send_state"]=="UNKNOWN":account["unknown_orders"]=True
                 if order["effect"]=="OPEN":
                     local_remaining+=OrderState.from_dict(order).potential_remaining
@@ -267,7 +265,10 @@ class DsvStrategyRuntime:
                     if cycle['plan']['contract_id']==candidate['contract_id']:symbol_extra+=per_lot*uncovered
         account["pending_margin"]=decimal_text(Decimal(account["pending_margin"])+pending) if account["pending_margin"] is not None else None
         account["symbol_margin"]=decimal_text(Decimal(account["symbol_margin"])+symbol_extra) if account["symbol_margin"] is not None else None
-        account["orders_today"]+=attempts;account["active_symbols"]=sorted(active)
+        counts=strategy_open_counts(self.kernel._staged.values(),account['trading_day'],reserve=True,
+                                    exclude_decision=counted_target or exclude_decision)
+        account["orders_today"]=counts.get(candidate['contract_id'],0) if candidate.get('entry_kind')!='MANUAL' else 0
+        account["active_symbols"]=sorted(active)
         result=evaluate_entry(self.profile,direction=candidate["direction"],contract_id=candidate["contract_id"],
             stop_distance=candidate["stop_distance"],limit_price=candidate["limit_price"],market_price=facts["event"]["last"],
             requested_qty=next(row["order_volume"] for row in self.profile.to_record()["settings"]["symbols"] if row["code"]==candidate["contract_id"]),
@@ -344,11 +345,11 @@ class DsvStrategyRuntime:
         return result["allowed"] and result["quantity"]>=quantity
 
     def _evaluate_entry(self,state,event,stops,*,exclude_decision=None):
-        decision_time=self.kernel.port.clock.now() if self.online else None
+        decision_time=self.kernel.port.strategy_wall_time() if self.online else None
         ordinary_quote_stale = False
         current=decision_time or datetime.fromisoformat(event['source_time_utc'])
         if decision_time is not None and self._quote_age_limit > 0:
-            elapsed = current - datetime.fromisoformat(event['source_time_utc'])
+            elapsed = current - datetime.fromisoformat(event['source_time_utc']).replace(microsecond=0)
             age = Decimal(elapsed.days * 86400 + elapsed.seconds) + Decimal(elapsed.microseconds).scaleb(-6)
             ordinary_quote_stale = age > self._quote_age_limit
         timing={'ordinary_quote_stale':ordinary_quote_stale,'decision_time':decision_time}
@@ -410,7 +411,7 @@ class DsvStrategyRuntime:
             if stop is not None and (not stop['allow_new_entries'] or
                     (candidate.get('entry_kind')=='CONTINUATION' and not stop['allow_continuation'])):return False
             candidate['limit_price']=order.limit_price
-            risk=self._risk(candidate,facts,exclude_attempt=order.attempt_id)
+            risk=self._risk(candidate,facts,exclude_attempt=order.attempt_id,counted_target=cycle['decision_key'])
             return risk['allowed'] and risk['quantity']>=order.original_qty
         if not ready():return None
         peer='dsv-owner-'+str(self.epoch)

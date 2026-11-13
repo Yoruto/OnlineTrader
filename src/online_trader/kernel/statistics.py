@@ -30,6 +30,23 @@ def _point(number):
     return '0' if not value else result
 
 
+def strategy_open_counts(cycles, day, *, reserve=False, exclude_decision=None):
+    """Count logical strategy targets once per contract and cabinet day."""
+    counts = {}
+    sent = {'CALL_RETURNED', 'CONFIRMED', 'UNKNOWN'}
+    if reserve:
+        sent |= {'PREPARED', 'SEND_POSSIBLE'}
+    for cycle in cycles:
+        plan = cycle['plan']
+        if (plan['trading_day'] != day or cycle.get('entry_origin') != 'STRATEGY'
+                or (exclude_decision is not None and cycle['decision_key'] == exclude_decision)):
+            continue
+        if any(order['effect'] == 'OPEN' and order['send_state'] in sent for order in cycle['orders']):
+            code = plan['contract_id']
+            counts[code] = counts.get(code, 0) + 1
+    return counts
+
+
 class StatisticsOwner:
     def __init__(self,kernel):
         self.kernel=kernel;self._committed={};self._staged={};self._receipts={};self._profiles={};self._calendars={}

@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 from io import StringIO
 from pathlib import Path
 import re
+import time
 from typing import NamedTuple
 
 from PySide6.QtCore import QBuffer, QIODevice, QItemSelectionModel, QPointF, QSettings, Qt, QTimer
@@ -20,10 +21,13 @@ from PySide6.QtWidgets import (
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.files import load_profile, publish_new_bytes
-from online_trader.configuration.rollover import expiry_date, expiry_warning, preview_rollover
+from online_trader.configuration.rollover import expiry_date, expiry_warning, future_product, preview_rollover
+from online_trader.configuration.symbol_csv import ALIASES, PRODUCT_NAMES
 from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.reports import EquityChart
+from online_trader.desktop.runtime_logs import JsonLogTail, comparison_file, executor_log_path, resolve_run, startup_only
 from online_trader.errors import TraderError
+from online_trader.runtime.comparison import dsv_log_category
 
 
 BEIJING = timezone(timedelta(hours=8))
@@ -32,6 +36,7 @@ ENTRY_MESSAGES = {
     'WAITING_FRESH_QUOTE': '等待行情',
     'MARKET_PATH_INCOMPLETE': '行情路径待补齐',
     'OPENING_WAIT': '开盘等待',
+    'AUCTION_DISABLED': '集合竞价期间暂停普通开仓',
     'CLOSE_SESSION_NO_OPEN': '收盘前禁开',
     'RECONCILIATION_REQUIRED': '柜台待核对',
     'CONTROL_BARRIER': '开仓权限受限',
@@ -45,24 +50,56 @@ ACTIVATION_MESSAGES = {
     'LONG:NO_CHASE_AFTER_ACT': '当日行情已跑过多头激活位',
     'SHORT:NO_CHASE_AFTER_ACT': '当日行情已跑过空头激活位',
 }
-STRATEGY_LOG_REASONS = {'GEOMETRY_BLOCK', 'OPENING_WAIT', 'CLOSE_SESSION_NO_OPEN', 'DSV_QUOTE_AGE_EXCEEDED',
-                        'NET_LOSS_LIMIT', 'CANDLE_OPPORTUNITY_CONSUMED', 'OBSERVATION_ONLY_BACKLOG',
-                        'LONG:TRIGGER_NOT_REACHED', 'SHORT:TRIGGER_NOT_REACHED', 'DUPLICATE_MARKET_EVENT',
-                        *ACTIVATION_MESSAGES}
+QUIET_ENTRY_REASONS = {'CANDLE_OPPORTUNITY_CONSUMED', 'OBSERVATION_ONLY_BACKLOG',
+                       'LONG:TRIGGER_NOT_REACHED', 'SHORT:TRIGGER_NOT_REACHED', 'DUPLICATE_MARKET_EVENT'}
 ORDER_HEADERS = ('报单号','合约','方向','开平','委托量','未成交','委托价','状态','报单时间','消息')
 TRADE_HEADERS = ('成交号','合约','方向','开平','手数','成交价','手续费','成交时间')
 POSITION_HEADERS = ('合约','方向','持仓量','成交价','止损价','止盈价','实时价格',
                     '盈利价差','持仓盈亏','浮盈比例','保证金','手续费')
 SYMBOL_HEADERS = ('品种名', '合约代码', '开仓偏移', '止损偏移', '止盈偏移', '下单手数', '半仓参数', '滞回点')
 LOG_EVENT_FILTERS = {
-    '开仓': {'open', 'auto'}, '平仓': {'close', 'auto'}, '错误': {'error'}, '手动': {'manual'},
+    '开仓': {'open', 'auto'}, '平仓': {'close', 'auto', 'half', 'close_win', 'close_loss'},
+    '错误': {'error'}, '手动': {'manual'},
 }
-LOG_TAGS = {'开仓':'open','平仓':'close','自动':'auto','错误':'error','手动':'manual'}
+LOG_TAGS = {'开仓':'open','平仓':'close','自动':'auto','错误':'error','手动':'manual',
+            '半仓':'half','风控':'error','警告':'error'}
+LOG_PHASES = {
+    'DSV_PRIMED_DISARMED': '策略已就绪，等待启动或同步',
+    'DSV_OBSERVING': '策略正在监控所选合约',
+    'DSV_MANAGING_OWNED': '继续管理已有持仓',
+    'DSV_WAITING_GATEWAY_SYNC': '行情或交易连接中断，等待重新同步',
+    'DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION': '柜台换日，等待核对原委托及持仓',
+    'DSV_STOPPING': '已停止开仓，继续保护并等待核对',
+    'DSV_STOPPED': '策略已停止',
+    'COMPARISON_REQUIRES_ATTENTION': '对照记录需核对',
+    'CLOCK_REFRESH_RETRY_PROTECTION_ACTIVE': '参考时钟暂不可用，继续保护已有持仓',
+    'DSV_CONTROLLER_INTERRUPTED_ORIGINAL_PROTECTION_CONTINUES': '控制连接中断，继续管理原持仓',
+    'AUTO_OFFSETS_WAITING_MATCHING_DSV_PARAMETERS': '等待两端有效偏移一致',
+}
 
 
 class WorkbenchLogLine(NamedTuple):
     text: str
     category: str | None = None
+    timestamp: datetime | None = None
+
+
+def log_time(value):
+    try:
+        moment = beijing(value)
+    except (TypeError, ValueError, OverflowError):
+        return '—', None
+    return moment.strftime('%H:%M:%S'), moment
+
+
+def display_quote_delay(value):
+    if value is None:
+        return '--（需启动策略）'
+    lag = Decimal(value)
+    if lag > 120:
+        return '--（休市/无行情）'
+    status = '正常' if lag <= 3 else '偏慢' if lag <= 10 else '很慢/疑似断流'
+    return f'{lag:.1f} 秒（{status}）'
 
 TRADE_FIELDS = (
     ('max_volume','最大手数'), ('max_risk_ratio','风险度上限'), ('max_daily_orders','最大报单'),
@@ -260,12 +297,11 @@ def position_cells(item):
     )]
 
 
-class SampledCandles(QWidget):
-    """OHLC of the quotes actually sampled by the workbench, with missing minutes left blank."""
+class MinuteCandles(QWidget):
+    """Display the most recent 60 native one-minute candles in source order."""
 
     def __init__(self):
         super().__init__()
-        self.history = {}
         self.native_series = {}
         self.code = ''
         self.setMinimumHeight(105)
@@ -279,31 +315,13 @@ class SampledCandles(QWidget):
                               for code,bars in payload.items()}
         self.update()
 
-    def record(self, market):
-        if not market.get('fresh') or not market.get('source_time_utc'):
-            return
-        try:
-            price = Decimal(market['last'])
-            minute = int(beijing(market['source_time_utc']).timestamp()) // 60
-        except (TypeError, ValueError, InvalidOperation):
-            return
-        if not price.is_finite() or price <= 0:
-            return
-        values = self.history.setdefault(market['contract_id'], deque(maxlen=48))
-        if values and values[-1][0] == minute:
-            _, first, high, low, _ = values[-1]
-            values[-1] = minute, first, max(high, price), min(low, price), price
-        elif not values or minute > values[-1][0]:
-            values.append((minute, price, price, price, price))
-        self.update()
-
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor('#ffffff'))
         painter.setPen(QColor('#52647d'))
-        candles = self.native_series.get(self.code) or self.history.get(self.code)
+        candles = self.native_series.get(self.code)
         if not candles:
-            painter.drawText(12, 27, '等待可用行情')
+            painter.drawText(12, 27, '等待原生分钟 K 线')
             return
         low = min(item[3] for item in candles)
         high = max(item[2] for item in candles)
@@ -315,13 +333,11 @@ class SampledCandles(QWidget):
         painter.drawText(plot.right()-38, self.height()-5, datetime.fromtimestamp(last*60, BEIJING).strftime('%H:%M'))
         painter.setPen(QColor('#d7e0eb'))
         painter.drawRect(plot)
-        step = plot.width()/48
+        step = plot.width()/60
         def y(price):
             return plot.bottom()-4-(plot.height()-8)*float((price-low)/span)
-        for minute, opening, maximum, minimum, closing in candles:
-            if last-minute >= 48:
-                continue
-            x = plot.right()-(last-minute+.5)*step
+        for index, (_, opening, maximum, minimum, closing) in enumerate(candles):
+            x = plot.right()-(len(candles)-index-.5)*step
             color = QColor('#c8323c' if closing >= opening else '#23845b')
             painter.setPen(QPen(color, 1))
             painter.drawLine(QPointF(x, y(maximum)), QPointF(x, y(minimum)))
@@ -359,15 +375,22 @@ class WorkbenchLayout:
         self.last_state = None
         self.last_log_text = None
         self.visible_log_lines = []
-        self.log_clear_offsets = {}
+        self.log_tails = {}
+        self.log_binding = None
+        self.log_resolution_at = 0.0
+        self.log_directory = None
+        self.log_comparison = None
         self.balance_history = deque(maxlen=8640)
         self.last_balance_slot = None
         self.chart_owner = None
         self.rendered_view = None
         self.last_reasons = {}
         self.manual_price_scope = None
+        self.manual_catalog = []
         self.fund_values = {}
         self.home_updated_at = None
+        self.quote_reference = {}
+        self.quote_worker = None
 
         original = window.takeCentralWidget()
         for widget in (window.connection_label, window.account_label, window.kernel_label,
@@ -417,7 +440,7 @@ class WorkbenchLayout:
         self.tabs.currentChanged.connect(self.page_changed)
         self.render_home()
         self.log_timer = QTimer(window)
-        self.log_timer.setInterval(1800)
+        self.log_timer.setInterval(400)
         self.log_timer.timeout.connect(self.update_logs)
         self.log_timer.start()
         for grid in (*self.tables.values(), window.cycles):
@@ -465,7 +488,7 @@ class WorkbenchLayout:
         bar.addWidget(QLabel('字号：'))
         self.font_size = QSpinBox()
         self.font_size.setRange(8, 13)
-        self.font_size.setValue(self.settings.value('font_size', 9, int))
+        self.font_size.setValue(self.settings.value('font_size', 12, int))
         bar.addWidget(self.font_size)
         bar.addWidget(button('快捷键', self.shortcuts))
         bar.addWidget(button('按屏幕自适应', self.window.showMaximized))
@@ -542,9 +565,11 @@ class WorkbenchLayout:
         self.home_state.setStyleSheet('font-weight: bold; color: #1746a1;')
         self.home_connection = QLabel()
         self.home_connection.setWordWrap(True)
+        self.home_quote_delay = QLabel('行情延迟   --（需启动策略）')
         status_line = QHBoxLayout()
         status_line.addWidget(self.home_state)
         status_line.addWidget(self.home_connection, 1)
+        status_line.addWidget(self.home_quote_delay)
         status.addLayout(status_line)
         self.home_pending = QLabel()
         self.home_pending.setObjectName('homePending')
@@ -636,27 +661,37 @@ class WorkbenchLayout:
         self.window.accounts_button.setEnabled(store is not None and ready)
         self.window.attach_button.setEnabled(store is not None and ready)
 
-    def reset_account_view(self):
+    def reset_account_view(self, *, preserve_logs=False):
         """Discard the previous account's display facts before requesting a new view."""
         self.rendered_view = None
+        self.quote_reference.clear()
         self.fund_values.clear()
         self.home_updated_at = None
         self.chart_owner = None
         self.last_state = None
         self.last_reasons.clear()
+        if not preserve_logs:
+            self.activity.clear()
+            self.log_binding = None
+            self.log_directory = None
+            self.log_comparison = None
+            self.log_tails.clear()
         self.balance_history.clear()
         self.last_balance_slot = None
         self.equity.set_rows([])
-        self.candles.history.clear()
         self.candles.native_series.clear()
         self.candles.select('')
         self.candle_contract.clear()
         self.manual_code.clear()
         self.manual_price_scope = None
+        self.manual_catalog = []
+        self.manual_scoped_codes = ()
+        self.manual_catalog_status.clear()
         self.manual_status.setText('等待所选账号同步')
         self.manual_funds.setText('资金未知')
         for label, title in self.fund_metrics.values():
             label.setText(f'{title}   —')
+        self.render_strategy_monitor(None)
         for label in self.status_labels:
             label.setText('等待同步')
         self.quote_status.setText('行情 · 等待所选账号同步')
@@ -664,11 +699,11 @@ class WorkbenchLayout:
         self.instrument_rules.set_markets(self.names, {})
         self.render_session_hours({})
         self.render_rollover_status({})
-        self.activity.clear()
-        self.visible_log_lines.clear()
-        self.last_log_text = None
-        self.log_text.clear()
-        self.log_count.setText('0 行')
+        if not preserve_logs:
+            self.visible_log_lines.clear()
+            self.last_log_text = None
+            self.log_text.clear()
+            self.log_count.setText('0 行')
         self.render_equity_chart()
         self.render_home()
 
@@ -801,6 +836,8 @@ class WorkbenchLayout:
                 pending.append('柜台持仓待核对')
             if view['configuration'].get('stop_cancel_pending'):
                 pending.append('停止时撤单待确认')
+            if view['configuration'].get('strategy_stop_wait'):
+                pending.append(view['configuration']['strategy_stop_wait'])
             for order in view['orders']:
                 code = order['contract_id']
                 quantity = order.get('potential_remaining', 0)
@@ -896,6 +933,9 @@ class WorkbenchLayout:
         self.schedule_fields = {key:self.read_value(data[key]) for key in ('night_start_time','day_start_time','catch_up_minutes')}
         schedule.addLayout(row(self.schedule_enabled,QLabel('夜盘'),self.schedule_fields['night_start_time'],
             QLabel('日盘'),self.schedule_fields['day_start_time'],QLabel('补启动分钟'),self.schedule_fields['catch_up_minutes']))
+        self.timed_start_button = button('安排定时启动', self.window.arrange_timed_start)
+        if self.window.store is not None and self.paired is None:
+            schedule.addWidget(self.timed_start_button)
 
         fields.addLayout(row(button('参数中心', self.open_parameters),
                              button('保存预览参数', self.export_parameters_preview)))
@@ -909,6 +949,9 @@ class WorkbenchLayout:
         if not self.paired:
             actions = row(button('重读 DSV 参数', lambda: self.reload_dsv_parameters()),
                           button('选择 DSV 配置', self.choose_dsv_parameters))
+            if self.window.store is not None:
+                self.quote_reference_button = button('订阅行情（新主力）', self.subscribe_reference_quotes)
+                actions.addWidget(self.quote_reference_button)
             actions.addStretch(1)
             contracts.addLayout(actions)
         self.symbol_grid = table(['品种名','合约代码','主力合约','换月提醒（到期日）','候选换月','开仓偏移','止损偏移','止盈偏移',
@@ -929,6 +972,9 @@ class WorkbenchLayout:
 
     def render_parameters(self, profile):
         settings = profile.to_record()['settings']
+        if self.calculator.base_hash != profile.content_hash:
+            self.calculator.set_base_profile(profile)
+            self.offset_preview.setText('参数预览已更新，请重新计算偏移。')
         self.parameter_state.setText(self.profile_source)
         if profile.content_hash!=self.profile.content_hash:
             self.parameter_state.setText('本地参数预览 · 用于下次启动')
@@ -996,12 +1042,9 @@ class WorkbenchLayout:
             if selected in values:
                 picker.setCurrentText(selected)
         if self.window.view is None:
-            self.manual_code.clear()
-            self.manual_code.addItems(self.names)
+            self.filter_manual_catalog()
         self.instrument_rules.set_markets(self.names, {
             item['contract_id']: item for item in (self.rendered_view or {}).get('markets', [])})
-        self.calculator.set_base_profile(profile)
-        self.offset_preview.setText('计算结果在此核对')
 
     def checked_start_profile(self):
         dialog = self.window._settings_dialog
@@ -1024,6 +1067,82 @@ class WorkbenchLayout:
         self.show_details(self.monitor_tab)
         self.monitor_details.setCurrentWidget(self.execution_parameters)
 
+    def subscribe_reference_quotes(self):
+        account = self.window.selected_account
+        if self.quote_worker is not None:
+            return
+        if self.window.view is not None and not self.window._stale:
+            self.render_rollover_status({item['contract_id']:item for item in self.window.view['markets']})
+            self.window.show_home_feedback('已刷新原执行器的主力与行情资料。')
+            return
+        if account is None:
+            self.window.show_home_feedback('请先选择提供行情的模拟账号。')
+            return
+        def start():
+            profile = self.window.current_start_profile()
+            codes = [item['code'] for item in profile.to_record()['settings']['symbols']]
+            if not codes:
+                raise TraderError('E_CONFIG','品种列表为空。')
+            self.window.show_home_feedback(f'正在订阅 {len(codes)} 个品种及对应主力行情。')
+            self.add_activity(f'开始订阅 {len(codes)} 个品种的行情')
+            self.start_market_read(account['account_id'], codes)
+        self.window._action(start)
+
+    def start_market_read(self, account_id, codes=(), *, catalog=False):
+        from online_trader.desktop.startup import QuoteReferenceWorker
+        worker = (QuoteReferenceWorker(self.window.store,account_id,codes,self.window,catalog=True) if catalog
+                  else QuoteReferenceWorker(self.window.store,account_id,codes,self.window))
+        self.quote_worker = worker
+        self.quote_reference_button.setEnabled(False)
+        self.manual_catalog_button.setEnabled(False)
+        worker.received.connect(self.window._quote_reference_received)
+        worker.failed.connect(self.window._quote_reference_failed)
+        worker.finished.connect(self.window._quote_reference_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def reference_quotes_received(self, rows):
+        worker = self.quote_worker
+        account = self.window.selected_account
+        if self.window._closing or worker is None or account is None or account['account_id'] != worker.account_id:
+            return
+        if getattr(worker,'catalog',False):
+            self.manual_catalog = rows
+            self.manual_catalog_status.setText(f'已加载 {len(rows)} 个期货合约' if rows else '行情服务未返回合约')
+            self.add_activity(self.manual_catalog_status.text())
+            self.filter_manual_catalog()
+            return
+        self.quote_reference = {row['contract_id']:row | {'quote_reference_ready':row['ready']} for row in rows}
+        markets = {row['contract_id']:row for row in (self.rendered_view or {}).get('markets',[])}
+        self.render_rollover_status(markets)
+        self.instrument_rules.set_markets(self.names,self.quote_reference | {code:row for code,row in markets.items() if row.get('fresh')})
+        for row in rows:
+            code = row['contract_id']
+            message = (f"{code} → 主力 {row['main_contract'] or '—'}，最新价 {row['last'] or '—'}，"
+                       f"保证金/手 {row['margin'] or '—'}，手续费/手 {row['commission'] or '—'}"
+                       if row['ready'] else f'{code} 行情未就绪')
+            self.add_activity(message)
+        self.window.show_home_feedback(f'行情订阅完成 · {sum(row["ready"] for row in rows)} / {len(rows)} 个品种就绪。')
+        self.update_logs()
+
+    def reference_quotes_failed(self, code):
+        account = self.window.selected_account
+        if (not self.window._closing and self.quote_worker is not None and account is not None
+                and self.quote_worker.account_id == account['account_id']):
+            if getattr(self.quote_worker,'catalog',False):
+                feedback = '已保留原合约目录' if self.manual_catalog else '仍可选择已配置合约'
+                message = f'合约加载失败 · {feedback}（{code}）'
+                self.manual_catalog_status.setText(message)
+            else:
+                message = f'行情订阅失败 · {code}'
+                self.window.show_home_feedback(message)
+            self.add_activity(message,category='error')
+
+    def reference_quotes_finished(self):
+        self.quote_worker = None
+        self.quote_reference_button.setEnabled(True)
+        self.manual_catalog_button.setEnabled(True)
+
     def render_rollover_status(self, markets):
         profile = self.window._settings_dialog.profile if self.window._settings_dialog is not None else self.profile
         settings = profile.to_record()['settings']
@@ -1032,7 +1151,8 @@ class WorkbenchLayout:
         from online_trader.configuration.instrument_rules import product_code
         for index, symbol in enumerate(symbols):
             market = markets.get(symbol['code'],{})
-            facts = market.get('rollover') or {}
+            reference = self.quote_reference.get(symbol['code'],{})
+            facts = market.get('rollover') or {key:reference.get(key) for key in ('main_contract','main_expiry_date')}
             today = expiry_date(facts.get('as_of_date')) or datetime.now(BEIJING).date()
             warning, urgent = expiry_warning(facts.get('expiry_date'),today)
             candidate = facts.get('candidate')
@@ -1229,7 +1349,7 @@ class WorkbenchLayout:
         self.candle_panel = prices.parentWidget()
         self.candle_contract = QComboBox()
         self.candle_contract.addItems(self.names)
-        self.candles = SampledCandles()
+        self.candles = MinuteCandles()
         self.candle_source = QLabel()
         self.candle_contract.currentTextChanged.connect(self.select_candles)
         self.select_candles(self.candle_contract.currentText())
@@ -1239,7 +1359,7 @@ class WorkbenchLayout:
 
     def select_candles(self, code):
         self.candles.select(code)
-        self.candle_source.setText('原生 1 分钟' if code in self.candles.native_series else '工作台采样')
+        self.candle_source.setText('原生 1 分钟' if code in self.candles.native_series else '等待原生 K 线')
 
     def market_panel(self):
         page = QWidget()
@@ -1318,9 +1438,18 @@ class WorkbenchLayout:
         self.manual_close_price_mode.addItems(['对手价','排队价','最新价'])
         account.addLayout(row(self.manual_status,button('模拟连接设置',self.window.open_session),
                               QLabel('平仓价格'),self.manual_close_price_mode))
+        self.manual_catalog_button = button('加载合约',self.load_manual_catalog)
+        self.manual_catalog_status = QLabel('')
+        account.addLayout(row(self.manual_catalog_button,self.manual_catalog_status))
         columns = QHBoxLayout()
         order = group('下单', columns, stretch=5)
         self.manual_code = QComboBox()
+        self.manual_code.setEditable(True)
+        self.manual_code.setInsertPolicy(QComboBox.NoInsert)
+        self.manual_code.setCompleter(None)
+        self.manual_scoped_codes = ()
+        self.manual_code.lineEdit().setPlaceholderText('合约、品种名或月份')
+        self.manual_code.lineEdit().textEdited.connect(self.manual_catalog_edited)
         self.manual_code.addItems(self.names)
         self.manual_code.currentTextChanged.connect(self.render_manual)
         self.manual_side = QComboBox()
@@ -1388,14 +1517,64 @@ class WorkbenchLayout:
 
     def update_manual_controls(self, enabled):
         self.manual_controls_enabled = enabled
+        self.update_manual_open_controls()
+        self.refresh_manual_selection()
+
+    def update_manual_open_controls(self):
         view = self.window.view
-        ready = bool(enabled and view and view['configuration'].get('manual_workbench'))
+        config = view['configuration'] if view is not None else {}
+        bound = self.manual_code.currentText() in (config.get('scoped_contracts') or self.names)
+        ready = self.manual_controls_enabled and config.get('manual_workbench',False) and bound
         self.submit_button.setEnabled(ready)
         self.latest_button.setEnabled(ready)
         for control in self.quick_sizes:
             control.setEnabled(ready)
-        self.refresh_manual_selection()
-        self.manual_notice.setText('提交前确认合约、方向、手数和限价' if ready else '人工开仓需要已同步的独立人工范围')
+        if ready:
+            message = '提交前确认合约、方向、手数和限价'
+        elif config.get('manual_workbench') and not bound:
+            message = '请选择当前人工范围内的合约'
+        else:
+            message = '人工开仓需要已同步的独立人工范围'
+        self.manual_notice.setText(message)
+
+    def load_manual_catalog(self):
+        account = self.window.selected_account
+        if self.quote_worker is not None:
+            return
+        if account is None:
+            self.manual_catalog_status.setText('请先选择提供行情的模拟账号')
+            return
+        self.manual_catalog_status.setText('正在加载期货合约…')
+        self.start_market_read(account['account_id'],catalog=True)
+
+    def manual_catalog_edited(self, text):
+        self.filter_manual_catalog(text)
+
+    def filter_manual_catalog(self, text=None):
+        codes = (self.rendered_view or {}).get('configuration',{}).get('scoped_contracts') or list(self.names)
+        selected = self.manual_code.currentText() if text is None else text
+        term = selected.strip().casefold() if text is not None else ''
+        prefix = term.rstrip('0123456789')
+        alias = ALIASES.get(prefix)
+        matches = []
+        for code in dict.fromkeys([*codes,*self.manual_catalog]):
+            product = future_product(code)
+            symbol = '.'.join(product) if product else ''
+            name = PRODUCT_NAMES.get(symbol, '').casefold()
+            suffix = code[len(symbol):] if product else ''
+            if (not term or term in code.casefold() or term in name
+                    or alias == product and product is not None and suffix.endswith(term[len(prefix):])):
+                matches.append(code)
+            if len(matches) >= 100:
+                break
+        self.manual_code.blockSignals(True)
+        self.manual_code.clear()
+        self.manual_code.addItems(matches)
+        self.manual_code.setCurrentText(selected or (matches[0] if matches else ''))
+        self.manual_code.blockSignals(False)
+        self.render_manual()
+        if text is not None and self.manual_catalog:
+            self.manual_catalog_status.setText(f'显示 {len(matches)} 个匹配合约' if matches else '未找到匹配合约')
 
     def quick_open(self, side, qty):
         self.manual_side.setCurrentIndex(side)
@@ -1486,6 +1665,7 @@ class WorkbenchLayout:
     def render_manual(self, *_):
         if self.rendered_view is None:
             return
+        self.update_manual_open_controls()
         quote = self.current_market()
         stamp = quote.get('source_time_utc')
         rows = [
@@ -1524,11 +1704,13 @@ class WorkbenchLayout:
         self.log_search.setPlaceholderText('搜索已加载日志')
         self.log_search.textChanged.connect(self.update_logs)
         self.log_count = QLabel('0 行')
+        self.log_source_status = QLabel('日志来源未绑定')
         tools = row(button('复制全部',self.copy_log),button('导出Excel',self.export_log),
                     button('清空',self.clear_log),button('导出日报',self.open_daily_report),self.log_filter,
                     self.log_event_filter,self.log_search)
         tools.addWidget(self.log_count)
         layout.addLayout(tools)
+        layout.addWidget(self.log_source_status)
         logs = group('运行日志',layout,stretch=1)
         self.log_text = QPlainTextEdit()
         self.log_text.setObjectName('runtimeLog')
@@ -1546,15 +1728,20 @@ class WorkbenchLayout:
         layout.addWidget(recovery)
 
     def copy_log(self):
+        self.update_logs()
         if self.visible_log_lines:
             QApplication.clipboard().setText('\n'.join(self.visible_log_lines))
 
     def export_log(self):
+        self.update_logs()
         if not self.visible_log_lines:
             QMessageBox.information(self.window,'导出日志','当前筛选下没有日志可导出')
             return
         name,_ = QFileDialog.getSaveFileName(self.window,'导出运行日志','运行日志.xlsx','Excel (*.xlsx);;文本 (*.txt)')
         if not name:
+            return
+        self.update_logs()
+        if not self.visible_log_lines:
             return
         try:
             if Path(name).suffix.lower() == '.txt':
@@ -1575,14 +1762,8 @@ class WorkbenchLayout:
             return
         run = self.latest_run()
         if run is not None:
-            paths = [run/'executor.log',run/'startup-failure.json',run/'strategy-log.jsonl',
-                     *run.glob('comparison-*/events.jsonl')]
-            self.log_clear_offsets.clear()
-            for path in paths:
-                try:
-                    self.log_clear_offsets[path] = path.stat().st_size
-                except OSError:
-                    continue
+            for path in self.log_paths(run):
+                self.log_tail(path).clear(path)
         self.activity.clear()
         self.update_logs()
 
@@ -1591,99 +1772,184 @@ class WorkbenchLayout:
         reports = self.window._reports_window
         if reports._worker is not None:
             return
+        binding = None
         if self.paired is not None:
-            reports.path_edit.setText(str(self.paired.packet/'ledger.db'))
+            binding = self.paired.packet/'ledger.db', self.window.paired_account_key
         elif self.window.store is not None and self.window.selected_account is not None:
-            reports.path_edit.setText(str(self.window.store.ledger_path(self.window.selected_account)))
-        reports.request_daily_export()
+            account = self.window.selected_account
+            binding = self.window.store.ledger_path(account), account['account_key']
+        if binding is not None:
+            reports.bind_source(*binding)
+        reports.request_daily_export(allow_offline=binding is not None)
 
     def latest_run(self):
-        if self.paired is None:
-            dialog = self.window._session_dialog
-            selected = self.window.selected_account
-            if dialog is not None and selected is not None and dialog.account_id == selected['account_id']:
-                return dialog.run_directory
+        window = self.window
+        selected = window.selected_account
+        view = window.view
+        if view is not None and selected is not None and view['account_key'] != selected['account_key']:
             return None
-        runs = self.paired.packet/'runs'
-        log = max(runs.glob('*/executor.log'), key=lambda path:path.parent.name, default=None)
-        return log.parent if log is not None else None
+        candidates = []
+        for launcher in (window._strategy_starter, window._session_dialog):
+            if launcher is not None and launcher.run_directory is not None and (
+                    (selected is not None and launcher.account_id == selected['account_id'])
+                    or (self.paired is not None and launcher is window._session_dialog)):
+                candidates.append(Path(launcher.run_directory).resolve())
+        finished = getattr(window, '_finished_run', None)
+        account = selected['account_key'] if selected else window.paired_account_key
+        if (view is not None or finished is None or finished[0] != account
+                or (candidates and candidates[0] != finished[2])):
+            finished = None
+        directory = getattr(window.store, 'directory', None)
+        account_root = directory / 'desktop-starts' if selected and isinstance(directory, Path) else None
+        paired_root = self.paired.packet / 'runs' if self.paired is not None else None
+        identity = (view['account_key'], view['kernel_boot_id']) if view is not None else None
+        if finished is not None:
+            identity = finished[:2]
+        binding = (identity, view['configuration'].get('run_directory') if view is not None else None,
+                   selected['account_id'] if selected else None, tuple(candidates), finished)
+        now = time.monotonic()
+        same_binding = binding == self.log_binding
+        archive = None
+        if same_binding and self.log_directory is not None:
+            archive = comparison_file(self.log_directory, identity) if identity is not None else None
+            if archive == self.log_comparison and (archive is not None or
+                    (identity is None and startup_only(self.log_directory))):
+                return self.log_directory
+        elif same_binding and now - self.log_resolution_at < 2.5:
+            return self.log_directory
+        directory = resolve_run(view, candidates, account_root, paired_root, finished=finished)
+        archive = comparison_file(directory, identity) if directory is not None and identity is not None else None
+        if identity is not None and archive is None:
+            directory = None
+        if (directory != self.log_directory or archive != self.log_comparison
+                or (self.log_binding and self.log_binding[0] != identity)):
+            self.log_tails.clear()
+            self.last_reasons.clear()
+        self.log_binding, self.log_directory = binding, directory
+        self.log_comparison = archive
+        self.log_resolution_at = now
+        return directory
 
-    def json_tail(self, path, size):
-        try:
-            with path.open('rb') as stream:
-                end = stream.seek(0,2)
-                cleared = self.log_clear_offsets.get(path,0)
-                if cleared > end:
-                    cleared = 0
-                offset = max(cleared,end-size)
-                stream.seek(offset)
-                lines = stream.read(size).splitlines()
-        except OSError:
-            return []
-        result = []
-        for line in (lines[1:] if offset > cleared else lines)[-800:]:
-            if not line.startswith(b'{'):
-                continue
-            try:
-                record = strict_loads(line)
-            except TraderError:
-                continue
-            if isinstance(record,dict):
-                result.append(record)
+    def log_source_matches(self, run, archive):
+        if archive is None:
+            return startup_only(run)
+        return comparison_file(run, self.log_binding[0]) == archive
+
+    def log_paths(self, run):
+        paths = [executor_log_path(run), run/'startup-failure.json', *sorted(run.glob('phase-*-bootstrap.json'))]
+        comparison = self.log_comparison
+        if comparison is not None:
+            paths.extend((run/'strategy-log.jsonl', comparison))
+        return paths
+
+    def log_tail(self, path):
+        if path not in self.log_tails:
+            document = path.suffix == '.json'
+            limit = 65_536 if document else 360_000
+            self.log_tails[path] = JsonLogTail(limit, document=document)
+        return self.log_tails[path]
+
+    def logged_strategy_reasons(self, run):
+        result = {}
+        archive = self.log_comparison
+        if run is not None and archive is not None:
+            path = run/'strategy-log.jsonl'
+            for record in self.log_tail(path).read(path):
+                kind = record.get('kind')
+                code, day = record.get('contract_id'), record.get('trading_day')
+                if all(isinstance(value, str) for value in (kind, code, day)) and record.get('message'):
+                    result.setdefault((code,day), set()).add(kind)
+            if not self.log_source_matches(run, archive):
+                self.latest_run()
+                return {}
         return result
 
     def executor_log(self, run):
         phases = []
-        log = run/'executor.log'
-        if not log.exists():
-            log = run.with_name(run.name + '.executor.log')
-        for record in self.json_tail(log,96_000):
-            if record.get('phase'):
-                stamp = record.get('observed_at_utc')
-                at = beijing(stamp).strftime('%H:%M:%S') if stamp else '—'
-                phases.append(WorkbenchLogLine(f"[{at}] [执行器] {record['phase']} {record.get('error_code','')}".rstrip(),
-                                               'error' if record.get('error_code') else None))
-        for record in self.json_tail(run/'startup-failure.json',8192):
-            phases.append(WorkbenchLogLine(f"[执行器] {record.get('status','启动失败')} · {record.get('error_code','—')}", 'error'))
-        for record in self.json_tail(run/'strategy-log.jsonl',360_000):
-            stamp, tag, message = (record.get(key) for key in ('observed_at_utc','tag','message'))
+        for path in (executor_log_path(run), *sorted(run.glob('phase-*-bootstrap.json'))):
+            for record in self.log_tail(path).read(path):
+                phase = record.get('phase')
+                if not isinstance(phase, str):
+                    continue
+                at, stamp = log_time(record.get('observed_at_utc'))
+                message = record.get('message') or LOG_PHASES.get(phase, '策略状态已更新')
+                if not isinstance(message, str):
+                    message = LOG_PHASES.get(phase, '策略状态已更新')
+                error = record.get('error_code')
+                if isinstance(error, str):
+                    message += ' · ' + error
+                phases.append(WorkbenchLogLine(f'[{at}] [执行器] {message}', 'error' if error else None, stamp))
+        failure = run/'startup-failure.json'
+        for record in self.log_tail(failure).read(failure):
+            phases.append(WorkbenchLogLine(f"[执行器] {record.get('message','启动失败')} · {record.get('error_code','—')}", 'error'))
+        if self.log_comparison is None:
+            return phases
+        path = run/'strategy-log.jsonl'
+        for record in self.log_tail(path).read(path):
+            stamp = record.get('native_time_utc') or record.get('observed_at_utc')
+            tag, message = record.get('tag'), record.get('message')
             if not all(isinstance(value,str) and value for value in (stamp,tag,message)):
                 continue
-            try:
-                at = beijing(stamp).strftime('%H:%M:%S')
-            except ValueError:
+            at, moment = log_time(stamp)
+            if moment is None:
                 continue
-            phases.append(WorkbenchLogLine(f'[{at}] [{tag}] {message}', LOG_TAGS.get(tag)))
+            category = record.get('category')
+            phases.append(WorkbenchLogLine(f'[{at}] [{tag}] {message}',
+                                           category if isinstance(category, str) else LOG_TAGS.get(tag), moment))
         return phases
 
     def comparison_logs(self, run):
-        path = next(run.glob('comparison-*/events.jsonl'),None)
+        path = self.log_comparison
         product, dsv = [], []
         if path is None:
             return product, dsv
-        for record in self.json_tail(path,360_000):
+        strategy_path = run/'strategy-log.jsonl'
+        recorded = {row['event_seq'] for row in self.log_tail(strategy_path).read(strategy_path)
+                    if isinstance(row.get('event_seq'), str)}
+        expected_boot = self.log_binding[0][1]
+        for record in self.log_tail(path).read(path):
             event = record.get('data',{})
+            if not isinstance(event, dict):
+                continue
             if record.get('kind')=='DSV_LOG':
                 stamp = event.get('source_time_utc')
-                if stamp:
-                    at = beijing(stamp).strftime('%H:%M:%S')
+                at, moment = log_time(stamp)
+                if moment is not None:
                     kind = event.get('kind')
-                    category = event.get('operator_tag') or {'ENTRY_ORDER':'open','ENTRY_FILL':'open','EXIT_DECISION':'close'}.get(kind)
-                    dsv.append(WorkbenchLogLine(f"[{at}] [DSV] {event.get('contract_id','—')} · {kind or ''} {event.get('reason','')}".rstrip(), category))
+                    message = event.get('message')
+                    category = dsv_log_category(message) if isinstance(message, str) else None
+                    if category is None:
+                        category = event.get('operator_tag')
+                    if not isinstance(category, str):
+                        if isinstance(kind, str):
+                            category = {'ENTRY_ORDER':'open','ENTRY_FILL':'open','EXIT_DECISION':'close'}.get(kind)
+                    detail = message or f"{kind or ''} {event.get('reason','')}".rstrip()
+                    dsv.append(WorkbenchLogLine(f"[{at}] [DSV] {event.get('contract_id','—')} · {detail}", category, moment))
             elif record.get('kind')=='PRODUCT_COMMITTED_EVENT':
+                if event.get('kernel_boot_id', expected_boot) != expected_boot:
+                    continue
+                sequence = event.get('event_seq')
+                if isinstance(sequence, str) and sequence in recorded:
+                    continue
                 label, category = {'ENTRY_PREPARED':('开仓意图','open'), 'EXIT_PREPARED':('平仓意图','close'),
                                    'FILL_CONFIRMED':('柜台成交',None), 'SEND_ABORTED':('发送取消','error'),
                                    'EXECUTION_CANCEL_TIMEOUT':('撤单待核对','error')}.get(event.get('event_type'), (None,None))
                 if label is None:
                     continue
                 payload = event.get('payload',{})
+                if not isinstance(payload, dict):
+                    continue
                 data = payload.get('data',payload)
-                cycle = data.get('cycle',{})
-                plan = cycle.get('plan',{})
+                if not isinstance(data, dict):
+                    continue
+                cycle = data.get('cycle')
+                cycle = cycle if isinstance(cycle, dict) else {}
+                plan = cycle.get('plan')
+                plan = plan if isinstance(plan, dict) else {}
                 fill = data.get('fill')
                 child_id = None
                 detail = ''
-                if fill:
+                if isinstance(fill, dict):
                     effect = '开仓' if fill.get('effect')=='OPEN' else '平仓'
                     if category is None:
                         category = 'open' if fill.get('effect')=='OPEN' else 'close'
@@ -1694,14 +1960,14 @@ class WorkbenchLayout:
                     child_id = order.get('child_order_id')
                     detail = f"{order.get('original_qty','—')} 手 @ {order.get('limit_price','—')}"
                 stamp = (fill or {}).get('observed_at_utc') or (cycle.get('money_quote') or {}).get('observed_at_utc')
-                at = beijing(stamp).strftime('%H:%M:%S') if stamp else '—'
+                at, moment = log_time(stamp)
                 manual_children = (cycle.get('execution') or {}).get('manual_reduction_children',{})
                 if category=='open' and cycle.get('entry_origin')=='MANUAL':
                     category = 'manual'
                 elif category=='close' and (child_id in manual_children
                         or (cycle.get('nominal_exit') or {}).get('exit_reason')=='MANUAL_EXIT'):
                     category = 'manual'
-                product.append(WorkbenchLogLine(f"[{at}] [执行器] {label} {plan.get('contract_id','—')} {detail}".rstrip(), category))
+                product.append(WorkbenchLogLine(f"[{at}] [执行器] {label} {plan.get('contract_id','—')} {detail}".rstrip(), category, moment))
         return product, dsv
 
     def update_logs(self, *_):
@@ -1709,12 +1975,24 @@ class WorkbenchLayout:
             return
         mode = self.log_filter.currentIndex()
         run = self.latest_run()
+        archive = self.log_comparison
         lines = []
         product, dsv = self.comparison_logs(run) if run and mode in (0,1,3) else ([],[])
         if run and mode in (0,1):lines.extend(self.executor_log(run) + product)
+        event_filter = self.log_event_filter.currentText()
+        if mode in (0,3):
+            if event_filter == '平仓':
+                # The original archive reload and export use close/auto.
+                dsv = [line for line in dsv if line.category in {'close', 'auto'}]
+            lines.extend(dsv)
+        if run and mode != 2 and not self.log_source_matches(run, archive):
+            self.latest_run()
+            run = None
+            lines.clear()
+        self.log_source_status.setVisible(run is None and mode != 2)
         if mode in (0,2):lines.extend(self.activity)
-        if mode in (0,3):lines.extend(dsv)
-        allowed = LOG_EVENT_FILTERS.get(self.log_event_filter.currentText())
+        lines.sort(key=lambda line: line.timestamp or datetime.min.replace(tzinfo=BEIJING))
+        allowed = LOG_EVENT_FILTERS.get(event_filter)
         query = self.log_search.text().strip().casefold()
         self.visible_log_lines = [line.text for line in lines if (allowed is None or line.category in allowed)
                                   and query in line.text.casefold()]
@@ -1757,6 +2035,11 @@ class WorkbenchLayout:
         self.instrument_rules.set_markets(self.names, {})
         cols.addWidget(self.instrument_rules, 6)
         layout.addLayout(cols,1)
+        transfers = group('银期转账时间表（以期货公司 App 为准 · 占位）', layout)
+        bank_times = table(['银行','日盘入金','日盘出金','夜盘入金','夜盘出金'])
+        populate(bank_times, [('银行','日盘入金','日盘出金','夜盘入金','夜盘出金')])
+        bank_times.setMaximumHeight(77)
+        transfers.addWidget(bank_times)
 
     def render_session_hours(self, view):
         active = view.get('configuration',{}).get('schedule_display')
@@ -1788,8 +2071,11 @@ class WorkbenchLayout:
         self.offset_preview = QLabel('计算结果在此核对')
         def applied():
             candidate = calculator.result_profile
-            if candidate is not None:
-                self.offset_preview.setText('已生成参数预览 · '+candidate.content_hash[:12])
+            dialog = self.parameter_dialog()
+            if candidate is not None and dialog.apply_edited_preview(candidate, expected_hash=calculator.base_hash):
+                self.offset_preview.setText('所选偏移已应用到主控预览，可保存参数。')
+            else:
+                calculator.error_label.setText('参数预览已变化，请重新计算后应用。')
             calculator.show()
         calculator.accepted.connect(applied)
         layout.addWidget(calculator,1)
@@ -1802,19 +2088,27 @@ class WorkbenchLayout:
             layout.addWidget(sound_settings())
         appearance = group('界面偏好', layout)
         appearance.addWidget(self.window._tray.preference_checkbox())
+        appearance.addWidget(button('授权状态', self.show_license_status))
         for title,key,panel in (('显示 K 线图','show_candles',self.candle_panel),
                                 ('显示权益曲线','show_equity',self.equity_panel)):
             chart = QCheckBox(title)
             chart.setChecked(self.settings.value(key,self.settings.value('show_charts',True,bool),bool))
             panel.setVisible(chart.isChecked())
-            chart.toggled.connect(panel.setVisible)
+            if key == 'show_equity':
+                chart.toggled.connect(panel.setVisible)
+            else:
+                chart.setToolTip('重开工作台后生效')
             chart.toggled.connect(lambda visible,k=key:self.settings.setValue(k,visible))
             appearance.addWidget(chart)
         layout.addStretch()
 
+    def show_license_status(self):
+        from online_trader.desktop.entrypoint import license_status_text
+        QMessageBox.information(self.window, '授权状态', license_status_text())
+
     def add_activity(self, message, *, category=None):
-        stamp = datetime.now(BEIJING).strftime('%H:%M:%S')
-        self.activity.append(WorkbenchLogLine(f'[{stamp}] [工作台] {message}', category))
+        moment = datetime.now(BEIJING)
+        self.activity.append(WorkbenchLogLine(f'[{moment:%H:%M:%S}] [工作台] {message}', category, moment))
 
     def record_balance(self, account, view):
         now = datetime.now(BEIJING)
@@ -1847,6 +2141,18 @@ class WorkbenchLayout:
         rows = [item for item in daily if item['trading_day'] in selected_days]
         return rows,selected_days
 
+    def equity_anchor(self):
+        view = self.rendered_view or {}
+        source = view.get('configuration', {}).get('equity_base')
+        daily = [source] if source is not None else sorted(view.get('equity_history', ()), key=lambda row: row['trading_day'])
+        for row in daily:
+            balance = row.get('balance')
+            if balance is None or Decimal(balance) <= 0:
+                continue
+            previous = row.get('pre_balance')
+            return Decimal(previous) if previous is not None and Decimal(previous) > 0 else Decimal(balance)
+        return next((Decimal(row['balance']) for row in self.balance_history if row['balance'] is not None), None)
+
     def render_equity_chart(self, *_):
         daily,days = self.equity_rows()
         current = self.current_trading_day(self.rendered_view) if self.rendered_view is not None else None
@@ -1856,12 +2162,11 @@ class WorkbenchLayout:
         if has_current_samples:
             rows.extend(intraday)
         if self.equity_mode.currentText()=='收益曲线':
-            anchor_rows = (self.rendered_view or {}).get('equity_history') or rows
-            anchor = next((Decimal(item['balance']) for item in anchor_rows if item.get('balance') is not None),None)
+            anchor = self.equity_anchor()
             if anchor is not None:
                 rows = [item|{'balance':str(Decimal(item['balance'])-anchor) if item.get('balance') is not None else None}
                         for item in rows]
-            self.equity.heading = '权益变化（相对首个已记录权益）'
+            self.equity.heading = '权益变化（相对起始权益）'
         else:
             self.equity.heading = '账户权益（柜台已记录）'
         self.equity.set_rows(rows)
@@ -1886,14 +2191,16 @@ class WorkbenchLayout:
             return
         stream = StringIO()
         writer = csv.writer(stream)
-        writer.writerow(('日期','最近记录权益','当日盈亏','累计盈亏','累计收益率','记录时间（北京时间）'))
-        first = Decimal(daily[0]['balance'])
+        writer.writerow(('日期','最近记录权益','当日盈亏','累计盈亏','区间收益率','记录时间（北京时间）','来源'))
+        anchor = self.equity_anchor()
+        selected_start = Decimal(daily[0]['balance'])
         for row in daily:
             equity = Decimal(row['balance'])
             previous = row.get('pre_balance')
             today = equity-Decimal(previous) if previous is not None and Decimal(previous)>0 else ''
-            writer.writerow((row['trading_day'],equity,today,equity-first,f'{equity/first-1:.2%}',
-                             beijing(row['observed_at_utc']).isoformat()))
+            writer.writerow((row['trading_day'],equity,today,equity-anchor if anchor is not None else '',
+                             f'{equity/selected_start-1:.2%}' if selected_start else '',
+                             beijing(row['observed_at_utc']).isoformat(),'柜台记录'))
         self.write_equity_export(stream.getvalue().encode('utf-8-sig'),path)
 
     def write_equity_export(self, raw, path):
@@ -1929,14 +2236,47 @@ class WorkbenchLayout:
             values['risk_ratio'] = f"{Decimal(values['risk_ratio']):.2%}"
         now = datetime.now(BEIJING)
         values['local_time'] = now.strftime('%H:%M:%S')
-        delays = [(now-beijing(market['source_time_utc'])).total_seconds()
-                  for market in markets.values() if market.get('fresh') and market.get('source_time_utc')]
-        if delays and all(delay >= 0 for delay in delays):
-            values['quote_delay'] = f'{max(delays):.1f} 秒'
         self.fund_values = values
         for key, (metric,title) in self.fund_metrics.items():
             value = values.get(key)
             metric.setText(f'{title}   {value if value is not None else "—"}')
+
+    def render_strategy_monitor(self, monitor):
+        value = display_quote_delay(monitor.get('quote_delay_seconds') if monitor else None)
+        self.home_quote_delay.setText(f'行情延迟   {value}')
+        metric, title = self.fund_metrics['quote_delay']
+        metric.setText(f'{title}   {value}')
+        if not monitor:
+            self.home_quote_delay.setToolTip('')
+            return
+        status = monitor['quote_status']
+        self.home_quote_delay.setToolTip(f'行情 · {status}')
+        self.quote_status.setText(f'行情 · {status}')
+        groups = {'ACTIVE': [], 'STOPPED': [], 'PENDING': []}
+        for symbol in monitor['symbols']:
+            state = symbol['state']
+            code = symbol['contract_id']
+            status = symbol.get('status') or '等待行情'
+            position = symbol.get('position_quantity', 0)
+            if state == 'ACTIVE' and position:
+                status = '📌持仓中' if status == '持仓中' else '📌持仓中 · ' + status
+            marker = {'ACTIVE':'●','STOPPED':'⛔','PENDING':'⏳'}[state]
+            parts = [f"{marker} {symbol['name']} ({code})  {status}"]
+            net = symbol.get('net_loss_points')
+            if net is not None:
+                points = Decimal(net)
+                parts.append(f'{"净亏" if points >= 0 else "净盈"}{abs(points):.0f}点')
+            if state == 'ACTIVE':
+                parts.append(f'报单{symbol["opening_orders"]}次')
+                if symbol.get('main_contract'):
+                    parts.append(f'主力:{symbol["main_contract"]}')
+                if symbol.get('real_margin_rate') is not None:
+                    parts.append(f'实时保证金率 {Decimal(symbol["real_margin_rate"]):.2%}')
+            elif state == 'PENDING' and position:
+                parts.append(f'剩余 {position} 手')
+            groups[state].append('  '.join(parts))
+        for label, lines in zip(self.status_labels, groups.values()):
+            label.setText('\n'.join(lines) or '（无）')
 
     def render(self, view):
         self.rendered_view = view
@@ -1956,12 +2296,9 @@ class WorkbenchLayout:
         markets = {item['contract_id']:item for item in view['markets']}
         self.render_rollover_status(markets)
         codes = view['configuration'].get('scoped_contracts') or list(self.names)
-        if [self.manual_code.itemText(i) for i in range(self.manual_code.count())]!=codes:
-            selected = self.manual_code.currentText()
-            self.manual_code.clear()
-            self.manual_code.addItems(codes)
-            if selected in codes:
-                self.manual_code.setCurrentText(selected)
+        if self.manual_scoped_codes != tuple(codes):
+            self.manual_scoped_codes = tuple(codes)
+            self.filter_manual_catalog()
         if [self.candle_contract.itemText(i) for i in range(self.candle_contract.count())]!=codes:
             selected = self.candle_contract.currentText()
             self.candle_contract.clear()
@@ -1973,7 +2310,7 @@ class WorkbenchLayout:
             self.chart_owner = owner
             self.balance_history.clear()
             self.last_balance_slot = None
-            self.candles.history.clear()
+            self.candles.native_series.clear()
             self.last_reasons.clear()
         account = getattr(self.window,'_last_account_record',{})
         self.render_funds(account,view,markets)
@@ -1981,10 +2318,10 @@ class WorkbenchLayout:
         self.render_home()
         self.record_balance(account,view)
         self.render_equity_chart()
-        self.candles.show_native_bars(view.get('minute_bars',{}))
+        self.candles.show_native_bars(view.get('minute_bars',{}) | view['configuration'].get('native_minute_bars',{}))
         self.select_candles(self.candle_contract.currentText())
         run = self.latest_run()
-        has_strategy_log = run is not None and (run/'strategy-log.jsonl').is_file()
+        strategy_records = self.logged_strategy_reasons(run)
         waiting, blocked, pending = [], [], []
         quote_states = {}
         for code in codes:
@@ -1993,11 +2330,18 @@ class WorkbenchLayout:
             reasons = market.get('entry_reasons',[])
             quote_states[code] = ('新鲜' if market.get('fresh') else
                                   '行情已滞后' if market.get('source_time_utc') else '等待行情')
-            activity_reasons = [reason for reason in reasons if not has_strategy_log or reason not in STRATEGY_LOG_REASONS]
+            covered = strategy_records.get((code,market.get('trading_day')), set())
+            activity_reasons = [reason for reason in reasons
+                                if reason not in covered and reason not in QUIET_ENTRY_REASONS]
             if activity_reasons != self.last_reasons.get(code):
                 self.last_reasons[code] = activity_reasons
                 if activity_reasons:
-                    self.add_activity(f'{code} · {" / ".join(activity_reasons)}')
+                    messages = ENTRY_MESSAGES | ACTIVATION_MESSAGES | {
+                        'NET_LOSS_LIMIT':'净亏已达上限，暂停开新仓',
+                        'ACCOUNT_VALUES_UNKNOWN':'柜台账户字段待同步',
+                        'ENTRY_AUTHORITY_DISARMED':'策略未启用开仓',
+                    }
+                    self.add_activity(f'{code} · {" / ".join(messages.get(reason,reason) for reason in activity_reasons)}')
             stop_reason = market.get('day_stop_reason')
             if stop_reason:
                 blocked.append(f'● {name}  {stop_reason}')
@@ -2013,8 +2357,6 @@ class WorkbenchLayout:
                     details = [ACTIVATION_MESSAGES[reason] for reason in reasons if reason in ACTIVATION_MESSAGES]
                     status = ' · '.join([primary,*details] if primary else details) or ('等待信号' if reasons else '可开仓')
                 waiting.append(f'● {name}  {status}')
-            if market:
-                self.candles.record(market)
         failed_exits = {block['position_cycle_id'] for block in view.get('blocks',())
                         if block.get('active') and block.get('reason_code')=='EXIT_REDUCTION_TERMINAL_UNFILLED'}
         for cycle in view['cycles']:
@@ -2025,9 +2367,11 @@ class WorkbenchLayout:
         for label, lines in zip(self.status_labels,(waiting,blocked,pending)):
             label.setText('\n'.join(lines) or '（无）')
         self.quote_status.setText(f"行情 · {sum(bool(item.get('fresh')) for item in markets.values())} / {len(codes)} 合约有新鲜报价")
+        self.render_strategy_monitor(view['configuration'].get('strategy_monitor'))
         populate(self.instrument_grid,[[self.names.get(code,code),code,markets.get(code,{}).get('trading_day','—'),
              display_value(markets.get(code,{}).get('last')),quote_states[code]] for code in codes])
-        self.instrument_rules.set_markets({code:self.names.get(code,code) for code in codes}, markets)
+        rule_markets = self.quote_reference | {code:market for code,market in markets.items() if market.get('fresh') or code not in self.quote_reference}
+        self.instrument_rules.set_markets({code:self.names.get(code,code) for code in codes}, rule_markets)
         self.render_manual_tables(view)
         self.render_manual()
         state = (view['kernel_boot_id'],view['entry_authority'],view['connection']['fault'],view['connection']['synchronized'])

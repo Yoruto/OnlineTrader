@@ -210,6 +210,9 @@
                     "enabled": {
                       "const": true
                     },
+                    "pullback_to_first": {
+                      "type": "boolean"
+                    },
                     "trigger_ratio": {
                       "type": "string",
                       "maxLength": 32,

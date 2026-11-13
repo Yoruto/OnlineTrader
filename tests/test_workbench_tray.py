@@ -21,19 +21,22 @@ class WorkbenchTrayTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.settings = QSettings(str(Path(self.temp.name) / 'view.ini'), QSettings.IniFormat)
 
-    def test_close_to_tray_keeps_refresh_and_exit_closes_the_window(self):
-        with patch('online_trader.desktop.workbench.QSettings', return_value=self.settings):
-            window = WorkbenchWindow(None)
-        self.addCleanup(window.deleteLater)
-        window.show()
-        self.settings.setValue('minimize_to_tray', True)
-        with patch('online_trader.desktop.tray.QSystemTrayIcon') as tray:
+    def test_default_close_to_tray_keeps_refresh_and_exit_closes_the_window(self):
+        self.assertFalse(self.settings.contains('minimize_to_tray'))
+        with (patch('online_trader.desktop.workbench.QSettings', return_value=self.settings),
+              patch('online_trader.desktop.tray.QSystemTrayIcon') as tray):
             tray.isSystemTrayAvailable.return_value = True
             tray.Trigger = QSystemTrayIcon.Trigger
             tray.DoubleClick = QSystemTrayIcon.DoubleClick
             icon = Mock()
             icon.isVisible.return_value = False
             tray.return_value = icon
+            window = WorkbenchWindow(None)
+            self.addCleanup(window.deleteLater)
+            self.assertTrue(window._tray.preference_checkbox().isChecked())
+            icon.show.assert_called_once()
+            icon.isVisible.return_value = True
+            window.show()
             self.assertFalse(window.close())
             self.assertFalse(window.isVisible())
             self.assertTrue(window.timer.isActive())
@@ -66,6 +69,18 @@ class WorkbenchTrayTests(unittest.TestCase):
             window._tray.preference_checkbox().setChecked(False)
             icon.hide.assert_called_once()
             self.assertTrue(window.close())
+
+    def test_saved_opt_out_closes_normally(self):
+        self.settings.setValue('minimize_to_tray', False)
+        with (patch('online_trader.desktop.workbench.QSettings', return_value=self.settings),
+              patch('online_trader.desktop.tray.QSystemTrayIcon') as tray):
+            tray.isSystemTrayAvailable.return_value = True
+            window = WorkbenchWindow(None)
+            self.addCleanup(window.deleteLater)
+            window.show()
+            self.assertFalse(window._tray.preference_checkbox().isChecked())
+            self.assertTrue(window.close())
+            tray.assert_not_called()
 
     def test_unavailable_tray_uses_normal_close_and_saved_geometry_restores(self):
         first = QMainWindow()

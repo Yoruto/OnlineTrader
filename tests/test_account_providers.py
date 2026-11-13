@@ -13,6 +13,7 @@ from online_trader.errors import TraderError
 from online_trader.gateway.simnow import account_fingerprint,credentials as simnow_credentials
 from online_trader.gateway.tqkq import credentials as kq_credentials
 from online_trader.runtime.instance import AccountLock
+from tests.qt_lifecycle import dispose_widget
 from tests.test_accounts import MemoryVault
 
 
@@ -105,7 +106,7 @@ class SimulationAccountTests(unittest.TestCase):
         self.assertNotEqual(account_identity(login)[0],account_identity(login,'TQ_SIMNOW')[0])
 
     def test_account_dialog_saves_simnow_and_clears_all_secrets(self):
-        _,rows=self.seed();dialog=AccountDialog(self.store);self.addCleanup(dialog.close)
+        _,rows=self.seed();dialog=AccountDialog(self.store);self.addCleanup(dispose_widget, dialog)
         self.assertEqual(dialog.provider.currentData(),'TQ_SIMNOW')
         for field,key in ((dialog.username,'simnow_username'),(dialog.password,'simnow_password'),
                           (dialog.market_username,'kq_username'),(dialog.market_password,'kq_password')):

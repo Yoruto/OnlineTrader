@@ -141,8 +141,13 @@ class ControlServer:
             peer.instance_id=body["client_instance_id"]
             peer.ready=True
             peer.last_seen=time.monotonic()
+            capabilities = ["READ_STATUS", "READ_STREAM"]
+            if peer.role == "DESKTOP":
+                capabilities.extend(("REQUEST_CONTEXT", "OPERATOR_COMMAND"))
+                if getattr(self.kernel, '_dsv_market_monitor', None) is not None:
+                    capabilities.append("READ_DIAGNOSTIC")
             peer.enqueue(self._reply(peer,message,"Welcome",{"negotiated_version":"1.0","peer_id":peer.peer_id,"granted_role":peer.role,
-                "kernel_epoch":str(self.kernel.kernel_epoch),"capabilities":["READ_STATUS","READ_STREAM","REQUEST_CONTEXT","OPERATOR_COMMAND"] if peer.role=="DESKTOP" else ["READ_STATUS","READ_STREAM"],
+                "kernel_epoch":str(self.kernel.kernel_epoch),"capabilities":capabilities,
                 "max_frame_bytes":1048576,"heartbeat_interval_ms":5000,"peer_liveness_timeout_ms":15000,"server_build_id":"online-trader-g1"}))
             return
         if (message["connection_id"],message["account_key"],message["kernel_boot_id"])!=(peer.connection_id,self.kernel.account_key,self.kernel.boot_id):
@@ -164,6 +169,13 @@ class ControlServer:
             from online_trader.kernel.workbench import workbench_view
             value=workbench_view(self.kernel)
             peer.enqueue(self._reply(peer,message,'WorkbenchSnapshot',{'payload':value,'content_hash':content_hash(value)}))
+        elif kind == 'WorkbenchMonitorRequest':
+            if peer.role != 'DESKTOP' or getattr(self.kernel, '_dsv_market_monitor', None) is None:
+                raise TraderError('E_AUTH', 'Read diagnostics capability was not granted')
+            from online_trader.kernel.workbench import workbench_monitor_view
+            value = workbench_monitor_view(self.kernel)
+            peer.enqueue(self._reply(peer, message, 'WorkbenchMonitorSnapshot',
+                                    {'payload': value, 'content_hash': content_hash(value)}))
         elif kind=="ContextRequest":
             if body["purpose"]!="OPERATOR_COMMAND" or body["operation"] not in OPERATIONS:
                 raise TraderError("E_AUTH","Context purpose is not an enabled control capability")

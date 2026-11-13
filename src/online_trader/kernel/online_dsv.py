@@ -4,6 +4,7 @@ import copy
 from online_trader.contracts.codec import strict_loads
 from online_trader.errors import TraderError
 from online_trader.kernel.simulation import OnlineSimulation
+from online_trader.online_scope import DsvSimulationGrant
 from online_trader.protection.reducer import DsvSimulationPlanPermit
 
 
@@ -11,19 +12,63 @@ class OnlineDsvSimulation(OnlineSimulation):
     strategy_enabled=True
 
     def __init__(self,kernel,grant):
+        self._archived_cycles = set()
+        self._archived_order_calendars = {}
+        self._approved_grants = {}
+        self._prior_calendars = {}
         super().__init__(kernel,grant)
         from online_trader.kernel.day_recovery import DayRecovery
         from online_trader.kernel.historical_orders import HistoricalOrders
         self.days=DayRecovery(self)
         self.historical_orders=HistoricalOrders(self)
 
+    def accepts_cycle(self, cycle):
+        if super().accepts_cycle(cycle):
+            return True
+        plan = cycle['plan']
+        if (plan.get('account_key') != self.grant.account_key
+                or plan.get('approval_record_id') == self.grant.value['grant_id']
+                or cycle['lifecycle'] != 'CLOSED' or cycle['protection']['owned_qty']
+                or cycle.get('statistics_review_required') or cycle['protection'].get('reconciliation_required')
+                or any(not order['terminal_confirmed'] or order['reported_fill_qty'] != order['filled_qty']
+                       or (order['send_state'] == 'DEFINITELY_NOT_SENT' and order['filled_qty'])
+                       or order['send_state'] not in {'DEFINITELY_NOT_SENT', 'CONFIRMED'}
+                       or order.get('cancel_status') in {'REQUESTED', 'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}
+                       for order in cycle['orders'])):
+            return False
+        original = self.approved_grant(plan['approval_record_id'])
+        try:DsvSimulationPlanPermit.issue(plan, original)
+        except TraderError:return False
+        self._archived_cycles.add(cycle['position_cycle_id'])
+        for order in cycle['orders']:
+            self._archived_order_calendars[order['child_order_id']] = original.value['calendar_hash']
+        return True
+
+    def archived_cycle(self, cycle):
+        return cycle['position_cycle_id'] in self._archived_cycles
+
+    def approved_grant(self, grant_id):
+        if grant_id not in self._approved_grants:
+            rows = self.kernel.ledger.query(
+                'SELECT manifest_json,manifest_hash FROM approval_manifests WHERE approval_record_id=?', (grant_id,))
+            if not rows:
+                raise TraderError('PLAN_APPROVAL_REQUIRED', 'The original strategy scope has not committed')
+            record = rows[0]
+            grant = DsvSimulationGrant.parse(record['manifest_json'])
+            if grant.content_hash != record['manifest_hash'] or grant.account_key != self.kernel.account_key:
+                raise TraderError('E_SCOPE', 'Committed strategy scope identity differs')
+            self._approved_grants[grant_id] = grant
+        return self._approved_grants[grant_id]
+
     def initialize(self):
         snapshot=super().initialize()
-        if not any(c['plan']['trading_day']!=snapshot['trading_day'] for c in self.kernel._staged.values()):
+        if not any(c['plan']['trading_day']!=snapshot['trading_day'] and not self.archived_cycle(c)
+                   for c in self.kernel._staged.values()):
             self.days.ready_day=snapshot['trading_day'];self.days.ready_epoch=self.port.source_epoch
         return snapshot
 
     def exit_day_ready(self,cycle,day):
+        if self.archived_cycle(cycle):return False
         if self.grant.multi_day:return self.grant.permits_day(day) and self.days.ready(day) and not self.port.fault
         return day==cycle['plan']['trading_day']
 
@@ -48,10 +93,11 @@ class OnlineDsvSimulation(OnlineSimulation):
                 'max_order_quantity':self.grant.value['max_order_quantity'],'opening_attempts':self.grant.value['opening_attempts']}
 
     def permit(self,plan):
-        rows=self.kernel.ledger.query('SELECT manifest_hash FROM approval_manifests WHERE approval_record_id=?',(self.grant.value['grant_id'],))
-        if not rows or rows[0]['manifest_hash']!=self.grant.content_hash:
-            raise TraderError('PLAN_APPROVAL_REQUIRED','The original strategy scope has not committed')
-        return DsvSimulationPlanPermit.issue(plan,self.grant)
+        grant = self.approved_grant(plan['approval_record_id'])
+        if (grant.content_hash != self.grant.content_hash
+                and plan['position_cycle_id'] not in self._archived_cycles):
+            raise TraderError('PLAN_APPROVAL_REQUIRED', 'The original plan is outside the current owner')
+        return DsvSimulationPlanPermit.issue(plan, grant)
 
     def consumed(self):
         return self.opening_attempt_count()>=self.grant.value['opening_attempts']
@@ -59,7 +105,7 @@ class OnlineDsvSimulation(OnlineSimulation):
     def opening_attempt_count(self):
         # All prepared attempts consume the finite scope, including unknown,
         # rejected and definitely-unsent children; restart never renews it.
-        return sum(o['effect']=='OPEN' for c in self.kernel._staged.values() for o in c['orders'])
+        return sum(o['effect']=='OPEN' for c in self.kernel._staged.values() if not self.archived_cycle(c) for o in c['orders'])
 
     def arm(self):
         k=self.kernel;scheduler=getattr(k,'_scheduled_runtime',None)
@@ -73,8 +119,8 @@ class OnlineDsvSimulation(OnlineSimulation):
             raise TraderError('E_NOT_READY','Current DSV owner, calendar, clock and control permission are required')
         return super().arm()
 
-    def validate_entry(self,plan,*,manual=False):
-        if manual!=self.grant.manual_workbench:
+    def validate_entry(self,plan,*,manual=False,entry_kind=None):
+        if manual!=self.grant.manual_workbench or plan.get('approval_record_id') != self.grant.value['grant_id']:
             raise TraderError('E_ONLINE_SCOPE','This scope does not authorize the requested entry origin')
         self.permit(plan)
         self.comparison_gate()
@@ -83,12 +129,18 @@ class OnlineDsvSimulation(OnlineSimulation):
         if (not self._configured or self.consumed() or not self.grant.in_window(self.port.clock.now())
                 or self.port.fault or not self.port.complete()):
             raise TraderError('E_ONLINE_SCOPE','DSV window, finite attempt budget or full-sync gate blocks entry')
-        if (not self.port.fresh(plan['contract_id']) or self.port.position(plan['contract_id'])!={'long':0,'short':0}
-                or self.port.active_orders(plan['contract_id'])):
-            raise TraderError('E_OWNERSHIP','Strategy entry requires a fresh unoccupied selected contract')
         runtime=getattr(self.kernel,'_dsv_runtime',None)
         if runtime is None or runtime.profile.content_hash!=self.grant.value['profile_hash']:
             raise TraderError('E_ONLINE_SCOPE','The active strategy profile differs from its original scope')
+        code = plan['contract_id']
+        if not manual and entry_kind == 'NORMAL':
+            facts = runtime._latest.get((code, plan['trading_day']))
+            side = 'BUY' if plan['direction']=='LONG' else 'SELL'
+            fresh = self.port.fresh_strategy_entry(code, side, facts['event'] if facts is not None else None)
+        else:
+            fresh = self.port.fresh(code)
+        if not fresh or self.port.position(code)!={'long':0,'short':0} or self.port.active_orders(code):
+            raise TraderError('E_OWNERSHIP','Strategy entry requires a fresh unoccupied selected contract')
 
     def manual_entry_facts(self,candidate,quantity,*,exclude_decision=None):
         k=self.kernel;runtime=k._dsv_runtime;code=candidate['contract_id']
@@ -150,9 +202,34 @@ class OnlineDsvSimulation(OnlineSimulation):
         # deadline must never be silently attached to an automatic DSV cycle.
         pass
 
-    def fill_day(self,observation,fill):
+    def native_day_proof(self, child, code, stamp, *, fill=False):
         from online_trader.gateway.native_days import native_day
-        proof=native_day(self.port.calendar,observation['contract_id'],fill['source_time_ns'])
+        calendar = self.port.calendar
+        digest = self._archived_order_calendars.get(child)
+        if digest is not None and digest != calendar.content_hash:
+            if digest not in self._prior_calendars:
+                from online_trader.scheduling.calendar import TradingCalendar
+                rows = self.kernel.ledger.query("""
+                    SELECT payload_json FROM config_revisions
+                    WHERE json_extract(payload_json,'$.scheduled_development.calendar_hash')=?
+                    ORDER BY config_revision DESC LIMIT 1
+                    """, (digest,))
+                if not rows:
+                    raise TraderError('E_CALENDAR_INCOMPLETE', 'The archived order calendar is unavailable')
+                record = strict_loads(rows[0]['payload_json'])['scheduled_development']['calendar']
+                previous = TradingCalendar.from_record(record)
+                if previous.content_hash != digest:
+                    raise TraderError('E_CALENDAR_INCOMPLETE', 'The archived order calendar identity differs')
+                self._prior_calendars[digest] = previous
+            try:
+                return native_day(self._prior_calendars[digest], code, stamp)
+            except TraderError as error:
+                if not fill or error.code != 'E_CALENDAR_INCOMPLETE':
+                    raise
+        return native_day(calendar, code, stamp)
+
+    def fill_day(self,observation,fill):
+        proof=self.native_day_proof(observation['child_order_id'],observation['contract_id'],fill['source_time_ns'],fill=True)
         if fill.get('native_day_evidence')!=proof or fill.get('trading_day')!=proof['trading_day']:
             raise TraderError('E_FACT_BARRIER','Native fill day is not proved by the original bound calendar')
         # Night sessions can belong to the next civil day. Compare exact time,
@@ -168,9 +245,8 @@ class OnlineDsvSimulation(OnlineSimulation):
         return proof['trading_day']
 
     def validate_native_order(self,observation):
-        from online_trader.gateway.native_days import native_day
         proof=observation.get('order_day_evidence')
-        if not proof or proof!=native_day(self.port.calendar,observation['contract_id'],proof['source_time_ns']):
+        if not proof or proof!=self.native_day_proof(observation['child_order_id'],observation['contract_id'],proof['source_time_ns']):
             raise TraderError('E_FACT_BARRIER','Original native order needs its exact calendar-bound day')
         cycle,_=self.kernel._find(observation['child_order_id'])
         order=next(o for o in cycle['orders'] if o['child_order_id']==observation['child_order_id'])
@@ -226,6 +302,7 @@ class OnlineDsvSimulation(OnlineSimulation):
         for observation in observations:
             if observation['status']!='ALIVE':continue
             cycle,_=k._find(observation['child_order_id'])
+            if self.archived_cycle(cycle):continue
             order=next(o for o in cycle['orders'] if o['child_order_id']==observation['child_order_id'])
             item=native.get(observation['order_id'])
             direction='BUY' if (cycle['plan']['direction']=='LONG')==(order['effect']=='OPEN') else 'SELL'
@@ -244,6 +321,7 @@ class OnlineDsvSimulation(OnlineSimulation):
             # identities before lifting only the original exit barrier.
             if not self.port.fresh(k._staged[cid]['plan']['contract_id']):continue
             cycle=k._staged[cid]
+            if self.archived_cycle(cycle):continue
             if ('CANCEL_TERMINAL_TIMEOUT' in cycle.get('execution',{}).get('last_reasons',[])
                     and any(o.get('cancel_status') in {'SEND_POSSIBLE','CALL_RETURNED','UNKNOWN'} and not o['terminal_confirmed'] for o in cycle['orders'])):
                 continue

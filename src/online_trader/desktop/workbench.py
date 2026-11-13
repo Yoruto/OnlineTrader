@@ -1,5 +1,8 @@
 """Trading workbench over the original owner IPC. Closing is local only."""
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import time
+import uuid
 from PySide6.QtCore import QItemSelectionModel,QSettings,QStandardPaths,Qt,QThread,QTimer,Signal
 from PySide6.QtWidgets import (QApplication,QLabel,QLineEdit,QPushButton,QTableWidget,
     QTableWidgetItem,QInputDialog,QFileDialog,QMessageBox)
@@ -10,6 +13,7 @@ from online_trader.desktop.notifications import WorkbenchSounds
 from online_trader.desktop.tray import WorkbenchTray
 from online_trader.desktop.workbench_layout import ACTIVATION_MESSAGES,WorkbenchLayout
 from online_trader.errors import TraderError
+from online_trader.runtime.market_monitor import append_latency
 from online_trader.transport.status_client import StatusClient
 
 
@@ -27,6 +31,8 @@ class _WorkbenchRequest(QThread):
                 client.expected_kernel_boot_id=metadata['kernel_boot_id'];view=client.workbench()
                 value={'base':base,'metadata':metadata,'view':view}
             elif self.action=='status':value=client.command_status(self.args)
+            elif self.action=='monitor':
+                value = {'monitor': client.workbench_monitor(), 'metadata': client.last_metadata}
             else:value=client.command(*self.args)
             if not self.isInterruptionRequested():self.result.emit({'action':self.action,'value':value})
         except Exception as error:
@@ -69,15 +75,17 @@ def display_cell(key,value):
 
 class WorkbenchWindow(StatusWindow):
     def __init__(self,pipe_name,*,store=None,account_id=None,client_factory=StatusClient,paired_launcher=None,
-                 dsv_config=None, use_desktop_dsv=False):
+                 dsv_config=None, use_desktop_dsv=False, autostart=False):
         super().__init__(pipe_name,client_factory=client_factory)
         self.store=store;self.selected_account=store.get(account_id) if store is not None and account_id is not None else None
         self.paired_launcher=paired_launcher
         self.paired_account_key=None
         if paired_launcher is not None:
             self.paired_account_key=paired_launcher.review()['account_key']
-        self.view=None;self.receipt_identity=None;self._boot=None;self._account_dialog=None
+        self.view=None;self.receipt_identity=None;self._boot=None
+        self._finished_run = None
         self._startup_in_progress = False
+        self._guard_launch = autostart
         self._deferred_request=None;self._control_notice=None
         self.home_feedback = ''
         self.home_issue = ''
@@ -107,6 +115,7 @@ class WorkbenchWindow(StatusWindow):
         self.session_button.clicked.connect(self.open_session)
         self._session_dialog=None
         self._strategy_starter=None
+        self._scheduled_start=None
         self.command_buttons={}
         for name,text,callback in (
             ('arm','启动策略 (F5)',self.start_strategy),('close','平选定自有仓',self.close_selected),
@@ -139,6 +148,19 @@ class WorkbenchWindow(StatusWindow):
         self._tray.restore_geometry()
         self._tray.sync_icon()
         self.timer=QTimer(self);self.timer.setInterval(2500);self.timer.timeout.connect(self.refresh);self.timer.start()
+        self.monitor_worker = None
+        self.monitor_timer = QTimer(self)
+        self.monitor_timer.setInterval(1000)
+        self.monitor_timer.timeout.connect(self.refresh_monitor)
+        self.monitor_timer.start()
+        self.monitor_diagnostics = None
+        self._diagnostic_instance = uuid.uuid4().hex[:12]
+        self._diagnostic_write_failed = False
+        self.schedule_timer = QTimer(self)
+        self.schedule_timer.setInterval(30_000)
+        self.schedule_timer.timeout.connect(self.check_timed_start)
+        if self._guard_launch and self.store is not None:
+            QTimer.singleShot(0, self.check_timed_start)
         self._enable_commands(False)
 
     def _read_account_login(self):
@@ -176,9 +198,12 @@ class WorkbenchWindow(StatusWindow):
     def _enable_commands(self,enabled):
         for button in self.command_buttons.values():button.setEnabled(enabled)
         self.command_buttons['arm'].setEnabled(not self._startup_in_progress and ((enabled and self.view['entry_authority']!='ARMED'
-            and not self.view['configuration'].get('stop_cancel_pending')) or
+            and not self.view['configuration'].get('stop_cancel_pending')
+            and not self.view['configuration'].get('strategy_stop_requested')) or
             (self.view is None and not self._closing)))
-        self.pause_button.setEnabled(enabled and self.view['entry_authority']=='ARMED')
+        self.pause_button.setEnabled(self._scheduled_start is not None or (enabled and (
+            self.view['entry_authority']=='ARMED' or ('cancel_on_stop' in self.view['configuration']
+            and not self.view['configuration'].get('strategy_stop_requested')))))
         self.dashboard.update_manual_controls(enabled)
         self.command_buttons['receipt'].setEnabled(enabled and self.receipt_identity is not None)
 
@@ -193,7 +218,7 @@ class WorkbenchWindow(StatusWindow):
                 self.show_home_feedback(self.notice_label.text())
             return
         if self.pipe_name is None:
-            self.notice_label.setText('请在账户管理中新增并选择账户，再查看所选账户；账户选择不启动连接。')
+            self.notice_label.setText('请在账户管理中新增并选择账户。')
             return
         if action!='refresh':
             self.refresh_button.setEnabled(False);self._enable_commands(False)
@@ -202,7 +227,85 @@ class WorkbenchWindow(StatusWindow):
         self._worker=worker;worker.result.connect(self._job_result);worker.failed.connect(self._job_failed);worker.finished.connect(self._finished);worker.start()
 
     def refresh(self):self._start_job('refresh')
+
+    def refresh_monitor(self):
+        view = self.view
+        if (self._closing or self._stale or self.monitor_worker is not None
+                or (self._worker is not None and self._worker.action != 'refresh')
+                or not self.pipe_name or view is None or 'strategy_monitor' not in view['configuration']):
+            return
+        worker = _WorkbenchRequest(self.pipe_name, self._factory, 'monitor', None, view['account_key'], self._boot)
+        worker.setParent(self)
+        worker.result.connect(self._monitor_result)
+        worker.failed.connect(self._monitor_failed)
+        worker.finished.connect(self._monitor_finished)
+        worker.finished.connect(worker.deleteLater)
+        self.monitor_worker = worker
+        worker.start()
+
+    def _monitor_result(self, result):
+        worker = self.sender()
+        value = result['value']['monitor']
+        if (self._closing or self._stale or worker is not self.monitor_worker or self.view is None
+                or worker.pipe != self.pipe_name or worker.account_key != self.view['account_key']
+                or worker.boot != self._boot):
+            return
+        if value is not None and int(value['checkpoint_event_seq']) < int(self.view['checkpoint_event_seq']):
+            return
+        if value is None:
+            return
+        if (value['account_key'], value['kernel_boot_id']) != (worker.account_key, worker.boot):
+            return
+        self.dashboard.render_strategy_monitor(value)
+        metadata = result['value']['metadata']
+        if value['diagnostics'] is not None:
+            self.monitor_diagnostics = value['diagnostics'] | {
+                'account_key': value['account_key'], 'kernel_boot_id': value['kernel_boot_id'],
+                'request_started_monotonic_ns': metadata['request_started_monotonic_ns'],
+                'reply_sent_at_utc': metadata['reply_sent_at_utc'],
+                'received_at_utc': metadata['received_at_utc'],
+                'received_monotonic_ns': metadata['received_monotonic_ns'],
+                'qt_rendered_monotonic_ns': str(time.monotonic_ns()),
+                'qt_rendered_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            }
+            directory = self.dashboard.latest_run()
+            if directory is not None and directory.is_dir():
+                try:
+                    path = directory / f'workbench-latency-{self._diagnostic_instance}.jsonl'
+                    append_latency(path, self.monitor_diagnostics)
+                except (OSError, TraderError):
+                    if not self._diagnostic_write_failed:
+                        self.dashboard.add_activity('行情诊断写入失败', category='error')
+                    self._diagnostic_write_failed = True
+        else:
+            self.monitor_diagnostics = None
+
+    def _monitor_failed(self, error):
+        worker = self.sender()
+        if (not self._closing and worker is self.monitor_worker and self.view is not None
+                and worker.pipe == self.pipe_name and worker.boot == self._boot
+                and worker.account_key == self.view['account_key']):
+            self.dashboard.render_strategy_monitor(None)
+
+    def _monitor_finished(self):
+        worker = self.sender()
+        if worker is self.monitor_worker:
+            self.monitor_worker = None
+            if self._closing:
+                QTimer.singleShot(0,self.close)
+
     def create_sound_settings(self):return self._sounds.settings_panel()
+
+    def _quote_reference_received(self, rows):
+        self.dashboard.reference_quotes_received(rows)
+
+    def _quote_reference_failed(self, code):
+        self.dashboard.reference_quotes_failed(code)
+
+    def _quote_reference_finished(self):
+        self.dashboard.reference_quotes_finished()
+        if self._closing:
+            QTimer.singleShot(0,self.close)
 
     def _notification_log(self, message):
         try:
@@ -212,12 +315,16 @@ class WorkbenchWindow(StatusWindow):
             return  # A pending network result may arrive after the workbench closes.
 
     def pause_entries(self):
-        if self._stale or self.view is None or self.view['entry_authority']!='ARMED':
+        self.cancel_timed_start()
+        if self._stale or self.view is None:
             return
         scope={'scope_type':'ACCOUNT','scope_ids':[]}
         config=self.view['configuration']
         if 'cancel_on_stop' not in config:
-            self.send('PAUSE_NEW_ENTRIES',scope,{'cancel_owned_entry_remainders':False})
+            if self.view['entry_authority']=='ARMED':
+                self.send('PAUSE_NEW_ENTRIES',scope,{'cancel_owned_entry_remainders':False})
+            return
+        if config.get('strategy_stop_requested'):
             return
         params={}
         review=config.get('native_cancel_review',{})
@@ -254,6 +361,8 @@ class WorkbenchWindow(StatusWindow):
             if self._boot is not None and self._boot!=value['view']['kernel_boot_id']:
                 self.receipt_identity=None;self._control_notice=None
                 self.home_feedback = self.home_issue = ''
+                self.monitor_diagnostics = None
+                self._diagnostic_write_failed = False
             selected=(self._selected_identities() if self._boot==value['view']['kernel_boot_id']
                       and self.view is not None and self.view['account_key']==value['view']['account_key'] else {})
             self._last_account_record=next(row for row in value['base']['records'] if row['record_type']=='ACCOUNT')
@@ -298,6 +407,37 @@ class WorkbenchWindow(StatusWindow):
                     if name in {'cycles','external_positions'}:break
 
     def _job_failed(self,error):
+        if self.view is not None and error['code'] in {'E_TIMEOUT','E_PIPE'}:
+            from online_trader.desktop.runtime_logs import read_record, supplied_run_directory
+            run = self.dashboard.latest_run() or supplied_run_directory(self.view)
+            result = read_record(run/'result.json', limit=4 * 1024 * 1024) if run is not None else None
+            if result is None and run is not None:
+                try:phase_path = max(run.glob('phase-*.json'), key=lambda path:path.stat().st_mtime_ns, default=None)
+                except OSError:phase_path = None
+                phase = read_record(phase_path) if phase_path is not None else None
+                if phase and phase.get('phase') == 'DSV_STOPPED':
+                    result = phase | {'status':'DSV_STOPPED'}
+            identity = (result.get('snapshot') or result) if result else None
+            if (isinstance(identity, dict) and isinstance(self._boot, str)
+                    and (identity.get('account_key'), identity.get('kernel_boot_id')) == (
+                        self.view['account_key'], self._boot)
+                    and result.get('status') in {'DSV_STOPPED','DSV_SCOPE_FINISHED'}):
+                self._finished_run = (self.view['account_key'], self._boot, run)
+                self.view = None
+                self._boot = None
+                self.receipt_identity = None
+                self._control_notice = None
+                self.monitor_diagnostics = None
+                self._stale = True
+                self._last_account_record = {}
+                self._base_cycle_ids = []
+                self.dashboard.reset_account_view(preserve_logs=True)
+                self._tray.set_status('idle')
+                self.connection_label.setText('本次策略运行已结束')
+                self.connection_detail.setText('已退出柜台连接')
+                self.notice_label.setText('策略运行已结束，可再次启动。')
+                self.show_home_feedback('可用当前账号和参数再次启动。')
+                return
         if self.view is not None or error['identity'] is not None:
             self._sounds.observe_request_error()
         if self.view is not None:self._tray.set_status('error')
@@ -306,6 +446,7 @@ class WorkbenchWindow(StatusWindow):
         if self.view is not None:self.dashboard.add_activity('状态刷新失败 · '+error['code'],category='error')
         if self.view is not None:
             self.dashboard.quote_status.setText('行情 · 上次快照已过期')
+            self.dashboard.render_strategy_monitor(None)
             self.dashboard.manual_status.setText('连接或请求失败 · 等待重新同步')
         if self.paired_launcher is not None and self.view is None and error['code']=='E_TIMEOUT':
             self.connection_label.setText('SimNow 执行器尚未连接')
@@ -363,7 +504,8 @@ class WorkbenchWindow(StatusWindow):
         self.filter_markets()
         self.command_buttons['arm'].setText('启用人工开仓 (F5)' if v['configuration'].get('manual_workbench') else '启动策略 (F5)')
         self.pause_button.setText('停止策略 (F6)' if 'cancel_on_stop' in v['configuration'] else '暂停开仓 (F6)')
-        self.command_buttons['arm'].setToolTip('等待原停止指令的撤单结果' if v['configuration'].get('stop_cancel_pending') else '')
+        self.command_buttons['arm'].setToolTip(v['configuration'].get('strategy_stop_wait') or
+            ('等待原停止指令的撤单结果' if v['configuration'].get('stop_cancel_pending') else ''))
         self.dashboard.render(v)
         self._sounds.observe(v)
         self.notice_label.setText('视图超过容量，已截断；批量操作关闭。' if v['truncated'] else
@@ -401,8 +543,9 @@ class WorkbenchWindow(StatusWindow):
         if self.view is None:
             if self.selected_account is None and self.paired_launcher is None:
                 self.dashboard.show_account_settings()
-                self.notice_label.setText('请先在账户管理中选择账户，再点击「查看所选账户」。')
+                self.notice_label.setText('请先在账户管理中选用模拟账户。')
             else:
+                self.cancel_timed_start()
                 self.open_session()
         elif not self._stale:
             self.arm()
@@ -420,6 +563,9 @@ class WorkbenchWindow(StatusWindow):
                 return
             if self.view['entry_authority']=='ARMED':return
             config = self.view['configuration']
+            if config.get('strategy_stop_requested'):
+                self.show_home_feedback(config.get('strategy_stop_wait') or '正在核对原策略的退出条件。')
+                return
             if self.dashboard.dsv_config is not None and config.get('scoped_contracts') and not config.get('manual_workbench'):
                 from online_trader.configuration.offsets import dsv_startup_profile
                 expected = dsv_startup_profile(self.current_start_profile()).content_hash
@@ -639,38 +785,62 @@ class WorkbenchWindow(StatusWindow):
 
     def open_accounts(self):
         if self.store is None:self.notice_label.setText('请通过 --account-store 指定本产品账户目录。');return
+        if self.paired_launcher is not None:return
         from online_trader.desktop.accounts import AccountDialog
-        self._account_dialog=AccountDialog(self.store,self);self._account_dialog.exec()
+        dialog = AccountDialog(self.store, self, use_account=self.use_account)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
         self.dashboard.reload_accounts()
 
     def select_account(self):
         if self.store is None or self.paired_launcher is not None:
             return
-        if (self._worker is not None or self._startup_in_progress or
-                (self._strategy_starter is not None and self._strategy_starter.is_preparing())):
-            self.notice_label.setText('正在刷新账号状态，请稍后切换。')
-            self.dashboard.reload_accounts()
-            return
         account_id = self.dashboard.account_picker.currentData()
         if account_id is None:
             return
         try:
-            state = self.store.read()
-            if state['selected_id'] != account_id:
-                self.store.change('select', expected_revision=state['revision'], account_id=account_id)
-            self.attach_selected()
+            self.use_account(account_id)
         except TraderError as error:
-            self.notice_label.setText('账号未切换：' + error.code)
-        finally:
+            self.notice_label.setText(f'账号未切换 · {error} · {error.code}')
             self.dashboard.reload_accounts()
 
     def attach_selected(self):
-        if self.store is None:return
-        if (self._worker is not None or self._startup_in_progress or
-                (self._strategy_starter is not None and self._strategy_starter.is_preparing())):return
-        state=self.store.read()
-        if state['selected_id'] is None:self.notice_label.setText('请先在账户管理中选择账户。');return
-        self.selected_account=self.store.get(state['selected_id']);self.pipe_name=self.store.pipe_name(self.selected_account)
+        if self.store is None or self.paired_launcher is not None:return
+        try:
+            self.use_account()
+        except TraderError as error:
+            self.notice_label.setText(f'账号未切换 · {error} · {error.code}')
+
+    def use_account(self, account_id=None, expected_revision=None):
+        if (self._closing or self._worker is not None or self._startup_in_progress
+                or (self._strategy_starter is not None and self._strategy_starter.is_preparing())):
+            raise TraderError('E_ACCOUNT_BUSY', '请等待当前账户操作结束')
+        state = self.store.read()
+        if expected_revision is not None and state['revision'] != expected_revision:
+            raise TraderError('E_REVISION_CONFLICT', '账户目录已变化，请刷新')
+        if account_id is None:
+            account_id = state['selected_id']
+        if account_id is None:
+            self.notice_label.setText('请先在账户管理中选择账户。')
+            return
+        attached_id = self.selected_account['account_id'] if self.selected_account else None
+        if state['selected_id'] != account_id or attached_id not in (None, account_id):
+            state = self.store.change('select', expected_revision=state['revision'], account_id=account_id,
+                                      attached_account_id=attached_id)
+        account = next(row for row in state['accounts'] if row['account_id'] == account_id)
+        if attached_id == account_id and self.pipe_name == self.store.pipe_name(account):
+            self.selected_account = account
+            self._account_login = self._read_account_login()
+            self.dashboard.reload_accounts()
+            self.refresh()
+            return
+        self._attach_account(account)
+
+    def _attach_account(self, account):
+        self.cancel_timed_start()
+        self.selected_account=account;self.pipe_name=self.store.pipe_name(account)
         if self._strategy_starter is not None:
             self._strategy_starter.status_timer.stop()
             self._strategy_starter.deleteLater()
@@ -682,11 +852,14 @@ class WorkbenchWindow(StatusWindow):
             self._session_dialog = None
         self._account_login = self._read_account_login()
         self._boot=None;self.view=None;self.receipt_identity=None;self._stale=True;self._account_key=None
+        self._finished_run = None
         self._control_notice=None
         self.home_feedback = self.home_issue = ''
         self._last_account_record = {}
         self._base_cycle_ids = []
         self.dashboard.rendered_view = None
+        self.monitor_diagnostics = None
+        self._diagnostic_write_failed = False
         for grid in (*self.tables.values(), self.cycles, *self.dashboard.manual_tables.values()):
             grid.setRowCount(0)
         self.account_label.setText('账户 · ' + self.display_account()[1])
@@ -699,7 +872,9 @@ class WorkbenchWindow(StatusWindow):
         self._enable_commands(False)
         self._tray.set_status('idle')
         # Child report windows are account-bound and must not silently follow.
-        if self._reports_window is not None:self._reports_window.close();self._reports_window=None
+        if self._reports_window is not None:
+            self._reports_window.close()
+            self._reports_window = None
         self.refresh()
 
     def open_data(self):
@@ -709,7 +884,81 @@ class WorkbenchWindow(StatusWindow):
         from online_trader.desktop.data import DataDialog
         self._data_dialog=DataDialog(ReferenceStore(self.store.directory/'reference'),self);self._data_dialog.show()
 
-    def open_session(self):
+    def arrange_timed_start(self):
+        if self._scheduled_start is not None:
+            self.cancel_timed_start()
+            return
+        if self.store is None or self.selected_account is None or self.paired_launcher is not None:
+            self.show_home_feedback('请先选择要定时启动的模拟账户。')
+            return
+        def arrange():
+            from online_trader.strategy.entry import CHINA_TIME
+            profile = self.current_start_profile()
+            settings = profile.to_record()['settings']
+            schedule = settings['schedule']
+            on_launch = settings['trade']['auto_start_on_launch']
+            if not (schedule['enabled'] or on_launch):
+                self.show_home_feedback('当前参数未启用定时启动或软件启动时自动启动。')
+                return
+            local = datetime.now(CHINA_TIME)
+            ends = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            message = (f"模拟账户 {self.selected_account['masked_login']}，{len(settings['symbols'])} 个品种。\n"
+                       f"北京时间日盘 {schedule['day_start_time']}、夜盘 {schedule['night_start_time']}，"
+                       f"补启动 {schedule['catch_up_minutes']} 分钟。\n"
+                       f"确认后仅启动一次，有效至 {ends:%m-%d %H:%M}。")
+            if QMessageBox.question(self, '安排定时启动', message) != QMessageBox.Yes:
+                return
+            self._scheduled_start = {'account_id':self.selected_account['account_id'],
+                                     'profile_hash':profile.content_hash, 'ends':ends}
+            self.dashboard.timed_start_button.setText('取消定时启动')
+            self.pause_button.setEnabled(True)
+            self.show_home_feedback('已安排本次定时启动。')
+            self.schedule_timer.start()
+            self.check_timed_start(on_launch=on_launch)
+        self._action(arrange)
+
+    def cancel_timed_start(self, *, message='已取消本次定时启动。'):
+        if self._scheduled_start is not None:
+            self._scheduled_start = None
+            self.schedule_timer.stop()
+            self.dashboard.timed_start_button.setText('安排定时启动')
+            self.show_home_feedback(message)
+            if self.view is None:
+                self.pause_button.setEnabled(False)
+
+    def check_timed_start(self, now=None, *, on_launch=False):
+        scheduled = self._scheduled_start
+        if scheduled is None:
+            if self._guard_launch:
+                self.show_home_feedback('守护已打开工作台，请安排本次策略启动。')
+                self._guard_launch = False
+            return
+        now = now or datetime.now(timezone.utc)
+        if now >= scheduled['ends'] or self._closing or self.selected_account is None or (
+                self.selected_account['account_id'] != scheduled['account_id']):
+            self.cancel_timed_start()
+            return
+        if self.view is not None:
+            self.cancel_timed_start()
+            self.show_home_feedback('原执行器已连接，请在主控核对策略状态。')
+            return
+        if self._startup_in_progress or self._worker is not None:
+            return
+        from online_trader.runtime.desktop_bootstrap import timed_start_trigger
+        try:
+            profile = self.current_start_profile()
+            if profile.content_hash != scheduled['profile_hash']:
+                raise TraderError('E_REVISION_CONFLICT', '已安排的账号或策略参数发生变化。')
+            trigger = timed_start_trigger(profile, now, on_launch=on_launch)
+        except TraderError as error:
+            self.cancel_timed_start()
+            self.show_home_feedback(str(error))
+            return
+        if trigger:
+            self.cancel_timed_start(message=f'定时启动已触发 · {trigger}')
+            self.open_session(timed_trigger=trigger, now=now)
+
+    def open_session(self, *, timed_trigger=None, now=None):
         if self.paired_launcher is not None:
             if self._session_dialog is not None and self._session_dialog.scheduled_request is not None:
                 self._session_dialog.show()
@@ -728,7 +977,7 @@ class WorkbenchWindow(StatusWindow):
             if self._strategy_starter is None:
                 self._strategy_starter = StrategyStarter(self.store, self.selected_account['account_id'],
                                                         self.dashboard.profile, self)
-            self._strategy_starter.start()
+            self._strategy_starter.start(timed_trigger=timed_trigger, now=now)
         self._action(start_current)
 
     def current_start_profile(self):
@@ -752,17 +1001,32 @@ class WorkbenchWindow(StatusWindow):
         if not self._closing and self._tray.minimize_on_close():
             event.ignore()
             return
+        if self.monitor_worker is not None and self.monitor_worker.isRunning():
+            self._closing = True
+            self.hide()
+            self.monitor_worker.requestInterruption()
+            event.ignore()
+            return
+        if self.dashboard.quote_worker is not None and self.dashboard.quote_worker.isRunning():
+            self._closing = True
+            self.hide()
+            self.dashboard.quote_worker.requestInterruption()
+            event.ignore()
+            return
         if self._session_dialog is not None:
             self._session_dialog.clear_scheduled_start()
         if self._strategy_starter is not None:
             self._strategy_starter.status_timer.stop()
+        self.cancel_timed_start()
+        self.monitor_timer.stop()
+        self.dashboard.log_timer.stop()
         self.timer.stop();super().closeEvent(event)
 
 
-def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None):
+def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None,autostart=False):
     app=QApplication.instance() or QApplication([])
     window=WorkbenchWindow(pipe_name,store=store,account_id=account_id,paired_launcher=paired_launcher,
-                           dsv_config=dsv_config,use_desktop_dsv=True)
+                           dsv_config=dsv_config,use_desktop_dsv=True,autostart=autostart)
     window.setAttribute(Qt.WA_DeleteOnClose)
     window.destroyed.connect(app.quit)
     window.show();QTimer.singleShot(0,window.refresh)

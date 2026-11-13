@@ -178,6 +178,17 @@ class SessionLaunchTests(unittest.TestCase):
                                                statement_path=statement)
         workbench.assert_not_called()
         connect.assert_not_called()
+
+    def test_license_diagnostic_uses_local_product_capabilities(self):
+        from online_trader.desktop.entrypoint import main
+        with (patch('online_trader.desktop.entrypoint.Path.cwd',return_value=self.root),
+              patch('online_trader.desktop.entrypoint.run') as workbench,
+              patch.object(TqKqDsvPort,'connect') as connect):
+            self.assertEqual(main(['--license']),0)
+        report = (self.root/'授权状态.txt').read_text(encoding='utf-8')
+        self.assertIn('快期模拟、SimNow 模拟',report)
+        self.assertIn('实盘开新仓：未启用',report)
+        workbench.assert_not_called(); connect.assert_not_called()
     def test_grant_changed_during_interpreter_probe_cannot_launch_unreviewed_scope(self):
         def probe(*args,**kwargs):
             self.paths[0].write_bytes(canonical_bytes(self.grant.value|{'opening_attempts':21}))
@@ -195,6 +206,7 @@ class SessionLaunchTests(unittest.TestCase):
         profile=profile or self.profile
         packet=self.root/'paired';packet.mkdir()
         config=self.root/'DSV settings.json';config.write_text(profile.to_json(),encoding='utf-8')
+        profile=DsvProfile.from_dsv_json(profile.to_json())
         ref={'schema_version':'SIMNOW_CREDENTIAL_REFERENCE/1','account_fingerprint':'1234567890123456'}
         grant=fixtures.scope_for(packet/'ledger.db',profile,self.calendar,schema_version='SIMNOW_DSV_SIM/1',
             trading_days=['2026-11-10'],resume_entries_on_day_change=False,account_fingerprint=ref['account_fingerprint'])

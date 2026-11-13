@@ -8,6 +8,8 @@ from unittest.mock import patch
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QFileDialog
 
+from tests.qt_lifecycle import dispose_widget
+
 from online_trader.configuration.instrument_rules import parse_rule_pages, rule_display
 from online_trader.desktop.instrument_rules import InstrumentRulesPanel, read_rule_pdf
 from online_trader.errors import TraderError
@@ -104,6 +106,7 @@ class InstrumentRulesTests(unittest.TestCase):
 
         logs = []
         panel = InstrumentRulesPanel(self.settings, logs.append)
+        self.addCleanup(dispose_widget, panel)
         panel.set_markets({'DCE.p2701':'棕榈油'}, {})
         with patch.object(QFileDialog, 'getOpenFileName', return_value=(str(path), '')), \
                 patch.object(panel, 'preview_import', return_value=False):
@@ -114,6 +117,7 @@ class InstrumentRulesTests(unittest.TestCase):
             panel.import_pdf()
         self.assertEqual(panel.grid.item(0, 2).text(), '12.00% 表')
         restored = InstrumentRulesPanel(self.settings, logs.append)
+        self.addCleanup(dispose_widget, restored)
         self.assertEqual(restored.rules['P'].company_margin, Decimal('.15'))
 
     def test_malformed_file_and_rows_are_reported(self):

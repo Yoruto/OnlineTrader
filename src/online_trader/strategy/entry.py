@@ -51,6 +51,12 @@ def is_night_session(moment):
     return hour >= 18 or hour < 3
 
 
+def is_in_auction(moment):
+    local = moment.astimezone(CHINA_TIME)
+    return ((local.hour in (8, 20) and local.minute >= 55)
+            or (local.hour in (9, 21) and local.minute == 0))
+
+
 def _native_tick_id(value):
     if value is None:
         return None
@@ -96,8 +102,7 @@ def hysteresis_ready(direction, last_price, trigger, distance, armed):
 def chase_within_cap(direction, last_price, opponent_price, trigger, cap):
     """DSV helper: one favourable price can override the other adverse price.
 
-    The caller separately requires valid complete prices.  The original helper's
-    treatment of absent/zero prices is deliberately not used as fact completeness.
+    The caller separately checks that the market path and selected price are valid.
     """
     last, opponent, line, distance = map(Decimal, (last_price, opponent_price, trigger, cap))
     values = (last, opponent)
@@ -363,6 +368,8 @@ class DsvEntryStrategy:
         entry_log = result["entry_log"]
         if trade["no_open_after_open"] and wait_limit > 0 and opening_session and elapsed <= wait_limit:
             reasons.append("OPENING_WAIT")
+        elif not trade["participate_auction"] and is_in_auction(_utc(event["source_time_utc"])):
+            reasons.append("AUCTION_DISABLED")
         elif remaining is not None and remaining <= Decimal(trade["no_open_before_close_minutes"]) * 60:
             reasons.append("CLOSE_SESSION_NO_OPEN")
         elif ordinary_quote_stale:
@@ -422,11 +429,12 @@ class DsvEntryStrategy:
             reached = last >= line if direction == "LONG" else last <= line
             if not reached:reasons.append(direction + ":TRIGGER_NOT_REACHED");continue
             opponent = event["ask1"] if direction == "LONG" else event["bid1"]
-            if opponent is None:
-                reasons.append(direction + ":OPPONENT_PRICE_MISSING");continue
-            if Decimal(opponent) % tick:
+            # DSV checks the two raw quotes for chasing, then prices a missing
+            # opponent from the current last in its SDK price callback.
+            entry_quote = opponent or event["last"]
+            if Decimal(entry_quote) % tick:
                 reasons.append(direction + ":QUOTE_NOT_TICK_ALIGNED");continue
-            if not chase_within_cap(direction, last, opponent, line, cap):
+            if not chase_within_cap(direction, last, opponent or "0", line, cap):
                 updated["last_signal_bar"] = event["candle_id"]
                 reasons.append(direction + ":CHASE_CAP_EXCEEDED");continue
             previous_stop = event.get("stop_trigger_prices", {}).get(direction)
@@ -436,10 +444,10 @@ class DsvEntryStrategy:
                 reasons.append(direction + ":STOP_TRIGGER_UNCHANGED");continue
             updated["last_signal_bar"] = event["candle_id"]
             near_open=opening_session and 0<=elapsed<=Decimal(trade['chase_window_minutes'])*60
-            if near_open:entry_price=opponent
+            if near_open:entry_price=entry_quote
             elif trade['passive_entry_first']:entry_price=decimal_text(line)
             else:
-                capped=min(Decimal(opponent),line+cap) if direction=='LONG' else max(Decimal(opponent),line-cap)
+                capped=min(Decimal(entry_quote),line+cap) if direction=='LONG' else max(Decimal(entry_quote),line-cap)
                 entry_price=decimal_text(capped)
             if Decimal(entry_price)%tick:
                 reasons.append(direction+':ENTRY_PRICE_NOT_TICK_ALIGNED');continue

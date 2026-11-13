@@ -6,13 +6,106 @@ Business rows come exclusively from accepted commits at the stated watermark.
 import copy
 from datetime import datetime
 from decimal import Decimal
+import time
 
 from online_trader.contracts.codec import canonical_bytes, strict_loads
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text
 from online_trader.kernel.projection import projection_batch
+from online_trader.kernel.statistics import strategy_open_counts
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import number
+
+
+def monitor_symbols(kernel, decisions):
+    """Small operator projection from cached quotes and committed execution state."""
+    monitor = kernel._dsv_market_monitor
+    runtime = kernel._dsv_runtime
+    day = monitor.trading_day
+    settings = runtime.profile.to_record()['settings']
+    names = {row['code']: row['name'] for row in settings['symbols']}
+    cycles = kernel._committed.values()
+    counts = strategy_open_counts(cycles, day)
+    trade = settings['trade']
+    maximum = trade['max_daily_orders']
+    by_code = {}
+    for cycle in cycles:
+        if cycle['lifecycle'] != 'CLOSED' or cycle['plan']['trading_day'] == day:
+            by_code.setdefault(cycle['plan']['contract_id'], []).append(cycle)
+    rows = []
+    for code in monitor.contracts:
+        key = (code, day)
+        stop = (kernel.statistics._committed.get(key) or {}).get('stop_result', {}).get('state', {})
+        runtime_stop = runtime._stop_states.get(key, {}).get('state', {})
+        facts = runtime._latest.get(key, {})
+        event = facts.get('event', {})
+        reasons = (decisions.get(code, {}).get('reasons', ()) if
+                   event.get('source_epoch') == monitor.source_epoch and not kernel.port.fault else ())
+        session = monitor.sessions.get(code, {})
+        row = {'contract_id': code, 'name': names.get(code, code), 'state': 'ACTIVE',
+               'status': None, 'real_margin_rate': monitor.margin_rates.get(code),
+               'position_quantity': 0, 'net_loss_points': (stop or runtime_stop).get('net_loss_points', '0' if day else None),
+               'opening_orders': counts.get(code, 0), 'main_contract': code}
+        arrival = monitor.arrivals.get(code)
+        if arrival is not None:
+            row['quote_observed_at_utc'] = arrival['wall'].isoformat().replace('+00:00', 'Z')
+        for cycle in by_code.get(code, ()):
+            protection = cycle['protection']
+            row['position_quantity'] += protection['owned_qty']
+            exits = set(protection.get('exit_reasons', ()))
+            force = exits & {'ADVERSE_SLIPPAGE', 'DATA_GAP_EXIT'}
+            if force and cycle['lifecycle'] != 'CLOSED':
+                row['state'] = 'PENDING'
+                row['status'] = ('开仓滑点超限强平' if 'ADVERSE_SLIPPAGE' in force else '行情断流强平') + '（待确认成交）'
+            if (row['status'] is None and cycle['plan']['trading_day'] == day
+                    and protection.get('block_new_for_trading_day')):
+                profit = cycle['plan']['profit_protection']
+                if protection.get('protected_event_seq') and profit.get('block_new_for_trading_day'):
+                    ratio = Decimal(profit['activation_ratio']) * 100
+                    row['status'] = f'浮盈曾达止盈{decimal_text(ratio)}%'
+                else:
+                    row['status'] = '持仓保护已锁定当日停开'
+        if row['state'] != 'PENDING':
+            stop_reason = next((state.get('day_stopped_reason') or '当日已停止开仓'
+                                for state in (stop, runtime_stop) if state.get('day_stopped')), None)
+            if not stop_reason:
+                if any(c == code and d <= day and saved['state'].get('month_stop') == day[:7]
+                       for (c,d),saved in runtime._stop_states.items() if day is not None):
+                    stop_reason = '本月连续停机停开'
+                elif runtime._states.get(key, {}).get('first_minute_blocks'):
+                    stop_reason = '开盘首分钟跳空'
+                elif 'EXPIRY_ENTRY_BLOCK' in reasons:
+                    stop_reason = '合约临近到期'
+                elif row['opening_orders'] >= maximum:
+                    stop_reason = f'报单达上限 {maximum}'
+                elif monitor.closing_protection(code, trade['close_before_seconds']):
+                    stop_reason = '本时段已收盘保护'
+            if stop_reason or row['status']:
+                row.update(state='STOPPED', status=stop_reason or row['status'])
+            elif not kernel.control.symbol_entry_enabled(code, committed=True):
+                row['status'] = '品种已手动停用'
+            elif 'GEOMETRY_BLOCK' in reasons:
+                row['status'] = '几何条件不满足，暂不建仓'
+            elif 'OPENING_WAIT' in reasons:
+                row['status'] = '开盘等待'
+            elif 'CLOSE_SESSION_NO_OPEN' in reasons and session.get('is_trading'):
+                row['status'] = '收盘前禁开'
+            elif arrival is None:
+                row['status'] = '等待行情'
+            elif row['position_quantity']:
+                row['status'] = '持仓中'
+            else:
+                row['status'] = '可开仓'
+        rows.append(row)
+    return rows
+
+
+def workbench_monitor_view(kernel):
+    kernel._check_owner()
+    monitor = kernel._dsv_market_monitor
+    return {'account_key': kernel.account_key, 'kernel_boot_id': kernel.boot_id,
+            'checkpoint_event_seq': str(kernel._durable_seq), **monitor.latest,
+            'symbols': kernel._dsv_monitor_rows, 'diagnostics': monitor.diagnostics(time.monotonic_ns())}
 
 
 def workbench_view(kernel):
@@ -127,7 +220,8 @@ def workbench_view(kernel):
     if scoped and callable(rollover_reader):
         for market in markets:
             facts=rollover_reader(market['contract_id'],day)
-            if facts:market['rollover']=facts
+            if facts:
+                market['rollover']=facts
     market_by_code={item['contract_id']:item for item in markets}
     broker_orders=port.api.get_order(account=port.account) if day is not None else {}
     broker_positions=port.api.get_position(account=port.account) if day is not None else {}
@@ -242,9 +336,19 @@ def workbench_view(kernel):
         'blocks':[r for r in records if r['record_type']=='BLOCK']+[{'reason_code':e,'active':True} for e in snapshot['errors'][-64:]]+exit_blocks,
         'commands':commands,'policies':policies,'truncated':False}
     result['symbol_entry_switches']=copy.deepcopy(kernel.control.symbol_entries)
+    run_directory = getattr(kernel, '_dsv_run_directory', None)
+    if run_directory is not None:
+        result['configuration']['run_directory'] = run_directory
+    if getattr(kernel, '_dsv_market_monitor', None) is not None:
+        monitor = kernel._dsv_market_monitor
+        result['configuration']['strategy_monitor'] = monitor.latest | {'symbols': kernel._dsv_monitor_rows}
+        if getattr(kernel, '_dsv_monitor_error', None):
+            result['configuration']['strategy_monitor_error'] = kernel._dsv_monitor_error
     equity=kernel.money.book.daily_equity
     if equity:
-        result['equity_history']=[equity[key].copy() for key in sorted(equity)[-512:]]
+        days = sorted(equity)
+        result['equity_history'] = [equity[day].copy() for day in days[-512:]]
+        result['configuration']['equity_base'] = equity[days[0]].copy()
     if scoped:
         if runtime is not None:
             trade=runtime.profile.to_record()['settings']['trade']
@@ -252,7 +356,11 @@ def workbench_view(kernel):
             result['configuration']['cancel_on_stop']=trade['cancel_on_stop']
             result['configuration']['manual_close_price_mode']=trade['close_price_mode']
             result['configuration']['stop_cancel_pending']=kernel.control.stop_cancel_pending()
-            result['configuration']['margin_rate_alert_threshold']=trade['margin_rate_alert_threshold']
+            result['configuration']['strategy_stop_requested']=kernel.control.strategy_stop_requested()
+            result['configuration']['strategy_stop_wait']=getattr(kernel, '_dsv_stop_wait', None)
+            # The strategy worker initializes MARGIN_ALERT_THRESHOLD to 0.0.
+            # The contract rules page still compares its separate reference rate.
+            result['configuration']['margin_rate_alert_threshold']='0'
             if getattr(port,'started_at',None) is not None:
                 try:result['configuration']['margin_alert_grace']=(port.clock.now()-port.started_at).total_seconds()<60
                 except TraderError:pass
@@ -274,7 +382,10 @@ def workbench_view(kernel):
             result['blocks'].append({'reason_code':native_error,'active':True})
         if callable(getattr(port,'minute_chart_bars',None)):
             bars=port.minute_chart_bars()
-            if bars:result['minute_bars']=bars
+            if bars:
+                result['minute_bars']={code: rows[-48:] for code, rows in bars.items()}
+                extension={code:rows for code, rows in bars.items() if len(rows)>48}
+                if extension:result['configuration']['native_minute_bars']=extension
         if day is not None and not result['connection']['fault']:
             if scheduler is not None:
                 schedules={code:scheduler.calendar.session_times(code,day) for code in result['configuration']['scoped_contracts']}
@@ -282,9 +393,7 @@ def workbench_view(kernel):
                     'intervals':{code:rows[:16] for code,rows in schedules.items()},
                     'truncated':any(len(rows)>16 for rows in schedules.values())}
             funds=native['funds']
-            native_ids={item['order_id'] for item in native['orders']}
-            opening_orders=sum(order['effect']=='OPEN' and order['native_trading_day']==day and
-                order['native_order_id'] in native_ids for order in orders)
+            opening_orders=sum(strategy_open_counts(snapshot['cycles'], day).values())
             result['account_metrics']={key:funds.get(key) for key in
                 ('balance','available','margin','risk_ratio','pre_balance','close_profit','position_profit','float_profit','commission')}
             result['account_metrics'].update(trading_day=day,opening_orders=opening_orders)
@@ -293,6 +402,8 @@ def workbench_view(kernel):
     for key in ('markets','cycles','orders','trades','blocks','commands','policies','external_positions'):
         if key not in result:continue
         if len(result[key])>512:result['truncated']=True;result[key]=result[key][-512:]
+    if len(canonical_bytes(result)) > 800000:
+        result['configuration'].pop('native_minute_bars', None)
     while len(canonical_bytes(result))>800000:
         key=max(('trades','commands','orders','cycles','blocks','markets','external_positions'),key=lambda k:len(canonical_bytes(result.get(k,[]))))
         result[key]=result[key][len(result[key])//2+1:];result['truncated']=True

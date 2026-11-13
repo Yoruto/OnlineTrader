@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout
 
 from online_trader.desktop.client import StatusClient
 from online_trader.errors import TraderError
+from online_trader.runtime.instance import AccountLock
 
 
 _TOTALS = (("gross_realized_pnl", "已实现毛收益"), ("confirmed_fees", "确认费用小计"), ("fees", "费用合计"),
@@ -117,29 +119,18 @@ class _ReportTask(QThread):
     failed = Signal(str)
 
     def __init__(self, *, action, reader=None, exporter=None, path=None, account_key=None,
-                 pipe_name=None, report=None, destination=None, table=None, format=None):
+                 pipe_name=None, report=None, destination=None, table=None, format=None,
+                 allow_offline=False):
         super().__init__()
         self.action, self.reader, self.exporter = action, reader, exporter
         self.path, self.account_key, self.pipe_name = path, account_key, pipe_name
         self.report, self.destination, self.table, self.format = report, destination, table, format
+        self.allow_offline = allow_offline
 
     def run(self):
         try:
             if self.action == "load":
-                metadata = None
-                account_key = self.account_key
-                if self.pipe_name:
-                    client = StatusClient(self.pipe_name)
-                    projection = client.snapshot()
-                    account = next(r for r in projection["records"] if r["record_type"] == "ACCOUNT")
-                    if account_key and account["record_id"] != account_key:
-                        raise TraderError("E_SCOPE", "Report account differs from the kernel account")
-                    account_key = account["record_id"]
-                    metadata = client.last_metadata
-                    if (not isinstance(metadata, dict) or metadata.get("account_key") != account_key
-                            or not metadata.get("durable_seq") or not metadata.get("received_at_utc")
-                            or not metadata.get("kernel_boot_id")):
-                        raise TraderError("E_FACT_BARRIER", "Report requires an accepted owner snapshot boundary")
+                account_key, metadata = self._load_boundary()
                 if self.reader is None:
                     from online_trader.reporting import read_report
                     reader = read_report
@@ -148,7 +139,11 @@ class _ReportTask(QThread):
                 options = {} if metadata is None else {
                     "checkpoint_event_seq": metadata["durable_seq"], "as_of_utc": metadata["received_at_utc"],
                     "expected_kernel_boot_id": metadata["kernel_boot_id"]}
-                report = reader(self.path, account_key, **options)
+                # The fallback reads only while the selected account has no
+                # execution owner. A failed IPC request alone does not prove that.
+                lock = AccountLock(account_key) if self.allow_offline and metadata is None else nullcontext()
+                with lock:
+                    report = reader(self.path, account_key, **options)
                 if (not isinstance(report, dict) or report.get("schema_version") != "MONEY_REPORT/1"
                         or report.get("account_key") != account_key
                         or not isinstance(report.get("summary"), dict)
@@ -159,7 +154,7 @@ class _ReportTask(QThread):
                 result = {"action": "load", "report": report, "metadata": metadata}
             elif self.format == "daily_xlsx":
                 from online_trader.reporting import export_daily_report
-                target = export_daily_report(self.report, self.destination, self.table)
+                target = export_daily_report(self.report, self.destination, self.table, allow_empty=True)
                 result = {"action":"export","destination":str(target)}
             else:
                 if self.exporter is None:
@@ -177,6 +172,26 @@ class _ReportTask(QThread):
         except Exception:
             if not self.isInterruptionRequested():
                 self.failed.emit("E_INTERNAL")
+
+    def _load_boundary(self):
+        if not self.pipe_name:
+            return self.account_key, None
+        client = StatusClient(self.pipe_name)
+        try:
+            projection = client.snapshot()
+        except TraderError as error:
+            if self.allow_offline and self.account_key and error.code in {"E_PIPE", "E_TIMEOUT"}:
+                return self.account_key, None
+            raise
+        account = next(r for r in projection["records"] if r["record_type"] == "ACCOUNT")["record_id"]
+        if self.account_key and account != self.account_key:
+            raise TraderError("E_SCOPE", "Report account differs from the kernel account")
+        metadata = client.last_metadata
+        if (not isinstance(metadata, dict) or metadata.get("account_key") != account
+                or not metadata.get("durable_seq") or not metadata.get("received_at_utc")
+                or not metadata.get("kernel_boot_id")):
+            raise TraderError("E_FACT_BARRIER", "Report requires an accepted owner snapshot boundary")
+        return account, metadata
 
 
 class ReportsWindow(QMainWindow):
@@ -265,6 +280,11 @@ class ReportsWindow(QMainWindow):
         self.account_edit.textEdited.connect(self._source_changed)
         self._enabled(True)
 
+    def bind_source(self, ledger_path, account_key):
+        self.path_edit.setText(str(ledger_path))
+        self.account_edit.setText(account_key)
+        self._source_changed()
+
     def _enabled(self, enabled):
         for widget in (self.path_edit, self.account_edit, self.choose_button, self.refresh_button,
                        self.from_day, self.to_day):widget.setEnabled(enabled)
@@ -301,7 +321,7 @@ class ReportsWindow(QMainWindow):
         worker.finished.connect(self._finished)
         worker.start()
 
-    def refresh(self):
+    def refresh(self, *, allow_offline=False):
         if self._worker is not None or self._closing:return
         path, account = self.path_edit.text().strip(), self.account_edit.text().strip()
         if not path or (not account and not self.pipe_name):
@@ -310,7 +330,7 @@ class ReportsWindow(QMainWindow):
             return
         self.status_label.setText("正在读取完整账本快照…")
         self._start(_ReportTask(action="load", reader=self._reader, path=Path(path),
-                                account_key=account or None, pipe_name=self.pipe_name))
+                                account_key=account or None, pipe_name=self.pipe_name, allow_offline=allow_offline))
 
     def _result(self, result):
         if self._closing:return
@@ -391,27 +411,34 @@ class ReportsWindow(QMainWindow):
         self.rows_label.setText(f"当前表 {len(rows)} 行，显示 {min(len(rows), _DISPLAY_LIMIT)} 行；CSV导出包含筛选后的全部行。"
             "日期筛选只影响带交易日明细；顶部、按品种汇总和JSON保持完整账本范围。")
 
-    def request_daily_export(self):
+    def request_daily_export(self, *, allow_offline=False):
         self._daily_after_load = bool(self.path_edit.text().strip())
         if self._daily_after_load:
-            self.refresh()
+            self.refresh(allow_offline=allow_offline)
         else:
             self.status_label.setText("请选择账本并刷新，然后导出所选交易日的日报")
 
     def export_daily(self):
         if self._report is None or self._stale or self._worker is not None or self._closing:
             return
+        report = self._report
         days = sorted({row.get('trading_day') for key in ('by_day','trades','nominal','equity')
-                       for row in self._report[key] if row.get('trading_day')}, reverse=True)
-        if not days:
-            self.status_label.setText("当前账本没有可导出的交易日报")
-            return
-        day, ok = QInputDialog.getItem(self, "导出日报", "柜台交易日", days, 0, False)
+                       for row in report[key] if row.get('trading_day')}, reverse=True)
+        if days:
+            day, ok = QInputDialog.getItem(self, "导出日报", "柜台交易日（可输入 YYYY-MM-DD）", days, 0, True)
+        else:
+            day, ok = QInputDialog.getText(self, "导出空白日报", "柜台交易日（YYYY-MM-DD）")
         if not ok:
             return
+        from online_trader.accounting.book import trading_day
+        try:
+            day = trading_day(day.strip())
+        except TraderError:
+            self.status_label.setText("请输入有效的柜台交易日（YYYY-MM-DD）")
+            return
         target, _ = QFileDialog.getSaveFileName(self, "保存日报", f"日报_{day}.xlsx", "Excel (*.xlsx)")
-        if target:
-            self._start(_ReportTask(action="export", report=copy.deepcopy(self._report),
+        if target and self._report is report and not self._stale and not self._closing:
+            self._start(_ReportTask(action="export", report=copy.deepcopy(report),
                         destination=Path(target), table=day, format="daily_xlsx"))
 
     def export(self, format):
@@ -446,8 +473,10 @@ class ReportsWindow(QMainWindow):
                 QTimer.singleShot(0, self.export_daily)
 
     def closeEvent(self, event):
+        self._closing = True
+        if self._reconciliation_window is not None:
+            self._reconciliation_window.close()
         if self._worker is not None:
-            self._closing = True
             self._worker.requestInterruption()
             self.hide();event.ignore()
             return

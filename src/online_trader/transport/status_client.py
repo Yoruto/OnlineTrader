@@ -78,8 +78,10 @@ class StatusClient:
         return min(remaining, 30.0)
 
     def _receive(self, connection, deadline: float, *, request: dict,
-                 welcome: dict | None = None, expected_type: str | None = None) -> dict:
+                 welcome: dict | None = None, expected_type: str | None = None, timings=None) -> dict:
         message = connection.recv(timeout=self._remaining(deadline))
+        if timings is not None:
+            timings.update(received_at_utc=_utc(), received_monotonic_ns=str(time.monotonic_ns()))
         validate_message(message)
         if message["correlation_id"] != request["message_id"]:
             raise TraderError("E_SCHEMA", "Response correlation does not match the request")
@@ -110,19 +112,30 @@ class StatusClient:
         return welcome
 
     def workbench(self):
+        return self._workbench('WorkbenchRequest', 'WorkbenchSnapshot', 'READ_STATUS')
+
+    def workbench_monitor(self):
+        return self._workbench('WorkbenchMonitorRequest', 'WorkbenchMonitorSnapshot', 'READ_DIAGNOSTIC')
+
+    def _workbench(self, request_type, response_type, capability):
         deadline=time.monotonic()+self.timeout
+        timings = {'request_started_monotonic_ns':str(time.monotonic_ns())}
         with connect(self.pipe_name,timeout=self._remaining(deadline),expected_server_pid=self.expected_server_pid) as connection:
             welcome=self._hello(connection,deadline)
-            if 'READ_STATUS' not in welcome['body']['capabilities']:raise TraderError('E_AUTH','Read capability was not granted')
-            request=self._message('WorkbenchRequest',{},welcome)
+            if capability not in welcome['body']['capabilities']:
+                if capability == 'READ_DIAGNOSTIC':
+                    return None
+                raise TraderError('E_AUTH','Read capability was not granted')
+            request=self._message(request_type,{},welcome)
             connection.send(request,timeout=self._remaining(deadline))
-            body=self._receive(connection,deadline,request=request,welcome=welcome,expected_type='WorkbenchSnapshot')['body']
+            response=self._receive(connection,deadline,request=request,welcome=welcome,expected_type=response_type,timings=timings)
+            body=response['body']
             value=body['payload']
             if (content_hash(value)!=body['content_hash'] or value['account_key']!=welcome['account_key']
                     or value['kernel_boot_id']!=welcome['kernel_boot_id']):
                 raise TraderError('E_SNAPSHOT','Workbench identity or content hash differs')
             self.last_metadata={'account_key':welcome['account_key'],'kernel_boot_id':welcome['kernel_boot_id'],
-                'checkpoint_event_seq':value['checkpoint_event_seq'],'received_at_utc':_utc()}
+                'checkpoint_event_seq':value['checkpoint_event_seq'], 'reply_sent_at_utc':response['sent_at_utc'], **timings}
             return value
 
     def command(self,operation,scope,parameters):

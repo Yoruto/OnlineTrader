@@ -3,17 +3,20 @@
 import argparse
 import ast
 import asyncio
+from collections import defaultdict
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 import json
 from pathlib import Path
+from statistics import median, quantiles
 from types import SimpleNamespace
 
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.execution.policy import decide_order_action, select_price
 from online_trader.protection import initial_state, reduce_event
+from online_trader.runtime.comparison import execution_trace, read_records
 from online_trader.strategy.entry import DsvEntryStrategy
 from online_trader.strategy.plan import build_development_plan
 from online_trader.strategy.risk import evaluate_entry
@@ -33,6 +36,107 @@ def market_rows(path):
             record = json.loads(line)
             if record['kind'] == 'PRODUCT_MARKET_DECISION':
                 yield record['data']
+
+
+def latency_rows(paths):
+    """Read bounded local diagnostic files, ignoring an in-progress final write."""
+    for path in paths:
+        with Path(path).open('rb') as stream:
+            while raw := stream.readline(4 * 1024 * 1024 + 1):
+                if len(raw) > 4 * 1024 * 1024:
+                    raise ValueError(f'Oversized latency row in {path}')
+                if not raw.endswith(b'\n'):
+                    break
+                yield json.loads(raw)
+
+
+def latency_summary(executor_rows, workbench_rows, *, quiet_seconds=3):
+    """Match exact tick identities for one desktop, retaining unmatched samples."""
+    def run_key(row):
+        return row['account_key'], row['kernel_boot_id']
+
+    def tick_key(row, tick):
+        return (*run_key(row), *(tick.get(field) for field in (
+            'contract_id','trading_day','session_id','source_epoch','native_time_ns','native_tick_id')))
+
+    def elapsed(left, right):
+        return (int(right) - int(left)) / 1_000_000
+
+    def metrics(values):
+        if not values:
+            return None
+        p95 = quantiles(values, n=20, method='inclusive')[18] if len(values) > 1 else values[0]
+        return {'n':len(values), 'p50':round(median(values), 3), 'p95':round(p95, 3), 'max':round(max(values), 3)}
+
+    if quiet_seconds < 0:
+        raise ValueError('Quiet interval must be nonnegative')
+    observed = {}
+    quiet = defaultdict(dict)
+    for row in executor_rows:
+        for tick in row['ticks']:
+            identity = tick_key(row, tick)
+            if all(value is not None for value in identity):
+                observed.setdefault(identity, tick)
+        for symbol in row.get('symbols', ()):
+            if not symbol['active']:
+                continue
+            key = (symbol['contract_id'], row['trading_day'], 'QUIET')
+            age = symbol['quote_age_seconds']
+            if age is None or float(age) >= quiet_seconds:
+                quiet[key][(*run_key(row),row['source_epoch'],row['snapshot_monotonic_ns'])] = age
+
+    desktop = {}
+    for row in workbench_rows:
+        for tick in row['ticks']:
+            identity = tick_key(row, tick)
+            owned = observed.get(identity)
+            if owned is None or any(tick.get(name) != owned.get(name) for name in (
+                    'source_time_utc','sdk_returned_monotonic_ns','strategy_end_monotonic_ns')):
+                continue
+            snapshot, received, rendered = (row[name] for name in (
+                'snapshot_monotonic_ns','received_monotonic_ns','qt_rendered_monotonic_ns'))
+            if not int(owned['strategy_end_monotonic_ns']) <= int(snapshot) <= int(received) <= int(rendered):
+                continue
+            previous = desktop.get(identity)
+            if previous is None or int(rendered) < int(previous['qt_rendered_monotonic_ns']):
+                desktop[identity] = row
+
+    results = {}
+    for identity, tick in observed.items():
+        key = (tick['contract_id'], tick['trading_day'], tick.get('phase','UNCLASSIFIED'))
+        totals = results.setdefault(key, {'executor_samples':0,'desktop_matches':0,'stages':defaultdict(list)})
+        totals['executor_samples'] += 1
+        stages = totals['stages']
+        arrived = datetime.fromisoformat(tick['sdk_returned_at_utc'])
+        source = datetime.fromisoformat(tick['source_time_utc'])
+        stages['source_to_sdk_host_wall'].append((arrived-source).total_seconds()*1000)
+        clock = tick.get('clock') or {}
+        if clock.get('reference_minus_system_ms') is not None:
+            offset = float(clock['reference_minus_system_ms'])
+            stages['reference_minus_host_wall'].append(offset)
+            stages['source_to_sdk_reference_wall'].append(stages['source_to_sdk_host_wall'][-1] + offset)
+        stages['sdk_to_strategy'].append(elapsed(tick['sdk_returned_monotonic_ns'],tick['strategy_start_monotonic_ns']))
+        stages['strategy'].append(elapsed(tick['strategy_start_monotonic_ns'],tick['strategy_end_monotonic_ns']))
+        row = desktop.get(identity)
+        if row is not None:
+            totals['desktop_matches'] += 1
+            snapshot, received, rendered = (row[name] for name in (
+                'snapshot_monotonic_ns','received_monotonic_ns','qt_rendered_monotonic_ns'))
+            stages['strategy_to_snapshot'].append(elapsed(tick['strategy_end_monotonic_ns'],snapshot))
+            stages['snapshot_to_desktop'].append(elapsed(snapshot,received))
+            stages['desktop_to_qt'].append(elapsed(received,rendered))
+    out = []
+    for contract, day, phase in sorted(results, key=lambda key:(key[0],key[1] or '',key[2])):
+        totals = results[(contract,day,phase)]
+        out.append({'contract_id':contract,'trading_day':day,'phase':phase,
+                    'executor_samples':totals['executor_samples'],'desktop_matches':totals['desktop_matches'],
+                    'match_ratio':round(totals['desktop_matches']/totals['executor_samples'],4),
+                    'latency_ms':{name:metrics(values) for name,values in totals['stages'].items()}})
+    for (contract, day, phase), samples in quiet.items():
+        ages = [float(age)*1000 for age in samples.values() if age is not None]
+        out.append({'contract_id':contract,'trading_day':day,'phase':phase,'snapshots':len(samples),
+                    'snapshots_without_quote':len(samples)-len(ages),'quiet_age_ms':metrics(ages)})
+    return out
 
 
 def load_price_watcher(path):
@@ -208,12 +312,27 @@ def replay(archive, events, recovery_events, sdk):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--archive',type=Path,required=True)
-    parser.add_argument('--events',type=Path,required=True)
-    parser.add_argument('--recovery-events',type=Path,required=True)
-    parser.add_argument('--dsv-sdk-source',type=Path,required=True)
+    parser.add_argument('--archive',type=Path)
+    parser.add_argument('--events',type=Path)
+    parser.add_argument('--recovery-events',type=Path)
+    parser.add_argument('--dsv-sdk-source',type=Path)
+    parser.add_argument('--trace',action='store_true',help='Include up to the last 10000 committed product decision, order and protection events')
+    parser.add_argument('--executor-latency',type=Path,action='append',help='Local market-latency JSONL file; repeat for rotation')
+    parser.add_argument('--workbench-latency',type=Path,action='append',help='Local workbench latency JSONL from one desktop; repeat for rotation')
     args = parser.parse_args()
-    print(json.dumps(replay(args.archive,args.events,args.recovery_events,args.dsv_sdk_source),indent=2))
+    archive_inputs = (args.archive,args.events,args.recovery_events,args.dsv_sdk_source)
+    if args.executor_latency:
+        if any(archive_inputs) or args.trace:
+            parser.error('Use latency input files independently of archive replay options')
+        result = {'product_latency':latency_summary(
+            latency_rows(args.executor_latency),latency_rows(args.workbench_latency or []))}
+    else:
+        if not all(archive_inputs) or args.workbench_latency:
+            parser.error('Specify all four archive inputs or --executor-latency')
+        result = replay(*archive_inputs)
+        if args.trace:
+            result['product_execution_trace'] = execution_trace(read_records(args.recovery_events))
+    print(json.dumps(result,indent=2))
 
 
 if __name__ == '__main__':

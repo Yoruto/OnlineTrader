@@ -140,13 +140,18 @@ def _positive(value):
     return None
 
 
+def live_margin_rate(margin, last, multiplier):
+    margin, last, multiplier = map(_positive, (margin, last, multiplier))
+    if None in (margin, last, multiplier):
+        return None
+    return margin / (last * multiplier)
+
+
 def rule_display(quote, rule, margin_add, fee_add):
     """Resolve live display values and DSV table fallback with independent provenance."""
-    price = _positive(quote.get('last')) if quote.get('fresh') else None
-    multiplier = _positive(quote.get('volume_multiple'))
-    margin = _positive(quote.get('margin'))
-    fee = _positive(quote.get('commission')) if quote.get('fresh') else None
-    live = margin / (price * multiplier) if price is not None and multiplier is not None and margin is not None else None
+    usable = quote.get('fresh') or quote.get('quote_reference_ready')
+    fee = _positive(quote.get('commission')) if usable else None
+    live = live_margin_rate(quote.get('margin'), quote.get('last'), quote.get('volume_multiple')) if usable else None
     table_exchange = rule.exchange_margin if rule and rule.exchange_margin > 0 else None
     table_company = rule.company_margin if rule and rule.company_margin > 0 else None
     difference = live - table_exchange if live is not None and table_exchange is not None else None

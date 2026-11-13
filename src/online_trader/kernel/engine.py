@@ -360,7 +360,8 @@ class Kernel:
         validate_plan(plan)
         if self.simulation is not None:
             if getattr(self.simulation,'strategy_enabled',False):
-                self.simulation.validate_entry(plan,manual=_manual is not None)
+                candidate = _strategy['metadata']['candidate'] if _strategy is not None else {}
+                self.simulation.validate_entry(plan, manual=_manual is not None, entry_kind=candidate.get('entry_kind'))
             else:self.simulation.validate_entry(plan)
             if (_strategy is not None or _manual is not None)!=bool(getattr(self.simulation,'strategy_enabled',False)):
                 raise TraderError('E_UNSUPPORTED','Online strategy and manual scopes cannot be interchanged')
@@ -653,49 +654,59 @@ class Kernel:
         if order["send_state"] != "SEND_POSSIBLE":
             self._entry_gates.pop(order["attempt_id"],None)
             return
-        valid = order.get("kernel_boot_id")==self.boot_id
+        checks = {}
+        checks['ORIGINAL_BOOT'] = order.get("kernel_boot_id") == self.boot_id
         scheduler=getattr(self,'_scheduled_runtime',None)
-        if scheduler is not None:
-            valid=valid and scheduler.scope_current(cycle['plan']['contract_id'],order.get('native_trading_day',cycle['plan']['trading_day']))
+        if scheduler is not None and checks['ORIGINAL_BOOT']:
+            checks['CURRENT_SESSION'] = scheduler.scope_current(cycle['plan']['contract_id'],
+                order.get('native_trading_day',cycle['plan']['trading_day']))
         if order["effect"]=="OPEN":
             authorization=cycle["entry_authorization"]
             try:
                 strategy=cycle.get("entry_origin")=="STRATEGY"
                 self.contexts.validate(authorization["context_id"],authorization["peer_id"],authorization.get("purpose","OPERATOR_COMMAND"),authorization.get("operation","MANUAL_OPEN"),cycle["plan"]["contract_id"],
                                        kernel_boot_id=self.boot_id,kernel_epoch=str(self.kernel_epoch),strategy_epoch=str(cycle["strategy_epoch"]) if strategy else None)
-                valid=valid and self._armed and not order["cancel_status"] and not order["terminal_confirmed"] and authorization["authority_revision"]==self._authority_revision and self._exposure()<=self.budget
-                valid=valid and not self.statistics.entry_reasons(cycle['plan']['contract_id'],cycle['plan']['trading_day'])
-                if strategy:
+                checks['ENTRY_AUTHORITY'] = (self._armed and not order["cancel_status"] and not order["terminal_confirmed"]
+                                             and authorization["authority_revision"]==self._authority_revision)
+                if all(checks.values()):
+                    checks['RISK_BUDGET'] = self._exposure() <= self.budget
+                    if checks['RISK_BUDGET']:
+                        checks['NOMINAL_DAY_STOP'] = not self.statistics.entry_reasons(
+                            cycle['plan']['contract_id'], cycle['plan']['trading_day'])
+                if strategy and all(checks.values()):
                     gate=self._entry_gates.get(order["attempt_id"])
-                    valid=valid and self.active_epoch==cycle["strategy_epoch"] and gate is not None and bool(gate())
-            except TraderError:
-                valid=False
+                    checks['STRATEGY_RECHECK'] = self.active_epoch==cycle["strategy_epoch"] and gate is not None and bool(gate())
+            except TraderError as error:
+                checks[error.code] = False
         else:
             quote=cycle.get("last_quote")
-            valid=bool(valid and cid not in self._recovery_pending and quote and quote["kernel_boot_id"]==self.boot_id
+            checks['ORIGINAL_EXIT_FACTS']=bool(all(checks.values()) and cid not in self._recovery_pending and quote and quote["kernel_boot_id"]==self.boot_id
                 and cycle.get("management_state")!="TAKEN_OVER"
                 and cycle["protection"]["quality"]=="CONTIGUOUS" and self._quote_age_ns(quote["received_ns"])<=self.max_quote_age_ms*1_000_000)
             if quote:
                 current_price=quote.get("bid1" if cycle["plan"]["direction"]=="LONG" else "ask1")
-                if not self.execution.active(cycle):valid=valid and current_price==order["limit_price"]
+                if not self.execution.active(cycle):checks['ORIGINAL_EXIT_PRICE']=current_price==order["limit_price"]
             other_pending=sum(OrderState.from_dict(o).potential_remaining for o in cycle["orders"] if o["effect"]=="REDUCE" and o["child_order_id"]!=child_id)
             target=cycle["protection"].get("target_remaining_qty")
-            valid=valid and target is not None and order["original_qty"]<=max(0,cycle["protection"]["owned_qty"]-target-other_pending)
+            checks['ORIGINAL_EXIT_QUANTITY']=target is not None and order["original_qty"]<=max(0,cycle["protection"]["owned_qty"]-target-other_pending)
         if self.execution.active(cycle):
             priced=self.execution.price(cycle,order['effect'])
-            valid=valid and priced['allowed'] and priced['price']==order['limit_price']
+            checks['EXECUTION_PRICE']=priced['allowed'] and priced['price']==order['limit_price']
         try:order_price(order["limit_price"],cycle.get("instrument",{}).get("tick_size",self.tick_size))
-        except TraderError:valid=False
+        except TraderError as error:checks[error.code]=False
         request=copy.deepcopy(order) | {"position_cycle_id":cid,"account_key":self.account_key}
         if self.simulation is not None:
             request.update(contract_id=cycle['plan']['contract_id'],direction='BUY' if (cycle['plan']['direction']=='LONG')==(order['effect']=='OPEN') else 'SELL',trading_day=order.get('native_trading_day',cycle['plan']['trading_day']))
             try:self.port.validate_send(request)
-            except TraderError:valid=False
-        if not valid:
+            except TraderError as error:checks[error.code]=False
+        if not all(checks.values()):
             self._entry_gates.pop(order["attempt_id"],None)
             order["send_state"] = "DEFINITELY_NOT_SENT"
             order["terminal_confirmed"] = True
             order["reported_fill_qty"] = order["filled_qty"]
+            if getattr(self.simulation, 'strategy_enabled', False):
+                cycle["last_dispatch_abort"] = {"child_order_id": child_id,
+                    "reasons": [check for check, passed in checks.items() if not passed]}
             cycle["revision"] += 1
             self._stage_cycle(cycle,"TX_ORDER","SEND_ABORTED",after=(lambda:self._progress_exits(cid)) if order["effect"]=="REDUCE" else None)
             return

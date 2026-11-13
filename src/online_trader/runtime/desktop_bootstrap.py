@@ -5,6 +5,7 @@ process acquires read-only market metadata, closes that reader, and derives the
 bounded internal files before entering the original strategy execution path.
 Request construction is entirely offline and does not read the credential vault.
 """
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -39,7 +40,7 @@ ERROR_MESSAGES = {
     'E_DESKTOP_START_REQUEST': '启动请求已过期或内容发生变化，请重新点击启动策略。',
     'E_DESKTOP_START_REPLAY': '本次启动请求已经执行，请查看原运行状态，避免重复启动。',
     'E_DESKTOP_START_LIMITS': '请在交易参数中设置有效的最大手数和每品种最大报单数。',
-    'E_DESKTOP_START_RECOVERY': '该账号已有策略运行记录，请恢复原运行并核对持仓；不会创建新账本覆盖历史。',
+    'E_DESKTOP_START_RECOVERY': '该账号有未核清的原运行，请恢复原范围并核对持仓、委托及回报。',
     'E_INSTANCE_EXISTS': '该账号的策略执行器已在运行，请刷新工作台查看。',
     'E_FACT_BARRIER': '该账号有持仓、委托或未知结果需要核对，请先恢复原策略运行。',
     'E_SCOPE': '所选账号或运行范围已变化，请重新确认。',
@@ -72,6 +73,34 @@ def _selected(store, account_id):
     return row
 
 
+def timed_start_trigger(profile, now, *, on_launch=False, metadata=None):
+    """Select the DSV local trigger and, when given SDK evidence, verify its session."""
+    from online_trader.runtime.launch import scheduled_minute
+    from online_trader.strategy.entry import CHINA_TIME
+    settings = profile.to_record()['settings']
+    local = now.astimezone(CHINA_TIME)
+    if local.weekday() >= 5 or local.date().isoformat() in settings['trade']['holidays']:
+        return None
+    trigger = 'AUTO_START_ON_LAUNCH' if on_launch and settings['trade']['auto_start_on_launch'] else (
+        scheduled_minute(settings['schedule'], local))
+    if trigger and metadata is not None:
+        calendar = TradingCalendar.from_record(metadata['calendar'])
+        sessions = [calendar.query(code, _stamp(now)) for code in metadata['instruments']]
+        near = []
+        for window in sessions:
+            session = window.get('session') or window.get('next_session')
+            if (window.get('complete') and session and session['trading_day'] == metadata['trading_day']
+                    and (window['is_trading'] or timedelta(0) <= _utc(session['open_utc']) - now <= timedelta(minutes=30))):
+                near.append(session)
+        if not near:
+            return None
+        if trigger != 'AUTO_START_ON_LAUNCH':
+            night = trigger.endswith('_night')
+            if not any((_utc(session['open_utc']).astimezone(CHINA_TIME).hour >= 18) == night for session in near):
+                return None
+    return trigger
+
+
 def _limits(profile):
     settings = profile.to_record()['settings']
     maximum = settings['trade']['max_volume']
@@ -82,19 +111,22 @@ def _limits(profile):
     return maximum, per_contract * count
 
 
-def build_start_request(store, account_id, profile, *, arm=True, now=None):
+def build_start_request(store, account_id, profile, *, arm=True, now=None, timed_trigger=None):
     """Called after the user's start confirmation. Never connects or reads secrets."""
     if not isinstance(profile, DsvProfile) or type(arm) is not bool:
         raise TraderError('E_DESKTOP_START_REQUEST', 'Expected a business profile and explicit startup intent')
     row = _selected(store, account_id)
     _limits(profile)
     instant = _now(now)
-    return {'schema_version': REQUEST_SCHEMA, 'request_id': 'desktop-' + uuid.uuid4().hex,
+    request = {'schema_version': REQUEST_SCHEMA, 'request_id': 'desktop-' + uuid.uuid4().hex,
         'created_at_utc': _stamp(instant), 'expires_at_utc': _stamp(instant + REQUEST_LIFETIME),
         'account_store': str(store.directory.resolve()), 'account_id': account_id,
         'account_key': row['account_key'], 'provider': row['provider'],
         'profile': profile.to_record(), 'profile_hash': profile.content_hash,
         'arm': arm, 'confirmed': True}
+    if timed_trigger is not None:
+        request['timed_trigger'] = timed_trigger
+    return request
 
 
 def _request(path, instant):
@@ -102,7 +134,8 @@ def _request(path, instant):
         with Path(path).open('rb') as stream:
             raw = stream.read(MAX_REQUEST_BYTES + 1)
         value = strict_loads(raw)
-        if len(raw) > MAX_REQUEST_BYTES or type(value) is not dict or set(value) != _REQUEST_KEYS:
+        if (len(raw) > MAX_REQUEST_BYTES or type(value) is not dict
+                or set(value) - {'timed_trigger'} != _REQUEST_KEYS):
             raise ValueError()
         if value['schema_version'] != REQUEST_SCHEMA or value['confirmed'] is not True or type(value['arm']) is not bool:
             raise ValueError()
@@ -116,6 +149,9 @@ def _request(path, instant):
         profile = DsvProfile.from_record(value['profile'])
         if value['profile_hash'] != profile.content_hash:
             raise ValueError()
+        trigger = value.get('timed_trigger')
+        if trigger is not None and trigger != timed_start_trigger(profile, created, on_launch=trigger=='AUTO_START_ON_LAUNCH'):
+            raise ValueError()
         _limits(profile)
         return value, profile
     except (OSError, ValueError, TypeError, KeyError, TraderError) as error:
@@ -125,22 +161,30 @@ def _request(path, instant):
 
 
 def _check_existing_ledger(store, row):
-    # Existing unresolved state must be managed by its original immutable grant.
-    # Even closed cycles remain in _staged and bind that owner to its original
-    # grant; do not make a fresh scope that will only fail after account login.
-    store._settled(row)
     ledger = store.ledger_path(row)
     if not ledger.exists():
         return
     try:
+        store._settled(row)
         connection = sqlite3.connect(ledger.as_uri() + '?mode=ro', uri=True, timeout=1)
-        try:
-            connection.execute('PRAGMA query_only=ON')
-            if connection.execute('SELECT 1 FROM position_cycles LIMIT 1').fetchone():
-                raise TraderError('E_DESKTOP_START_RECOVERY', ERROR_MESSAGES['E_DESKTOP_START_RECOVERY'])
-        finally:
-            connection.close()
+        with closing(connection):
+            pending = connection.execute("""
+                SELECT 1 FROM child_orders AS child
+                LEFT JOIN send_attempts AS attempt USING (child_order_id)
+                LEFT JOIN cancel_actions AS cancel USING (child_order_id)
+                WHERE (attempt.send_state IS NULL OR attempt.send_state NOT IN ('CONFIRMED','DEFINITELY_NOT_SENT')
+                    OR child.terminal_evidence_json IS NULL
+                    OR json_extract(child.terminal_evidence_json,'$.confirmed_fill_qty') IS NOT child.confirmed_fill_qty
+                    OR (cancel.status IS NOT NULL AND cancel.status NOT IN ('CONFIRMED','REJECTED','NOT_NEEDED')))
+                LIMIT 1
+                """).fetchone()
+            if pending:
+                raise TraderError('E_FACT_BARRIER', 'Prior orders or cancellations still need reconciliation')
     except sqlite3.Error:
+        raise TraderError('E_DESKTOP_START_RECOVERY', ERROR_MESSAGES['E_DESKTOP_START_RECOVERY']) from None
+    except TraderError as error:
+        if error.code != 'E_FACT_BARRIER':
+            raise
         raise TraderError('E_DESKTOP_START_RECOVERY', ERROR_MESSAGES['E_DESKTOP_START_RECOVERY']) from None
 
 
@@ -250,6 +294,10 @@ def run_desktop_start(request_path, output, *, now=None):
             current = _now(now)
             if current >= _utc(request['expires_at_utc']):
                 raise TraderError('E_DESKTOP_START_REQUEST', ERROR_MESSAGES['E_DESKTOP_START_REQUEST'])
+            trigger = request.get('timed_trigger')
+            if trigger and trigger != timed_start_trigger(source_profile, _utc(request['created_at_utc']),
+                    on_launch=trigger=='AUTO_START_ON_LAUNCH', metadata=metadata):
+                raise TraderError('E_CALENDAR_INCOMPLETE', '定时启动未找到匹配的当前或临近交易时段。')
             grant, effective, calendar, details = compile_start_scope(request, store, metadata, now=current)
             for name, record in (('scope.json', grant.value), ('profile.json', effective.to_record()),
                                  ('calendar.json', calendar.to_record()), ('startup-preparation.json', details)):

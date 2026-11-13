@@ -36,9 +36,10 @@ class SimNowComparisonTests(unittest.TestCase):
         with patch.object(fixture,'scope_for',simnow_scope),patch.object(fixture,'TqKqDsvPort',SimNowDsvPort):
             self.x.start(**options)
 
-    def read_strategy_log(self):
+    def read_strategy_log(self, *, market_only=True):
         path = self.x.session.comparison.directory.parent / 'strategy-log.jsonl'
-        return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+        rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+        return [row for row in rows if not market_only or 'event_seq' not in row]
 
     def test_strategy_log_throttles_geometry_trigger_and_activation_in_dsv_order(self):
         self.start(trade={'no_chase_after_act': True, 'trailing_activate_ratio': 0.8})
@@ -223,6 +224,12 @@ class SimNowComparisonTests(unittest.TestCase):
         close=parse_dsv_line('[09:48:54] [自动] [平仓] 沥青(SHFE.bu2701) 空头止损 数量:16 出场:4282.0','2026-11-10')
         self.assertEqual(close['kind'],'EXIT_DECISION');self.assertFalse(close['fill_confirmed'])
         self.assertEqual(close['operator_tag'],'auto')
+        half = parse_dsv_line('[09:48:54] [半仓] 沥青(SHFE.bu2701) 减仓', '2026-11-10')
+        win = parse_dsv_line('[09:48:55] [平仓] 沥青(SHFE.bu2701) 单笔:+5', '2026-11-10')
+        loss = parse_dsv_line('[09:48:56] [平仓] 沥青(SHFE.bu2701) 单笔:-5', '2026-11-10')
+        self.assertEqual((half['kind'], half['operator_tag']), ('OPERATOR_LOG', 'half'))
+        self.assertEqual((win['kind'], win['operator_tag'], loss['operator_tag']),
+                         ('EXIT_DECISION', 'close_win', 'close_loss'))
 
     def test_log_tail_preserves_partial_lines_and_never_writes_source(self):
         root=Path(self.x.temp.name);log=root/'trade_2026-11-10.log'
@@ -284,9 +291,50 @@ class SimNowComparisonTests(unittest.TestCase):
     def test_changed_dsv_business_settings_are_rejected(self):
         self.start();x=self.x;path=Path(x.temp.name)/'business.json'
         value=x.profile.to_settings();path.write_text(json.dumps(value),encoding='utf-8')
-        self.assertEqual(verify_dsv_profile(path,x.profile).content_hash,x.profile.content_hash)
+        from online_trader.configuration.dsv import DsvProfile
+        expected = DsvProfile.from_dsv_json(json.dumps(value))
+        self.assertEqual(verify_dsv_profile(path,expected).content_hash,expected.content_hash)
         value['symbols'][0]['open_offset']+=1;path.write_text(json.dumps(value),encoding='utf-8')
-        with self.assertRaises(TraderError):verify_dsv_profile(path,x.profile)
+        with self.assertRaises(TraderError):verify_dsv_profile(path,expected)
+
+    def test_trace_distinguishes_target_cancel_partial_fill_and_final_closure(self):
+        from online_trader.runtime.comparison import execution_trace
+        self.start(trade={'half_close_enabled':False})
+        x = self.x
+        x.quote()
+        first = x.api.inserted[0]
+        x.api.fill(first['order_id'],2,1055,finish=False)
+        x.quote(1038)
+        self.assertIn(first['order_id'],x.api.cancelled)
+        x.api.terminal(first['order_id'])
+        x.session.step()
+        x.quote(1038)
+        x.finish_last(1038)
+        self.assertEqual(x.cycle()['lifecycle'],'CLOSED')
+        trace = execution_trace(read_records(x.session.comparison.path))
+        candidates = [row['candidates'][0] for row in trace if row['kind']=='DECISION' and row['candidates']]
+        self.assertEqual(candidates[0]['direction'],'LONG')
+        opening = [row['order'] for row in trace if row['kind']=='ORDER_TRANSITION' and row['order']['effect']=='OPEN']
+        self.assertTrue(any(order['cancel_status']=='CALL_RETURNED' for order in opening))
+        self.assertTrue(any(order['terminal_confirmed'] and order['filled_qty']==2 for order in opening))
+        states = [row for row in trace if row['kind']=='OWNED_STATE']
+        self.assertEqual([row['fill']['effect'] for row in states if row['fill']],['OPEN','REDUCE'])
+        self.assertEqual(states[-1]['lifecycle'],'CLOSED')
+        logs = self.read_strategy_log(market_only=False)
+        self.assertTrue(any(row.get('origin')=='策略' and '准备报单' in row['message'] for row in logs))
+        self.assertEqual([row['origin'] for row in logs if row.get('trade_key')],['柜台','柜台'])
+
+    def test_native_rejection_is_not_displayed_as_a_cancellation(self):
+        self.start();x=self.x
+        x.quote()
+        native = x.api.inserted[0]['order_id']
+        x.api.orders[native].is_error = True
+        x.api.terminal(native)
+        x.session.step()
+        self.assertEqual(x.cycle()['orders'][0]['broker_state'],'REJECTED')
+        self.assertEqual(x.cycle()['lifecycle'],'CLOSED')
+        logs = self.read_strategy_log(market_only=False)
+        self.assertTrue(any(row.get('origin')=='柜台' and '柜台拒单' in row['message'] for row in logs))
 
     def test_scope_fingerprint_mismatch_stops_before_sdk_import(self):
         self.start();x=self.x

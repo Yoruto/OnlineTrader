@@ -3,12 +3,18 @@ import asyncio
 import copy
 from datetime import datetime,timezone,timedelta
 from decimal import Decimal
+import math
 import time
 
 from online_trader.configuration.rollover import CHINA_TIME, expiry_date, future_product, rollover_hint
+from online_trader.domain.values import order_price
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import TqKqPort, number
 from online_trader.online_scope import DsvSimulationGrant
+
+
+def _missing_book_price(value):
+    return value is None or type(value) in (int, float) and (value == 0 or math.isnan(value))
 
 
 class TqKqDsvPort(TqKqPort):
@@ -16,6 +22,38 @@ class TqKqDsvPort(TqKqPort):
         if not self.broker_connected:return True  # injected QA facts have their own clock
         from online_trader.scheduling.reference import clock_observation
         return clock_observation(self.clock)['system_aligned']
+
+    def strategy_wall_time(self):
+        return datetime.now(timezone.utc) if self.broker_connected else self.clock.now()
+
+    def fresh_strategy_entry(self, code, side, event):
+        """Verify the exact native last used when the order's opponent is absent."""
+        if event is None:
+            return False
+        field = 'ask1' if side == 'BUY' else 'bid1'
+        if event[field] is not None:
+            return self.fresh(code)
+        if not self._fresh_last(code):
+            return False
+        quote = self.quotes[code]
+        stamp = datetime.fromisoformat(quote.datetime).replace(tzinfo=CHINA_TIME)
+        if stamp != datetime.fromisoformat(event['source_time_utc']) or number(quote.last_price) != event['last']:
+            return False
+        opponent, other, volume = ((getattr(quote,'ask_price1',None), getattr(quote,'bid_price1',None),
+                                    getattr(quote,'bid_volume1',None)) if side == 'BUY'
+                                   else (getattr(quote,'bid_price1',None), getattr(quote,'ask_price1',None),
+                                         getattr(quote,'ask_volume1',None)))
+        if not _missing_book_price(opponent):
+            return False
+        if not _missing_book_price(other) and not (type(other) in (int, float) and math.isfinite(other)
+                and quote.lower_limit <= other <= quote.upper_limit and type(volume) in (int, float)
+                and math.isfinite(volume) and volume > 0):
+            return False
+        try:
+            order_price(event['last'], number(quote.price_tick))
+        except TraderError:
+            return False
+        return True
 
     def __init__(self,api,account,grant,clock):
         if type(grant) is not DsvSimulationGrant:
@@ -27,8 +65,14 @@ class TqKqDsvPort(TqKqPort):
         # Pinned SDK 3.10.4 api.get_tick_serial explicitly caps native history
         # at 10000. Use its supported full window; never synthesize older ticks.
         self.tick_serials={code:api.get_tick_serial(code,data_length=10000) for code in grant.value['contracts']}
+        self._tick_backfill_serials={}
+        self._tick_backfill_attempts={}
+        self._tick_backfill_after={}
+        self._tick_backfill_pending=set()
         self.minute_chart_serials={}
         self.minute_chart_requested=False
+        self.minute_chart_sample_at = None
+        self.minute_chart_cache = {}
         self._rollover_main = {}
         self._rollover_catalog = {}
         self._rollover_poll_at = None
@@ -133,12 +177,19 @@ class TqKqDsvPort(TqKqPort):
             task=self._subscribe_minute_charts()
             try:self.api.create_task(task)
             except Exception:task.close()
+        if self.fault:
+            self.minute_chart_sample_at = None
+            self.minute_chart_cache = {}
+            return {}
+        now = time.monotonic()
+        if self.minute_chart_sample_at is not None and now - self.minute_chart_sample_at < 6:
+            return self.minute_chart_cache
         result={}
         for code,serial in self.minute_chart_serials.items():
             try:
                 if not self.api.is_serial_ready(serial):continue
                 bars={}
-                for row in serial.tail(48).to_dict('records'):
+                for row in serial.tail(60).to_dict('records'):
                     try:stamp=native_integer(row.get('datetime'),minimum=60_000_000_000)
                     except TraderError:continue
                     opening,high,low,closing=(number(row.get(key)) for key in ('open','high','low','close'))
@@ -149,6 +200,8 @@ class TqKqDsvPort(TqKqPort):
                 if bars:result[code]=[[minute,*bars[minute]] for minute in sorted(bars)]
             except (AttributeError,TypeError,ValueError,ArithmeticError):
                 continue
+        self.minute_chart_sample_at = now
+        self.minute_chart_cache = result
         return result
 
     def configure_calendar(self,calendar):
@@ -182,30 +235,40 @@ class TqKqDsvPort(TqKqPort):
     def poll_updates(self,seconds=0.1):
         epoch=self.source_epoch
         self._refresh_rollover_quotes()
-        super().poll_updates(seconds)
+        received = super().poll_updates(seconds)
         if self.source_epoch!=epoch:
             self.started_at=self.clock.now();self.subscription_ready_at.clear()
+            self.minute_chart_sample_at = None
+            self.minute_chart_cache = {}
             if self._rollover_task is not None:
                 self._rollover_task.cancel()
                 self._rollover_task = None
             self._rollover_poll_at = None
             self._rollover_main.clear()
             self._rollover_catalog.clear()
+        return received
 
     def observations(self):
         from online_trader.gateway.native_days import native_day
         observations=super().observations()
         orders=self.api.get_order(account=self.account)
+        owner = getattr(getattr(self, 'kernel', None), 'simulation', None)
         for observation in observations:
             item=orders[observation['order_id']]
             stamp=getattr(item,'insert_date_time',None)
+            child, code = observation['child_order_id'], observation['contract_id']
+            if getattr(item, 'is_error', None) is True:
+                observation['rejected'] = True
             try:
                 if type(stamp) is not int:raise TraderError('E_FACT_BARRIER','Missing native order time')
-                observation['order_day_evidence']=native_day(self.calendar,observation['contract_id'],str(stamp))
+                observation['order_day_evidence'] = (owner.native_day_proof(child, code, str(stamp)) if owner
+                                                     else native_day(self.calendar, code, str(stamp)))
             except TraderError as error:observation['order_day_error']=error.code
             for fill in observation['fills']:
                 try:
-                    proof=native_day(self.calendar,observation['contract_id'],fill['source_time_ns'])
+                    stamp = fill['source_time_ns']
+                    proof = (owner.native_day_proof(child, code, stamp, fill=True) if owner
+                             else native_day(self.calendar, code, stamp))
                     fill.update(trading_day=proof['trading_day'],native_day_evidence=proof)
                 except TraderError as error:fill['native_day_error']=error.code
         return observations
@@ -224,12 +287,22 @@ class TqKqDsvPort(TqKqPort):
         cycle,_=kernel._find(request['child_order_id'])
         order=next(o for o in cycle['orders'] if o['child_order_id']==request['child_order_id'])
         if (cycle['position_cycle_id']!=request.get('position_cycle_id') or cycle.get('management_state')=='TAKEN_OVER'
+                or kernel.simulation.archived_cycle(cycle)
                 or any(order[key]!=request[key] for key in ('effect','original_qty','limit_price','native_offset'))):
             raise TraderError('E_OWNERSHIP','Native order is not the exact committed original child')
         manual = kernel.execution.manual_reduction(cycle) if order['effect']=='REDUCE' else None
         direct = (manual and manual.get('price')==request['limit_price']
                   and cycle['execution'].get('manual_reduction_children',{}).get(order['child_order_id'])==manual['request_id'])
-        if not self.fresh(request['contract_id']) and not (direct and self.fresh_manual_reduction(request['contract_id'])):
+        code = request['contract_id']
+        metadata = cycle.get('strategy_metadata') or {}
+        candidate = metadata.get('candidate') or {}
+        runtime = getattr(kernel, '_dsv_runtime', None)
+        facts = runtime._latest.get((code, request['trading_day'])) if runtime is not None else None
+        if request['effect']=='OPEN' and candidate.get('entry_kind')=='NORMAL' and cycle['entry_origin']=='STRATEGY':
+            fresh = self.fresh_strategy_entry(code, request['direction'], facts['event'] if facts is not None else None)
+        else:
+            fresh = self.fresh(code) or (direct and self.fresh_manual_reduction(code))
+        if not fresh:
             raise TraderError('E_GATEWAY_SCOPE','A current native quote is required before sending')
         expected='BUY' if (cycle['plan']['direction']=='LONG')==(order['effect']=='OPEN') else 'SELL'
         if request['direction']!=expected:raise TraderError('E_OWNERSHIP','Native order direction differs from the original cycle')
@@ -247,7 +320,6 @@ class TqKqDsvPort(TqKqPort):
             kernel.simulation.comparison_gate()
             if not self.entry_clock_ready():
                 raise TraderError('E_CLOCK','Windows clock alignment is required immediately before native opening send')
-            facts=kernel._dsv_runtime._latest.get((request['contract_id'],request['trading_day']))
             current=datetime.fromisoformat(self.quotes[request['contract_id']].datetime).replace(tzinfo=timezone(timedelta(hours=8)))
             if facts is None or current!=datetime.fromisoformat(facts['event']['source_time_utc']):
                 raise TraderError('E_GATEWAY_SCOPE','The entry proposal does not reflect the latest native quote')
@@ -291,9 +363,40 @@ class TqKqDsvPort(TqKqPort):
 
     def tick_records(self,code):
         serial=self.tick_serials[code]
+        backfill=self._tick_backfill_serials.get(code)
+        if (backfill is not None and self.api.is_serial_ready(backfill)
+                and backfill.iloc[-1]['id']>=serial.iloc[-1]['id']):
+            serial=self.tick_serials[code]=self._tick_backfill_serials.pop(code)
         if not self.api.is_serial_ready(serial):return []
         self.subscription_ready_at.setdefault(code,self.clock.now())
         return serial.to_dict('records')
+
+    def request_tick_backfill(self,code):
+        """Refresh a gapped native serial through a new, bounded SDK request."""
+        if not self.broker_connected or code in self._tick_backfill_pending:
+            return
+        now=time.monotonic()
+        attempts=self._tick_backfill_attempts.get(code,0)
+        if attempts>=4 or now<self._tick_backfill_after.get(code,0):
+            return
+        self._tick_backfill_attempts[code]=attempts+1
+        self._tick_backfill_after[code]=now+10
+        self._tick_backfill_pending.add(code)
+        task=self._subscribe_tick_backfill(code,10000-attempts-1)
+        try:self.api.create_task(task)
+        except Exception:
+            task.close()
+            self._tick_backfill_pending.discard(code)
+
+    async def _subscribe_tick_backfill(self,code,width):
+        try:
+            # The pinned SDK caches tick subscriptions by contract and width.
+            # A distinct width requests a fresh native window on the same feed.
+            self._tick_backfill_serials[code]=self.api.get_tick_serial(code,data_length=width)
+        except Exception:
+            pass
+        finally:
+            self._tick_backfill_pending.discard(code)
 
     def cancel_external(self,order,day):
         if (self.read_only or not self.grant.manual_workbench or self.fault or not self.grant.in_window(self.clock.now())

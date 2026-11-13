@@ -5,7 +5,7 @@
   },
   "resources": {
     "ipc.schema.json": "68bee449c968752827e0a6d0f6e0dce562f55d6ab59a18563bb80bb12b7a4f71",
-    "workbench-ipc.schema.json": "8eff6a1a5acb57d2ca335ea7e0e21f81b80a8a1879b3f84170eceade948b3ac9"
+    "workbench-ipc.schema.json": "4bc46e1b6b3986ad1d3b45833b8c0b77ee312e44336dbf25b1b14ac53b279985"
   },
-  "note": "Workbench projections and the additive manual-account, external-position and historical-evidence controls. The G0 IPC source digest is retained; protection and storage resources are unchanged."
+  "note": "Workbench projections, existing operator controls and the capability-gated WorkbenchMonitor request. The copied G0 IPC digest is retained."
 }

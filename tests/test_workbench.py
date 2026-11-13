@@ -43,6 +43,42 @@ class WorkbenchPipe(desktop_fixtures.FakePipe):
 
 
 class WorkbenchClientTests(unittest.TestCase):
+    def test_monitor_requires_capability_and_verifies_inner_boot(self):
+        class Pipe(WorkbenchPipe):
+            def send(self, message, *, timeout):
+                if message['type'] == 'WorkbenchMonitorRequest':
+                    validate_message(message)
+                    self.sent.append(copy.deepcopy(message))
+                    value = {'account_key':'account-test','kernel_boot_id':'boot-test','checkpoint_event_seq':'2',
+                             'sample_at_utc':None,'quote_delay_seconds':None,'quote_status':'等待行情',
+                             'symbols':[],'diagnostics':None}
+                    self.queue.append(self.response('WorkbenchMonitorSnapshot',
+                        {'payload':value,'content_hash':content_hash(value)},message))
+                else:
+                    super().send(message,timeout=timeout)
+
+        old = Pipe()
+        with patch('online_trader.transport.status_client.connect',return_value=old):
+            self.assertIsNone(StatusClient('pipe').workbench_monitor())
+        self.assertEqual([row['type'] for row in old.sent],['Hello'])
+
+        for invalid in (False, True):
+            def transform(message):
+                if message['type'] == 'Welcome':
+                    message['body']['capabilities'].append('READ_DIAGNOSTIC')
+                elif invalid and message['type'] == 'WorkbenchMonitorSnapshot':
+                    message['body']['payload']['kernel_boot_id'] = 'other-boot'
+                    message['body']['content_hash'] = content_hash(message['body']['payload'])
+                return message
+            with patch('online_trader.transport.status_client.connect',return_value=Pipe(transform)):
+                client = StatusClient('pipe', expected_account_key='account-test', expected_kernel_boot_id='boot-test')
+                if invalid:
+                    with self.assertRaises(TraderError):
+                        client.workbench_monitor()
+                else:
+                    self.assertEqual(client.workbench_monitor()['quote_status'],'等待行情')
+                    self.assertIn('received_monotonic_ns',client.last_metadata)
+
     def test_checked_workbench_view_is_account_and_boot_bound(self):
         pipe=WorkbenchPipe()
         with patch('online_trader.transport.status_client.connect',return_value=pipe):

@@ -85,6 +85,26 @@ class OnlineDsvTests(unittest.TestCase):
         self.clock.advance(milliseconds);self.api.tick(self.code,last=price,**values);self.session.step()
         self.assertNotIn('DSV_BLOCKED',self.session.phase or '',self.session.phase)
 
+    def test_ordinary_missing_opponent_uses_current_legal_last_at_the_native_adapter(self):
+        cases = (
+            ('BUY', 1055, {'ask': float('nan')}, 1055),
+            ('SELL', 1035, {'bid': 0}, 1035),
+            ('BUY', 1058, {'ask': 0}, None),
+            ('SELL', 1034.5, {'bid': float('nan')}, None),
+            ('BUY', 1055, {'ask': -1}, None),
+        )
+        for direction, price, book, expected in cases:
+            with self.subTest(direction=direction, price=price, book=book):
+                case = OnlineDsvTests()
+                case.setUp()
+                try:
+                    case.start(trade={'passive_entry_first': False})
+                    case.quote(price, **book)
+                    inserted = [(order['direction'], order['limit_price']) for order in case.api.inserted]
+                    self.assertEqual(inserted, [(direction, expected)] if expected is not None else [])
+                finally:
+                    case.tearDown()
+
     def test_same_cabinet_day_night_boundary_opens_one_continuation_through_owner(self):
         self.clock=FactClock('2026-11-10T01:00:10Z')
         record=day_calendar().to_record()
@@ -260,8 +280,13 @@ class OnlineDsvTests(unittest.TestCase):
     def finish_last(self,price):
         order=self.api.inserted[-1];self.api.fill(order['order_id'],order['volume'],price);self.session.step()
 
-    def restart(self,*,history=True):
+    def restart(self,*,history=True,new_scope=False):
         original_api=self.api;self.session.close();self.kernel.close()
+        self.session=self.kernel=None
+        if new_scope:
+            options = {} if new_scope is True else new_scope
+            self.grant=DsvSimulationGrant.parse(canonical_bytes(self.grant.value|
+                {'grant_id':'offline-dsv-'+uuid.uuid4().hex, 'calendar_hash':self.calendar.content_hash}|options))
         api=NativeFactApi(self.clock)
         for name in ('orders','trades','positions','quotes','serials'):setattr(api,name,copy.deepcopy(getattr(original_api,name)))
         if not history:
@@ -272,6 +297,81 @@ class OnlineDsvTests(unittest.TestCase):
         self.session=DsvSimulationSession(self.kernel,Path(self.temp.name)/('restart-'+uuid.uuid4().hex),
             profile=self.profile,calendar=self.calendar,clock=self.clock,emit=lambda event:None)
         self.session.prime();self.session.step()
+
+    def test_fresh_scope_reuses_settled_history_and_has_its_own_attempt_budget(self):
+        self.entered(trade={'half_close_enabled':False})
+        first = self.cycle()['position_cycle_id']
+        self.quote(1038)
+        self.finish_last(1038)
+        self.assertEqual(self.cycle()['lifecycle'],'CLOSED')
+        from online_trader.runtime.desktop_bootstrap import _check_existing_ledger
+        from types import SimpleNamespace
+        _check_existing_ledger(SimpleNamespace(ledger_path=lambda row:self.path, _settled=lambda row:None), {})
+        before = len(self.kernel.ledger.query('SELECT trade_key FROM fill_facts'))
+        self.restart(new_scope=True)
+        owner = self.kernel.simulation
+        self.assertTrue(owner.archived_cycle(self.kernel._staged[first]))
+        self.assertEqual(owner.opening_attempt_count(),0)
+        self.assertEqual(len(self.kernel.ledger.query('SELECT trade_key FROM fill_facts')),before)
+        self.assertEqual(self.api.inserted,[])
+        self.session.request_initial_arm()
+        self.quote(1040,milliseconds=61_000)
+        self.quote(1055)
+        self.assertTrue(self.kernel.snapshot()['armed'])
+        self.assertEqual(owner.opening_attempt_count(),1)
+
+    def test_new_scope_cannot_inherit_pending_order(self):
+        self.start()
+        self.quote()
+        with self.assertRaises(TraderError) as result:
+            self.restart(new_scope=True)
+        self.assertEqual(result.exception.code,'E_SCOPE')
+
+    def test_new_scope_keeps_late_fill_on_original_order_and_disarms(self):
+        self.start()
+        self.quote()
+        original = self.api.inserted[0]['order_id']
+        self.api.terminal(original)
+        self.session.step()
+        self.assertEqual(self.cycle()['lifecycle'],'CLOSED')
+        self.restart(new_scope=True)
+        self.kernel.simulation.arm()
+        self.kernel.wait_idle()
+        self.api.fill(original, 1, 1055, finish=True)
+        self.session.step()
+        self.assertFalse(self.kernel.snapshot()['armed'])
+        self.assertTrue(self.kernel.recovery_required)
+        self.assertEqual(self.cycle()['protection']['owned_qty'],1)
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(),0)
+        self.assertEqual(self.api.inserted,[])
+        facts = self.kernel.ledger.query('SELECT trade_key FROM fill_facts')
+        self.assertEqual(len(facts),1)
+        self.session.step()
+        self.assertEqual(self.kernel.ledger.query('SELECT trade_key FROM fill_facts'),facts)
+
+    def test_next_day_start_uses_original_calendar_for_prior_order_evidence(self):
+        self.entered(trade={'half_close_enabled':False})
+        self.quote(1038)
+        self.finish_last(1038)
+        self.assertEqual(self.cycle()['lifecycle'],'CLOSED')
+        original = self.cycle()['position_cycle_id']
+        record = self.calendar.to_record()
+        record.update(coverage_from_utc='2026-11-11T00:00:00Z', coverage_to_utc='2026-11-11T08:00:00Z')
+        record['contracts'][0]['sessions'][0].update(trading_day='2026-11-11',open_utc='2026-11-11T01:00:00Z',
+                                                   close_utc='2026-11-11T07:00:00Z')
+        self.calendar = TradingCalendar.from_record(record)
+        self.clock.advance(86_400_000)
+        self.api.tick(self.code,at='2026-11-11T01:00:00Z',last=1040)
+        self.api.tick(self.code,last=1040)
+        self.restart(new_scope={'trading_day':'2026-11-11','not_before_utc':'2026-11-11T01:00:00Z',
+                                'not_after_utc':'2026-11-11T07:00:00Z'})
+        self.assertTrue(self.kernel.simulation.archived_cycle(self.kernel._staged[original]))
+        self.assertFalse(self.kernel.recovery_required)
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(),0)
+        self.session.request_initial_arm()
+        self.quote()
+        self.assertTrue(self.kernel.snapshot()['armed'])
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(),1)
 
     def test_restart_continues_durable_path_when_native_window_overlaps(self):
         self.start()
@@ -339,6 +439,63 @@ class OnlineDsvTests(unittest.TestCase):
         self.kernel.wait_idle()
         self.quote()
         self.assertEqual(len(self.api.inserted), 1)
+
+    def test_restart_before_break_rebuilds_next_session_without_old_checkpoint_overlap(self):
+        self.start(calendar=split_day_calendar(), max_quote_age_ms=5000)
+        self.quote(price=1040)
+        key = (self.code, '2026-11-10')
+        self.clock.advance(60_000)
+        rows = self.api.serials[self.code].rows
+        rows.clear()
+        self.api.tick(self.code, index=10, last=1040)
+        self.restart()
+        self.assertTrue(self.session.driver.strategy._states[key]['coverage_lost'])
+
+        # The skipped IDs precede the boundary; 10 and 11 bracket this session.
+        self.clock.advance(int((FactClock('2026-11-10T05:30:01Z').now() - self.clock.now()).total_seconds() * 1000))
+        self.api.tick(self.code, at='2026-11-10T05:30:00.500Z', last=1040)
+        self.session.step()
+        state = self.session.driver.strategy._states[key]
+        self.assertEqual(state['session_id'], 'afternoon')
+        self.assertFalse(state['coverage_lost'])
+        self.assertFalse(self.kernel.snapshot()['armed'])
+        self.assertEqual(self.api.inserted, [])
+        self.quote(price=1040)
+        self.assertNotIn('MARKET_PATH_INCOMPLETE', self.session.last_decisions[self.code]['reasons'])
+
+    def test_missing_open_tick_stays_blocked_until_native_boundary_is_backfilled(self):
+        self.start(history=False, max_quote_age_ms=5000)
+        self.kernel.pause()
+        self.kernel.wait_idle()
+        self.api.serials[self.code].rows[0]['id'] = 1
+        self.quote(price=1040)
+        self.assertIn('MARKET_PATH_INCOMPLETE', self.session.last_decisions[self.code]['reasons'])
+        serial = self.api.serials[self.code]
+        ticks = serial.rows[:]
+        serial.rows.clear()
+        self.api.tick(self.code, at='2026-11-10T01:00:00Z', index=0, last=1040)
+        serial.rows.extend(ticks)
+        self.session.step()
+        self.assertTrue(self.session.driver.strategy._states[(self.code, '2026-11-10')]['coverage_lost'])
+        self.quote(price=1040)
+        key = (self.code, '2026-11-10')
+        self.assertFalse(self.session.driver.strategy._states[key]['coverage_lost'])
+        self.assertFalse(self.kernel.snapshot()['armed'])
+        self.assertEqual(self.api.inserted, [])
+        self.quote(price=1040)
+        self.assertNotIn('MARKET_PATH_INCOMPLETE', self.session.last_decisions[self.code]['reasons'])
+
+    def test_native_id_gap_requests_backfill_and_keeps_opening_blocked(self):
+        self.start(max_quote_age_ms=5000)
+        rows = self.api.serials[self.code].rows
+        self.clock.advance(1000)
+        missing_id = rows[-1]['id'] + 1
+        self.api.tick(self.code, index=missing_id + 1, last=1055)
+        with patch.object(self.port, 'request_tick_backfill') as request:
+            self.session.step()
+        request.assert_called_once_with(self.code)
+        self.assertIn('MARKET_PATH_INCOMPLETE', self.session.last_decisions[self.code]['reasons'])
+        self.assertEqual(self.api.inserted, [])
 
     def test_lunch_restart_keeps_entry_blocked_without_afternoon_boundary_proof(self):
         self.start(calendar=split_day_calendar())
@@ -914,7 +1071,7 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertFalse(self.cycle().get('statistics_review_required',False));self.assertIsNone(self.kernel.money.error)
 
     def test_passive_wait_switches_to_cap_but_same_price_keeps_original_order(self):
-        self.start(trade={'passive_entry_first':True})
+        self.start(trade={'passive_entry_first':True, 'max_daily_orders':1})
         self.quote(1055,bid=1054,ask=1055)
         first = self.api.inserted[0]
         self.quote(1055,milliseconds=2999,bid=1054,ask=1055)
@@ -930,3 +1087,6 @@ class OnlineDsvTests(unittest.TestCase):
         self.quote(1056,bid=1055,ask=1056)
         self.assertEqual([(order['volume'],order['limit_price']) for order in self.api.inserted],
                          [(5,1055),(5,1056)])
+        from online_trader.kernel.statistics import strategy_open_counts
+        self.assertEqual(strategy_open_counts(self.kernel._committed.values(), '2026-11-10'), {self.code:1})
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(),2)

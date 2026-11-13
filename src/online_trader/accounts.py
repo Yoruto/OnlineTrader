@@ -201,7 +201,8 @@ class AccountStore:
             finally:connection.close()
         except sqlite3.Error:_error('Account ledger cannot prove a safe switch','E_FACT_BARRIER')
 
-    def change(self,operation,*,expected_revision,account_id=None,alias=None,username=None,broker=None,line=None,provider='TQKQ'):
+    def change(self,operation,*,expected_revision,account_id=None,alias=None,username=None,broker=None,line=None,
+               provider='TQKQ',attached_account_id=None):
         # Catalogue mutex serializes profile and vault operations; each account
         # mutex additionally excludes its current execution owner across sessions.
         if operation=='edit' and username is not None:_error('Account identity is immutable; create a separate profile')
@@ -222,9 +223,12 @@ class AccountStore:
                 if row is None:_error('Selected account profile does not exist')
                 locks.enter_context(AccountLock(row['account_key']))
                 if operation=='select':
-                    old=next((r for r in rows if r['account_id']==selected),None)
-                    if old is not None and old['account_key']!=row['account_key']:
-                        locks.enter_context(AccountLock(old['account_key']));self._settled(old)
+                    # A workbench can still be viewing the old account after another
+                    # instance changed the catalogue. Protect both identities.
+                    for old in rows:
+                        if old['account_id'] in (selected, attached_account_id) and old['account_id']!=account_id:
+                            locks.enter_context(AccountLock(old['account_key']))
+                            self._settled(old)
                     selected=account_id
                 elif operation=='edit':row.update(alias=_label(alias),broker=_label(broker if broker is not None else row['broker']),line=_label(line if line is not None else row['line']))
                 elif operation=='delete':

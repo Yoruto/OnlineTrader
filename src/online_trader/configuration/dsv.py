@@ -42,6 +42,8 @@ protect_80_ratio protect_keep_ratio risk_per_trade_ratio risk_reference_equity
 stale_force_close_seconds stop_cooldown_minutes total_margin_cap trailing_activate_ratio
 trailing_pullback_ratio""".split())
 _TRADE_KEYS = _BOOLEANS | _INTEGERS | _DECIMALS | {"night_session_close", "close_price_mode", "holidays"}
+_OPTIONAL_DURATIONS = {"passive_wait_seconds", "resume_gap_seconds"}
+_OPTIONAL_SWITCHES = {"half_pullback_close"}
 _RATIOS = frozenset(key for key in _DECIMALS if key.endswith("_ratio")) | {"total_margin_cap"}
 _SYMBOL_REQUIRED = frozenset({"name", "code", "open_offset", "stop_offset", "profit_offset", "order_volume", "half_close_ratio", "hysteresis_points"})
 _SYMBOL_DECIMALS = ("open_offset", "stop_offset", "profit_offset", "half_close_ratio", "hysteresis_points")
@@ -49,6 +51,40 @@ _CODE = re.compile(r"[A-Z]{2,8}\.[A-Za-z][A-Za-z0-9]{1,31}\Z")
 _KEY = re.compile(r"[A-Za-z][A-Za-z0-9._:-]{0,63}\Z")
 _COEFFICIENT_KEY = re.compile(r"\w[\w.:-]{0,63}\Z", re.UNICODE)
 _TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]\Z")
+
+# DEFAULT_CONFIG (gui 2222–2334), with the two verified runtime fallbacks.
+_DSV_DEFAULT_TRADE = {
+    "max_volume": 30, "max_risk_ratio": 0.85, "max_daily_orders": 200, "max_net_loss_stops": 2,
+    "close_before_seconds": 20, "trailing_activate_ratio": 0.8, "trailing_pullback_ratio": 0.1,
+    "stop_day_on_trailing": True, "protect_80_enabled": True, "protect_80_ratio": 0.8,
+    "protect_keep_ratio": 0.5, "protect_stop_day": True, "entry_slip_abort": True,
+    "entry_slip_abort_ratio": 0.4, "entry_slip_abort_stop_day": False, "half_close_enabled": False,
+    "cont_stop_day_stop": True, "continuation_entry": True, "continuation_ignore_no_open": False,
+    "no_chase_after_act": True, "manual_close_day_stop": False, "tick_diag": False, "risk_per_trade_ratio": 0.002,
+    "stale_force_close_seconds": 180, "stale_close_day_stop": False, "aggressive_mode": False,
+    "passive_entry_first": False, "auto_start_on_launch": True, "chase_slip_ratio": 0.05,
+    "chase_base_now": False, "min_one_lot_fallback": True, "stop_cooldown_enabled": False,
+    "stop_cooldown_minutes": 5, "require_trigger_update": False, "max_symbols_enabled": False,
+    "max_symbols_on": 4, "rollover_stop_enabled": True, "live_protect": False, "live_max_lots": 2,
+    "live_daily_loss_limit": 5000, "live_first_one_lot": False, "half_close_ratio": 0.5,
+    "manual_tp_drop_ratio": 0.1, "month_stop_days": 4, "night_session_close": "23:00",
+    "holidays": [], "entry_slip_ratio": 0.03, "chase_window_minutes": 1, "no_chase_tolerance": 1,
+    "no_open_before_close_minutes": 10, "no_open_after_open": True, "no_open_after_open_minutes": 5,
+    "open_jump_block_ratio": 0.8, "hysteresis_points": 0, "half_stage2": False,
+    "half_stage2_trigger_ratio": 0.6, "half_breakeven": False, "total_margin_cap": 0.7,
+    "position_sync_seconds": 2, "participate_auction": False, "close_price_mode": "对手价",
+    "cancel_on_stop": True, "margin_rate_alert_threshold": 0.005, "max_quote_age_seconds": 0,
+    "min_days_to_expiry": 5, "limit_fallback_ratio": 0.01, "open_gap_max_ratio": 0.2,
+    "entry_confirm_timeout": 60, "risk_reference_equity": 0,
+}
+_DSV_DEFAULT_AUTO = {"formula":"minrange", "ceiling":0.5, "floor":0.4, "coef":{}}
+_DSV_DEFAULT_SCHEDULE = {"enabled":True, "night_start_time":"20:55", "day_start_time":"08:55", "catch_up_minutes":60}
+_DSV_MIGRATION_MARKERS = {"chase_slip_migrated", "no_open_migrated", "half_pullback_migrated",
+                          "no_open_before_open", "no_open_before_open_minutes"}
+_DSV_DEFAULT_SYMBOLS = (
+    ("棕榈油","DCE.p2701",55,16,50), ("塑料","DCE.l2701",79,20,72),
+    ("沥青","SHFE.bu2701",79,12,72), ("菜油","CZCE.OI701",58,15,53),
+)
 
 
 def _error(message="Invalid business configuration"):
@@ -123,10 +159,14 @@ def _code(value):
 
 def _normalize(settings, *, canonical=False):
     _object(settings, SECTIONS)
-    trade = _object(settings["trade"], _TRADE_KEYS)
+    trade = _object(settings["trade"], _TRADE_KEYS, _OPTIONAL_SWITCHES | _OPTIONAL_DURATIONS)
     normalized = {key: _boolean(trade[key]) for key in _BOOLEANS}
     normalized.update({key: _integer(trade[key]) for key in _INTEGERS})
     normalized.update({key: _decimal(trade[key], canonical=canonical, ratio=key in _RATIOS) for key in _DECIMALS})
+    for key in _OPTIONAL_DURATIONS & trade.keys():
+        normalized[key] = _decimal(trade[key], canonical=canonical)
+    for key in _OPTIONAL_SWITCHES & trade.keys():
+        normalized[key] = _boolean(trade[key])
     normalized["night_session_close"] = _time(trade["night_session_close"])
     normalized["close_price_mode"] = _text(trade["close_price_mode"], 24)
     holidays = trade["holidays"]
@@ -231,7 +271,7 @@ def _native_decimal(text):
 
 
 def _native_settings(settings):
-    for key in _DECIMALS:
+    for key in (_DECIMALS | _OPTIONAL_DURATIONS) & settings["trade"].keys():
         settings["trade"][key] = _native_decimal(settings["trade"][key])
     for key in ("floor", "ceiling"):
         settings["auto_offset"][key] = _native_decimal(settings["auto_offset"][key])
@@ -240,6 +280,66 @@ def _native_settings(settings):
         for key in _SYMBOL_DECIMALS:
             row[key] = _native_decimal(row[key])
     return settings
+
+
+def _dsv_saved_settings(source):
+    """Interpret only business values from the original application's load_config."""
+    _object(source, (), SECTIONS | EXCLUDED_SOURCE_SECTIONS)
+    trade = dict(_object(source.get("trade", {}), (),
+                         _TRADE_KEYS | _OPTIONAL_SWITCHES | _OPTIONAL_DURATIONS | _DSV_MIGRATION_MARKERS))
+    chase_migrated = trade.pop("chase_slip_migrated", False)
+    chase = trade.get("chase_slip_ratio")
+    if type(chase) in {int, float, Decimal} and abs(Decimal(str(chase)) - Decimal("0.03")) < Decimal("1e-9") and not chase_migrated:
+        trade["chase_slip_ratio"] = 0.05
+    if trade.get("no_open_after_open") is False and not trade.pop("no_open_migrated", False):
+        trade["no_open_after_open"] = True
+    trade.pop("no_open_migrated", None)
+    if trade.get("half_pullback_close") is True and not trade.pop("half_pullback_migrated", False):
+        trade["half_pullback_close"] = False
+    trade.pop("half_pullback_migrated", None)
+    for old, new in (("no_open_before_open","no_open_after_open"),
+                     ("no_open_before_open_minutes","no_open_after_open_minutes")):
+        if old in trade:
+            trade.setdefault(new, trade.pop(old))
+    for key, old, new in (("max_quote_age_seconds",120,0), ("max_volume",20,30),
+                          ("max_daily_orders",20,200), ("entry_slip_ratio",Decimal("0.05"),0.03),
+                          ("chase_window_minutes",3,1)):
+        if trade.get(key) == old:
+            trade[key] = new
+    if trade.get("stale_close_day_stop") is True:
+        trade["stale_close_day_stop"] = False
+    trade = _DSV_DEFAULT_TRADE | trade
+
+    schedule = _DSV_DEFAULT_SCHEDULE | _object(source.get("schedule", {}), (), _DSV_DEFAULT_SCHEDULE)
+    if schedule["enabled"] is False:
+        schedule["enabled"] = True
+    automatic = _DSV_DEFAULT_AUTO | _object(source.get("auto_offset", {}), (), _DSV_DEFAULT_AUTO)
+    if automatic["formula"] in ("atr20_main", "range3x09_contract"):
+        automatic["formula"] = "minrange"
+
+    symbols = source.get("symbols")
+    if "symbols" not in source:
+        fields = ("name","code","open_offset","stop_offset","profit_offset")
+        symbols = [dict(zip(fields, values)) for values in _DSV_DEFAULT_SYMBOLS]
+    if type(symbols) is not list or len(symbols) > MAX_SYMBOLS:
+        _error("Saved symbol list exceeds the supported capacity")
+    rows = []
+    for raw in symbols:
+        row = dict(_object(raw, _SYMBOL_REQUIRED - {"order_volume","half_close_ratio","hysteresis_points"}, _SYMBOL_REQUIRED | {"code_new"}))
+        pending = row.pop("code_new", None)
+        if isinstance(pending, str):
+            pending = pending.strip()
+        if pending == row["code"]:
+            row["code_new"] = pending
+        elif pending:
+            row["code"] = pending
+        row.setdefault("order_volume", 0)
+        if row.get("half_close_ratio") is None:
+            row["half_close_ratio"] = trade["half_close_ratio"]
+        if row.get("hysteresis_points") is None:
+            row["hysteresis_points"] = 0
+        rows.append(row)
+    return {"trade":trade, "schedule":schedule, "auto_offset":automatic, "symbols":rows}
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -263,12 +363,18 @@ class DsvProfile:
     @classmethod
     def from_dsv_json(cls, raw):
         """Explicitly strip known private/non-business sections from a DSV file."""
+        return cls.from_settings(_dsv_saved_settings(_source_loads(raw)))
+
+    @classmethod
+    def from_preview_json(cls, raw):
+        """Preserve business exports and recognize files with original DSV fields."""
         source = _source_loads(raw)
-        _object(source, SECTIONS, EXCLUDED_SOURCE_SECTIONS)
-        trade = source["trade"]
-        if type(trade) is dict and trade.get("max_quote_age_seconds") == 120:
-            trade["max_quote_age_seconds"] = 0
-        return cls.from_settings({key: source[key] for key in SECTIONS})
+        if isinstance(source, dict):
+            trade = source.get("trade")
+            if (EXCLUDED_SOURCE_SECTIONS.intersection(source)
+                    or (isinstance(trade, dict) and _DSV_MIGRATION_MARKERS.intersection(trade))):
+                source = _dsv_saved_settings(source)
+        return cls.from_settings(source)
 
     @classmethod
     def from_payload(cls, payload):
@@ -304,7 +410,7 @@ class DsvProfile:
         # Decimal tokens are tagged internally only while constructing this export.
         class Number(str):
             pass
-        for key in _DECIMALS:
+        for key in (_DECIMALS | _OPTIONAL_DURATIONS) & settings["trade"].keys():
             settings["trade"][key] = Number(settings["trade"][key])
         for key in ("floor", "ceiling"):
             settings["auto_offset"][key] = Number(settings["auto_offset"][key])

@@ -60,6 +60,21 @@ class DsvScopeBoundaryTests(unittest.TestCase):
             with self.assertRaises(TraderError):run(self.root/'scope.json','unused',self.root/'profile.json',self.root/'calendar.json',self.root/'out')
         ntp.assert_not_called();connect.assert_not_called()
 
+    def test_used_run_directory_is_refused_before_reference_or_connection(self):
+        output = self.root / 'previous-run'
+        output.mkdir()
+        prior = output / 'strategy-log.jsonl'
+        prior.write_bytes(b'old log')
+        with (patch('online_trader.runtime.dsv_simulation.measure_reference') as clock,
+              patch('online_trader.runtime.dsv_simulation.strategy_port') as port):
+            with self.assertRaises(TraderError) as error:
+                run(self.root/'scope.json', 'unused', self.root/'profile.json', self.root/'calendar.json', output)
+        self.assertEqual(error.exception.code, 'E_RUN_OUTPUT')
+        clock.assert_not_called()
+        port.assert_not_called()
+        self.assertEqual(list(output.iterdir()), [prior])
+        self.assertEqual(prior.read_bytes(), b'old log')
+
     def test_missing_force_close_calendar_is_not_replaced_by_invented_default(self):
         value=self.calendar.to_record();value['contracts'][0]['sessions'][0]['force_close_at_end']=False
         from online_trader.scheduling.calendar import TradingCalendar
@@ -87,6 +102,30 @@ class DsvScopeBoundaryTests(unittest.TestCase):
         clock.advance(420000);api.tick(last=1055)
         feed=DsvFactFeed(port,self.profile,self.calendar)
         self.assertFalse(feed.batches()[0][1][0]['path_complete'])
+
+    def test_native_backfill_uses_a_new_window_and_waits_for_its_tail(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        clock = FactClock()
+        api = NativeFactApi(clock)
+        code = 'DCE.p2701'
+        port = TqKqDsvPort(api, api._account, self.grant, clock)
+        port.broker_connected = True
+        original = SimpleNamespace(iloc=[{'id': 30}], to_dict=lambda _: [{'id': 30}])
+        replacement = SimpleNamespace(iloc=[{'id': 29}], to_dict=lambda _: [{'id': 29}])
+        port.tick_serials[code] = original
+        with (patch.object(api, 'get_tick_serial', return_value=replacement) as subscribe,
+              patch.object(api, 'is_serial_ready', return_value=True),
+              patch.object(api, 'create_task', side_effect=asyncio.run, create=True)):
+            port.request_tick_backfill(code)
+            port.request_tick_backfill(code)
+            subscribe.assert_called_once_with(code, data_length=9999)
+            self.assertEqual(port.tick_records(code), [{'id': 30}])
+            self.assertIs(port.tick_serials[code], original)
+            replacement.iloc[-1]['id'] = 30
+            self.assertIsNotNone(port.tick_records(code))
+            self.assertIs(port.tick_serials[code], replacement)
 
 
 class DsvPlanBoundaryTests(unittest.TestCase):

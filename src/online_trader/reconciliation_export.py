@@ -7,6 +7,7 @@ signature over a redacted display copy.
 
 from io import BytesIO, StringIO
 import csv
+from decimal import Decimal
 import json
 from pathlib import Path
 import re
@@ -14,7 +15,7 @@ from xml.etree import ElementTree as ET
 import zipfile
 
 from online_trader.contracts.codec import canonical_bytes, content_hash
-from online_trader.domain.values import decimal_value, identifier, sequence
+from online_trader.domain.values import decimal_text, decimal_value, identifier, sequence
 from online_trader.errors import TraderError
 
 
@@ -220,9 +221,15 @@ def _sheet(rows,widths):
         row=ET.SubElement(data,_tag('row'),{'r':str(row_index)})
         for col,value in enumerate(values,1):
             if value is None:continue
-            cell=ET.SubElement(row,_tag('c'),{'r':_column(col)+str(row_index),'t':'inlineStr','s':'1' if row_index==1 else '0'})
+            reference = _column(col)+str(row_index)
+            style = '1' if row_index==1 else '0'
+            if type(value) is Decimal and len(value.as_tuple().digits) <= 15:
+                cell = ET.SubElement(row, _tag('c'), {'r':reference, 't':'n', 's':style})
+                ET.SubElement(cell, _tag('v')).text = decimal_text(value)
+                continue
+            cell=ET.SubElement(row,_tag('c'),{'r':reference,'t':'inlineStr','s':style})
             inline=ET.SubElement(cell,_tag('is'));text=ET.SubElement(inline,_tag('t'),{'{http://www.w3.org/XML/1998/namespace}space':'preserve'})
-            text.text=_xml_text(value)
+            text.text=_xml_text(decimal_text(value) if type(value) is Decimal else value)
     ET.SubElement(sheet,_tag('autoFilter'),{'ref':'A1:'+_column(cols)+str(max(1,len(rows)))})
     return _xml(sheet)
 
@@ -266,7 +273,7 @@ def _xlsx(material):
 
 
 def tabular_workbook(tables):
-    """Encode local export tables as text cells, with no formula evaluation."""
+    """Write explicit Decimal cells within Excel precision, and preserve longer values as text."""
     workbook=ET.Element(_tag('workbook'));views=ET.SubElement(workbook,_tag('bookViews'));ET.SubElement(views,_tag('workbookView'))
     sheets=ET.SubElement(workbook,_tag('sheets'))
     for index,(name, _, _) in enumerate(tables,1):

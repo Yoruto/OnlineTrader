@@ -1,12 +1,20 @@
 # OnlineTrader
 
+[DSV 行为基准、源码落点与验收交接](docs/dsv-behavior-baseline-20261113.md)
+
+11 月 13 日完成 DSV 与 OnlineTrader 的定向离线联合验证。两边用同一份旧格式配置载入的五合约字段及归档偏移重算结果一致。国债尾盘、首分钟零比例及缺资金字段的处理仍有差异，原 DSV EXE 的完整启动和两边在线交易待验。[联合验证报告](output/validation/20261113-dsv-onlinetrader-joint/test-report.md)
+
+11 月 13 日源码继续对齐 DSV 的普通入场缺价回退、整手边界、账户选用、权益累计、日报和日志归档筛选。剩余差异及 Qt 单进程诊断均有独立复测证据。本轮保持离线，未打包。[剩余 20 项复测](output/validation/20261113-dsv-remaining-fixes/test-report.md) · [首轮优先修复复测](output/validation/20261113-dsv-priority-fixes/test-report.md) · [原 96 项验收](output/validation/20261113-dsv-item-acceptance/test-report.md)
+
 当前桌面交付为 **0.1.0.dev28 · DSV 参数同步版（2026-11-13）**。在桌面 `OnlineTrader` 文件夹双击 `OnlineTrader.exe`。独立验收从资源管理器双击桌面 EXE，并用工作台导出的业务参数对照本机 DSV，117 项逐字段一致。验收期间工作台未连接模拟盘。[便携 ZIP](dist/OnlineTrader-0.1.0.dev28-Windows-x64-Portable-20261113-DSV-Parameters.zip) · [独立测试报告](output/portable-acceptance/20261113-dsv-parameters/qa/test-report.md)
 
 工程状态见[功能实现与待办清单](docs/功能实现与待办清单_20261110.md)。旧版桌面交付见[历史记录](docs/history/releases/README.md)。`output/` 和 `dist/` 的链接指向本机生成的验收证据和制品。
 
+11 月 13 日 **dev28 棕榈油行情路径修复与托盘版**包含 DSV 参数同步版的改动。源码复测覆盖旧账本恢复、盘段切换和缺失 Tick 回补。[新版便携 ZIP](dist/OnlineTrader-0.1.0.dev28-Windows-x64-Portable-20261113-PalmPath-Tray.zip) · [解压文件校验](output/portable-acceptance/20261113-palm-path-tray/archive-evidence.json) · [源码独立复测](output/validation/20261113-parallel/independent-fixed-test-report.md)
+
 ## Windows 便携发行目录
 
-便携发行使用 `release/OnlineTrader.spec` 和 `release/portable/`。工作台与控制台执行器共享 `_internal`，把整个目录一起移动。双击主程序打开工作台。启用关闭到托盘后，图标立即显示，并提示策略未启用、已启用或状态待核对。双击恢复窗口，右键可退出工作台。
+便携发行使用 `release/OnlineTrader.spec` 和 `release/portable/`。工作台与控制台执行器共享 `_internal`，把整个目录一起移动。双击主程序打开工作台。关闭到托盘默认开启，可在系统设置中关闭。托盘图标提示策略状态，双击恢复窗口，右键可退出工作台。
 
 ```text
 OnlineTrader/
@@ -47,7 +55,11 @@ E:\online-trader\.venv\Scripts\python.exe -m online_trader workbench --account-s
 
 当前工作台默认读取 Windows 桌面 `trading\config.json` 中的交易、定时、偏移计算及品种设置。也可在「策略主控」选择其他 DSV 配置路径并重读。F5 启动前核对源文件，发现业务参数变化会提示核对后重试。找不到配置时，历史基准仅供查看，可选择 DSV 文件或导入已核对的业务参数。主控的「查看执行参数」显示原执行器绑定的品种与偏移。
 
-普通工作台点击「启动策略」或 F5，直接使用当前账号、品种和交易参数启动，不再弹出二次确认。启动进度及错误在主界面显示，准备期间阻止重复点击；已连接的策略也直接沿原内核启用。源码入口自动复用已有 SDK 环境和当前源码，无需填写 scope/profile/calendar/Python 路径。启动前读取原生交易日历、合约时段与乘数，仅绑定一个柜台交易日；不能证明的节假日时段拒绝推断。已有持仓周期记录仍要求沿原账本恢复，不自动创建新账本绕过恢复，也不提供跨日自动续启。仅打开软件不会连接模拟盘；在线登录与策略成交仍需单独验证。
+「保存预览参数」生成的业务 JSON 在参数中心用「导入参数预览」读回，包括原样保存的定时开关和候选合约。旧版原始配置可选「导入原版 DSV 配置」应用 DSV 的加载迁移。「偏移计算」页应用所选结果后可回主控核对并保存预览。
+
+普通工作台点击「启动策略」或 F5，使用当前账号、品种和参数启动。主界面显示进度及失败原因，准备期间阻止重复点击。已连接的策略沿原内核启用。「交易参数」可安排本窗口内的一次定时启动，F6 可取消等待。启动时读取原生交易日历、合约时段与乘数，每次绑定一个柜台交易日。已结案历史保留在原账本并可继续查询，未结案周期和未知回报须沿原范围恢复。F6 停止开仓并按设置撤单，原执行器继续管理自有持仓，柜台仓位和委托核清后结束会话。在线登录及策略成交仍待独立验证。
+
+运行日志按账户和执行器启动标识核对归属。命令行每次运行使用新的输出路径，原账本和历史记录可继续用于核对及恢复。
 
 “历史与交易日历”支持本地日线缓存/导出及带来源日历核对，不更改执行行情或旧计划。10000条原生窗口、跨日屏障和今昨仓核对均已有离线检查；dev20已接多日范围的今昨混合子单、旧单撤改和原周期恢复；更长历史、权威日历及缺失原单查询源仍待补，详见[当前边界](docs/dsv-runtime-completion-20261110.md)。
 

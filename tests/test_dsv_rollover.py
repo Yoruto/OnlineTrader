@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from tests.qt_lifecycle import dispose_widget
+
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.rollover import expiry_date, expiry_warning, preview_rollover, rollover_hint
@@ -94,7 +96,7 @@ class DsvRolloverTests(unittest.TestCase):
         app = QApplication.instance() or QApplication([])
         window = WorkbenchWindow(None)
         window.timer.stop()
-        self.addCleanup(window.close)
+        self.addCleanup(dispose_widget, window)
         view = test_workbench.view()
         view["markets"] = [{"contract_id":"DCE.p2701","rollover":{
             "main_contract":"DCE.p2705","candidate":"DCE.p2705","candidate_basis":"DUAL",

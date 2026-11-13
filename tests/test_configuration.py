@@ -43,12 +43,45 @@ class DsvProfileTests(unittest.TestCase):
         }
         raw = json.dumps(source)
         profile = DsvProfile.from_dsv_json(raw)
-        self.assertEqual(profile.to_settings(), BASE)
+        expected = copy.deepcopy(BASE)
+        expected['symbols'][4]['code'] = expected['symbols'][4].pop('code_new')
+        self.assertEqual(profile.to_settings(), expected)
         self.assertNotIn("PRIVATE", profile.to_json())
         self.assertNotIn(b"PRIVATE", canonical_bytes(profile.to_record()))
         self.assertNotIn(b"PRIVATE", canonical_bytes(profile.summary()))
         with self.assertRaises(TraderError):
             DsvProfile.from_json(raw)
+
+    def test_dsv_legacy_import_applies_one_time_markers_and_supplies_original_defaults(self):
+        old = {'trade':{'max_volume':20, 'max_daily_orders':20, 'max_quote_age_seconds':120,
+                        'chase_window_minutes':3, 'entry_slip_ratio':0.05, 'chase_slip_ratio':0.03,
+                        'no_open_after_open':False, 'half_pullback_close':True,
+                        'passive_wait_seconds':1.25, 'resume_gap_seconds':0, 'stale_close_day_stop':True},
+               'schedule':{'enabled':False}, 'symbols':[]}
+        imported = DsvProfile.from_dsv_json(json.dumps(old))
+        settings = imported.to_settings()
+        self.assertEqual(settings['symbols'], [])
+        self.assertTrue(settings['schedule']['enabled'])
+        trade = settings['trade']
+        self.assertEqual((trade['max_volume'],trade['max_daily_orders'],trade['max_quote_age_seconds']), (30,200,0))
+        self.assertEqual((trade['chase_window_minutes'],trade['entry_slip_ratio'],trade['chase_slip_ratio']), (1,.03,.05))
+        self.assertTrue(trade['no_open_after_open'])
+        self.assertFalse(trade['half_pullback_close'])
+        self.assertFalse(trade['stale_close_day_stop'])
+        self.assertEqual((trade['passive_wait_seconds'],trade['resume_gap_seconds']), (1.25,0))
+        self.assertEqual(DsvProfile.from_json(imported.to_json()).content_hash, imported.content_hash)
+        old['trade'].update(chase_slip_migrated=True, no_open_migrated=True, half_pullback_migrated=True)
+        trade = DsvProfile.from_dsv_json(json.dumps(old)).to_settings()['trade']
+        self.assertEqual((trade['chase_slip_ratio'],trade['no_open_after_open'],trade['half_pullback_close']), (.03,False,True))
+
+    def test_legacy_rollover_ignores_blank_candidate_and_preserves_same_contract(self):
+        for candidate in ("", "   ", "SHFE.ag2612"):
+            with self.subTest(candidate=candidate):
+                source = copy.deepcopy(BASE)
+                source["symbols"][-1]["code_new"] = candidate
+                saved = DsvProfile.from_dsv_json(json.dumps(source)).to_settings()["symbols"][-1]
+                self.assertEqual(saved["code"], "SHFE.ag2612")
+                self.assertEqual(saved.get("code_new"), candidate.strip() or None)
 
     def test_missing_or_unknown_business_fields_are_not_defaulted_or_ignored(self):
         for section in BASE:

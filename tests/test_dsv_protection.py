@@ -71,6 +71,16 @@ def legacy(value):
 
 
 class DsvProtectionTests(unittest.TestCase):
+    def test_legacy_second_stage_retraces_to_first_trigger_at_equality(self):
+        for switch, enabled, expected in ((True,True,1), (False,True,None), (True,False,None)):
+            with self.subTest(pullback=switch, second_stage=enabled):
+                value = plan(half_pullback_close=switch, half_stage2=enabled)
+                state = quote(value, opened(value), 21)
+                self.assertEqual(state.phase1_target, 3)
+                state = reduce_event(value, state, {'type':'EXIT_FILL','quantity':4}).state
+                self.assertIsNone(quote(value, state, 21).phase2_target)
+                self.assertEqual(quote(value, state, 20).phase2_target, expected)
+
     def test_first_stage_rounds_current_quantity_with_ties_to_even_and_both_directions(self):
         for direction in ("LONG", "SHORT"):
             for quantity, target in ((1, None), (2, 1), (3, 1), (5, 3), (7, 3), (9, 5)):

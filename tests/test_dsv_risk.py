@@ -70,7 +70,7 @@ class DsvRiskTests(unittest.TestCase):
             result = self.evaluate(self.configured(min_one_lot_fallback=fallback))
             self.assertTrue(result["allowed"])
             self.assertEqual(result["metrics"]["risk_based_quantity"], 0)
-            self.assertEqual(result["quantity"], 14)
+            self.assertEqual(result["quantity"], 13)
             self.assertFalse(result["metrics"]["min_one_lot_used"])
 
     def test_minimum_one_lot_requires_available_and_total_margin_capacity(self):
@@ -187,8 +187,12 @@ class DsvRiskTests(unittest.TestCase):
                             risk_ratio="0.69", available="30000")
         result = self.evaluate(self.configured(aggressive_mode=True))
         self.assertTrue(result["allowed"])
-        self.assertEqual(result["quantity"], 13)
+        self.assertEqual(result["quantity"], 12)
         self.assertEqual(result["metrics"]["risk_based_quantity"], 1)
+        self.account["symbol_margin"] = "999.99"
+        self.assertEqual(self.evaluate(self.configured(aggressive_mode=True))["quantity"], 13)
+        self.account["symbol_margin"] = "1000.01"
+        self.assertEqual(self.evaluate(self.configured(aggressive_mode=True))["quantity"], 12)
         self.account["risk_ratio"] = "0.7"
         self.assertIn("EFFECTIVE_RISK_CAP", self.evaluate(self.configured(aggressive_mode=True))["reasons"])
 
@@ -197,7 +201,7 @@ class DsvRiskTests(unittest.TestCase):
                             symbol_margin="0", risk_ratio="0", daily_loss="0")
         self.instrument["margin_per_lot"] = "10"
         protected = self.configured(live_protect=True)
-        self.assertEqual(self.evaluate(protected)["quantity"], 14)
+        self.assertEqual(self.evaluate(protected)["quantity"], 13)
         self.account["mode"] = "live"
         self.assertEqual(self.evaluate(protected)["quantity"], 2)
         self.assertEqual(self.evaluate(self.configured(live_protect=True, live_first_one_lot=True))["quantity"], 1)

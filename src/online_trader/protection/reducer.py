@@ -372,7 +372,10 @@ def _dsv_partial(plan: Mapping[str, Any], state: ProtectionState) -> ProtectionS
             return state
         sign = Decimal(1) if state.direction == "LONG" else Decimal(-1)
         move = sign * (state.last_price - _decimal(plan["theoretical_entry_price"]))
-        if move < ratio * _decimal(plan["fixed_take_profit"]["distance_points"]):
+        take = _decimal(plan["fixed_take_profit"]["distance_points"])
+        pullback = (number == 2 and partial["second_stage"].get("pullback_to_first", False)
+                    and move <= _decimal(partial["first_trigger_ratio"]) * take)
+        if move < ratio * take and not pullback:
             return state
         state = replace(state, **{name: "WAITING_ENTRY_TERMINAL"}, block_new=True)
     if not state.entry_terminal_reconciled or state.reconciliation_required:

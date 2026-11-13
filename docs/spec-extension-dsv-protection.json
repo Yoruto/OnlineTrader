@@ -4,7 +4,7 @@
   "scope": "DEVELOPMENT_INTERNAL_ONLY",
   "legacy_resources_unchanged": true,
   "resources": {
-    "protection-plan-v1.1.schema.json": "f3f6fdb2e4668d404ce47414321c6ec5779d774c32bfaa5ea4d8baf6c42f4a8c"
+    "protection-plan-v1.1.schema.json": "277117b41f90a79278db8bb9d77b1fa98e9250a8cd7c921510249dd3a7e529bb"
   },
-  "reason": "DSV ties-even current quantity stages, configurable day stops and max(T,peak) drawdown cannot be expressed by G0 1.0."
+  "reason": "DSV ties-even current quantity stages, configurable day stops and max(T,peak) drawdown cannot be expressed by G0 1.0. The optional second-stage pullback preserves previously stored plans."
 }

@@ -89,6 +89,44 @@ def _count(value, issues, **scope):
     return value
 
 
+def add_close_point_checks(trades, cycles, issues):
+    """Project the original DSV close diagnostics from owned, settled cycles."""
+    reductions = {}
+    for row in trades:
+        if row['effect']=='REDUCE':
+            reductions.setdefault(row['position_cycle_id'], []).append(row)
+    for cid, fills in reductions.items():
+        cycle = cycles[cid]
+        exit_fact = cycle.get('nominal_exit') or {}
+        reference = exit_fact.get('nominal_exit_price')
+        if (cycle.get('lifecycle') != 'CLOSED' or not cycle.get('statistics_close_id')
+                or cycle.get('statistics_review_required') or reference is None
+                or exit_fact.get('exit_reason') not in
+                   {'STOP_LOSS','BREAK_EVEN','TAKE_PROFIT','TRAILING_STOP','PROTECTED_FLOOR','SESSION_CLOSE'}):
+            continue
+        row = max(fills, key=lambda item: (item['trading_day'], int(item['event_seq'])))
+        sign = Decimal(1) if row['direction']=='LONG' else Decimal(-1)
+        with localcontext() as context:
+            context.prec = 80
+            quantity = sum(fill['quantity'] for fill in fills)
+            actual = sum(Decimal(fill['price']) * fill['quantity'] for fill in fills) / quantity
+            state = cycle['protection']
+            manual_reductions = (cycle.get('execution') or {}).get('manual_reduction_children')
+            # Older cycles do not bind each reduction to its protection target.
+            # A prior partial target cannot be compared to the final exit anchor.
+            if state.get('phase1_target') is None and state.get('phase2_target') is None and not manual_reductions:
+                row['close_slippage_points'] = _amount(sign * (Decimal(reference) - actual), issues,
+                    trade_key=row['trade_key'], field='close_slippage_points')
+            opening = cycle.get('initial_open_confirmation') or {}
+            if opening.get('quantity'):
+                entry = Decimal(opening['value']) / opening['quantity']
+            else:
+                entry = cycle.get('actual_average_entry_price')
+            if entry is not None:
+                row['real_close_points'] = _amount(sign * (actual - Decimal(entry)), issues,
+                    trade_key=row['trade_key'], field='real_close_points')
+
+
 def _fill(raw, account_key):
     if type(raw) is not dict or not set(_FILL_KEYS) <= raw.keys():_invalid('Incomplete confirmed fill')
     if raw.get('account_key', account_key) != account_key:raise TraderError('E_SCOPE', 'Fill belongs to another account')

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from online_trader.accounts import AccountStore
 from online_trader.errors import TraderError
-from online_trader.runtime.startup_metadata import _sdk_factory, build_metadata, read_metadata
+from online_trader.runtime.startup_metadata import _sdk_factory, build_metadata, read_contract_catalog, read_metadata
 from online_trader.scheduling.calendar import TradingCalendar
 from tests.test_accounts import MemoryVault
 
@@ -62,6 +62,38 @@ class StartupMetadataTests(unittest.TestCase):
     def build(self, at, **kwargs):
         return build_metadata(kwargs.get('days', dates()), {CODE: kwargs.get('quote', quote())}, [CODE],
                               now=datetime.fromisoformat(at), provider='TQ_SIMNOW')
+
+    def test_quote_reference_uses_selected_and_main_quotes_and_closes(self):
+        class QuoteApi(Api):
+            def get_quote(self, code):
+                values = {CODE:quote(last_price=1000,margin=1500,price_tick=1,commission=3),
+                          'KQ.m@SHFE.ag':{'underlying_symbol':'SHFE.ag2701'},
+                          'SHFE.ag2701':{'last_price':1010,'expire_datetime':'2027-01-15'}}
+                return values[code]
+
+            def get_trading_calendar(self, *_):
+                raise AssertionError('The one-time subscription only needs quote facts')
+
+        api = QuoteApi()
+        rows = read_metadata(self.reference, [CODE], now=self.now, sdk_factory=lambda *_args,**_kw:api,
+                             quote_preview=True)
+        self.assertTrue(api.closed)
+        self.assertEqual(len(rows),1)
+        self.assertEqual((rows[0]['contract_id'], rows[0]['main_contract'], rows[0]['main_expiry_date']),
+                         (CODE,'SHFE.ag2701','2027-01-15'))
+        self.assertEqual((rows[0]['margin'],rows[0]['volume_multiple']),('1500','15'))
+
+    def test_catalog_queries_futures_and_closes_on_success_and_failure(self):
+        api = Api()
+        with patch.object(api,'query_quotes',create=True,return_value=['GFEX.ps2701', CODE, CODE, 'KQ.m@SHFE.ag']) as query:
+            rows = read_contract_catalog(self.store,self.state['selected_id'],sdk_factory=lambda *a,**kw:api)
+        query.assert_called_once_with(ins_class='FUTURE')
+        self.assertEqual(rows,['GFEX.ps2701',CODE])
+        self.assertTrue(api.closed)
+        api.closed = False
+        with patch.object(api,'query_quotes',create=True,side_effect=RuntimeError('local fake failure')), self.assertRaises(TraderError):
+            read_contract_catalog(self.store,self.state['selected_id'],sdk_factory=lambda *a,**kw:api)
+        self.assertTrue(api.closed)
 
     def test_evening_selects_next_trading_day_and_covers_wait_before_night(self):
         result = self.build('2026-11-12T11:30:00+00:00')

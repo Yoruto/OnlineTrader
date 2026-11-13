@@ -2,9 +2,9 @@
   "extension_id": "OT-DSV-EXECUTION-1.2",
   "extends": "OT-DSV-PROTECTION-1.1",
   "scope": "DEVELOPMENT_INTERNAL_ONLY",
-  "legacy_resources_unchanged": true,
+  "legacy_resources_unchanged": false,
   "resources": {
-    "protection-plan-v1.2.schema.json": "3021fd58909e01fc30b695714b0e6eadcdb32946a154a0465995995e4c9f76e3"
+    "protection-plan-v1.2.schema.json": "da7a0cfb640c2a1aa87ae3256e6bd09e421d9454f5441b384da533a49a55d45d"
   },
-  "reason": "Explicit SDK price-worsening cancel/reprice and source session close timing need an independent execution policy; previous plans remain immutable."
+  "reason": "Explicit SDK price-worsening cancel/reprice and source session close timing need an independent execution policy. A saved passive wait may differ from the default 3000 ms. Previously stored plans retain their values."
 }

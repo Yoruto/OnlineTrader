@@ -10,7 +10,7 @@ from online_trader.accounts import AccountStore
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.contracts.codec import canonical_bytes, strict_loads
 from online_trader.errors import TraderError
-from online_trader.runtime.desktop_bootstrap import build_start_request, compile_start_scope, run_desktop_start
+from online_trader.runtime.desktop_bootstrap import build_start_request, compile_start_scope, run_desktop_start, timed_start_trigger
 from online_trader.runtime.instance import AccountLock
 from tests.test_accounts import MemoryVault
 
@@ -60,6 +60,25 @@ class DesktopBootstrapTests(unittest.TestCase):
         self.assertEqual(datetime.fromisoformat(request['expires_at_utc']) - self.now, timedelta(minutes=10))
         self.assertNotIn('offline-sn-secret', repr(request))
         self.assertFalse(self.store.ledger_path(self.row).exists())
+
+    def test_scheduled_bootstrap_uses_same_confirmed_request_and_checks_session(self):
+        request = self.request(timed_trigger='2026-11-12_night')
+        self.assertEqual(timed_start_trigger(self.profile,self.now), request['timed_trigger'])
+        self.assertIsNone(timed_start_trigger(self.profile,self.now-timedelta(minutes=1)))
+        self.assertEqual(timed_start_trigger(self.profile,self.now+timedelta(minutes=60,seconds=59)), request['timed_trigger'])
+        self.assertIsNone(timed_start_trigger(self.profile,self.now+timedelta(minutes=61)))
+        evidence = self.metadata(request)
+        self.assertEqual(timed_start_trigger(self.profile,self.now,metadata=evidence),request['timed_trigger'])
+        missing = copy.deepcopy(evidence)
+        for entry in missing['calendar']['contracts']:
+            entry['sessions'].pop(0)
+        self.assertIsNone(timed_start_trigger(self.profile,self.now,metadata=missing))
+        path = self.save_request(request)
+        with (patch('online_trader.runtime.desktop_bootstrap.AccountStore',return_value=self.store),
+              patch('online_trader.runtime.startup_metadata.read_metadata',return_value=evidence),
+              patch('online_trader.runtime.desktop_bootstrap.dsv_simulation.run',return_value=0) as run):
+            self.assertEqual(run_desktop_start(path,self.root/'scheduled',now=self.now),0)
+        run.assert_called_once()
 
     def test_scope_uses_live_multipliers_per_contract_limits_and_original_zero_repair(self):
         request = self.request()

@@ -149,6 +149,8 @@ def build_development_plan(profile, candidate, *, account_key, trading_day,
             "break_even": ({"enabled": True, "anchor": "THEORETICAL_ENTRY",
                             "activate_after": "FIRST_STAGE_CONFIRMED_REDUCTION"}
                            if trade["half_breakeven"] else {"enabled": False})}
+        if trade["half_stage2"] and trade.get("half_pullback_close", False):
+            partial["second_stage"]["pullback_to_first"] = True
     plan = {
         "schema_version": execution_version, "plan_id": plan_id, "plan_revision": "1",
         "account_key": account_key, "position_cycle_id": position_cycle_id,
@@ -185,7 +187,8 @@ def build_development_plan(profile, candidate, *, account_key, trading_day,
             context.prec = 80
             chase_window_ms = int((decimal_value(trade["chase_window_minutes"]) * 60_000).to_integral_value(rounding=ROUND_FLOOR))
         timeout_ms = trade["entry_confirm_timeout"] * 1000
-        if max(chase_window_ms, timeout_ms) > 2_147_483_647:
+        passive_wait_ms = int(decimal_value(trade.get("passive_wait_seconds", "3")) * 1000)
+        if max(chase_window_ms, timeout_ms, passive_wait_ms) > 2_147_483_647:
             _unsupported("Execution duration exceeds the bounded millisecond contract")
         plan["execution_policy"] = {
             "policy_id": reference("execution"),
@@ -194,7 +197,7 @@ def build_development_plan(profile, candidate, *, account_key, trading_day,
             "cancel_check_interval_ms": 3000, "max_child_order_attempts": None,
             "price_steps": [], "close_offset_policy_id": reference("close-offset"),
             "algorithm": "DSV_TARGET_POSITION", "entry_confirm_timeout_ms": timeout_ms,
-            "passive_entry_first": trade["passive_entry_first"], "passive_wait_ms": 3000,
+            "passive_entry_first": trade["passive_entry_first"], "passive_wait_ms": passive_wait_ms,
             "close_retry_ms": 3000, "extra_tick_remaining_ms": 10_000,
             "exchange_limit_remaining_ms": 5000, "force_retry_ms": 5000,
             "passive_ttl_ms": 90_000, "aggr_ttl_ms": 60_000,

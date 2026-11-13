@@ -14,6 +14,8 @@ import time
 
 from online_trader.domain.values import decimal_text, identifier
 from online_trader.errors import TraderError
+from online_trader.configuration.rollover import expiry_date, future_product
+from online_trader.gateway.tqkq import number
 from online_trader.scheduling.calendar import TradingCalendar
 
 
@@ -185,7 +187,7 @@ def build_metadata(calendar_dates, quote_records, contracts, *, now, provider):
             'source': 'TqSdk 3.10.4 get_trading_calendar + quote.trading_time; market metadata, not cabinet reconciliation'}
 
 
-def read_metadata(credential_reference, contracts, *, now=None, timeout_seconds=60, sdk_factory=None):
+def read_metadata(credential_reference, contracts, *, now=None, timeout_seconds=60, sdk_factory=None, quote_preview=False):
     """Read market metadata and close its session before returning.
 
     ``timeout_seconds`` bounds SDK update waits. The SDK's synchronous account
@@ -194,20 +196,37 @@ def read_metadata(credential_reference, contracts, *, now=None, timeout_seconds=
     metadata. No result obtained after the budget is accepted.
     A caller requiring a hard process deadline must supervise this child process.
     """
-    from online_trader.accounts import StoredCredential, StoredSimNowCredential
-    if type(credential_reference) not in (StoredCredential, StoredSimNowCredential):
-        _error('启动需要所选账号的本地凭据引用。', 'E_CREDENTIALS')
     if not isinstance(contracts, (list, tuple)) or not 1 <= len(contracts) <= 64 or len(set(contracts)) != len(contracts):
         _error('启动品种列表无效。')
     for code in contracts:
         identifier(code)
         if not re.fullmatch(r'(?:SHFE|DCE|CZCE|CFFEX|INE|GFEX)\.[A-Za-z]+\d+', code):
             _error('启动需要明确的期货合约代码。')
-    if type(timeout_seconds) not in (int, float) or not 1 <= timeout_seconds <= 180:
-        _error('启动资料等待期限无效。')
     instant = now or datetime.now(timezone.utc)
     if instant.tzinfo is None:
         _error('启动时间必须包含时区。')
+
+    def read(api, deadline, provider):
+        quotes = {code: api.get_quote(code) for code in contracts}
+        if quote_preview:
+            return quote_reference(api, quotes, deadline)
+        local_day = instant.astimezone(BEIJING).date()
+        start, end = local_day - timedelta(days=20), local_day + timedelta(days=20)
+        raw = api.get_trading_calendar(start, end)
+        if time.monotonic() >= deadline:
+            _error('读取启动资料超时，请检查行情连接。', 'E_STARTUP_METADATA_TIMEOUT')
+        dates = _calendar_dates(raw, start, end)
+        return build_metadata(dates, quotes, contracts, now=instant, provider=provider)
+
+    return _read_market(credential_reference, read, timeout_seconds=timeout_seconds, sdk_factory=sdk_factory)
+
+
+def _read_market(credential_reference, read, *, timeout_seconds, sdk_factory):
+    from online_trader.accounts import StoredCredential, StoredSimNowCredential
+    if type(credential_reference) not in (StoredCredential, StoredSimNowCredential):
+        _error('行情查询需要所选账号的本地凭据引用。', 'E_CREDENTIALS')
+    if type(timeout_seconds) not in (int, float) or not 1 <= timeout_seconds <= 180:
+        _error('启动资料等待期限无效。')
     store = credential_reference.store
     row = store.get(credential_reference.account_id)
     if store.read()['selected_id'] != row['account_id']:
@@ -221,21 +240,16 @@ def read_metadata(credential_reference, contracts, *, now=None, timeout_seconds=
         api = (sdk_factory or _sdk_factory)(auth, deadline=deadline)
         if time.monotonic() >= deadline:
             _error('读取启动资料超时，请检查行情连接。', 'E_STARTUP_METADATA_TIMEOUT')
-        quotes = {code: api.get_quote(code) for code in contracts}
-        local_day = instant.astimezone(BEIJING).date()
-        start, end = local_day - timedelta(days=20), local_day + timedelta(days=20)
-        raw = api.get_trading_calendar(start, end)
+        result = read(api, deadline, row['provider'])
         if time.monotonic() >= deadline:
-            _error('读取启动资料超时，请检查行情连接。', 'E_STARTUP_METADATA_TIMEOUT')
-        dates = _calendar_dates(raw, start, end)
-        result = build_metadata(dates, quotes, contracts, now=instant, provider=row['provider'])
+            _error('读取行情资料超时，请检查行情连接。', 'E_STARTUP_METADATA_TIMEOUT')
         if store.read()['selected_id'] != row['account_id']:
-            _error('所选账号已经改变，请重新启动。', 'E_SCOPE')
+            _error('所选账号已经改变，请重新查询。', 'E_SCOPE')
         return result
     except TraderError:
         raise
     except Exception:
-        _error('读取交易日历或合约资料失败，请检查行情连接。')
+        _error('读取行情资料失败，请检查行情连接。')
     finally:
         secrets = auth = None
         if api is not None:
@@ -247,3 +261,57 @@ def read_metadata(credential_reference, contracts, *, now=None, timeout_seconds=
 
 def read_startup_metadata(store, account_id, contracts, **kwargs):
     return read_metadata(store.credential_reference(account_id), contracts, **kwargs)
+
+
+def read_contract_catalog(store, account_id, *, timeout_seconds=30, sdk_factory=None):
+    """Query the original FUTURE category using the selected market identity."""
+    def read(api, deadline, provider):
+        contracts = sorted({code for code in api.query_quotes(ins_class='FUTURE')
+                            if future_product(code) is not None})
+        if len(contracts) > 20_000:
+            _error('返回的期货合约目录超过可读取范围。', 'E_CONTRACT_CATALOG')
+        return contracts
+
+    return _read_market(store.credential_reference(account_id), read, timeout_seconds=timeout_seconds,
+                        sdk_factory=sdk_factory)
+
+
+def quote_reference(api, quotes, deadline):
+    """Sample the selected and main contracts on the market-only connection."""
+    main_refs, resolved = {}, {}
+    for code in quotes:
+        product = future_product(code)
+        if product is not None:
+            if product not in main_refs:
+                main_refs[product] = api.get_quote(f'KQ.m@{product[0]}.{product[1]}')
+            resolved[code] = main_refs[product]
+
+    def wait(ready, seconds):
+        end = min(deadline, time.monotonic() + seconds)
+        while not ready() and time.monotonic() < end:
+            api.wait_update(deadline=time.time()+min(0.3, max(0, end-time.monotonic())))
+
+    def has_price(quote):
+        value = number(_get(quote, 'last_price'))
+        return value is not None and Decimal(value) > 0
+
+    wait(lambda: all(has_price(quote) for quote in quotes.values()), 5)
+    main_quotes = {}
+    for code, reference in resolved.items():
+        main = _get(reference, 'underlying_symbol')
+        if isinstance(main,str) and future_product(main) == future_product(code):
+            main_quotes[code] = (main, api.get_quote(main))
+    wait(lambda: all(expiry_date(_get(quote,'expire_datetime')) is not None for _,quote in main_quotes.values()), 4)
+    rows = []
+    for code, quote in quotes.items():
+        main, main_quote = main_quotes.get(code, (None, {}))
+        expires = expiry_date(_get(main_quote,'expire_datetime'))
+        fields = {name:number(_get(quote, source)) for name,source in (
+            ('last','last_price'),('margin','margin'),('volume_multiple','volume_multiple'),
+        ('commission','commission'),('price_tick','price_tick'))}
+        rows.append(fields | {'contract_id':code, 'source_time_utc':_get(quote,'datetime'),
+            'main_contract':main,'main_expiry_date':expires.isoformat() if expires else None,
+            'main_last':number(_get(main_quote,'last_price')), 'ready':has_price(quote)})
+    if time.monotonic() >= deadline:
+        _error('读取行情超时。', 'E_STARTUP_METADATA_TIMEOUT')
+    return rows

@@ -12,6 +12,18 @@ from online_trader.runtime.dsv_simulation import load_inputs
 from online_trader.runtime.executable import bundled_cli
 
 
+def scheduled_minute(schedule, local):
+    if not schedule['enabled']:
+        return None
+    minute = local.hour * 60 + local.minute
+    for label in ('night', 'day'):
+        hour, minutes = map(int, schedule[f'{label}_start_time'].split(':'))
+        target = hour * 60 + minutes
+        if target <= minute <= target + schedule['catch_up_minutes']:
+            return f'{local.date()}_{label}'
+    return None
+
+
 class SessionLauncher:
     def __init__(self,store,account_id,scope,profile,calendar):
         self.store=store;self.account_id=account_id
@@ -93,13 +105,9 @@ class SessionLauncher:
             raise TraderError('E_REVISION_CONFLICT','The scheduled scope or reviewed inputs changed')
         schedule=review['schedule']
         local=now.astimezone(timezone(timedelta(hours=8)))
-        minute=local.hour*60+local.minute
-        if schedule['enabled']:
-            for label in ('day','night'):
-                hour,minutes=map(int,schedule[f'{label}_start_time'].split(':'))
-                target=hour*60+minutes
-                if target<=minute<=target+schedule['catch_up_minutes']:
-                    return f'{local.date()}_{label}'
+        trigger = scheduled_minute(schedule, local)
+        if trigger:
+            return trigger
         if review['auto_start_on_launch']:
             at=now.astimezone(timezone.utc).isoformat().replace('+00:00','Z')
             for contract in review['contracts']:

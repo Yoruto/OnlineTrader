@@ -5,8 +5,9 @@ from online_trader.errors import TraderError
 
 
 class AccountDialog(QDialog):
-    def __init__(self,store,parent=None):
+    def __init__(self,store,parent=None,*,use_account=None):
         super().__init__(parent);self.store=store;self.state=None
+        self._use_account=use_account
         self.setWindowTitle('OnlineTrader · 账户管理');self.resize(900,650)
         layout=QVBoxLayout(self)
         self.notice=QLabel('SimNow / 快期模拟账户 · 选择账户不登录。口令仅保存在当前 Windows 用户的凭据管理器。');self.notice.setWordWrap(True);layout.addWidget(self.notice)
@@ -26,6 +27,7 @@ class AccountDialog(QDialog):
         for text,callback in [('新增',self.add),('编辑所选',self.edit),('选择所选',self.select),('保存凭据',self.save),('忘记凭据',self.forget),('删除所选',self.delete),('刷新',self.reload)]:
             button=QPushButton(text);button.clicked.connect(callback);actions.addWidget(button)
         layout.addLayout(actions);self.table.itemSelectionChanged.connect(self.fill)
+        self.table.cellDoubleClicked.connect(self._double_click)
         self.provider.currentIndexChanged.connect(self.provider_changed);self.provider_changed();self.reload()
 
     def provider_changed(self):
@@ -60,7 +62,11 @@ class AccountDialog(QDialog):
 
     def _apply(self,callback):
         try:callback();self.reload();self.notice.setText('操作已保存。账户连接和新增交易权限没有改变。')
-        except TraderError as error:self.notice.setText('账户操作未完成：'+error.code)
+        except TraderError as error:
+            if error.code=='E_REVISION_CONFLICT':
+                self.reload()
+            message = '正在刷新或启动账号，请稍后重试。' if error.code=='E_ACCOUNT_BUSY' else error.code
+            self.notice.setText('账户操作未完成 · '+message)
         finally:self.clear_credentials()
 
     def add(self):self._apply(lambda:self.store.change('add',expected_revision=self.state['revision'],alias=self.alias.text(),username=self.username.text(),broker=self.broker.text(),line=self.line.text(),provider=self.provider.currentData()))
@@ -70,7 +76,18 @@ class AccountDialog(QDialog):
             if row['provider']!=self.provider.currentData():raise TraderError('E_ACCOUNT','账户类型不可修改，请新增独立账户')
             self.store.change('edit',expected_revision=self.state['revision'],account_id=row['account_id'],alias=self.alias.text(),broker=self.broker.text(),line=self.line.text())
         self._apply(action)
-    def select(self):self._apply(lambda:self.store.change('select',expected_revision=self.state['revision'],account_id=self.selected()['account_id']))
+    def _double_click(self, row, _column):
+        self.table.selectRow(row)
+        self.select()
+
+    def select(self):
+        def action():
+            account_id = self.selected()['account_id']
+            if self._use_account is None:
+                self.store.change('select', expected_revision=self.state['revision'], account_id=account_id)
+            else:
+                self._use_account(account_id, self.state['revision'])
+        self._apply(action)
     def save(self):
         def action():
             row=self.selected()

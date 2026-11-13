@@ -67,7 +67,8 @@ def _validate(name: str, value: dict[str, Any]) -> None:
 
 
 def validate_message(message: dict[str, Any]) -> None:
-    name='workbench-ipc.schema.json' if message.get('type') in {'WorkbenchRequest','WorkbenchSnapshot'} else 'ipc.schema.json'
+    workbench = {'WorkbenchRequest', 'WorkbenchSnapshot', 'WorkbenchMonitorRequest', 'WorkbenchMonitorSnapshot'}
+    name = 'workbench-ipc.schema.json' if message.get('type') in workbench else 'ipc.schema.json'
     _validate(name, message)
 
 

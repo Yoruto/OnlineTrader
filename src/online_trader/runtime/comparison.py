@@ -17,9 +17,10 @@ from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.offsets import dsv_startup_profile
 from online_trader.configuration.files import publish_new_bytes
 from online_trader.contracts.codec import canonical_bytes,content_hash,strict_loads
+from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
-from online_trader.runtime.strategy_log import DsvEntryLog
+from online_trader.runtime.strategy_log import COMMITTED_EVENT_TYPES, DsvEntryLog
 from online_trader.scheduling.reference import clock_observation
 
 
@@ -46,6 +47,24 @@ _START_HEADER=re.compile(r'^启动时间[:：]\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\
 _NUMBER=r'([0-9]+(?:\.[0-9]+)?)'
 
 
+def dsv_log_category(message):
+    if any(tag in message for tag in ('[错误]', '[风控]', '[警告]')):
+        return 'error'
+    if '[手动' in message:
+        return 'manual'
+    if '[半仓]' in message:
+        return 'half'
+    if '[平仓]' in message:
+        if re.search(r'单笔\s*[:：]\s*\+', message):
+            return 'close_win'
+        if re.search(r'单笔\s*[:：]\s*-', message):
+            return 'close_loss'
+        return 'close'
+    if '[自动]' in message:
+        return 'auto'
+    return None
+
+
 def parse_dsv_line(line,civil_date,*,directions=None):
     """Only documented business text; retain both cached and inner timestamps."""
     clocks=_TIME.match(line);contract=_CODE.search(line)
@@ -55,6 +74,8 @@ def parse_dsv_line(line,civil_date,*,directions=None):
         at=datetime.fromisoformat(civil_date+'T'+stamps[-1]+'+08:00')
     except ValueError:raise TraderError('E_COMPARISON_LOG','Invalid DSV civil log timestamp') from None
     code=contract[1];directions={} if directions is None else directions
+    message = line[clocks.end():].strip()
+    category = dsv_log_category(message)
     row={'side':'DSV_KQ','contract_id':code,'source_time_utc':at.astimezone(timezone.utc).isoformat().replace('+00:00','Z'),
          'log_times_local':stamps,'timestamp_precision_ms':1000,'timestamp_source':'DSV_LOG_LAST_LEADING_TIMESTAMP',
          'direction':directions.get(code),'native_identity_available':False}
@@ -83,14 +104,14 @@ def parse_dsv_line(line,civil_date,*,directions=None):
     elif '[跳过]' in line or '[提示]' in line:
         row.update(kind='ENTRY_FILTER',reason='GEOMETRY' if '几何' in line or '振幅' in line else
                    'ACTIVATION_PASSED' if '激活位' in line else 'PRICE_SLIPPAGE' if '超出上限' in line else 'OTHER')
+    elif category is not None:
+        # A half target or an operator message has no order/fill comparison identity.
+        row['kind'] = 'OPERATOR_LOG'
     else:return None
-    tags=re.match(r'(?:\[[^\]]+\]\s*)+',line[clocks.end():])
-    if tags:
-        categories={'自动':'auto','手动':'manual','错误':'error'}
-        for tag in re.findall(r'\[([^\]]+)\]',tags[0]):
-            if tag in categories:
-                row['operator_tag']=categories[tag]
-                break
+    row['message'] = message
+    if category is not None:
+        # Keep the comparison event's automation marker for existing consumers.
+        row['operator_tag'] = 'auto' if category == 'close' and '[自动]' in message else category
     return row
 
 
@@ -160,6 +181,7 @@ class ComparisonRecorder:
         self.dsv_config=None if dsv_config is None else Path(dsv_config)
         self.tail=None if dsv_log_dir is None else DsvLogTail(dsv_log_dir)
         self.last_seq=0;self.last_clock=0;self.last_profile_check=0
+        self.last_slow_loop_ns = None
         self.directory=Path(output)/('comparison-'+uuid.uuid4().hex[:12]);self.directory.mkdir(parents=True)
         self.path=self.directory/'events.jsonl';self.stream=self.path.open('xb');self.closed=False
         self.manifest={'schema_version':'DSV_COMPARISON/1','run_id':self.directory.name,
@@ -203,12 +225,46 @@ class ComparisonRecorder:
             'source_epoch':self.kernel.port.source_epoch,'profile_hash':self.profile.content_hash})
         self.entry_log.market(event, decision)
 
+    def monitor(self, monitor, loop_start, timings):
+        now_ns = time.monotonic_ns()
+        summary = monitor.summary(now_ns)
+        now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        rows = []
+        if monitor.recoveries:
+            threshold = Decimal(self.entry_log.trade.get('resume_gap_seconds', '60'))
+            cycles = self.kernel._committed.values()
+            for code, gap in monitor.recoveries.items():
+                if Decimal(str(gap)) <= threshold:
+                    continue
+                position = self.kernel.port.position(code)
+                owned = [cycle for cycle in cycles if cycle['plan']['contract_id'] == code and cycle['lifecycle']!='CLOSED']
+                if not (position['long'] or position['short'] or any(
+                        OrderState.from_dict(order).potential_remaining for cycle in owned for order in cycle['orders'])):
+                    continue
+                rows.append({'observed_at_utc':now, 'kind':'QUOTE_RESUMED', 'tag':'恢复', 'contract_id':code,
+                    'trading_day':monitor.trading_day,
+                    'message':f'{code} 行情断档 {gap:.0f} 秒后恢复：对账结果 账户多{position["long"]}/空{position["short"]}'})
+        if summary:
+            rows.append({'observed_at_utc': now, 'kind': 'TICK_DIAGNOSTIC', 'tag': '行情诊断',
+                         'message': '60 秒行情更新 · ' + summary})
+        if now_ns - loop_start > 2_000_000_000 and (
+                self.last_slow_loop_ns is None or now_ns - self.last_slow_loop_ns >= 60_000_000_000):
+            self.last_slow_loop_ns = now_ns
+            detail = '，'.join(f'{name} {span/1e9:.3f} 秒' for name, span in timings.items())
+            rows.append({'observed_at_utc': now, 'kind': 'SLOW_DSV_LOOP', 'tag': '慢',
+                         'message': f'本轮耗时 {(now_ns-loop_start)/1e9:.1f} 秒' + (f'（{detail}）' if detail else '')})
+        self.entry_log.write(rows)
+
     def poll(self):
         k=self.kernel
-        for row in k.ledger.query('SELECT event_seq,event_type,payload_json FROM event_journal WHERE event_seq>? AND event_seq<=? ORDER BY event_seq LIMIT 1000',
+        for row in k.ledger.query('SELECT event_seq,event_type,payload_json,kernel_boot_id,observed_at_utc FROM event_journal WHERE event_seq>? AND event_seq<=? ORDER BY event_seq LIMIT 1000',
                                   (self.last_seq,k._durable_seq)):
+            payload = strict_loads(row['payload_json'])
             self.write('PRODUCT_COMMITTED_EVENT',{'event_seq':str(row['event_seq']),'event_type':row['event_type'],
-                'payload':strict_loads(row['payload_json'])});self.last_seq=row['event_seq']
+                'kernel_boot_id':row['kernel_boot_id'],'payload':payload})
+            self.last_seq = row['event_seq']
+            if row['kernel_boot_id'] == k.boot_id and row['event_type'] in COMMITTED_EVENT_TYPES:
+                self.entry_log.committed(row['event_type'], row['event_seq'], row['observed_at_utc'], payload['data'])
         now=time.monotonic()
         if now-self.last_clock>=1:
             self.write('CLOCK',clock_observation(k.port.clock)|{'source_epoch':k.port.source_epoch,
@@ -304,6 +360,43 @@ def _product_events(records):
     return out
 
 
+def execution_trace(records, *, limit=10_000):
+    """Project exact events for side-by-side replay, with gaps left observable."""
+    from collections import deque
+    rows, attempts = deque(maxlen=limit), {}
+    for record in records:
+        data = record['data']
+        if record['kind'] == 'PRODUCT_MARKET_DECISION':
+            event, decision = data['event'], data['decision']
+            rows.append({'kind':'DECISION', 'event_seq':data['durable_seq'],
+                         'identity':{field:event.get(field) for field in (
+                             'contract_id','trading_day','session_id','source_epoch','native_time_ns','native_tick_id','source_time_utc')},
+                         'candidates':decision.get('candidates',[]), 'risk':decision.get('risk'),
+                         'reasons':decision.get('reasons',[]), 'status':decision.get('status')})
+        elif record['kind'] == 'PRODUCT_COMMITTED_EVENT':
+            kind = data['event_type']
+            body = data['payload'].get('data', data['payload'])
+            cycle = body.get('cycle')
+            if not cycle:
+                continue
+            identity = {field:cycle['plan'][field] for field in ('contract_id','trading_day','direction','position_cycle_id')}
+            for order in cycle['orders']:
+                child = order['child_order_id']
+                transition = tuple(order.get(field) for field in ('send_state','cancel_status','broker_state','terminal_confirmed','filled_qty'))
+                if attempts.get(child) == transition:
+                    continue
+                attempts[child] = transition
+                rows.append({'kind':'ORDER_TRANSITION','event_type':kind,'event_seq':data['event_seq'],
+                             'identity':identity,'order':order,
+                             'dispatch_abort':cycle.get('last_dispatch_abort') if kind=='SEND_ABORTED' else None})
+            if 'fill' in body or kind in {'ONLINE_SIMULATION_RECONCILED','PROTECTION_OBSERVATION','EXECUTION_OBSERVATION','SCHEDULED_DATA_GAP'}:
+                rows.append({'kind':'OWNED_STATE', 'event_type':kind, 'event_seq':data['event_seq'], 'identity':identity,
+                             'lifecycle':cycle['lifecycle'], 'protection':cycle['protection'],
+                             'exit':cycle.get('nominal_exit'), 'statistics':body.get('nominal_statistics'),
+                             'fill':body.get('fill')})
+    return list(rows)
+
+
 def native_totals(statement_path,source_account,manifest,product):
     """Cross-account CSV totals, never trade-ID ownership/fee registration."""
     from online_trader.reconciliation import load_statement
@@ -397,7 +490,7 @@ def build_report(manifest_path,output,*,tolerance_ms=2000,dsv_trades=None,dsv_so
         'clock_samples':len(clocks),'clock_alignment_enforced':bool(clocks) and all(c['entry_clock_gate_enforced'] for c in clocks),
         'source_coverage':{'product_market_decisions':sum(r['kind']=='PRODUCT_MARKET_DECISION' for r in records),
             'committed_product_events':sum(r['kind']=='PRODUCT_COMMITTED_EVENT' for r in records),
-            'recognized_dsv_business_lines_in_window':len(dsv)},
+            'recognized_dsv_business_lines_in_window':sum(row.get('kind')!='OPERATOR_LOG' for row in dsv)},
         'maximum_observed_system_skew_ms':str(max((abs(Decimal(c['reference_minus_system_ms'])) for c in clocks),default=Decimal(0))),
         'dsv_exit_decisions':[r for r in dsv if r.get('kind')=='EXIT_DECISION'],
         'dsv_filters':[r for r in dsv if r.get('kind')=='ENTRY_FILTER'],

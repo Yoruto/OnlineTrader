@@ -17,10 +17,7 @@ class OnlineSimulation:
         prior=kernel.ledger.query('SELECT manifest_hash FROM approval_manifests WHERE approval_record_id=?',(grant.value['grant_id'],))
         if prior and prior[0]['manifest_hash']!=grant.content_hash:
             raise TraderError('E_SCOPE','The original immutable scope identity has different contents')
-        if any(c['plan'].get('approval_record_id')!=grant.value['grant_id']
-               or c['plan'].get('account_key')!=grant.account_key
-               or not self.day_permitted(c['plan'].get('trading_day'))
-               or c['plan'].get('contract_id') not in grant.value['contracts'] for c in kernel._staged.values()):
+        if any(not self.accepts_cycle(cycle) for cycle in kernel._staged.values()):
             raise TraderError('E_SCOPE','A simulation restart requires the original grant and owned cycle identities')
         self.port.bind(kernel);self._configured=False;self._last_observations=None;self._quotes={};self._fault_recorded=False
         self.baseline=None;self._terminal=set();self._entry_reconciled=set();self._closed=set()
@@ -29,6 +26,16 @@ class OnlineSimulation:
         for row in kernel.ledger.query("SELECT payload_json FROM event_journal WHERE event_type='ONLINE_ORDER_OBSERVATIONS' ORDER BY event_seq"):
             data=strict_loads(row['payload_json'])['data']
             self._observed_orders=self._merge_observations(data['orders'])
+
+    def accepts_cycle(self, cycle):
+        plan = cycle['plan']
+        return (plan.get('approval_record_id') == self.grant.value['grant_id']
+                and plan.get('account_key') == self.grant.account_key
+                and self.day_permitted(plan.get('trading_day'))
+                and plan.get('contract_id') in self.grant.value['contracts'])
+
+    def archived_cycle(self, cycle):
+        return False
 
     def _merge_observations(self,observations):
         # Retain immutable native trade IDs/timestamps across reconnect/restart.
@@ -210,8 +217,16 @@ class OnlineSimulation:
                     proved_fills.append((fill, day))
                 proved = len(proved_fills) == len(observation['fills'])
                 total = sum(fill['quantity'] for fill in observation['fills'])
+                rejected = observation.get('rejected', False)
+                if rejected and (observation['status'] != 'FINISHED' or observation['reported_fill_qty'] or total):
+                    k._record_conflict('ONLINE_NATIVE_ORDER_REJECTION_CONFLICT', {'child_order_id':child})
+                    k.wait_idle()
+                    continue
                 cycle, _ = k._find(child)
                 order = next(order for order in cycle['orders'] if order['child_order_id'] == child)
+                archived = self.archived_cycle(cycle)
+                if archived and (observation['status'] != 'FINISHED' or observation['reported_fill_qty'] != order['filled_qty']):
+                    self.flag_archived_order(cycle, order, observation)
                 first_confirmation = None
                 defer_entry_slippage = False
                 opening = order['effect'] == 'OPEN' and cycle['plan']['schema_version'] == '1.3'
@@ -238,14 +253,33 @@ class OnlineSimulation:
                         self._closed.discard(cid);self._entry_reconciled.discard(cid)
                 if proved and observation['status']=='FINISHED' and total==observation['reported_fill_qty']:
                     terminal_key=(child,total)
-                    if terminal_key not in self._terminal:
+                    if ((terminal_key not in self._terminal and (not archived or not order['terminal_confirmed']
+                                                                 or order['reported_fill_qty'] != total))
+                            or (rejected and order['broker_state'] != 'REJECTED')):
                         cycle,_=k._find(child);order=next(o for o in cycle['orders'] if o['child_order_id']==child)
-                        status='FILLED' if total==order['original_qty'] else 'CANCELLED'
+                        status='FILLED' if total==order['original_qty'] else 'REJECTED' if rejected else 'CANCELLED'
                         k.confirm_terminal(child,status,total,_adapter_token=self.port.callback_token,
                             _historical_recovery=self.historical_terminal(observation))
                         k.wait_idle();self._terminal.add(terminal_key)
             self._last_observations=digest
         return observations
+
+    def flag_archived_order(self, cycle, order, observation):
+        k = self.kernel
+        issue = {'child_order_id':order['child_order_id'],'original_grant_id':cycle['plan']['approval_record_id'],
+                 'status':observation['status'],'reported_fill_qty':observation['reported_fill_qty']}
+        if cycle.get('archived_order_review') == issue:
+            return
+        k._record_conflict('ONLINE_ARCHIVED_ORDER_CHANGED', issue)
+        k.wait_idle()
+        cycle['archived_order_review'] = issue
+        cycle['protection'].update(reconciliation_required=True, block_new=True)
+        if cycle['lifecycle'] == 'CLOSED':
+            cycle['lifecycle'] = 'FLAT_PENDING_CONFIRM'
+        k._recovery_pending.add(cycle['position_cycle_id'])
+        cycle['revision'] += 1
+        k._stage_cycle(cycle, 'TX_RECONCILE', 'ONLINE_ARCHIVED_ORDER_NEEDS_ORIGINAL_SCOPE')
+        k.wait_idle()
 
     def tick(self):
         k=self.kernel;k._writable()
@@ -260,6 +294,7 @@ class OnlineSimulation:
         self.recover_working(observations)
         if self.strategy_enabled and self.port.fault:return
         for cid,cycle in list(k._staged.items()):
+            if self.archived_cycle(cycle):continue
             if self.strategy_enabled and cid in k._recovery_pending:continue
             if cid in self._closed and cycle['lifecycle']=='CLOSED':continue
             code=cycle['plan']['contract_id']

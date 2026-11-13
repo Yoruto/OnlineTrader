@@ -64,18 +64,54 @@ class ReportingTests(unittest.TestCase):
 
     def test_excel_daily_report_exports_only_the_selected_cabinet_day(self):
         from zipfile import ZipFile
+        from xml.etree import ElementTree as ET
         from online_trader.reporting import export_daily_report
 
-        report = self.seed(entry_fee="1")
+        report = self.seed(entry_fee="0")
         path = self.folder / "日报.xlsx"
         export_daily_report(report, path, DAY)
         with ZipFile(path) as workbook:
+            names = workbook.read("xl/workbook.xml").decode("utf-8")
+            for name in ('按品种','交易明细','每日盈亏'):
+                self.assertIn(name,names)
             detail = workbook.read("xl/worksheets/sheet3.xml").decode("utf-8")
             self.assertIn("report-entry", detail)
             self.assertIn("report-exit", detail)
+            ns = {"sheet": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            cells = {cell.attrib["r"]: cell for cell in ET.fromstring(detail).findall(".//sheet:c", ns)}
+            for name, expected in {"F2":"100", "G2":"2", "I2":"0", "H3":"100"}.items():
+                self.assertEqual(cells[name].attrib["t"], "n")
+                self.assertEqual(cells[name].findtext("sheet:v", namespaces=ns), expected)
+            self.assertEqual(cells["K2"].attrib["t"], "inlineStr")
+            self.assertNotIn("I3", cells)
         with self.assertRaises(TraderError) as error:
             export_daily_report(report, self.folder / "missing.xlsx", "2026-11-11")
         self.assertEqual(error.exception.code, "E_REPORT_DAY")
+        empty = self.folder / "empty.xlsx"
+        export_daily_report(report, empty, "2026-11-11", allow_empty=True)
+        with ZipFile(empty) as workbook:
+            self.assertIn("所选柜台交易日无已记录数据", workbook.read("xl/worksheets/sheet1.xml").decode("utf-8"))
+            self.assertNotIn("report-entry", workbook.read("xl/worksheets/sheet3.xml").decode("utf-8"))
+
+    def test_close_check_points_use_settled_owned_fills_and_keep_fifo_money(self):
+        self.submit(self.data('OPEN', price='104'))
+        self.submit(self.data('REDUCE', quantity=1, price='107', fee='0'))
+        second = self.data('REDUCE', quantity=1, price='109')
+        second['fill'].update(trade_key='report-exit-2', fill_id='fill-exit-2')
+        self.submit(second)
+        at_exit = read_report(self.path, self.key, as_of_utc=AT)
+        self.assertNotIn('close_slippage_points', at_exit['trades'][-1])
+        settled = self.data('REDUCE')['cycle']
+        settled.update(lifecycle='CLOSED', statistics_close_id='close-stat',
+                       nominal_exit={'exit_reason':'TAKE_PROFIT', 'nominal_exit_price':'109'},
+                       initial_open_confirmation={'status':'CONFIRMED', 'quantity':2, 'value':'208'})
+        self.ledger.submit('TX_RECONCILE', 'REPORT_TEST_SETTLED_CLOSE', {'cycle':settled}).result(timeout=3)
+        report = read_report(self.path, self.key, as_of_utc=AT)
+        last = report['trades'][-1]
+        self.assertEqual((last['close_slippage_points'], last['real_close_points'], last['realized_pnl']),
+                         ('1', '4', '50'))
+        self.assertNotIn('close_slippage_points', report['trades'][-2])
+        self.assertEqual(report['summary']['gross_realized_pnl'], '80')
 
     def test_missing_ledger_does_not_create_a_database_or_writer_lock(self):
         missing=self.folder/'missing.db'

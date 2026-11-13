@@ -24,6 +24,57 @@ class DsvStopCommandTests(unittest.TestCase):
     def command_status(self, receipt):
         return self.kernel.control.get_status(receipt['command_id'], receipt['payload_hash']).result()
 
+    def test_flat_stop_ends_session_after_current_broker_proof(self):
+        self.start()
+        self.stop()
+        self.session.step()
+        self.assertTrue(self.session.stop.is_set())
+        self.assertEqual(self.session.result['status'], 'DSV_STOPPED')
+        self.assertTrue(self.session.result['verification']['whole_account_flat_claimed'])
+        self.assertEqual(self.api.inserted, [])
+
+    def test_stop_keeps_own_protection_until_exit_fill(self):
+        self.entered(trade={'half_close_enabled':False})
+        self.stop()
+        self.quote(1058)
+        self.assertFalse(self.session.stop.is_set())
+        self.assertIn('继续管理', workbench_view(self.kernel)['configuration']['strategy_stop_wait'])
+        self.quote(1038)
+        close = self.api.inserted[-1]
+        self.assertEqual(close['offset'], 'CLOSE')
+        self.api.fill(close['order_id'], close['volume'], 1038)
+        self.session.step()
+        self.assertEqual(self.cycle()['lifecycle'], 'CLOSED')
+        self.assertTrue(self.session.stop.is_set())
+
+    def test_stop_waits_for_foreign_active_order_without_cancelling_it(self):
+        self.start()
+        self.foreign_order('foreign')
+        self.stop()
+        self.session.step()
+        self.assertFalse(self.session.stop.is_set())
+        self.assertEqual(self.api.cancelled, [])
+        self.api.terminal('foreign')
+        self.session.step()
+        self.assertTrue(self.session.stop.is_set())
+
+    def test_stop_request_survives_restart_of_same_scope(self):
+        from online_trader.errors import TraderError
+        self.entered(trade={'half_close_enabled':False})
+        original_boot = self.kernel.boot_id
+        self.stop()
+        test_online_dsv.OnlineDsvTests.restart(self)
+        self.assertNotEqual(self.kernel.boot_id,original_boot)
+        self.assertTrue(self.kernel.control.strategy_stop_requested())
+        with self.assertRaises(TraderError):
+            self.kernel.simulation.arm()
+        self.quote(1038)
+        close = self.api.inserted[-1]
+        self.assertEqual(close['offset'],'CLOSE')
+        self.api.fill(close['order_id'],close['volume'],1038)
+        self.session.step()
+        self.assertTrue(self.session.stop.is_set())
+
     def foreign_order(self, oid):
         self.api.orders[oid] = SimpleNamespace(
             exchange_id='DCE', instrument_id='p2701', direction='BUY', offset='OPEN',

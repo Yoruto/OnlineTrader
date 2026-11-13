@@ -8,12 +8,14 @@ from PySide6.QtCore import Qt, QItemSelectionModel
 from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QFileDialog, QTableWidgetItem
 
 from online_trader.configuration.baseline import load_confirmed_baseline
+from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.editor import form_values, profile_from_form
 from online_trader.configuration.offsets import DailyDataset
 from online_trader.desktop.settings import SettingsDialog
 from online_trader.desktop.editor import ParameterEditorDialog
 from online_trader.desktop.symbol_editor import SymbolEditorDialog
 from online_trader.desktop.calculator import OffsetCalculatorDialog
+from tests.qt_lifecycle import flush_deferred_deletes
 from tests.test_offset_calculator import daily_csv
 
 
@@ -28,6 +30,7 @@ class ParameterToolsDesktopTests(unittest.TestCase):
 
     def tearDown(self):
         for window in reversed(self.windows): window.close(); window.deleteLater()
+        flush_deferred_deletes()
         self.app.processEvents(); self.temp.cleanup()
 
     def editor(self):
@@ -196,6 +199,39 @@ class ParameterToolsDesktopTests(unittest.TestCase):
             settings.calculator_button.click()
         self.assertEqual(settings.profile.content_hash, candidate.content_hash)
         self.assertEqual(list(self.root.rglob("*.db")), [])
+
+    def test_workbench_embedded_calculator_applies_to_current_preview(self):
+        from PySide6.QtCore import QSettings
+        from online_trader.desktop.workbench import WorkbenchWindow
+
+        local = QSettings(str(self.root / "workbench.ini"), QSettings.IniFormat)
+        with patch("online_trader.desktop.workbench_layout.QSettings", return_value=local):
+            window = WorkbenchWindow(None)
+        self.windows.append(window)
+        window.timer.stop()
+        dashboard = window.dashboard
+        calculator = dashboard.calculator
+        source = self.root / "daily.csv"
+        source.write_bytes(daily_csv("DCE.p2701", [100] * 30).encode("utf-8"))
+        self.assertTrue(calculator.load_file(source))
+        calculator.date_input.setText("2026-11-10")
+        self.assertTrue(calculator.calculate())
+        calculator.select_successful()
+        dialog = dashboard.parameter_dialog()
+        settings = dialog.profile.to_settings()
+        settings["trade"]["max_volume"] = 21
+        edited = DsvProfile.from_settings(settings)
+        self.assertTrue(dialog.apply_edited_preview(edited, expected_hash=dialog.profile.content_hash))
+        self.assertFalse(calculator.apply_button.isEnabled())
+        self.assertTrue(calculator.calculate())
+        calculator.select_successful()
+        calculator.apply_button.click()
+        self.assertEqual(dashboard.symbol_grid.item(0, 5).text(), "45")
+        self.assertEqual(dashboard.symbol_grid.item(0, 7).text(), "40")
+        result = window.current_start_profile().to_settings()
+        self.assertEqual(result["trade"]["max_volume"], 21)
+        self.assertEqual(result["symbols"][1:], edited.to_settings()["symbols"][1:])
+        self.assertEqual(dashboard.profile.content_hash, self.profile.content_hash)
 
     def test_main_rejects_stale_editor_or_calculator_result(self):
         settings = self.settings()

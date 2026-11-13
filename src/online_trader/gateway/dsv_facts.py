@@ -38,6 +38,7 @@ class DsvFactFeed:
         self.port,self.profile,self.calendar=port,profile,calendar
         self._accepted={};self._sequences={};self._path={};self._revision=0;self._last_native={}
         self.resume_anchors={}
+        self.rebuild_paths=set()
         trade = profile.to_record()['settings']['trade']
         self._continuation_seconds = float(trade['chase_window_minutes']) * 60 if trade['continuation_entry'] else None
         self._night_references = {}
@@ -72,8 +73,14 @@ class DsvFactFeed:
                 raise TraderError('E_FACT_BARRIER','Native tick identities move backwards in source time')
             if not rows:continue
             session=at['session'];start=datetime.fromisoformat(session['open_utc'])
+            close=datetime.fromisoformat(session['close_utc'])
             key=(code,self.port.source_epoch,session['session_id'])
             contiguous=all(b[0]==a[0]+1 for a,b in zip(rows,rows[1:]))
+            first_index=next((index for index,row in enumerate(rows) if row[1]>=start),len(rows))
+            session_rows=[row for row in rows[first_index:] if row[1]<close]
+            if not session_rows:continue
+            boundary_rows=rows[max(0,first_index-1):first_index+len(session_rows)]
+            session_contiguous=all(b[0]==a[0]+1 for a,b in zip(boundary_rows,boundary_rows[1:]))
             accepted_key=(code,self.port.source_epoch)
             previous=self._accepted.get(accepted_key)
             if previous is None and contiguous and resume_states is not None:
@@ -86,19 +93,30 @@ class DsvFactFeed:
                 normalized.update(_tick_prices(prior[2]))
                 if normalized!=self._last_native[(code,self.port.source_epoch)]:
                     raise TraderError('E_DUPLICATE_CONFLICT','An accepted native tick identity changed its source facts')
-            pending=[row for row in rows if previous is None or row[0]>previous]
-            if not pending:continue
-            gap=previous is not None and pending[0][0]!=previous+1
+            pending=[row for row in session_rows if previous is None or row[0]>previous]
+            start_ns=(int(start.timestamp())*1_000_000+start.microsecond)*1000
+            same_session=previous is not None and int(self._last_native[accepted_key]['native_time_ns'])>=start_ns
             ready=self.port.subscription_ready_at.get(code)
-            proof=contiguous and not gap and (rows[0][1]<=start or ready is not None and ready<=start)
-            if gap or not contiguous:self._path[key]=False
-            elif key not in self._path:self._path[key]=proof
-            elif previous is None and proof and rows[0][1]<=start:
-                # A larger native window can now prove the entire session
-                # before any event was accepted. Prime will rebuild disarmed.
+            boundary_proved=session_contiguous and (first_index>0 or session_rows[0][1]==start)
+            subscribed_at_open=session_contiguous and ready is not None and ready<=start
+            if key in self.rebuild_paths and not boundary_proved:
+                self.rebuild_paths.remove(key)
+                self._path[key]=False
+            gap=bool(same_session and pending and pending[0][0]!=previous+1)
+            pending_contiguous=all(b[0]==a[0]+1 for a,b in zip(pending,pending[1:]))
+            if not session_contiguous or gap:
+                self.port.request_tick_backfill(code)
+            if gap or not pending_contiguous:self._path[key]=False
+            elif key not in self._path:self._path[key]=boundary_proved or subscribed_at_open
+            if not pending:continue
+            if not self._path[key] and boundary_proved:
+                if same_session:
+                    # Rebuild the whole proved segment before publishing a complete
+                    # quote. An accepted incomplete tick cannot supply the proof.
+                    self.rebuild_paths.add(key)
                 self._path[key]=True
+            if key in self.rebuild_paths:pending=session_rows
             events=[]
-            close=datetime.fromisoformat(session['close_utc'])
             night_reference = None
             if (contiguous and self._path[key] and self._continuation_seconds is not None
                     and start.astimezone(CHINA_TIME).strftime('%H:%M') == '09:00'
@@ -111,11 +129,10 @@ class DsvFactFeed:
                     if night_reference is not None:
                         self._night_references[code] = (key, night_reference)
             for row in pending:
-                if start<=row[1]<close:
-                    event = self._event(code,session,row,self._sequences.get(accepted_key,0)+len(events)+1,self._path[key])
-                    if night_reference is not None:
-                        event['night_reference'] = night_reference
-                    events.append(event)
+                event = self._event(code,session,row,self._sequences.get(accepted_key,0)+len(events)+1,self._path[key])
+                if night_reference is not None:
+                    event['night_reference'] = night_reference
+                events.append(event)
             if events:result.append((code,events))
         return result
 
@@ -188,23 +205,23 @@ class DsvFactFeed:
 
     def accept(self,event):
         key=(event['contract_id'],event['source_epoch'])
+        self.rebuild_paths.discard((*key,event['session_id']))
         self._accepted[key]=int(event['native_tick_id']);self._sequences[key]=event['sequence']
         self._last_native[key]={field:event[field] for field in ('native_time_ns','last','bid1','ask1','day_high','day_low')}
 
     def facts(self,event,kernel):
         p=self.port;code=event['contract_id'];snapshot=p.snapshot();kernel.simulation._validate_snapshot(snapshot)
-        funds=snapshot['funds'];native_orders={o['order_id']:o for o in snapshot['orders']}
+        funds=snapshot['funds']
         positions=p.api.get_position(account=p.account)
         selected=p.api.get_position(code,account=p.account)
         self._revision+=1
-        covered=[];attempts=[]
+        covered=[]
         for cid,cycle in kernel._staged.items():
+            if cycle['lifecycle'] == 'CLOSED':
+                continue
             native=p.position(cycle['plan']['contract_id'])
             side='long' if cycle['plan']['direction']=='LONG' else 'short'
             if native[side]==cycle['protection']['owned_qty']:covered.append(cid)
-            if cycle['plan']['contract_id']==code:
-                attempts.extend(o['attempt_id'] for o in cycle['orders'] if p.order_id(o['child_order_id']) in native_orders
-                    and o.get('native_trading_day',cycle['plan']['trading_day'])==event['trading_day'])
         equity=funds.get('balance');margin=funds.get('margin')
         ratio = funds.get('risk_ratio')
         if ratio is not None:
@@ -224,9 +241,10 @@ class DsvFactFeed:
             native=p.api.get_order(account=p.account);orders_today=0
             for order in snapshot['orders']:
                 if order['contract_id']!=code:continue
-                stamp=getattr(native[order['order_id']],'insert_date_time',None)
-                if type(stamp) is not int:raise TraderError('E_FACT_BARRIER','Daily order count needs original native order times')
-                orders_today+=native_day(self.calendar,code,str(stamp))['trading_day']==event['trading_day']
+                stamp=getattr(native.get(order['order_id']),'insert_date_time',None)
+                if type(stamp) is int:
+                    try:orders_today+=native_day(self.calendar,code,str(stamp))['trading_day']==event['trading_day']
+                    except TraderError:pass  # A missing native-day diagnostic does not alter strategy target counts.
         symbol_margin=number(getattr(selected,'margin',None))
         if symbol_margin is None and not any(row['contract_id']==code for row in snapshot['positions']):
             # The full snapshot contains every nonzero native position.
@@ -239,7 +257,7 @@ class DsvFactFeed:
             'orders_today':orders_today,
             'active_symbols':sorted(key for key,value in positions.items() if value.pos_long or value.pos_short),
             'stopped_symbols':sorted(stopped),'unknown_orders':kernel._has_unknown(),
-            'local_reservations_excluded':True,'covered_local_cycle_ids':covered,'covered_local_attempt_ids':attempts}
+            'local_reservations_excluded':True,'covered_local_cycle_ids':covered}
         quote = p.quotes[code]
         expiry = expiry_date(getattr(quote, 'expire_datetime', None))
         days_to_expiry = (datetime.combine(expiry,time.min,CHINA_TIME)-p.clock.now()).days if expiry else None

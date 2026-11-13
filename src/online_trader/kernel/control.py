@@ -262,12 +262,20 @@ class ControlProtocol:
         return any(state["metadata"].get("operation")=="STOP_DSV_STRATEGY" and state["metadata"].get("native_cancel_orders")
                    and state.get("receipt",{}).get("status") not in FINAL for state in self.states.values())
 
+    def strategy_stop_requested(self):
+        owner = self.kernel.simulation
+        if not getattr(owner, 'strategy_enabled', False):
+            return False
+        return any(state["metadata"].get("strategy_stop_grant_id") == owner.grant.value['grant_id']
+                   and state.get("receipt", {}).get("status") in {"SUCCEEDED", "EXECUTING", "NEEDS_RECONCILIATION"}
+                   for state in self.states.values())
+
     def can_increase(self, contract_id=None):
         if contract_id is not None and not self.symbol_entry_enabled(contract_id):return False
         if self.maintenance and self.maintenance["status"] not in {"COMPLETE", "FAILED"}: return False
         if any(c.get("management_state") in {"TAKEOVER_PENDING","TAKEN_OVER"} and (contract_id is None or c["plan"]["contract_id"] == contract_id) for c in self.kernel._staged.values()): return False
         if any(s["metadata"].get("operation") == "ENTER_MAINTENANCE" and s.get("receipt",{}).get("status") not in FINAL for s in self.states.values()): return False
-        if self.stop_cancel_pending():return False
+        if self.strategy_stop_requested() or self.stop_cancel_pending():return False
         return not any(s["metadata"].get("operation") == "FLATTEN_THEN_STOP" and s.get("receipt",{}).get("status") not in FINAL for s in self.states.values())
 
     def symbol_entry_enabled(self,contract_id,*,committed=False):

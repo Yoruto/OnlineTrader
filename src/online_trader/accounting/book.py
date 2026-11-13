@@ -185,7 +185,7 @@ class MoneyBook:
             state=nominal['state'];self.nominal[(state['contract_id'],state['trading_day'])]=copy.deepcopy(state)
 
     def report(self,*,checkpoint_event_seq,as_of_utc=None,valuation_boot_id=None):
-        from online_trader.accounting.report import build_report
+        from online_trader.accounting.report import add_close_point_checks, build_report
         at=as_of_utc or utc_now();ClockSample(at,'0');now=datetime.fromisoformat(at)
         marks={}
         for cid,cycle in self.cycles.items():
@@ -210,6 +210,7 @@ class MoneyBook:
             inventory_reductions=[row|{'position_cycle_id':cid} for cid,cycle in self.cycles.items()
                 for row in cycle.get('external_reductions',[])])
         result['issues']+=copy.deepcopy(self.issues)
+        add_close_point_checks(result['trades'], self.cycles, result['issues'])
         result['fee_imports']=[copy.deepcopy(row) for _,row in sorted(self.fee_imports.items())]
         for cid,cycle in self.cycles.items():
             if cycle.get('statistics_review_required'):

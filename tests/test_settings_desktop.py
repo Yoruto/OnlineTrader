@@ -107,7 +107,9 @@ class SettingsDesktopTests(unittest.TestCase):
             for value in ("PRIVATE-USER", "PRIVATE-PASSWORD", "PRIVATE-WEBHOOK", "PRIVATE-SECRET", "account", "notify"):
                 self.assertNotIn(value, text)
             restored = DsvProfile.from_json(text)
-            self.assertEqual(restored.content_hash, self.profile.content_hash)
+            expected = copy.deepcopy(SETTINGS)
+            expected["symbols"][-1]["code"] = expected["symbols"][-1].pop("code_new")
+            self.assertEqual(restored.to_settings(), expected)
             self.assertEqual(source.read_bytes(), before)
 
     def test_import_file_failure_and_invalid_source_leave_previous_view(self):
@@ -117,6 +119,23 @@ class SettingsDesktopTests(unittest.TestCase):
         self.assertEqual(self.dialog.profile.content_hash, self.profile.content_hash)
         self.assertFalse(self.dialog.import_bytes(json.dumps(SETTINGS), source_kind="unknown"))
         self.assertEqual(self.dialog.symbols_table.rowCount(), 5)
+
+    def test_own_export_reimport_preserves_disabled_schedule_and_rollover_candidate(self):
+        settings = copy.deepcopy(SETTINGS)
+        settings["schedule"]["enabled"] = False
+        preview = DsvProfile.from_settings(settings)
+        self.assertTrue(self.dialog.apply_edited_preview(preview, expected_hash=self.profile.content_hash))
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "renamed-config.json"
+            self.assertTrue(self.dialog.export_file(path))
+            self.dialog.reset_to_baseline()
+            with patch("online_trader.desktop.settings.QFileDialog.getOpenFileName", return_value=(str(path), "")):
+                self.dialog.import_button.click()
+                self.assertEqual(self.dialog.profile.content_hash, preview.content_hash)
+                self.assertEqual(self.parameter("schedule.enabled"), "关闭")
+                self.dialog.import_dsv_button.click()
+                self.assertEqual(self.parameter("schedule.enabled"), "开启")
+                self.assertEqual(self.dialog.symbols_table.item(4, 1).text(), "SHFE.ag2702")
 
     def test_status_window_opens_settings_without_creating_ipc_client(self):
         calls = []

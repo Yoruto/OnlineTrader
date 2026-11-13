@@ -180,7 +180,9 @@
           "maximum": 2147483647
         },
         "passive_wait_ms": {
-          "const": 3000
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
         },
         "close_retry_ms": {
           "const": 3000

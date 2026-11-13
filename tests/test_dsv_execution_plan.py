@@ -121,7 +121,7 @@ class DsvExecutionPlanTests(unittest.TestCase):
 
     def test_policy_cannot_silently_change_source_algorithm_constants_or_attempt_semantics(self):
         for field,value in {'algorithm':'OTHER','cancel_check_interval_ms':5000,'max_child_order_attempts':1,
-            'passive_wait_ms':1,'close_retry_ms':0,'extra_tick_remaining_ms':10001,
+            'close_retry_ms':0,'extra_tick_remaining_ms':10001,
             'exchange_limit_remaining_ms':4999,'force_retry_ms':5001,'passive_ttl_ms':90001,
             'aggr_ttl_ms':60001,'market_ttl_ms':119999,'cap_ttl_ms':90001}.items():
             with self.subTest(field=field):
@@ -141,12 +141,21 @@ class DsvExecutionPlanTests(unittest.TestCase):
         for field,values in {'entry_slip_ratio':['-0.01','1.01','0.030','3e-2',True],
                              'chase_slip_ratio':['-1','2',0.05],
                              'entry_confirm_timeout_ms':[True,-1,2147483648],
+                             'passive_wait_ms':[True,'3000',-1,2147483648],
                              'chase_window_ms':[True,-1,2147483648],
                              'open_offset':['0','-1','55.0','5.5e1',True,55]}.items():
             for value in values:
                 with self.subTest(field=field,value=value):
                     plan=make_plan();plan['execution_policy'][field]=value
                     with self.assertRaises(TraderError):validate_plan(plan)
+
+    def test_passive_wait_uses_saved_value_and_keeps_the_missing_field_default(self):
+        self.assertEqual(make_plan()['execution_policy']['passive_wait_ms'],3000)
+        for wait, expected in ((0,0),(Decimal('1.25'),1250)):
+            with self.subTest(wait=wait):
+                plan=make_plan(profile(passive_entry_first=True,passive_wait_seconds=wait))
+                self.assertEqual(plan['execution_policy']['passive_wait_ms'],expected)
+                validate_plan(plan)
 
     def test_passive_flag_and_first_mode_must_describe_same_policy(self):
         for selected in (profile(passive_entry_first=False),profile(passive_entry_first=True)):

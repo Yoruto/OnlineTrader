@@ -19,6 +19,7 @@ from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.startup import StrategyStarter
 from online_trader.desktop.workbench import WorkbenchWindow
 from online_trader.errors import TraderError
+from tests.qt_lifecycle import dispose_widget, flush_deferred_deletes
 from tests.test_accounts import MemoryVault
 
 
@@ -47,8 +48,10 @@ class DesktopStartupTests(unittest.TestCase):
 
     def starter(self, parent=None):
         starter = StrategyStarter(self.store, self.account_id, self.profile, parent)
-        self.addCleanup(starter.deleteLater)
-        self.addCleanup(starter.status_timer.stop)
+        if parent is None:
+            self.addCleanup(flush_deferred_deletes)
+            self.addCleanup(starter.deleteLater)
+            self.addCleanup(starter.status_timer.stop)
         return starter
 
     def window(self, **options):
@@ -66,7 +69,7 @@ class DesktopStartupTests(unittest.TestCase):
         path = self.root / 'config.json'
         path.write_text(self.profile.to_json(), encoding='utf-8')
         window = self.window(dsv_config=path)
-        self.assertEqual(window.dashboard.symbol_grid.item(4, 1).text(), 'SHFE.ag2612')
+        self.assertEqual(window.dashboard.symbol_grid.item(4, 1).text(), 'SHFE.ag2702')
 
         changed = self.profile.to_settings()
         changed['symbols'][4].update(code='SHFE.ag2702', open_offset=96, stop_offset=15, profit_offset=139)
@@ -100,7 +103,43 @@ class DesktopStartupTests(unittest.TestCase):
             launch.assert_not_called()
         self.assertIn('E_DSV_PROFILE', window.home_feedback)
         self.assertFalse((self.store.directory / 'desktop-starts').exists())
-        self.assertEqual(window.dashboard.symbol_grid.item(4, 1).text(), 'SHFE.ag2612')
+        self.assertEqual(window.dashboard.symbol_grid.item(4, 1).text(), 'SHFE.ag2702')
+
+    def test_quote_reference_updates_display_without_starting_strategy(self):
+        window = self.window()
+        code = window.dashboard.profile.to_record()['settings']['symbols'][0]['code']
+        row = {'contract_id':code, 'last':'1000','margin':'1000','volume_multiple':'10',
+               'commission':'3','price_tick':'1','main_contract':'DCE.p2703','main_expiry_date':'2027-03-31','ready':True}
+        with (patch('online_trader.runtime.startup_metadata.read_startup_metadata',return_value=[row]) as read,
+              patch('online_trader.runtime.startup_environment.launch_bootstrap') as launch):
+            window.dashboard.quote_reference_button.click()
+            worker = window.dashboard.quote_worker
+            self.assertIsNotNone(worker)
+            self.assertTrue(worker.wait(5_000))
+            self.app.processEvents()
+        self.assertEqual(read.call_args.kwargs,{'quote_preview':True})
+        launch.assert_not_called()
+        self.assertIsNone(window.view)
+        self.assertEqual(window.dashboard.symbol_grid.item(0,2).text(),'DCE.p2703')
+        self.assertIn('10.00%',window.dashboard.instrument_rules.grid.item(0,2).text())
+
+    def test_manual_catalog_loads_and_filters_without_starting_a_session(self):
+        window = self.window()
+        dashboard = window.dashboard
+        with (patch('online_trader.runtime.startup_metadata.read_contract_catalog',
+                    return_value=['DCE.p2705','DCE.p2709','GFEX.ps2705']) as read,
+              patch('online_trader.runtime.startup_environment.launch_bootstrap') as launch):
+            dashboard.manual_catalog_button.click()
+            self.assertTrue(dashboard.quote_worker.wait(5_000))
+            self.app.processEvents()
+        read.assert_called_once_with(self.store,self.account_id)
+        launch.assert_not_called()
+        self.assertIn('已加载 3 个',dashboard.manual_catalog_status.text())
+        dashboard.manual_code.lineEdit().textEdited.emit('棕榈05')
+        self.assertEqual([dashboard.manual_code.itemText(i) for i in range(dashboard.manual_code.count())],['DCE.p2705'])
+        dashboard.manual_code.lineEdit().textEdited.emit('不存在')
+        self.assertIn('未找到',dashboard.manual_catalog_status.text())
+        self.assertFalse(dashboard.submit_button.isEnabled())
 
     def close_window(self, window):
         starter = getattr(window, '_strategy_starter', None)
@@ -108,7 +147,7 @@ class DesktopStartupTests(unittest.TestCase):
             self.idle(starter)
             starter.status_timer.stop()
         window._closing = True
-        window.close()
+        dispose_widget(window)
         self.app.processEvents()
 
     def assert_no_start_dialog(self):
@@ -288,6 +327,36 @@ class DesktopStartupTests(unittest.TestCase):
                 release.set()
                 self.idle(starter)
         self.assertFalse(starter.is_preparing())
+
+    def test_account_dialog_switches_the_current_workbench_and_keeps_old_owner_barrier(self):
+        from online_trader.desktop.accounts import AccountDialog
+        from online_trader.runtime.instance import AccountLock
+
+        window = self.window()
+        state = self.store.read()
+        old = self.store.get(self.account_id)
+        new = next(row for row in state['accounts'] if row['account_id'] != self.account_id)
+
+        def choose(dialog):
+            dialog.table.selectRow(next(index for index, row in enumerate(state['accounts'])
+                                        if row['account_id'] == new['account_id']))
+            with AccountLock(old['account_key']):
+                dialog.select()
+            self.assertIn('E_INSTANCE_EXISTS', dialog.notice.text())
+            self.assertEqual(self.store.read()['selected_id'], self.account_id)
+            self.assertEqual(window.selected_account, old)
+            dialog.table.cellDoubleClicked.emit(dialog.table.currentRow(), 0)
+            self.assertEqual(window.selected_account, new)
+            self.assertEqual(window.pipe_name, self.store.pipe_name(new))
+            self.assertIsNone(window.view)
+            dialog.reject()
+
+        with (patch.object(AccountDialog, 'exec', choose),
+              patch.object(window, 'refresh') as refresh):
+            window.accounts_button.click()
+            refresh.assert_called_once_with()
+        self.assertEqual(self.store.read()['selected_id'], new['account_id'])
+        self.assertEqual(window.dashboard.account_picker.currentData(), new['account_id'])
 
 
 if __name__ == '__main__':

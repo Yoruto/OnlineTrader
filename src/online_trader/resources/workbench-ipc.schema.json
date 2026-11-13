@@ -8,7 +8,9 @@
     "type": {
       "enum": [
         "WorkbenchRequest",
-        "WorkbenchSnapshot"
+        "WorkbenchSnapshot",
+        "WorkbenchMonitorRequest",
+        "WorkbenchMonitorSnapshot"
       ]
     },
     "message_id": {
@@ -76,6 +78,57 @@
   "allOf": [
     {
       "oneOf": [
+        {
+          "properties": {
+            "type": {"const": "WorkbenchMonitorRequest"},
+            "body": {"type": "object", "maxProperties": 0}
+          }
+        },
+        {
+          "properties": {
+            "type": {"const": "WorkbenchMonitorSnapshot"},
+            "body": {
+              "type": "object",
+              "required": ["payload", "content_hash"],
+              "additionalProperties": false,
+              "properties": {
+                "content_hash": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/hash"},
+                "payload": {
+                  "type": "object",
+                  "required": ["account_key", "kernel_boot_id", "checkpoint_event_seq", "sample_at_utc",
+                               "quote_delay_seconds", "quote_status", "symbols", "diagnostics"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "account_key": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"},
+                    "kernel_boot_id": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"},
+                    "checkpoint_event_seq": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/seq"},
+                    "sample_at_utc": {
+                      "anyOf": [{"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/utc"}, {"type": "null"}]
+                    },
+                    "quote_delay_seconds": {
+                      "type": ["string", "null"], "pattern": "^-?[0-9]+(\\.[0-9]+)?$", "maxLength": 32
+                    },
+                    "quote_status": {"enum": ["等待行情", "连接中", "正常", "延迟", "无行情", "休市", "未知"]},
+                    "symbols": {"type": "array", "maxItems": 64, "items": {"type": "object", "maxProperties": 12}},
+                    "diagnostics": {
+                      "type": ["object", "null"],
+                      "properties": {
+                        "snapshot_at_utc": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/utc"},
+                        "snapshot_monotonic_ns": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/seq"},
+                        "source_epoch": {"type": ["integer", "null"], "minimum": 1},
+                        "trading_day": {"type": ["string", "null"], "format": "date"},
+                        "ticks": {"type": "array", "maxItems": 128, "items": {"type": "object", "maxProperties": 13}},
+                        "symbols": {"type": "array", "maxItems": 64, "items": {"type": "object", "maxProperties": 4}}
+                      },
+                      "required": ["snapshot_monotonic_ns", "ticks"],
+                      "additionalProperties": false
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         {
           "properties": {
             "type": {

@@ -98,11 +98,13 @@ class TqKqPort(OnlineSimulationPort):
 
     def poll_updates(self,seconds=0.1):
         self.api.wait_update(deadline=time.time()+seconds)
+        received = datetime.now(timezone.utc), time.monotonic_ns()
         for key,item in self.api._data.get('notify',{}).items():
             if key in self._known_notifications:continue
             self._known_notifications.add(key);code=item.get('code')
             if code in {2019112910,2019112911}:self.fault=True;self._transport_up=False
             elif code==2019112902:self.fault=True;self._transport_up=True;self.source_epoch+=1
+        return received
 
     def complete(self):return self._transport_up and not self.api._account._get_trade_more_data(self.api._data)
 
@@ -116,6 +118,9 @@ class TqKqPort(OnlineSimulationPort):
 
     def fresh_manual_reduction(self,code):
         """Validate a current native quote for a frozen manual reduction limit."""
+        return self._fresh_last(code)
+
+    def _fresh_last(self,code):
         try:
             q = self.quotes[code]
             stamp = datetime.fromisoformat(q.datetime).replace(tzinfo=timezone(timedelta(hours=8)))

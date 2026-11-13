@@ -64,7 +64,7 @@ dev19在原owner/OMS链新增[原生日证明、逐周期目标/桶预占与最�
 
 | 模式/场景 | 计价与边界 |
 | --- | --- |
-| ACTIVE | BUY ask1或last，SELL bid1或last。缺价沿源回调候选回退计算，但不因此获得发送资格。 |
+| ACTIVE | BUY 用 ask1，SELL 用 bid1。普通入场缺该侧报价时用同一已核实行情的 last。候选和派发都校验时效、价格与账户事实。 |
 | PASSIVE | 方向相符且age<=90000ms时取正level。 |
 | AGGR1 | 方向相符且age<=60000ms时取对手价±1tick。 |
 | MARKET | 方向相符且age<=120000ms时BUY取涨停限价、SELL取跌停限价；源缺限价时的±10tick仅作为raw候选，完整性不足仍拒发。名称不等于市价单类型。 |

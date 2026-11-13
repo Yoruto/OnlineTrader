@@ -16,6 +16,8 @@ from PySide6.QtWidgets import QApplication
 from online_trader.desktop.app import StatusWindow
 from online_trader.desktop.reports import EquityChart, ReportsWindow
 from online_trader.errors import TraderError
+from online_trader.runtime.instance import AccountLock
+from tests.qt_lifecycle import dispose_widget
 
 
 def report():
@@ -56,7 +58,7 @@ class ReportDesktopTests(unittest.TestCase):
     def tearDown(self):
         for window in self.windows:
             if getattr(window, "_worker", None) is not None:self.wait_idle(window)
-            window.close()
+            dispose_widget(window)
         self.app.processEvents()
 
     def window(self, *, reader=None, exporter=None, pipe_name=None, account_key="DEV:report-view", path="ledger.db"):
@@ -213,6 +215,31 @@ class ReportDesktopTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIsNone(window._report)
         self.assertIn("E_FACT_BARRIER", window.status_label.text())
+
+    def test_bound_daily_report_falls_back_only_when_the_account_owner_is_absent(self):
+        class UnavailableClient:
+            def __init__(self, _pipe):pass
+            def snapshot(self):raise TraderError("E_TIMEOUT", "No IPC response")
+
+        calls = []
+        def read(path, account, **options):
+            calls.append((path, account, options))
+            return report()
+
+        window = self.window(reader=read, account_key=None, pipe_name="missing-pipe")
+        window.bind_source("selected-ledger.db", "DEV:report-view")
+        with patch("online_trader.desktop.reports.StatusClient", UnavailableClient):
+            with AccountLock("DEV:report-view"):
+                window.request_daily_export(allow_offline=True)
+                self.wait_idle(window)
+                self.assertIn("E_INSTANCE_EXISTS", window.status_label.text())
+                self.assertEqual(calls, [])
+            with patch("online_trader.desktop.reports.QInputDialog.getItem", return_value=("", False)):
+                window.request_daily_export(allow_offline=True)
+                self.wait_idle(window)
+                self.app.processEvents()
+        self.assertIn("离线账本已提交", window.status_label.text())
+        self.assertEqual(calls, [(Path("selected-ledger.db"), "DEV:report-view", {})])
 
     def test_reader_boot_mismatch_preserves_old_rows_and_marks_the_report_stale(self):
         calls = []

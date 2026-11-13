@@ -49,7 +49,7 @@ try {
             $_.ExecutablePath -eq $program -and $_.CommandLine -notmatch '\s--compare-fills(?:\s|$)'
         } | Select-Object -First 1
         if (-not $running -and -not (Test-Path -LiteralPath $stop)) {
-            try { Start-Process -FilePath $program -WorkingDirectory $root }
+            try { Start-Process -FilePath $program -WorkingDirectory $root -ArgumentList '--autostart' }
             catch { Write-Error -ErrorAction Continue $_ }
         }
         Start-Sleep -Seconds 60

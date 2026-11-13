@@ -1,4 +1,4 @@
-"""Optional DSV-style window hiding and restoration through the Windows tray."""
+"""Window hiding and restoration through the Windows tray."""
 from PySide6.QtCore import QByteArray, QObject, Qt
 from PySide6.QtGui import QColor, QIcon, QPainter
 from PySide6.QtWidgets import QCheckBox, QMenu, QStyle, QSystemTrayIcon
@@ -17,7 +17,7 @@ class WorkbenchTray(QObject):
 
     def preference_checkbox(self):
         control = QCheckBox('关闭窗口时最小化到系统托盘')
-        control.setChecked(self.settings.value('minimize_to_tray', False, bool))
+        control.setChecked(self.settings.value('minimize_to_tray', True, bool))
         control.toggled.connect(self.set_enabled)
         return control
 
@@ -43,7 +43,7 @@ class WorkbenchTray(QObject):
     def sync_icon(self):
         if self.exit_requested:
             return False
-        if (not self.settings.value('minimize_to_tray', False, bool)
+        if (not self.settings.value('minimize_to_tray', True, bool)
                 or not QSystemTrayIcon.isSystemTrayAvailable()):
             if self.icon is not None and self.icon.isVisible():
                 self.icon.hide()

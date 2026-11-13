@@ -28,6 +28,7 @@ START_ERRORS = {
     'E_CONFIG': '交易参数不完整，请到「交易参数」中核对。',
     'E_METADATA': '没有取得完整的合约资料和交易时段，请检查网络后重试。',
     'E_STARTUP_EXITED': '启动进程已退出，策略未能启动，请查看运行日志后重试。',
+    'E_RUN_OUTPUT': '运行目录已使用或无法写入，请用新的可写目录启动。',
 }
 
 
@@ -35,15 +36,17 @@ class _StartWorker(QThread):
     started_run = Signal(object)
     failed = Signal(object)
 
-    def __init__(self, store, account_id, profile, parent):
+    def __init__(self, store, account_id, profile, parent, *, timed_trigger=None, now=None):
         super().__init__(parent)
         self.store, self.account_id, self.profile = store, account_id, profile
+        self.timed_trigger, self.now = timed_trigger, now
 
     def run(self):
         try:
             from online_trader.runtime.desktop_bootstrap import build_start_request
             from online_trader.runtime.startup_environment import launch_bootstrap
-            request = build_start_request(self.store, self.account_id, self.profile, arm=True)
+            options = {} if self.timed_trigger is None else {'timed_trigger':self.timed_trigger, 'now':self.now}
+            request = build_start_request(self.store, self.account_id, self.profile, arm=True, **options)
             directory = self.store.directory / 'desktop-starts' / request['request_id']
             request_path = publish_new_bytes(canonical_bytes(request), directory / 'request.json')
             output = directory / 'run'
@@ -53,6 +56,30 @@ class _StartWorker(QThread):
             self.failed.emit({'code': getattr(error, 'code', 'E_DEPENDENCY')})
         except Exception:
             self.failed.emit({'code': 'E_STARTUP'})
+
+
+class QuoteReferenceWorker(QThread):
+    received = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, store, account_id, codes, parent, *, catalog=False):
+        super().__init__(parent)
+        self.store, self.account_id, self.codes = store, account_id, codes
+        self.catalog = catalog
+
+    def run(self):
+        from online_trader.runtime.startup_metadata import read_contract_catalog, read_startup_metadata
+        try:
+            if self.catalog:
+                result = read_contract_catalog(self.store,self.account_id)
+            else:
+                result = read_startup_metadata(self.store,self.account_id,self.codes,quote_preview=True)
+        except (TraderError, OSError, ValueError) as error:
+            if not self.isInterruptionRequested():
+                self.failed.emit(getattr(error,'code','E_STARTUP_METADATA'))
+        else:
+            if not self.isInterruptionRequested():
+                self.received.emit(result)
 
 
 class StrategyStarter(QObject):
@@ -89,13 +116,13 @@ class StrategyStarter(QObject):
             parent._enable_commands(not parent._stale and parent.view is not None and not parent.view['truncated'])
             parent.dashboard.reload_accounts()
 
-    def start(self):
+    def start(self, *, timed_trigger=None, now=None):
         try:
-            self._start_current()
+            self._start_current(timed_trigger=timed_trigger, now=now)
         except (TraderError, OSError, ValueError) as error:
             self._failed({'code': getattr(error, 'code', 'E_STARTUP')})
 
-    def _start_current(self):
+    def _start_current(self, *, timed_trigger=None, now=None):
         if self._worker is not None or self._launched:
             return
         parent = self.parent()
@@ -116,7 +143,7 @@ class StrategyStarter(QObject):
         self._process_id = None
         self._set_status('正在准备交易连接环境…')
         self._set_busy(True)
-        worker = _StartWorker(self.store, self.account_id, self.profile, self)
+        worker = _StartWorker(self.store, self.account_id, self.profile, self, timed_trigger=timed_trigger, now=now)
         self._worker = worker
         worker.started_run.connect(self._started)
         worker.failed.connect(self._failed)
@@ -174,15 +201,16 @@ class StrategyStarter(QObject):
             }.get(phase)
             if message:
                 self._set_status(message)
-        if (self.run_directory / 'result.json').is_file():
-            self._set_status('本次策略运行已结束。')
-            self._launched = False
-            self.status_timer.stop()
-            self._set_busy(False)
-            return
-        elif self._process_id is not None:
+        if self._process_id is not None:
             from online_trader.runtime.startup_environment import process_running
-            if process_running(self._process_id) is False:
+            ended = process_running(self._process_id) is False
+            if ended:
+                if (self.run_directory / 'result.json').is_file():
+                    self._set_status('本次策略运行已结束。')
+                    self._launched = False
+                    self.status_timer.stop()
+                    self._set_busy(False)
+                    return
                 self.status_timer.stop()
                 self._failed({'code': 'E_STARTUP_EXITED'})
                 return
@@ -193,7 +221,9 @@ class StrategyStarter(QObject):
                 if view['entry_authority'] == 'ARMED':
                     self._set_status('策略已启动，正在监控所选合约。')
                     self._set_busy(False)
-                    self.status_timer.stop()
+                elif view['configuration'].get('strategy_stop_requested'):
+                    self._set_status(view['configuration'].get('strategy_stop_wait') or '策略已停止开仓，正在核对退出条件。')
+                    self._set_busy(False)
                 else:
                     self._set_status('已连接模拟盘，正在核对行情、持仓及开仓条件。')
                     self._set_busy(False)

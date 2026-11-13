@@ -198,14 +198,18 @@ class SettingsDialog(QDialog):
         self.template_label.setWordWrap(True); layout.addWidget(self.template_label)
         controls = QHBoxLayout()
         self.import_button = QPushButton("导入参数预览")
+        self.import_dsv_button = QPushButton("导入原版 DSV 配置")
         self.export_button = QPushButton("导出业务参数")
         self.reset_button = QPushButton("恢复基准预览")
         self.edit_button = QPushButton("编辑全部业务参数")
         self.calculator_button = QPushButton("离线偏移计算器")
         self.close_button = QPushButton("关闭")
-        for button in (self.edit_button, self.calculator_button, self.import_button, self.export_button, self.reset_button): controls.addWidget(button)
+        for button in (self.edit_button, self.calculator_button, self.import_button,
+                       self.import_dsv_button, self.export_button, self.reset_button):
+            controls.addWidget(button)
         controls.addStretch(); controls.addWidget(self.close_button); layout.addLayout(controls)
         self.import_button.clicked.connect(self._choose_import)
+        self.import_dsv_button.clicked.connect(lambda: self._choose_import(source_kind="dsv"))
         self.export_button.clicked.connect(self._choose_export)
         self.reset_button.clicked.connect(self.reset_to_baseline)
         self.edit_button.clicked.connect(self._choose_editor)
@@ -284,11 +288,12 @@ class SettingsDialog(QDialog):
         self.error_label.setText(f"操作未完成，当前预览已保留。错误代码：{code}。{hint}")
         return False
 
-    def import_bytes(self, raw, *, source_kind="dsv"):
+    def import_bytes(self, raw, *, source_kind="preview"):
         from online_trader.configuration.dsv import DsvProfile
         try:
             if source_kind == "dsv": candidate = DsvProfile.from_dsv_json(raw)
             elif source_kind == "settings": candidate = DsvProfile.from_json(raw)
+            elif source_kind == "preview": candidate = DsvProfile.from_preview_json(raw)
             else: return self._failure("E_CONFIG_SOURCE")
         except TraderError as error: return self._failure(error.code)
         self._profile = candidate
@@ -296,7 +301,7 @@ class SettingsDialog(QDialog):
         self.notice_label.setText("参数已导入预览。差异见对应页签；运行参数与持仓计划未改变。")
         return True
 
-    def import_file(self, path, *, source_kind="dsv"):
+    def import_file(self, path, *, source_kind="preview"):
         try:
             with Path(path).open("rb") as file: raw = file.read(MAX_IMPORT_BYTES + 1)
             if len(raw) > MAX_IMPORT_BYTES: return self._failure("E_CONFIG_SIZE")
@@ -480,9 +485,11 @@ class SettingsDialog(QDialog):
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
             self.delete_template(name)
 
-    def _choose_import(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择DSV或业务参数文件", "", "JSON参数 (*.json)")
-        if path: self.import_file(path)
+    def _choose_import(self, *, source_kind="preview"):
+        title = "选择原版 DSV 配置" if source_kind == "dsv" else "选择业务参数文件"
+        path, _ = QFileDialog.getOpenFileName(self, title, "", "JSON参数 (*.json)")
+        if path:
+            self.import_file(path, source_kind=source_kind)
 
     def _choose_export(self):
         path, _ = QFileDialog.getSaveFileName(self, "导出到新的业务参数文件", "dsv-business-settings.json", "JSON参数 (*.json)")

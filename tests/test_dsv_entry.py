@@ -94,6 +94,15 @@ class DsvEntryTests(unittest.TestCase):
         self.assertIn("OPENING_WAIT", result["reasons"])
         self.assertEqual(result["candidates"], [])
 
+    def test_auction_uses_source_minute_with_switch(self):
+        fact = event(source_time_utc="2026-11-09T01:00:59.999999Z", last="1055")
+        after = event(source_time_utc="2026-11-09T01:01:00Z", last="1055")
+        strategy, state = self.setup_strategy(profile(no_open_after_open=False, participate_auction=False))
+        self.assertIn("AUCTION_DISABLED", strategy.evaluate(state, fact)["reasons"])
+        self.assertNotIn("AUCTION_DISABLED", strategy.evaluate(state, after)["reasons"])
+        strategy, state = self.setup_strategy(profile(no_open_after_open=False, participate_auction=True))
+        self.assertNotIn("AUCTION_DISABLED", strategy.evaluate(state, fact)["reasons"])
+
     def test_continuation_direction_matches_source_gap_and_equality_cases(self):
         for opening, night_last, high, low, fallback, expected in (
             ("1048", "1050", "1080", "990", None, "LONG"),
@@ -222,11 +231,21 @@ class DsvEntryTests(unittest.TestCase):
         self.assertIn("LONG:CHASE_CAP_EXCEEDED", result["reasons"])
         self.assertEqual(result["state"]["last_signal_bar"], event()["candle_id"])
 
-    def test_missing_opponent_cannot_inherit_original_helper_missing_price_exemption(self):
-        strategy, state = self.setup_strategy()
-        result = strategy.evaluate(state, event(ask1=None))
-        self.assertIn("LONG:OPPONENT_PRICE_MISSING", result["reasons"])
-        self.assertFalse(result["candidates"])
+    def test_missing_opponent_uses_last_without_waiving_chase_or_tick_validation(self):
+        for direction, price, book in (
+            ("LONG", "1055", {"ask1": None}),
+            ("SHORT", "1035", {"bid1": None, "ask1": "1036"}),
+        ):
+            with self.subTest(direction=direction):
+                strategy, state = self.setup_strategy()
+                result = strategy.evaluate(state, event(last=price, **book))
+                self.assertEqual([(row["direction"], row["limit_price"]) for row in result["candidates"]],
+                                 [(direction, price)])
+        for price, reason in (("1058", "CHASE_CAP_EXCEEDED"), ("1055.5", "QUOTE_NOT_TICK_ALIGNED")):
+            strategy, state = self.setup_strategy()
+            result = strategy.evaluate(state, event(last=price, ask1=None))
+            self.assertIn("LONG:" + reason, result["reasons"])
+            self.assertFalse(result["candidates"])
 
     def test_hysteresis_helper_uses_inclusive_reverse_boundary(self):
         self.assertEqual(hysteresis_ready("LONG", "1039", "1055", "16", False), (True, True))
@@ -235,7 +254,7 @@ class DsvEntryTests(unittest.TestCase):
         self.assertEqual(hysteresis_ready("SHORT", "1035", "1035", "16", True), (True, True))
 
     def test_first_minute_observer_uses_both_absolute_distances_and_stops_whole_day(self):
-        strategy, state = self.setup_strategy(profile(no_open_after_open=False))
+        strategy, state = self.setup_strategy(profile(no_open_after_open=False, participate_auction=True))
         result = strategy.evaluate(state, event(source_time_utc="2026-11-09T01:00:20Z", last="1010", bid1="1009", ask1="1011"))
         self.assertIn("FIRST_MINUTE_JUMP_DAY_STOP", result["reasons"])
         self.assertEqual(result["state"]["first_minute_blocks"], ["LONG", "SHORT"])
@@ -243,7 +262,7 @@ class DsvEntryTests(unittest.TestCase):
         self.assertIn("FIRST_MINUTE_JUMP_DAY_STOP", later["reasons"])
 
     def test_need_hysteresis_is_session_observer_state_and_zero_falls_back_to_stop(self):
-        settings = profile(no_open_after_open=False).to_settings();settings["symbols"][0]["stop_offset"] = 30
+        settings = profile(no_open_after_open=False, participate_auction=True).to_settings();settings["symbols"][0]["stop_offset"] = 30
         strategy, state = self.setup_strategy(DsvProfile.from_settings(settings))
         first = strategy.evaluate(state, event(source_time_utc="2026-11-09T01:00:20Z", day_high="1080", last="1026", bid1="1025", ask1="1027"))
         self.assertIn("LONG:HYSTERESIS_NOT_READY", first["reasons"])

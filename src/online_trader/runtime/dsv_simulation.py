@@ -16,6 +16,7 @@ from online_trader.kernel.scheduler import ExpiredMarketQuote,ScheduledRuntime
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.simulation import SimulationSession
 from online_trader.runtime.instance import AccountLock
+from online_trader.runtime.market_monitor import DsvMarketMonitor, append_latency
 from online_trader.scheduling.calendar import TradingCalendar
 from online_trader.scheduling.reference import measure_reference
 from online_trader.scheduling.reference import clock_observation
@@ -30,7 +31,7 @@ class NativeReferenceClock:
 class DsvSimulationSession(SimulationSession):
     def status(self,phase,**values):
         try:return super().status(phase,**values)
-        except OSError:
+        except (OSError, TraderError):
             self.kernel._comparison_fault='E_SESSION_STATUS_WRITE'
             if self.kernel._armed and not self.kernel._failed:
                 self.kernel.pause();self.kernel.wait_idle()
@@ -43,13 +44,24 @@ class DsvSimulationSession(SimulationSession):
         if profile.content_hash!=kernel.simulation.grant.value['profile_hash'] or calendar.content_hash!=kernel.simulation.grant.value['calendar_hash']:
             raise TraderError('E_ONLINE_SCOPE','Session settings and calendar differ from the original strategy scope')
         super().__init__(kernel,output,emit=emit,profile=profile)
+        kernel._dsv_run_directory = str(self.output.resolve())
         self.driver=ScheduledRuntime(kernel,calendar,profile=profile,clock=clock or NativeReferenceClock(self.port))
         self.driver.activate();kernel.wait_idle()
         self.feed=DsvFactFeed(self.port,profile,calendar);self.last_decisions={};self._primed=False
+        scoped = set(self.grant.value['contracts'])
+        monitor_settings = profile.to_record()['settings']
+        monitor_contracts = [row['code'] for row in monitor_settings['symbols'] if row['code'] in scoped]
+        self.monitor = DsvMarketMonitor(monitor_contracts, calendar, diagnostic=monitor_settings['trade']['tick_diag'])
+        kernel._dsv_market_monitor = self.monitor
+        kernel._dsv_monitor_rows = []
+        self._monitor_scope = None
+        self._monitor_seq = None
+        self._monitor_at_ns = 0
+        self._latency_at_ns = 0
+        self._latency_written_ns = 0
         self.owner.manual_native_facts=self.feed.facts
         self._last_funds_capture=0
         self._source_epoch=self.port.source_epoch
-        self._deferred_session_paths={}
         self._arm_request_revision=None
         self._calendar_anchor=utc(self.port.clock.now())
         self._day_barriers=set()
@@ -160,27 +172,18 @@ class DsvSimulationSession(SimulationSession):
         return False
 
     def request_initial_arm(self):
-        if self.kernel._staged:raise TraderError('E_NOT_READY','A restored ledger manages original exits only')
+        if any(not self.owner.archived_cycle(cycle) for cycle in self.kernel._staged.values()):
+            raise TraderError('E_NOT_READY','A restored scope manages original exits only')
         self._arm_request_revision=self.kernel._authority_revision
 
     def _market_batches(self):
-        if self.kernel._staged or not self.driver.strategy._states:
+        if not self.driver.strategy._states or any(not self.owner.archived_cycle(cycle) for cycle in self.kernel._staged.values()):
             return self.feed.batches()
         return self.feed.batches(resume_states=self.driver.strategy._states,calendar_event=self.driver._event)
 
     def prime(self,*,manage_owned=False):
         """Rebuild available history with zero signal execution and no arming."""
         self.kernel.pause();self.kernel.wait_idle()
-        self._deferred_session_paths.clear()
-        now=utc(self.port.clock.now())
-        for code in self.grant.value['contracts']:
-            at=self.driver.calendar.query(code,now)
-            upcoming=at['next_session']
-            if not at['complete'] or at['is_trading'] or upcoming is None:continue
-            day,session=upcoming['trading_day'],upcoming['session_id']
-            state=self.driver.strategy._states.get((code,day))
-            if state and state['source_epoch']<self.port.source_epoch and state['session_id']!=session:
-                self._deferred_session_paths[code]=(day,session)
         rebuilt={}
         for code,events in self._market_batches():
             if events and all(e['path_complete'] for e in events):
@@ -192,7 +195,6 @@ class DsvSimulationSession(SimulationSession):
                     and state['session_id']==first['session_id']
                     and state['last_sequence']+1==first['sequence'])
                 rebuilt[code]=self._prime_path(code,events,extend=True) if extends_checkpoint else self._prime_path(code,events)
-                self._deferred_session_paths.pop(code,None)
         # Replaying a long session can outlive the freshness budget. Catch up
         # the native path first, then register a fresh quote for execution.
         catchup_deadline=time.monotonic()+8
@@ -246,16 +248,19 @@ class DsvSimulationSession(SimulationSession):
                 and all(event['path_complete'] for event in events)):
             self._prime_path(code,events,extend=True,preserve_authority=True)
 
-    def _rebuild_deferred_paths(self,batches):
+    def _rebuild_session_paths(self,batches):
         rebuilt=set()
         for code,events in batches:
             first=events[0]
-            expected=self._deferred_session_paths.get(code)
-            if expected==(first['trading_day'],first['session_id']) and all(e['path_complete'] for e in events):
-                # Priming during a break could not prove the next session yet.
-                # Rebuild its first complete batch with the usual disarm.
+            state=self.driver.strategy._states.get((code,first['trading_day']))
+            epoch,session=first['source_epoch'],first['session_id']
+            needs_rebuild=(code,epoch,session) in self.feed.rebuild_paths
+            if state is not None and state['session_id']!=session:
+                needs_rebuild |= state['source_epoch']!=epoch or state['coverage_lost']
+            if needs_rebuild and all(e['path_complete'] for e in events):
+                # The feed proved the active session independently of the
+                # previous session's checkpoint. Replay it without signals.
                 self._prime_path(code,events)
-                del self._deferred_session_paths[code]
                 rebuilt.add(code)
         return rebuilt
 
@@ -263,10 +268,82 @@ class DsvSimulationSession(SimulationSession):
         age=(self.port.clock.now()-datetime.fromisoformat(event['source_time_utc'])).total_seconds()
         return age>self.kernel.max_quote_age_ms/1000
 
+    def _update_monitor(self):
+        from online_trader.kernel.workbench import monitor_symbols
+        now = time.monotonic_ns()
+        scope = (self.monitor.source_epoch, self.monitor.trading_day, self.monitor.latest['quote_status'] == '连接中')
+        if scope != self._monitor_scope:
+            self._monitor_at_ns = 0
+        self._monitor_scope = scope
+        if self._monitor_seq != self.kernel._durable_seq or now - self._monitor_at_ns >= 250_000_000:
+            self.kernel._dsv_monitor_rows = monitor_symbols(self.kernel, self.last_decisions)
+            self._monitor_at_ns = now
+            self._monitor_seq = self.kernel._durable_seq
+        if self.monitor.diagnostic and now - self._latency_at_ns >= 1_000_000_000:
+            diagnostic = self.monitor.diagnostics(now)
+            ticks = [tick for tick in diagnostic['ticks'] if int(tick['strategy_end_monotonic_ns']) > self._latency_written_ns]
+            append_latency(self.output/'market-latency.jsonl', diagnostic | {
+                'ticks': ticks, 'account_key': self.kernel.account_key, 'kernel_boot_id': self.kernel.boot_id,
+                **self.monitor.latest,
+            })
+            self._latency_at_ns = now
+            if ticks:
+                self._latency_written_ns = int(ticks[-1]['strategy_end_monotonic_ns'])
+
+    def _finish_strategy_stop(self):
+        k = self.kernel
+        snapshot = self.port.snapshot()
+        if self.port.fault or not snapshot['complete']:
+            reason = '等待柜台恢复同步'
+        elif snapshot['positions']:
+            reason = '账户仍有持仓，继续管理自有持仓'
+        elif any(order['status'] == 'ALIVE' or (order['quantity'] > 0 and order['status'] != 'FINISHED')
+                 for order in snapshot['orders']):
+            reason = '等待柜台活动委托结束'
+        elif (k._pending or k.recovery_required or k._has_unknown() or k.control.stop_cancel_pending()
+              or any(c['lifecycle'] != 'CLOSED' or c.get('statistics_review_required')
+                     for c in k._staged.values())):
+            reason = '等待委托、成交与账本核对'
+        else:
+            try:
+                self.owner._validate_snapshot(snapshot)
+                proof = verify_closed_snapshot(k, snapshot)
+            except TraderError:
+                reason = '等待柜台终态与逐笔成交核对'
+            else:
+                self.owner.capture('ONLINE_DSV_STOP_VERIFIED', {
+                    'grant_hash':self.grant.content_hash, 'native_snapshot_id':snapshot['snapshot_id'],
+                    'trading_day':snapshot['trading_day'], 'source_epoch':snapshot['source_epoch'],
+                    'positions':0, 'active_orders':0})
+                result = {'status':'DSV_STOPPED', 'execution_scope':'ONLINE_SIMULATION',
+                          'account_key':k.account_key, 'kernel_boot_id':k.boot_id,
+                          'checkpoint_event_seq':str(k._durable_seq), 'grant_hash':self.grant.content_hash,
+                          'native_snapshot_id':snapshot['snapshot_id'],
+                          'verification':proof | {'whole_account_flat_claimed':True}}
+                try:self.write('result.json', result)
+                except (OSError, TraderError):self._comparison_failed(TraderError('E_SESSION_STATUS_WRITE','Stop result file could not be written'))
+                k._dsv_stop_wait = None
+                self.result = result
+                self.status('DSV_STOPPED', armed=False, kernel_boot_id=k.boot_id)
+                self.stop.set()
+                return
+        k._dsv_stop_wait = reason
+        self.status('DSV_STOPPING', armed=False, reason=reason)
+
     def step(self):
         k=self.kernel
+        loop_start = time.monotonic_ns()
+        timings = {}
         try:
-            self._refresh_reference();self.port.poll_updates(.05)
+            self._refresh_reference()
+            update_start = time.monotonic_ns()
+            received = self.port.poll_updates(.05)
+            wall, sdk_return = received or (datetime.now(timezone.utc), time.monotonic_ns())
+            timings['SDK 更新'] = sdk_return - update_start
+            try:
+                self.monitor.observe(self.port, returned_ns=sdk_return, wall=wall)
+            except (TraderError, ValueError, AttributeError, TypeError):
+                self.monitor.invalidate(wall)
             if not self.port.entry_clock_ready() and k._armed:
                 k.pause();k.wait_idle()
                 self.owner.capture('ONLINE_WINDOWS_CLOCK_ALIGNMENT_LOST',{'clock':clock_observation(self.port.clock)})
@@ -275,17 +352,21 @@ class DsvSimulationSession(SimulationSession):
                 # and entry remain behind the durable reconciliation barrier.
                 self.owner.observe_native_orders();k.wait_idle()
                 self.status('DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION',armed=False)
+                if k.control.strategy_stop_requested():k._dsv_stop_wait = '等待换日核对'
                 return
             if self.port.fault and not self.port.complete():
                 self.owner.tick();k.wait_idle()
                 self.status('DSV_WAITING_GATEWAY_SYNC',armed=False)
+                if k.control.strategy_stop_requested():k._dsv_stop_wait = '等待柜台恢复同步'
                 return
             if self.port.source_epoch!=self._source_epoch:
                 self.driver._quotes.clear();self.driver._ages.clear()
                 self.prime();self._source_epoch=self.port.source_epoch
             self.owner.tick();k.wait_idle()
+            path_start = time.monotonic_ns()
             batches=self._market_batches()
-            rebuilt=self._rebuild_deferred_paths(batches)
+            rebuilt=self._rebuild_session_paths(batches)
+            timings['行情与路径'] = time.monotonic_ns() - path_start
             if self._arm_request_revision is not None:
                 if k._authority_revision!=self._arm_request_revision:
                     self._arm_request_revision=None
@@ -298,7 +379,7 @@ class DsvSimulationSession(SimulationSession):
                 if replayed:
                     events=events[-1:]
                 elif (code,events[0]['source_epoch']) in self.feed.resume_anchors and all(e['path_complete'] for e in events):
-                    self._prime_path(code,events,extend=True)
+                    self._prime_path(code,events,extend=True,preserve_authority=True)
                     continue
                 late=[]
                 for index,event in enumerate(events):
@@ -312,13 +393,18 @@ class DsvSimulationSession(SimulationSession):
                         if self._quote_expired(event):
                             late.append(event)
                             continue
+                    strategy_start = time.monotonic_ns()
                     account,instrument=self.feed.facts(event,k)
                     try:future=self.driver.on_market(event,account,instrument,_allow_entry=not replayed and index==len(events)-1)
                     except ExpiredMarketQuote:
                         late.append(event)
                         continue
                     k.wait_idle();self.last_decisions[code]=future.result();self.feed.accept(event)
-                    self._deferred_session_paths.pop(code,None)
+                    strategy_end = time.monotonic_ns()
+                    timings['策略处理'] = timings.get('策略处理', 0) + strategy_end - strategy_start
+                    if self.monitor.diagnostic:
+                        try:self.monitor.processed(event, strategy_start, strategy_end, self.port.clock)
+                        except (TraderError, ValueError, TypeError, KeyError):k._dsv_monitor_error = 'E_MARKET_DIAGNOSTIC'
                     self._comparison('market',event,account,instrument,self.last_decisions[code])
                 if late:self._extend_late_path(code,late)
             self.driver.poll();k.wait_idle();self.owner.tick();k.wait_idle()
@@ -327,21 +413,33 @@ class DsvSimulationSession(SimulationSession):
                 self._last_funds_capture=time.monotonic()
             expired=self.port.clock.now()>datetime.fromisoformat(self.grant.value['not_after_utc'])
             if expired and k._armed:k.pause();k.wait_idle()
-            if expired and all(c['lifecycle']=='CLOSED' for c in k._staged.values()):
+            if k.control.strategy_stop_requested():
+                self._finish_strategy_stop()
+            elif expired and all(c['lifecycle']=='CLOSED' for c in k._staged.values()):
                 self.result={'status':'DSV_SCOPE_FINISHED','execution_scope':'ONLINE_SIMULATION',
                     'snapshot':k.snapshot(),'money_report':k.money.report(),'grant_hash':self.grant.content_hash}
                 self.write('result.json',self.result);self.stop.set()
             elif getattr(k,'_auto_parameter_wait',False):
                 self.status('AUTO_OFFSETS_WAITING_MATCHING_DSV_PARAMETERS',armed=k._armed,
                     effective_profile_hash=self.driver.strategy.profile.content_hash)
-            else:self.status('DSV_MANAGING_OWNED' if k._staged else 'DSV_OBSERVING',armed=k._armed)
+            else:self.status('DSV_MANAGING_OWNED' if any(c['lifecycle']!='CLOSED' for c in k._staged.values())
+                             else 'DSV_OBSERVING',armed=k._armed)
         except Exception as error:
+            self.monitor.invalidate(datetime.now(timezone.utc))
+            self._monitor_at_ns = 0
             if not k._failed:
                 if getattr(error,'code',None) in {'E_DUPLICATE_CONFLICT','E_SCOPE','E_OWNERSHIP','E_FACT_BARRIER'}:
                     k._record_conflict('ONLINE_DSV_FACT_BARRIER',{'error_code':error.code,'detail':str(error)});k.wait_idle()
                 k.pause();k.wait_idle()
             self.status('DSV_BLOCKED_'+getattr(error,'code','E_GATEWAY_RUNTIME'),error_code=getattr(error,'code','E_GATEWAY_RUNTIME'))
-        finally:self._comparison('poll')
+        finally:
+            try:
+                self._update_monitor()
+            except (OSError, TraderError, ValueError, KeyError, TypeError, ArithmeticError):
+                k._dsv_monitor_error = 'E_MARKET_DIAGNOSTIC'
+                self._latency_at_ns = time.monotonic_ns()
+            self._comparison('monitor', self.monitor, loop_start, timings)
+            self._comparison('poll')
 
 
 def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=False,dsv_config=None,dsv_log_dir=None,
@@ -362,6 +460,8 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
     lease=_execution_lock if _execution_lock is not None else AccountLock(grant.account_key)
     port=None;kernel=None;session=None
     try:
+        output = Path(output).resolve()
+        _claim_run_output(output, grant)
         if automatic:
             from online_trader.runtime.auto_offsets import load_preparation,prepare_connected
             restored=load_preparation(source_grant,source_profile)
@@ -396,7 +496,7 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
                 'calculation':preparation['calculation'],'offset_changes':preparation['offset_changes'],
                 'preparation':preparation,
                 'restored_original_calculation':restored is not None,'existing_plans_changed':False})
-        restoring=bool(kernel._staged)
+        restoring=any(not kernel.simulation.archived_cycle(cycle) for cycle in kernel._staged.values())
         session=DsvSimulationSession(kernel,output,profile=profile,calendar=calendar,dsv_config=dsv_config,dsv_log_dir=dsv_log_dir)
         session.prime()
         # Restart is original exits only, regardless of a repeated --arm flag.
@@ -406,8 +506,10 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
             ControlServer(kernel,pipe).serve(session.stop,owner_tick=session.step)
         else:
             while not session.stop.is_set():session.step();time.sleep(.01)
-        return 0 if session.result and final_relogin(kernel,session,credentials) else 2
+        return 0 if session.result and (session.result['status']=='DSV_STOPPED' or final_relogin(kernel,session,credentials)) else 2
     except (KeyboardInterrupt,Exception) as error:
+        if isinstance(error, TraderError) and error.code == 'E_RUN_OUTPUT':
+            raise
         if kernel is None:
             publish_new_bytes(canonical_bytes({'status':'NOT_CONNECTED_OR_NOT_INITIALIZED','provider':grant.provider,
                 'error_code':getattr(error,'code','E_GATEWAY_RUNTIME'),'entry_authority':'DISARMED'}),Path(output)/'startup-failure.json')
@@ -426,7 +528,8 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
                 while not session.stop.is_set():
                     try:session.step();time.sleep(.01)
                     except KeyboardInterrupt:continue
-        return 0 if session is not None and session.result and final_relogin(kernel,session,credentials) else 2
+        return 0 if (session is not None and session.stop.is_set() and session.result
+                     and (session.result['status']=='DSV_STOPPED' or final_relogin(kernel,session,credentials))) else 2
     finally:
         if session is not None:session.close()
         try:
@@ -434,6 +537,23 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
         finally:
             if port is not None:port.close()
             lease.close()
+
+
+def _claim_run_output(output, grant):
+    """Claim the output once, including when different accounts start concurrently."""
+    records = ('comparison-*', 'strategy-log.jsonl', 'phase-[0-9][0-9][0-9][0-9]*.json',
+               'result.json', 'startup-failure.json', 'auto-offsets-starting.json',
+               'auto-offsets-completed.json', 'market-latency.jsonl*', 'workbench-latency-*', 'final-relogin.json',
+               'final-money-report.json')
+    try:
+        if any(next(output.glob(pattern), None) is not None for pattern in records):
+            raise TraderError('E_RUN_OUTPUT', 'Choose a new DSV output directory for each run')
+        publish_new_bytes(canonical_bytes({'account_key': grant.account_key, 'scope_hash': grant.content_hash}),
+                          output / 'dsv-run-claim.json')
+    except TraderError as error:
+        if error.code == 'E_RUN_OUTPUT':
+            raise
+        raise TraderError('E_RUN_OUTPUT', 'Cannot claim this DSV output directory. Choose a new writable path.') from error
 
 
 def verify_closed_snapshot(kernel,snapshot):
@@ -452,9 +572,14 @@ def verify_closed_snapshot(kernel,snapshot):
     codes=set(grant.value['contracts'])
     if any(p['contract_id'] in codes and (p['long'] or p['short']) for p in snapshot['positions']):
         raise TraderError('E_OWNERSHIP','Final selected contracts are not flat; external activity is not adopted')
+    trades_by_order = {}
+    for trade in snapshot['trades']:
+        trades_by_order.setdefault(trade['order_id'], []).append(trade)
     for cycle in kernel._staged.values():
         if cycle['lifecycle']!='CLOSED' or cycle['protection']['owned_qty']:
             raise TraderError('E_FACT_BARRIER','Every original owned cycle must be quantity-consistent closed')
+        if kernel.simulation.archived_cycle(cycle):
+            continue
         for order in cycle['orders']:
             if order['send_state']=='DEFINITELY_NOT_SENT' and not order['filled_qty']:continue
             item=by_id.get(kernel.port.order_id(order['child_order_id']))
@@ -468,7 +593,7 @@ def verify_closed_snapshot(kernel,snapshot):
             facts=kernel.ledger.query('SELECT trade_key,quantity,price FROM fill_facts WHERE broker_order_key=?',(order['child_order_id'],))
             expected={f['trade_key'][3:]:{'quantity':f['quantity'],'price':f['price'],
                 'source_time_ns':evidence.get(f['trade_key'],{}).get('source_time_ns')} for f in facts}
-            trades=[t for t in snapshot['trades'] if t['order_id']==item['order_id']]
+            trades=trades_by_order.get(item['order_id'], ())
             actual={t['trade_id']:{key:t[key] for key in ('quantity','price','source_time_ns')} for t in trades}
             if (expected!=actual or sum(t['quantity'] for t in trades)!=order['filled_qty']
                     or any(t['contract_id']!=item['contract_id'] or t['direction']!=direction or t['offset']!=item['offset'] for t in trades)):

@@ -9,6 +9,8 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+from tests.qt_lifecycle import dispose_widget
+
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes, content_hash
 from online_trader.contracts.validation import validate_message
@@ -19,10 +21,38 @@ from online_trader.transport.status_client import StatusClient
 from tests import test_online_dsv, test_workbench
 
 
+def comparison_fixture(run, view):
+    directory = run/'comparison-example'
+    directory.mkdir()
+    (directory/'manifest.json').write_bytes(canonical_bytes({
+        'schema_version':'DSV_COMPARISON/1', 'events_file':'events.jsonl',
+        'account_key':view['account_key'], 'kernel_boot_id':view['kernel_boot_id'],
+    }))
+    return directory
+
+
 class DsvWorkbenchParityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
+
+    def test_empty_bound_strategy_log_keeps_chinese_filter_feedback(self):
+        window = WorkbenchWindow(None)
+        window.timer.stop()
+        self.addCleanup(dispose_widget, window)
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            (run/'strategy-log.jsonl').touch()
+            view = test_workbench.view()
+            comparison_fixture(run, view)
+            view['configuration'].update(run_directory=str(run), scoped_contracts=['DCE.p2701'])
+            view['markets'] = [{'contract_id':'DCE.p2701','fresh':True,'trading_day':'2026-11-12',
+                                'entry_reasons':['GEOMETRY_BLOCK']}]
+            window.view = view
+            window.render_view()
+            window.dashboard.show_details(window.dashboard.log_tab)
+            window.dashboard.log_filter.setCurrentText('工作台')
+            self.assertIn('几何条件不满足', window.dashboard.log_text.toPlainText())
 
     def test_committed_80_percent_stop_is_separate_from_geometry_and_position(self):
         case = test_online_dsv.OnlineDsvTests()
@@ -49,7 +79,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
     def test_three_dsv_status_boxes_and_cabinet_account_display(self):
         window = WorkbenchWindow(None)
         window.timer.stop()
-        self.addCleanup(window.close)
+        self.addCleanup(dispose_widget, window)
         view = test_workbench.view()
         codes = ['DCE.p2701','DCE.l2701','SHFE.bu2701','CZCE.OI701','SHFE.ag2702']
         view['configuration']['scoped_contracts'] = codes
@@ -89,26 +119,27 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             try:
                 window.selected_account = {'account_id': 'this-account', 'account_key': 'account-test',
                                            'environment': 'ONLINE_SIM', 'masked_login': '****82'}
-                window._session_dialog = SimpleNamespace(account_id='this-account',run_directory=run,
-                                                         clear_scheduled_start=Mock())
+                window._strategy_starter = SimpleNamespace(account_id='this-account',run_directory=run,
+                                                         is_preparing=lambda: False, status_timer=Mock())
                 dashboard = window.dashboard
                 strategy = run/'strategy-log.jsonl'
                 started = '2026-11-12T05:30:00Z'
                 (run/'executor.log').write_bytes(canonical_bytes({'phase':'DSV_OBSERVING',
                                                                   'observed_at_utc':started})+b'\n')
-                comparison = run/'comparison-example'
-                comparison.mkdir()
+                view = test_workbench.view()
+                comparison = comparison_fixture(run, view)
                 (comparison/'events.jsonl').write_bytes(canonical_bytes({'kind':'DSV_LOG','data':{
                     'source_time_utc':started,'contract_id':'DCE.p2701','kind':'ENTRY_FILTER','reason':'GEOMETRY'}})+b'\n')
                 content = [('提示','棕榈油(DCE.p2701) 振幅超出上限'),('提示','棕榈油(DCE.p2701) 当日高低及触发价'),
                            ('跳过','棕榈油(DCE.p2701) 当日行情已跑过多头激活位')]
-                records = b''.join(canonical_bytes({'observed_at_utc':started,'tag':tag,'message':message})+b'\n'
-                                   for tag,message in content)
+                kinds = ['GEOMETRY_BLOCK','TRIGGER_HINT','LONG:NO_CHASE_AFTER_ACT']
+                records = b''.join(canonical_bytes({'observed_at_utc':started,'tag':tag,'message':message,
+                    'kind':kind,'trading_day':'2026-11-12','contract_id':'DCE.p2701'})+b'\n'
+                    for (tag,message),kind in zip(content,kinds))
                 strategy.write_bytes(records)
-                view = test_workbench.view()
                 view['entry_authority'] = 'ARMED'
                 view['configuration']['scoped_contracts'] = ['DCE.p2701']
-                view['markets'] = [{'contract_id':'DCE.p2701','fresh':True,'last':'8932','source_time_utc':started,
+                view['markets'] = [{'contract_id':'DCE.p2701','fresh':True,'last':'8932','source_time_utc':started,'trading_day':'2026-11-12',
                                     'entry_reasons':['GEOMETRY_BLOCK','LONG:NO_CHASE_AFTER_ACT','RECONCILIATION_REQUIRED']}]
                 window.view = view
                 window.render_view()
@@ -119,12 +150,12 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                 dashboard.show_details(dashboard.log_tab)
                 dashboard.log_filter.setCurrentText('工作台')
                 self.assertIn('本地连接诊断',dashboard.log_text.toPlainText())
-                self.assertIn('RECONCILIATION_REQUIRED',dashboard.log_text.toPlainText())
-                self.assertNotIn('GEOMETRY_BLOCK',dashboard.log_text.toPlainText())
+                self.assertIn('柜台待核对',dashboard.log_text.toPlainText())
+                self.assertNotIn('几何条件不满足',dashboard.log_text.toPlainText())
                 dashboard.log_filter.setCurrentText('DSV 对照')
                 self.assertEqual(dashboard.visible_log_lines,['[13:30:00] [DSV] DCE.p2701 · ENTRY_FILTER GEOMETRY'])
                 dashboard.log_filter.setCurrentText('执行器')
-                expected = ['[13:30:00] [执行器] DSV_OBSERVING',
+                expected = ['[13:30:00] [执行器] 策略正在监控所选合约',
                             *(f'[13:30:00] [{tag}] {message}' for tag,message in content)]
                 self.assertEqual(dashboard.visible_log_lines,expected)
                 exported = run/'export.txt'
@@ -155,11 +186,11 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                 dashboard.update_logs()
                 self.assertEqual(dashboard.visible_log_lines,[])
             finally:
-                window.close()
+                dispose_widget(window)
 
     def test_dsv_auto_log_tag_appears_in_both_open_and_close_filters(self):
         window = WorkbenchWindow(None)
-        self.addCleanup(window.close)
+        self.addCleanup(dispose_widget, window)
         window.timer.stop()
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
@@ -167,11 +198,18 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                                            'environment': 'ONLINE_SIM', 'masked_login': '****82'}
             window._session_dialog = SimpleNamespace(account_id='this-account',run_directory=run,
                                                      clear_scheduled_start=Mock())
-            comparison = run/'comparison-example'
-            comparison.mkdir()
+            window.view = test_workbench.view()
+            comparison = comparison_fixture(run, window.view)
             rows = [{'kind':'DSV_LOG','data':{'kind':kind,'operator_tag':tag,'contract_id':code,
                                             'source_time_utc':'2026-11-12T05:30:00Z'}}
-                    for kind,tag,code in [('EXIT_DECISION','auto','DCE.p2701'),('EXIT_DECISION','manual','SHFE.bu2701')]]
+                    for kind,tag,code in [('EXIT_DECISION','auto','DCE.p2701'),('EXIT_DECISION','manual','SHFE.bu2701'),
+                                          ('EXIT_DECISION','half','DCE.l2701'),('EXIT_DECISION','close_win','SHFE.ag2702')]]
+            rows.append({'kind':'DSV_LOG','data':{'kind':'EXIT_DECISION', 'contract_id':'CZCE.OI701',
+                         'source_time_utc':'2026-11-12T05:30:00Z', 'message':'[平仓] 单笔:-5'}})
+            automatic_close = '[13:30:01] [DSV] CZCE.OI701 · [自动] [平仓] 自动退出'
+            rows.append({'kind':'DSV_LOG','data':{'kind':'EXIT_DECISION', 'contract_id':'CZCE.OI701',
+                         'source_time_utc':'2026-11-12T05:30:01Z', 'message':'[自动] [平仓] 自动退出',
+                         'operator_tag':'auto'}})
             (comparison/'events.jsonl').write_bytes(b''.join(canonical_bytes(row)+b'\n' for row in rows))
             dashboard = window.dashboard
             dashboard.show_details(dashboard.log_tab)
@@ -179,11 +217,70 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             for category in ('开仓','平仓','手动'):
                 dashboard.log_event_filter.setCurrentText(category)
                 expected = 'SHFE.bu2701' if category=='手动' else 'DCE.p2701'
-                self.assertEqual(dashboard.visible_log_lines,[f'[13:30:00] [DSV] {expected} · EXIT_DECISION'])
+                expected_rows = [f'[13:30:00] [DSV] {expected} · EXIT_DECISION']
+                if category == '平仓':
+                    expected_rows.append(automatic_close)
+                self.assertEqual(dashboard.visible_log_lines, expected_rows)
+            dashboard.log_filter.setCurrentText('全部')
+            dashboard.log_event_filter.setCurrentText('平仓')
+            self.assertEqual(dashboard.visible_log_lines,
+                             ['[13:30:00] [DSV] DCE.p2701 · EXIT_DECISION', automatic_close])
+
+    def test_workbench_log_rejects_another_owner_in_the_published_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            local = QSettings(str(run/'ui.ini'), QSettings.IniFormat)
+            with patch('online_trader.desktop.workbench_layout.QSettings', return_value=local):
+                window = WorkbenchWindow(None)
+            self.addCleanup(dispose_widget, window)
+            window.timer.stop()
+            view = test_workbench.view()
+            comparison_fixture(run, view | {'kernel_boot_id':'previous-boot'})
+            record = {'observed_at_utc':'2026-11-12T05:30:00Z', 'tag':'策略', 'message':'other owner log'}
+            (run/'strategy-log.jsonl').write_bytes(canonical_bytes(record)+b'\n')
+            view['configuration']['run_directory'] = str(run)
+            window.view = view
+            dashboard = window.dashboard
+            dashboard.show_details(dashboard.log_tab)
+            dashboard.log_filter.setCurrentText('执行器')
+            self.assertEqual(dashboard.visible_log_lines, [])
+            self.assertIsNone(dashboard.latest_run())
+
+    def test_workbench_log_revalidates_owner_when_archive_changes_during_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            local = QSettings(str(run/'ui.ini'), QSettings.IniFormat)
+            with patch('online_trader.desktop.workbench_layout.QSettings', return_value=local):
+                window = WorkbenchWindow(None)
+            window.timer.stop()
+            self.addCleanup(dispose_widget, window)
+            view = test_workbench.view()
+            comparison_fixture(run, view)
+            strategy = run/'strategy-log.jsonl'
+            record = {'observed_at_utc':'2026-11-12T05:30:00Z', 'tag':'策略', 'message':'current owner log'}
+            strategy.write_bytes(canonical_bytes(record)+b'\n')
+            view['configuration']['run_directory'] = str(run)
+            window.view = view
+            dashboard = window.dashboard
+            dashboard.show_details(dashboard.log_tab)
+            dashboard.log_filter.setCurrentText('执行器')
+            self.assertIn('current owner log', dashboard.log_text.toPlainText())
+
+            log_reader = dashboard.log_tail(strategy)
+            read = log_reader.read
+            def add_foreign_archive(path):
+                (run/'comparison-other').mkdir(exist_ok=True)
+                with strategy.open('ab') as stream:
+                    stream.write(canonical_bytes(record | {'message':'foreign owner log'})+b'\n')
+                return read(path)
+            with patch.object(log_reader, 'read', side_effect=add_foreign_archive):
+                dashboard.update_logs()
+            self.assertEqual(dashboard.visible_log_lines, [])
+            self.assertIsNone(dashboard.latest_run())
 
     def test_suggested_lots_is_display_only_with_unknown_inputs(self):
         window = WorkbenchWindow(None)
-        self.addCleanup(window.close)
+        self.addCleanup(dispose_widget, window)
         window.timer.stop()
         dashboard = window.dashboard
         settings = dashboard.profile.to_record()['settings']
@@ -210,7 +307,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         self.addCleanup(case.tearDown)
         case.start()
         window = WorkbenchWindow(None)
-        self.addCleanup(window.close)
+        self.addCleanup(dispose_widget, window)
         window.timer.stop()
         window.view = workbench_view(case.kernel)
         window.render_view()
@@ -235,16 +332,18 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         self.assertEqual(view['cycles'][0]['remaining_quantity'],5)
         self.assertEqual(len(case.api.inserted),2)
         window = WorkbenchWindow(None)
-        self.addCleanup(window.close)
+        self.addCleanup(dispose_widget, window)
         window.timer.stop()
         window.view = view
         window.render_view()
-        self.assertIn('剩余目标待核对',window.dashboard.status_labels[2].text())
+        blocks = window.tables['blocks']
+        self.assertTrue(any('剩余目标待核对' in blocks.item(i,0).text() for i in range(blocks.rowCount())))
+        self.assertNotIn(case.code,window.dashboard.status_labels[2].text())
 
     def test_workbench_labels_retained_quote_stale_and_keeps_price(self):
         window = WorkbenchWindow(None)
         window.timer.stop()
-        self.addCleanup(window.close)
+        self.addCleanup(dispose_widget, window)
         view = test_workbench.view()
         view['configuration']['scoped_contracts'] = ['DCE.p2701']
         view['markets'] = [{'contract_id':'DCE.p2701','fresh':False,'last':'8932',
@@ -258,7 +357,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
     def test_manual_controls_use_selected_id_and_quick_open_opponent(self):
         window = WorkbenchWindow(None)
         window.timer.stop()
-        self.addCleanup(window.close)
+        self.addCleanup(dispose_widget, window)
         window.close_manual_cycle = Mock()
         window.cancel_manual_children = Mock()
         window.submit_manual = Mock()
@@ -310,24 +409,24 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                 self.assertEqual(dashboard.profile.content_hash,binding)
                 self.assertIn('预览',dashboard.parameter_state.text())
             finally:
-                window.close()
+                dispose_widget(window)
 
     def test_equity_date_filter_and_export_use_recorded_cabinet_values(self):
         window = WorkbenchWindow(None)
         window.timer.stop()
-        self.addCleanup(window.close)
+        self.addCleanup(dispose_widget, window)
         view = test_workbench.view()
         view['equity_history'] = [
-            {'trading_day':day,'balance':balance,'pre_balance':'1000',
+            {'trading_day':day,'balance':balance,'pre_balance':previous,
              'observed_at_utc':f'{day}T07:00:00Z'}
-            for day,balance in [('2026-11-10','1000'),('2026-11-11','1200'),('2026-11-12','1300')]
+            for day,balance,previous in [('2026-11-10','1000','950'),('2026-11-11','1200','1000'),('2026-11-12','1300','1200')]
         ]
         dashboard = window.dashboard
         dashboard.render(view)
         dashboard.equity_from.setCurrentText('2026-11-11')
         dashboard.equity_to.setCurrentText('2026-11-12')
         dashboard.equity_mode.setCurrentText('收益曲线')
-        self.assertEqual([item['balance'] for item in dashboard.equity.rows],['200','300'])
+        self.assertEqual([item['balance'] for item in dashboard.equity.rows],['250','350'])
         window.dashboard.show_details(window.dashboard.monitor_tab)
         window.show()
         self.app.processEvents()
@@ -341,7 +440,8 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             self.assertTrue(png.read_bytes().startswith(b'\x89PNG\r\n\x1a\n'))
             content = csv.read_text(encoding='utf-8-sig')
             self.assertNotIn('2026-11-10',content)
-            self.assertIn('2026-11-11,1200,200,0,0.00%',content)
+            self.assertIn('2026-11-11,1200,200,250,0.00%',content)
+            self.assertIn('2026-11-12,1300,100,350,8.33%',content)
 
     def test_native_minute_chart_drops_padding_and_replaces_ui_sampling(self):
         case = test_online_dsv.OnlineDsvTests()
@@ -361,7 +461,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         validate_message(StatusClient._message('WorkbenchSnapshot',{'payload':result,'content_hash':content_hash(result)}))
         window = WorkbenchWindow(None)
         window.timer.stop()
-        self.addCleanup(window.close)
+        self.addCleanup(dispose_widget, window)
         window.dashboard.render(result)
         window.dashboard.candle_contract.setCurrentText(case.code)
         self.assertEqual(window.dashboard.candle_source.text(),'原生 1 分钟')

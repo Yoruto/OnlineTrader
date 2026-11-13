@@ -6,6 +6,8 @@ keeps SQLite-committed but not yet owner-accepted facts outside the chosen repor
 
 from contextlib import closing
 import csv
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from hashlib import sha256
 import io
 import json
@@ -15,7 +17,7 @@ import sqlite3
 
 from online_trader.accounting.book import MoneyBook
 from online_trader.contracts.codec import canonical_bytes, strict_loads
-from online_trader.domain.values import decimal_value, identifier, sequence
+from online_trader.domain.values import decimal_text, decimal_value, identifier, sequence
 from online_trader.errors import TraderError
 from online_trader.scheduling.clock import ClockSample
 
@@ -44,7 +46,8 @@ _TABLES={
     'trades':('trade_key','fill_id','child_order_id','order_intent_id','position_cycle_id',
               'contract_id','direction','effect','quantity','price','multiplier',
               'theoretical_entry_price','trading_day','observed_at_utc','event_seq','time_basis',
-              'realized_pnl','fee','fee_quality','fee_revision','fee_evidence_id','directional_slippage_points'),
+              'realized_pnl','fee','fee_quality','fee_revision','fee_evidence_id','directional_slippage_points',
+              'close_slippage_points','real_close_points'),
     'equity':_ACCOUNT,
     'nominal':('contract_id','trading_day','daily_pnl_points','net_loss_points','stop_count',
                'profit_count','trade_count','total_volume','stop_streak','day_stopped',
@@ -207,7 +210,11 @@ def _cell(value):
     return text
 
 
-def export_daily_report(report, destination, day):
+def _daily_numbers(row, fields):
+    return [decimal_value(str(row[field])) if row.get(field) is not None else None for field in fields]
+
+
+def export_daily_report(report, destination, day, *, allow_empty=False):
     """Export the selected cabinet day from the already accepted ledger report."""
     from online_trader.accounting.book import trading_day
     from online_trader.configuration.files import publish_new_bytes
@@ -217,27 +224,71 @@ def export_daily_report(report, destination, day):
     material = _export_material(report)
     selected = {key:[row for row in material[key] if row.get('trading_day') == day]
                 for key in ('by_day','nominal','trades','equity')}
-    if not any(selected.values()):
+    if not any(selected.values()) and not allow_empty:
         raise TraderError('E_REPORT_DAY', '所选柜台交易日没有已接受的日报数据')
     account = selected['equity'][-1] if selected['equity'] else {}
     totals = selected['by_day'][0] if selected['by_day'] else {}
-    overview = [
-        ('项目','值'),('交易日',day),('账户',material['account_key']),('账本事件',material['checkpoint_event_seq']),
-        ('账户权益',account.get('balance')),('可用资金',account.get('available')),('保证金',account.get('margin')),
-        ('柜台当日盈亏',account.get('today_pnl')),('柜台手续费',account.get('commission')),
-        ('已实现毛收益',totals.get('gross_realized_pnl')),('确认费用',totals.get('confirmed_fees')),
-        ('已实现净收益',totals.get('net_realized_pnl')),
-        ('开仓手数',totals.get('entry_quantity')),('平仓手数',totals.get('exit_quantity')),
-    ]
-    symbols = [('合约','名义盈亏点数','净亏点数','止损次数','成交次数','当日已停开','停开原因')]
-    symbols.extend([row.get(field) for field in ('contract_id','daily_pnl_points','net_loss_points','stop_count',
-                   'trade_count','day_stopped','day_stopped_reason')] for row in selected['nominal'])
-    trades = [('成交身份','合约','方向','开平','手数','成交价','手续费','费用质量','成交时间')]
-    trades.extend([row.get(field) for field in ('trade_key','contract_id','direction','effect','quantity','price',
-                  'fee','fee_quality','observed_at_utc')] for row in selected['trades'])
+    overview = [('项目','值'),('交易日',day),('账户',material['account_key']),('账本事件',material['checkpoint_event_seq'])]
+    if not any(selected.values()):
+        overview.append(('数据状态','所选柜台交易日无已记录数据'))
+    overview.extend(zip(('账户权益','可用资金','保证金','柜台当日盈亏','柜台手续费'),
+                        _daily_numbers(account, ('balance','available','margin','today_pnl','commission'))))
+    overview.extend(zip(('已实现毛收益','确认费用','已实现净收益','开仓手数','平仓手数'),
+                        _daily_numbers(totals, ('gross_realized_pnl','confirmed_fees','net_realized_pnl',
+                                               'entry_quantity','exit_quantity'))))
+    symbols = [('合约','交易次数','总手数（策略请求）','止损','止盈','当日盈亏（名义点）','累计净亏（名义点）',
+                '确认手续费（元）','滑点成交笔数','累计入场滑点（点）','当日已停开','停开原因',
+                '平仓滑点（点）','真实盈亏（点）')]
+    facts = {}
+    point_fields = ('close_slippage_points','real_close_points')
+    for fill in selected['trades']:
+        amounts = facts.setdefault(fill['contract_id'], {'fees':Decimal(0),'fee_unknown':False,'slippage':[],
+                                                       'close_points':{field:[] for field in point_fields}})
+        if fill.get('fee_quality') == 'CONFIRMED' and fill.get('fee') is not None:
+            amounts['fees'] += Decimal(fill['fee'])
+        else:
+            amounts['fee_unknown'] = True
+        if fill.get('directional_slippage_points') is not None:
+            amounts['slippage'].append(Decimal(fill['directional_slippage_points']))
+        for field, value in zip(point_fields, _daily_numbers(fill, point_fields)):
+            if value is not None:
+                amounts['close_points'][field].append(value)
+    nominal = {row['contract_id']:row for row in selected['nominal']}
+    for code in sorted(nominal.keys() | facts.keys()):
+        row = nominal.get(code,{})
+        fact = facts.get(code)
+        slippage = fact['slippage'] if fact else []
+        fee = fact['fees'] if fact and not fact['fee_unknown'] else None
+        close_points = fact['close_points'] if fact else {}
+        symbols.append([code, *_daily_numbers(row, ('trade_count','total_volume','stop_count',
+                        'profit_count','daily_pnl_points','net_loss_points')), fee,
+                        Decimal(sum(value != 0 for value in slippage)) if slippage else None,
+                        sum(slippage, Decimal(0)) if slippage else None,
+                        row.get('day_stopped'),row.get('day_stopped_reason'),
+                        *(sum(close_points[field], Decimal(0)) if close_points.get(field) else None for field in point_fields)])
+    trades = [('时间（北京时间）','合约','买/卖','开/平','理论开仓点位','成交价','手数',
+               '平仓盈亏（成交金额，元）','手续费（元）','费用质量','成交身份')]
+    for fill in selected['trades']:
+        opening = fill['effect']=='OPEN'
+        side = '买' if (fill['direction']=='LONG')==opening else '卖'
+        observed = fill.get('observed_at_utc')
+        local = datetime.fromisoformat(observed).astimezone(timezone(timedelta(hours=8))) if observed else None
+        trades.append([local.isoformat() if local else None, fill['contract_id'], side,'开' if opening else '平',
+                       *_daily_numbers(fill, ('theoretical_entry_price','price','quantity','realized_pnl','fee')),
+                       fill.get('fee_quality'), fill.get('trade_key')])
+    point_history = {}
+    for row in material['nominal']:
+        if row.get('trading_day','') <= day and row.get('daily_pnl_points') is not None:
+            point_history.setdefault(row['trading_day'],{})[row['contract_id']] = row['daily_pnl_points']
+    contracts = sorted({code for values in point_history.values() for code in values})
+    history = [('交易日',*contracts,'合计（名义点）')]
+    for stamp, values in sorted(point_history.items()):
+        points = _daily_numbers(values, contracts)
+        history.append([stamp, *points, sum((value for value in points if value is not None), Decimal(0))])
     workbook = tabular_workbook([
-        ('交易日报',overview,[23,46]),('品种统计',symbols,[18,18,18,14,14,18,38]),
-        ('逐笔成交',trades,[34,18,12,12,12,16,16,18,35]),
+        ('交易日报',overview,[23,46]),('按品种',symbols,[16,12,21,8,8,22,22,18,14,19,14,38,18,18]),
+        ('交易明细',trades,[33,16,10,10,17,13,9,24,16,16,36]),
+        ('每日盈亏',history,[15,*([16]*len(contracts)),20]),
     ])
     return publish_new_bytes(workbook,destination)
 

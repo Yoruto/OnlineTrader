@@ -15,6 +15,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
 
+from tests.qt_lifecycle import dispose_widget
+
 from online_trader.contracts.codec import canonical_bytes, payload_hash
 from online_trader.contracts.validation import validate_message
 from online_trader.desktop.app import StatusWindow
@@ -215,7 +217,7 @@ class DesktopTests(unittest.TestCase):
             self.assertIn("过期", window.connection_label.text())
             self.assertIn("DEGRADED", window.kernel_label.text())
         finally:
-            window.close(); self.app.processEvents()
+            dispose_widget(window); self.app.processEvents()
         self.assertEqual(calls, ["snapshot", "snapshot"])
 
     def test_pause_displays_actual_stage_and_marks_snapshot_stale(self):
@@ -230,7 +232,7 @@ class DesktopTests(unittest.TestCase):
             self.assertTrue(window._stale)
             self.assertNotIn("已成交", window.notice_label.text())
         finally:
-            window.close(); self.app.processEvents()
+            dispose_widget(window); self.app.processEvents()
 
     def test_close_while_request_runs_only_hides_and_waits_for_local_worker(self):
         entered, release = threading.Event(), threading.Event()
@@ -252,7 +254,7 @@ class DesktopTests(unittest.TestCase):
             release.set(); self.wait_idle(window); self.app.processEvents()
             self.assertEqual(calls, ["snapshot"])
         finally:
-            release.set(); self.wait_idle(window); window.close(); self.app.processEvents()
+            release.set(); self.wait_idle(window); dispose_widget(window); self.app.processEvents()
 
 
 if __name__ == "__main__":
