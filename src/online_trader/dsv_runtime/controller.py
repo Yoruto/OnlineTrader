@@ -3,16 +3,32 @@
 from decimal import Decimal, localcontext
 import sqlite3
 from uuid import uuid4
+from typing import NamedTuple
 
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text, quantity
 from online_trader.dsv_core.price_rules import strategy_price
 from online_trader.dsv_core.transition import entry_price, price_value
-from online_trader.errors import TraderError
+from online_trader.errors import TraderError, exception_record
 from online_trader.execution.close_routes import close_routes, replay_lots
 
 
+class SendNotAttempted(NamedTuple):
+    """Adapter proof, returned only before entering the native insert call.
+
+    A generic exception (including a TraderError from inside the SDK) is not
+    this proof. Cancellation outcomes never use this send-only result.
+    """
+    effect_id: str
+    error_code: str
+    exception: dict
+
+
 def terminal(order):
+    if order['send_state'] == 'DEFINITELY_NOT_SENT':
+        proof = order.get('local_send_rejection', {})
+        return (proof.get('effect_id') == order['child_order_id'] + '-send'
+                and order.get('native_id') is None and order['filled_qty'] == 0)
     return (order['terminal_confirmed'] and order['reported_fill_qty'] == order['filled_qty']
             and order['send_state'] not in {'UNKNOWN', 'SEND_POSSIBLE'})
 
@@ -33,6 +49,8 @@ def _native_id(value):
 
 def _bind_native(order, value):
     native = _native_id(value)
+    if order['send_state'] == 'DEFINITELY_NOT_SENT':
+        raise TraderError('E_DSV_NATIVE_FACT', 'Native evidence contradicts a locally proved unsent child')
     if order['native_id'] is not None and order['native_id'] != native:
         raise TraderError('E_DSV_NATIVE_ID', 'A child cannot change its native order identity')
     order['native_id'] = native
@@ -371,7 +389,8 @@ class ExplicitOrderController:
             old = self.child_orders(state, position, 'REDUCE')
             if old and old[-1]['filled_qty'] < old[-1]['original_qty']:
                 last = old[-1]
-                if last['broker_state'] != 'CANCELLED' or position.get('exit_revision', 0) <= last.get('exit_revision', 0):
+                if (last['broker_state'] != 'CANCELLED' and last['send_state'] != 'DEFINITELY_NOT_SENT'
+                        or position.get('exit_revision', 0) <= last.get('exit_revision', 0)):
                     continue
             side = position['direction'].lower()
             fills = [fill | {'position_cycle_id': candidate['id'], 'event_seq': index}
@@ -478,8 +497,9 @@ class ExplicitOrderController:
                 allowed_retry = old['cancel_reason'] in {'REPRICE', 'TARGET_REDUCED'}
                 rolled_exit = not opening and old['native_trading_day'] != state['trading_day']
                 newer_target = not opening and position.get('exit_revision', 0) > old.get('exit_revision', 0)
-                if old['broker_state'] != 'CANCELLED' or not (
-                        allowed_retry or newer_target or rolled_exit and old['cancel_reason'] != 'USER_CANCEL'):
+                local_retry = old['send_state'] == 'DEFINITELY_NOT_SENT' and newer_target
+                if not local_retry and (old['broker_state'] != 'CANCELLED' or not (
+                        allowed_retry or newer_target or rolled_exit and old['cancel_reason'] != 'USER_CANCEL')):
                     continue
             if opening:
                 effects.append(self.new_order(state, position, market, effect, needed, desired, 'OPEN'))
@@ -513,20 +533,41 @@ class ExplicitOrderController:
         for effect in effects:
             order = state['orders'][effect['child_order_id']]
             sender = self.port.send if effect['kind'] == 'SEND' else self.port.cancel
+            details = {'id': effect['id'], 'child_order_id': effect['child_order_id'],
+                       'kind': effect['kind'], 'stage': 'PORT_CALL'}
             try:
-                sender(dict(effect))
-            except Exception:
+                outcome = sender(dict(effect))
+                if isinstance(outcome, SendNotAttempted):
+                    if (effect['kind'] != 'SEND' or outcome.effect_id != effect['id']
+                            or order['send_state'] != 'SEND_POSSIBLE' or order.get('native_id') is not None
+                            or order['filled_qty']):
+                        raise TraderError('E_DSV_DISPATCH_RESULT', 'Unsent proof does not match a new prepared send')
+                    result = 'DEFINITELY_NOT_SENT'
+                    details.update(stage='PRE_SEND_VALIDATION', error_code=outcome.error_code,
+                                   exception=outcome.exception)
+                else:
+                    result = 'CALL_RETURNED'
+            except Exception as error:
                 result = 'UNKNOWN'
-            else:
-                result = 'CALL_RETURNED'
+                details.update(error_code=getattr(error, 'code', 'E_DSV_PORT_CALL'),
+                               exception=exception_record(error))
             if effect['kind'] == 'SEND':
                 order['send_state'] = result
+                if result == 'DEFINITELY_NOT_SENT':
+                    # This is local proof, NOT a fabricated broker terminal or
+                    # a cancelled order. Do not refund the consumed strategy target.
+                    order['local_send_rejection'] = {'effect_id': effect['id'], **details}
+                    position = state['symbols'][order['contract_id']]['position']
+                    if position is not None and position['id'] == order['position_id'] and order['effect'] == 'OPEN':
+                        position.update(entry_stopped=True, preserve_open_on_stop=False)
             else:
                 order['cancel_status'] = result
+            if 'error_code' in details:
+                order['last_dispatch_error'] = dict(details)
             try:
                 with self.journal.transaction():
                     self.journal.resolve(effect, result)
-                    self.journal.event('EFFECT_RESULT', {'id': effect['id'], 'result': result})
+                    self.journal.event('EFFECT_RESULT', details | {'result': result})
                     self.journal.save(state)
             except sqlite3.Error as error:
                 raise TraderError('E_DSV_STORE', 'Dispatch outcome could not be committed; prepared effect requires reconciliation') from error

@@ -660,13 +660,24 @@ class DsvSession:
                                     'until': str(protection_now + cooldown)
                                     if self._trade['stop_cooldown_enabled'] and cooldown > 0 else None}
             if result.get('remaining') == 0:
+                reference, nominal_move = market['tick']['last'], result['move']
+                if reason == 'PROTECTED_FLOOR':
+                    # DSV _run 7733-7735 books this exit at the protection line,
+                    # not the quote that may have jumped through it. Keep source
+                    # float operation order; native fills and prices are untouched.
+                    theory = float(position['theory'])
+                    distance = float(position['profit']) * (float(self._trade['protect_keep_ratio']) or 0.5)
+                    level = theory + distance if position['direction'] == 'LONG' else theory - distance
+                    reference = decimal_text(Decimal(str(level)))
+                    nominal_move = str(level - theory if position['direction'] == 'LONG' else theory - level)
+                result.update(nominal_reference_price=reference, nominal_move=nominal_move)
                 position['rollback_exit'] = {'reason': reason,
                                              'at': market.get('wall_reads', {}).get('protection', frame['wall_time']),
-                                             'price': market['tick']['last'], 'slip': None}
+                                             'price': reference, 'slip': None}
                 if reason in {'TAKE_PROFIT', 'TRAILING_STOP', 'PROTECTED_FLOOR'}:
                     row['stop_streak'] = 0
                 loss = (Decimal(position['stop']) if reason == 'STOP_LOSS' else
-                        -Decimal(position['profit']) if reason == 'TAKE_PROFIT' else -Decimal(result['move']))
+                        -Decimal(position['profit']) if reason == 'TAKE_PROFIT' else -Decimal(nominal_move))
                 row['net_loss'] = decimal_text(Decimal(row['net_loss']) + loss)
         return [result | {'rule_ids': ['D08', 'D09', 'D10']} for result in results] or [
             {'reason': 'POSITION_OR_ENTRY_PENDING', 'rule_ids': ['D08', 'D12']}]
