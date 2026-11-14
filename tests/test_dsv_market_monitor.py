@@ -157,7 +157,7 @@ class RuntimeLogUnitTests(unittest.TestCase):
             self.assertEqual(resolve_run(None, [run]), run)
             comparison.mkdir(parents=True)
             (comparison/'manifest.json').write_bytes(canonical_bytes(manifest))
-            self.assertIsNone(resolve_run(None, [run]))
+            self.assertEqual(resolve_run(None, [run]), run)
             self.assertEqual(resolve_run(None, [], finished=('account-a','boot-a',run)), run)
             self.assertEqual(resolve_run(view, [], account_root=root), run)
             self.assertIsNone(resolve_run(view | {'kernel_boot_id':'boot-b'}, [run]))
@@ -169,6 +169,11 @@ class RuntimeLogUnitTests(unittest.TestCase):
             (run/'comparison-older').mkdir()
             self.assertIsNone(resolve_run(supplied, [run]))
             self.assertIsNone(resolve_run(None, [], finished=('account-a','boot-a',run)))
+            (run/'run-identity.json').write_bytes(canonical_bytes({
+                'schema_version':'DSV_RUN_IDENTITY/1', 'account_key':'account-a',
+                'kernel_boot_id':'boot-a', 'run_directory':str(run)}))
+            self.assertEqual(resolve_run(supplied, []), run)
+            self.assertIsNone(resolve_run(supplied | {'account_key':'account-b'}, [run]))
             self.assertEqual(executor_log_path(run), run.with_name('run.executor.log'))
             (run/'executor.log').touch()
             self.assertEqual(executor_log_path(run), run/'executor.log')

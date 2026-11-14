@@ -2,12 +2,14 @@
 from datetime import datetime,timezone
 from pathlib import Path
 import json
+from queue import Empty, SimpleQueue
+from threading import Thread
 import time
 
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import strict_loads,canonical_bytes,content_hash
 from online_trader.configuration.files import publish_new_bytes
-from online_trader.errors import TraderError
+from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.dsv_facts import DsvFactFeed,utc
 from online_trader.gateway.tqkq_dsv import TqKqDsvPort
 from online_trader.gateway.simnow import strategy_port
@@ -18,9 +20,9 @@ from online_trader.runtime.simulation import SimulationSession
 from online_trader.runtime.instance import AccountLock
 from online_trader.runtime.market_monitor import DsvMarketMonitor, append_latency
 from online_trader.scheduling.calendar import TradingCalendar
-from online_trader.scheduling.reference import measure_reference
-from online_trader.scheduling.reference import clock_observation
-from online_trader.runtime.comparison import ComparisonRecorder,verify_dsv_profile
+from online_trader.scheduling.reference import LocalWallClock, check_wall_clock
+from online_trader.runtime.comparison import ComparisonRecorder, verify_dsv_profile
+from online_trader.runtime.strategy_log import DsvEntryLog
 
 
 class NativeReferenceClock:
@@ -29,14 +31,20 @@ class NativeReferenceClock:
 
 
 class DsvSimulationSession(SimulationSession):
-    def status(self,phase,**values):
-        try:return super().status(phase,**values)
-        except (OSError, TraderError):
-            self.kernel._comparison_fault='E_SESSION_STATUS_WRITE'
-            if self.kernel._armed and not self.kernel._failed:
-                self.kernel.pause();self.kernel.wait_idle()
-            try:self.emit({'phase':phase,'error_code':'E_SESSION_STATUS_WRITE','owned_protection_continues':True})
-            except Exception:pass
+    def status(self, phase, **values):
+        diagnostic = {key: val for key, val in values.items() if key not in {'exception', 'repeat_count'}}
+        if values.get('exception'):
+            diagnostic['fingerprint'] = values['exception']['fingerprint']
+        if (phase, diagnostic) == self._status_signature:
+            return
+        self._status_signature = (phase, diagnostic)
+        self.phase = None  # The base status deduplicates by phase only.
+        try:
+            super().status(phase, **values)
+            self.kernel._dsv_diagnostics.pop('status', None)
+        except Exception:
+            self.kernel._dsv_diagnostics['status'] = 'E_SESSION_STATUS_WRITE'
+            self._status_signature = None
 
     def __init__(self,kernel,output,*,profile,calendar,clock=None,emit=None,dsv_config=None,dsv_log_dir=None):
         if not getattr(kernel.simulation,'strategy_enabled',False):
@@ -45,7 +53,18 @@ class DsvSimulationSession(SimulationSession):
             raise TraderError('E_ONLINE_SCOPE','Session settings and calendar differ from the original strategy scope')
         super().__init__(kernel,output,emit=emit,profile=profile)
         kernel._dsv_run_directory = str(self.output.resolve())
-        self.driver=ScheduledRuntime(kernel,calendar,profile=profile,clock=clock or NativeReferenceClock(self.port))
+        kernel._dsv_diagnostics = {}
+        identity = {'schema_version': 'DSV_RUN_IDENTITY/1', 'account_key': kernel.account_key,
+                    'kernel_boot_id': kernel.boot_id, 'scope_hash': self.grant.content_hash,
+                    'run_directory': kernel._dsv_run_directory}
+        try:
+            publish_new_bytes(canonical_bytes(identity), self.output / 'run-identity.json')
+        except (OSError, TraderError):
+            kernel._dsv_diagnostics['run_identity'] = 'E_RUN_IDENTITY_WRITE'
+        source_clock = self.port.clock
+        self.driver = ScheduledRuntime(kernel, calendar, profile=profile,
+                                       clock=clock or (source_clock if isinstance(source_clock, LocalWallClock)
+                                                       else NativeReferenceClock(self.port)))
         self.driver.activate();kernel.wait_idle()
         self.feed=DsvFactFeed(self.port,profile,calendar);self.last_decisions={};self._primed=False
         scoped = set(self.grant.value['contracts'])
@@ -63,6 +82,7 @@ class DsvSimulationSession(SimulationSession):
         self._last_funds_capture=0
         self._source_epoch=self.port.source_epoch
         self._arm_request_revision=None
+        self._entry_resume = None
         self._calendar_anchor=utc(self.port.clock.now())
         self._day_barriers=set()
         self._last_day_observations=None
@@ -73,31 +93,86 @@ class DsvSimulationSession(SimulationSession):
         for row in kernel.ledger.query("SELECT payload_json FROM event_journal WHERE event_type='ONLINE_DSV_DAY_CHANGE_REQUIRES_RECONCILIATION'"):
             record=strict_loads(row['payload_json']);data=record.get('data',record)
             self._day_barriers.add(data['conflict']['transition_hash'])
-        self.comparison=None;self.comparison_error=None
-        kernel._comparison_profile_source=dsv_config
-        try:self.comparison=ComparisonRecorder(kernel,output,profile,calendar,dsv_config=dsv_config,dsv_log_dir=dsv_log_dir)
-        except Exception as error:self._comparison_failed(error)
-
-    def _comparison_failed(self,error):
-        self.comparison_error=getattr(error,'code','E_COMPARISON_WRITE')
-        self.kernel._comparison_fault=self.comparison_error
-        if self.kernel._armed and not self.kernel._failed:
-            self.kernel.pause();self.kernel.wait_idle()
-        try:self.status('COMPARISON_REQUIRES_ATTENTION',error_code=self.comparison_error)
-        except Exception:pass  # A full output disk must not interrupt owned exits.
-
-    def _comparison(self,method,*args):
-        if self.comparison is None:return
-        try:getattr(self.comparison,method)(*args)
+        self._status_signature = None
+        self._runtime_error = None
+        self._ntp_results = SimpleQueue()
+        self._next_clock_check = 0
+        self._clock_worker = None
+        self.entry_log = None
+        self.comparison = None
+        self.comparison_error = None
+        try:
+            self.entry_log = DsvEntryLog(kernel, output, profile)
+        except (OSError, TraderError):
+            kernel._dsv_diagnostics['operation_log'] = 'E_OPERATION_LOG'
+        try:
+            self.comparison = ComparisonRecorder(kernel, output, profile, calendar,
+                                                 dsv_config=dsv_config, dsv_log_dir=dsv_log_dir)
         except Exception as error:
-            # Capture is auxiliary. Stop new risk but always finish this owner
-            # turn, so a disk/log problem cannot remove owned protection.
             self._comparison_failed(error)
+
+    def _comparison_failed(self, error):
+        self.comparison_error = getattr(error, 'code', 'E_COMPARISON_WRITE')
+        self.kernel._dsv_diagnostics['comparison'] = self.comparison_error
+
+    def _comparison(self, method, *args):
+        if self.comparison is None:
+            return
+        try:
+            getattr(self.comparison, method)(*args)
+        except Exception as error:
+            self._comparison_failed(error)
+        else:
+            if method == 'poll' and self.comparison_error in {
+                    None, 'E_COMPARISON_SETTINGS', 'E_COMPARISON_SETTINGS_UNAVAILABLE', 'E_COMPARISON_LOG_UNAVAILABLE'}:
+                self.comparison_error = self.comparison.profile_warning or self.comparison.log_warning
+                if self.comparison_error:
+                    self.kernel._dsv_diagnostics['comparison'] = self.comparison_error
+                else:
+                    self.kernel._dsv_diagnostics.pop('comparison', None)
+
+    def _operation_log(self, method, *args):
+        if self.entry_log is None:
+            return
+        try:
+            getattr(self.entry_log, method)(*args)
+        except Exception:
+            self.kernel._dsv_diagnostics['operation_log'] = 'E_OPERATION_LOG'
+
+    def _poll_clock_diagnostic(self):
+        if not isinstance(self.port.clock, LocalWallClock):
+            return
+        try:
+            result = self._ntp_results.get_nowait()
+        except Empty:
+            pass
+        else:
+            self.kernel._dsv_diagnostics['ntp'] = result['code']
+            self._operation_log('write', [{
+                'observed_at_utc': utc(self.port.clock.now()), 'kind': result['code'],
+                'tag': '时钟', 'message': result['message']}])
+        now = time.monotonic()
+        if now >= self._next_clock_check and (self._clock_worker is None or not self._clock_worker.is_alive()):
+            self._next_clock_check = now + 3600
+
+            def sample():
+                try:
+                    result = check_wall_clock()
+                except Exception:
+                    result = {'code': 'NTP_UNAVAILABLE', 'message': 'NTP 样本不可用，策略使用 Windows 时间。'}
+                self._ntp_results.put(result)
+
+            self._clock_worker = Thread(target=sample, name='OnlineTrader-clock-check', daemon=True)
+            try:
+                self._clock_worker.start()
+            except RuntimeError:
+                self.kernel._dsv_diagnostics['ntp'] = 'NTP_UNAVAILABLE'
 
     def close(self):
         super().close()
+        self._operation_log('poll')
         self._comparison('poll')
-        if self.comparison is not None:self.comparison.close()
+        self._comparison('close')
 
     def check_day_transition(self):
         """Persist a day-change barrier, retaining every original exit/UNKNOWN.
@@ -128,6 +203,7 @@ class DsvSimulationSession(SimulationSession):
                     'observation_hash':observation_hash,'requires_explicit_reconciliation':True})
                 self._last_day_observations=observation_hash
             self._arm_request_revision=None
+            self._entry_resume = None
         self._calendar_anchor=now
         return bool(changes)
 
@@ -141,6 +217,8 @@ class DsvSimulationSession(SimulationSession):
                 k.wait_idle();self._incomplete_day_barrier=True
             return True
         self._incomplete_day_barrier=False
+        if self._entry_resume is not None and day != self._entry_resume[1]:
+            self._entry_resume = None
         if (day==self._managed_day and self.port.source_epoch==self._source_epoch and not self.port.fault
                 and self.owner.days.ready(day)):return False
         key=(day,self.port.source_epoch)
@@ -200,6 +278,8 @@ class DsvSimulationSession(SimulationSession):
         catchup_deadline=time.monotonic()+8
         while rebuilt and time.monotonic()<catchup_deadline:
             self.port.poll_updates(.2)
+            if isinstance(self.port.clock, LocalWallClock):
+                self.port.clock.begin_turn()
             pending=dict(self.feed.batches())
             for code,event in tuple(rebuilt.items()):
                 suffix=pending.get(code,[])
@@ -260,9 +340,52 @@ class DsvSimulationSession(SimulationSession):
             if needs_rebuild and all(e['path_complete'] for e in events):
                 # The feed proved the active session independently of the
                 # previous session's checkpoint. Replay it without signals.
+                self._suspend_for_recovery()
                 self._prime_path(code,events)
                 rebuilt.add(code)
         return rebuilt
+
+    def _suspend_for_recovery(self):
+        k = self.kernel
+        if (self._entry_resume is None and k._armed and not self.grant.manual_workbench
+                and not k.recovery_required and not k._has_unknown()):
+            self._entry_resume = (k.control.entry_stop_generation, self._managed_day)
+            self._arm_request_revision = None
+            k.pause()
+            k.wait_idle()
+            self.owner.capture('ONLINE_DSV_ENTRY_RECOVERY_PENDING', {
+                'trading_day': self._managed_day, 'source_epoch': self.port.source_epoch,
+                'reason': 'WAITING_FOR_NATIVE_RECONCILIATION_AND_LIVE_QUOTE'})
+
+    def _try_resume_entries(self, event):
+        if self._entry_resume is None:
+            return
+        k = self.kernel
+        generation, original_day = self._entry_resume
+        now = self.port.clock.now()
+        if (generation != k.control.entry_stop_generation or event['trading_day'] != original_day
+                or not self.grant.in_window(now) or k.control.strategy_stop_requested()):
+            self._entry_resume = None
+            return
+        key = event['contract_id'], event['trading_day']
+        state = self.driver.strategy._states.get(key)
+        if (state is None or state['coverage_lost'] or state['session_id'] != event['session_id']
+                or state['source_epoch'] != event['source_epoch'] or state['last_sequence'] + 1 != event['sequence']
+                or not event['path_complete'] or not event['day_range_complete'] or self._quote_expired(event)
+                or not self.owner.can_resume_entries(self.port.snapshot())):
+            return
+        try:
+            self.owner.arm()
+        except TraderError as error:
+            if error.code != 'E_NOT_READY':
+                raise
+            return
+        k.wait_idle()
+        if k._armed:
+            self._entry_resume = None
+            self.owner.capture('ONLINE_DSV_ENTRIES_RESUMED', {
+                'trading_day': event['trading_day'], 'source_epoch': event['source_epoch'],
+                'quote_id': event.get('native_tick_id', event['sequence'])})
 
     def _quote_expired(self,event):
         age=(self.port.clock.now()-datetime.fromisoformat(event['source_time_utc'])).total_seconds()
@@ -332,25 +455,42 @@ class DsvSimulationSession(SimulationSession):
 
     def step(self):
         k=self.kernel
+        clock = self.port.clock
         loop_start = time.monotonic_ns()
         timings = {}
+        code, event = None, None
         try:
-            self._refresh_reference()
             update_start = time.monotonic_ns()
             received = self.port.poll_updates(.05)
+            if isinstance(clock, LocalWallClock):
+                clock.begin_turn()
             wall, sdk_return = received or (datetime.now(timezone.utc), time.monotonic_ns())
             timings['SDK 更新'] = sdk_return - update_start
             try:
                 self.monitor.observe(self.port, returned_ns=sdk_return, wall=wall)
             except (TraderError, ValueError, AttributeError, TypeError):
                 self.monitor.invalidate(wall)
-            if not self.port.entry_clock_ready() and k._armed:
-                k.pause();k.wait_idle()
-                self.owner.capture('ONLINE_WINDOWS_CLOCK_ALIGNMENT_LOST',{'clock':clock_observation(self.port.clock)})
+            if self._entry_resume and self._entry_resume[0] != k.control.entry_stop_generation:
+                self._entry_resume = None
+            if self.port.fault or self.port.source_epoch != self._source_epoch:
+                self._suspend_for_recovery()
+            self.driver.preflight()
+            if self.driver._fault:
+                self.owner.observe_native_orders()
+                k.wait_idle()
+                self._entry_resume = None
+                self._arm_request_revision = None
+                self.driver.poll()
+                k.wait_idle()
+                self.status('DSV_CLOCK_FAULT', armed=False, reasons=list(self.driver._fault))
+                return
             if self.check_day_transition():
-                # Receive proved original fills even while cross-day execution
-                # and entry remain behind the durable reconciliation barrier.
-                self.owner.observe_native_orders();k.wait_idle()
+                self.owner.observe_native_orders()
+                k.wait_idle()
+                if self._entry_resume and self.port.complete():
+                    day = self.port.snapshot()['trading_day']
+                    if day is not None and day != self._entry_resume[1]:
+                        self._entry_resume = None
                 self.status('DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION',armed=False)
                 if k.control.strategy_stop_requested():k._dsv_stop_wait = '等待换日核对'
                 return
@@ -360,8 +500,12 @@ class DsvSimulationSession(SimulationSession):
                 if k.control.strategy_stop_requested():k._dsv_stop_wait = '等待柜台恢复同步'
                 return
             if self.port.source_epoch!=self._source_epoch:
-                self.driver._quotes.clear();self.driver._ages.clear()
-                self.prime();self._source_epoch=self.port.source_epoch
+                self.owner.tick()
+                k.wait_idle()
+                self.driver._quotes.clear()
+                self.driver._ages.clear()
+                self.prime()
+                self._source_epoch = self.port.source_epoch
             self.owner.tick();k.wait_idle()
             path_start = time.monotonic_ns()
             batches=self._market_batches()
@@ -383,19 +527,19 @@ class DsvSimulationSession(SimulationSession):
                     continue
                 late=[]
                 for index,event in enumerate(events):
-                    if self._quote_expired(event):
+                    live = not replayed and index == len(events) - 1
+                    if (not live or not event['path_complete']) and self._quote_expired(event):
                         late.append(event)
                         continue
                     if late:
                         # Rebuild a proved suffix for observation only. Entry
                         # and existing exits still require fresh market facts.
                         self._extend_late_path(code,late);late=[]
-                        if self._quote_expired(event):
-                            late.append(event)
-                            continue
+                    if live:
+                        self._try_resume_entries(event)
                     strategy_start = time.monotonic_ns()
                     account,instrument=self.feed.facts(event,k)
-                    try:future=self.driver.on_market(event,account,instrument,_allow_entry=not replayed and index==len(events)-1)
+                    try:future=self.driver.on_market(event,account,instrument,_allow_entry=live)
                     except ExpiredMarketQuote:
                         late.append(event)
                         continue
@@ -405,6 +549,7 @@ class DsvSimulationSession(SimulationSession):
                     if self.monitor.diagnostic:
                         try:self.monitor.processed(event, strategy_start, strategy_end, self.port.clock)
                         except (TraderError, ValueError, TypeError, KeyError):k._dsv_monitor_error = 'E_MARKET_DIAGNOSTIC'
+                    self._operation_log('market', event, self.last_decisions[code])
                     self._comparison('market',event,account,instrument,self.last_decisions[code])
                 if late:self._extend_late_path(code,late)
             self.driver.poll();k.wait_idle();self.owner.tick();k.wait_idle()
@@ -412,34 +557,74 @@ class DsvSimulationSession(SimulationSession):
                 self.owner.capture('ONLINE_DSV_ACCOUNT_REFRESH',{'snapshot':self.port.snapshot()})
                 self._last_funds_capture=time.monotonic()
             expired=self.port.clock.now()>datetime.fromisoformat(self.grant.value['not_after_utc'])
-            if expired and k._armed:k.pause();k.wait_idle()
+            if expired:
+                self._entry_resume = None
+                if k._armed:
+                    k.pause()
+                    k.wait_idle()
             if k.control.strategy_stop_requested():
                 self._finish_strategy_stop()
             elif expired and all(c['lifecycle']=='CLOSED' for c in k._staged.values()):
                 self.result={'status':'DSV_SCOPE_FINISHED','execution_scope':'ONLINE_SIMULATION',
                     'snapshot':k.snapshot(),'money_report':k.money.report(),'grant_hash':self.grant.content_hash}
-                self.write('result.json',self.result);self.stop.set()
-            elif getattr(k,'_auto_parameter_wait',False):
-                self.status('AUTO_OFFSETS_WAITING_MATCHING_DSV_PARAMETERS',armed=k._armed,
-                    effective_profile_hash=self.driver.strategy.profile.content_hash)
+                try:
+                    self.write('result.json', self.result)
+                except (OSError, TraderError) as error:
+                    self.kernel._dsv_diagnostics['status'] = getattr(error, 'code', 'E_SESSION_STATUS_WRITE')
+                self.stop.set()
+            elif self._entry_resume is not None:
+                self.status('DSV_ENTRY_RECOVERY_PENDING', armed=False)
             else:self.status('DSV_MANAGING_OWNED' if any(c['lifecycle']!='CLOSED' for c in k._staged.values())
                              else 'DSV_OBSERVING',armed=k._armed)
         except Exception as error:
             self.monitor.invalidate(datetime.now(timezone.utc))
             self._monitor_at_ns = 0
+            self._entry_resume = None
+            self._arm_request_revision = None
+            error_code = getattr(error, 'code', 'E_GATEWAY_RUNTIME')
+            record = exception_record(error)
+            decision = self.last_decisions.get(code, {})
+            opportunity = decision.get('opportunity') or {}
+            matches = event is not None and opportunity.get('market', {}).get('sequence') == event['sequence']
+            decision_id = decision.get('decision_id') if matches else None
+            fingerprint = record['fingerprint']
+            previous = self._runtime_error
+            new = previous is None or previous['fingerprint'] != fingerprint
+            self._runtime_error = (record | {'count': 1} if new else previous | {'count': previous['count'] + 1})
+            repeat = self._runtime_error['count']
             if not k._failed:
-                if getattr(error,'code',None) in {'E_DUPLICATE_CONFLICT','E_SCOPE','E_OWNERSHIP','E_FACT_BARRIER'}:
-                    k._record_conflict('ONLINE_DSV_FACT_BARRIER',{'error_code':error.code,'detail':str(error)});k.wait_idle()
-                k.pause();k.wait_idle()
-            self.status('DSV_BLOCKED_'+getattr(error,'code','E_GATEWAY_RUNTIME'),error_code=getattr(error,'code','E_GATEWAY_RUNTIME'))
+                if new and error_code in {'E_DUPLICATE_CONFLICT', 'E_SCOPE', 'E_OWNERSHIP', 'E_FACT_BARRIER'}:
+                    k._record_conflict('ONLINE_DSV_FACT_BARRIER', {'error_code': error_code, 'exception': record})
+                    k.wait_idle()
+                if k._armed or new:
+                    k.pause()
+                    k.wait_idle()
+            if new or repeat in {10, 100, 1000} or self.phase != 'DSV_BLOCKED_' + error_code:
+                self._status_signature = None
+                self.status('DSV_BLOCKED_' + error_code, error_code=error_code, contract_id=code, decision_id=decision_id,
+                            exception={key: val for key, val in self._runtime_error.items() if key != 'count'},
+                            repeat_count=repeat)
+                self._operation_log('write', [{
+                    'observed_at_utc': utc(datetime.now(timezone.utc)), 'kind': 'DSV_RUNTIME_ERROR', 'tag': '警告',
+                    'message': f"{error_code} · {self._runtime_error['exception_id']} · 累计 {repeat} 次",
+                    'contract_id': code, 'decision_id': decision_id,
+                    'exception_id': self._runtime_error['exception_id'],
+                    'exception': {key: val for key, val in self._runtime_error.items() if key != 'count'},
+                    'repeat_count': repeat}])
         finally:
             try:
                 self._update_monitor()
             except (OSError, TraderError, ValueError, KeyError, TypeError, ArithmeticError):
                 k._dsv_monitor_error = 'E_MARKET_DIAGNOSTIC'
                 self._latency_at_ns = time.monotonic_ns()
-            self._comparison('monitor', self.monitor, loop_start, timings)
-            self._comparison('poll')
+            try:
+                self._poll_clock_diagnostic()
+                self._operation_log('monitor', self.monitor, loop_start, timings)
+                self._operation_log('poll')
+                self._comparison('poll')
+            finally:
+                if isinstance(clock, LocalWallClock):
+                    clock.end_turn()
 
 
 def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=False,dsv_config=None,dsv_log_dir=None,
@@ -449,8 +634,6 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
     if grant.manual_workbench and (arm or not pipe):
         raise TraderError('E_ONLINE_SCOPE','Manual workbench runs need a control pipe and explicit arming after attachment')
     source_grant,source_profile=grant,profile;automatic=grant.automatic_offsets;preparation=None
-    if dsv_log_dir is not None and not Path(dsv_log_dir).is_dir():
-        raise TraderError('E_COMPARISON_LOG','Explicit DSV log directory does not exist')
     # Claim the original account before even reading credentials or connecting.
     # The same lease is adopted by Kernel; a second GUI/CLI cannot briefly log
     # in and only then discover that an execution owner already exists.
@@ -466,15 +649,7 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
             from online_trader.runtime.auto_offsets import load_preparation,prepare_connected
             restored=load_preparation(source_grant,source_profile)
             if restored is not None:preparation,grant,profile=restored
-        if dsv_config is not None:
-            try:verify_dsv_profile(dsv_config,profile,source_profile=source_profile if automatic else None)
-            except TraderError:
-                if not (automatic and restored is not None and Path(grant.value['ledger_path']).exists()):raise
-                # Rebuild original exits with the original calculation. The
-                # comparison observer will retain the mismatch and block entry.
-        reference=measure_reference()
-        if not clock_observation(reference)['system_aligned']:
-            raise TraderError('E_CLOCK','Synchronize Windows with the reference clock before connecting for DSV comparison')
+        reference=LocalWallClock()
         port=strategy_port(grant).connect(credentials,grant,reference)
         port.configure_calendar(calendar)
         if automatic and preparation is None:
@@ -498,7 +673,9 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
                 'restored_original_calculation':restored is not None,'existing_plans_changed':False})
         restoring=any(not kernel.simulation.archived_cycle(cycle) for cycle in kernel._staged.values())
         session=DsvSimulationSession(kernel,output,profile=profile,calendar=calendar,dsv_config=dsv_config,dsv_log_dir=dsv_log_dir)
+        session._poll_clock_diagnostic()
         session.prime()
+        reference.end_turn()
         # Restart is original exits only, regardless of a repeated --arm flag.
         if arm and not restoring:session.request_initial_arm()
         if pipe:
@@ -512,14 +689,15 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
             raise
         if kernel is None:
             publish_new_bytes(canonical_bytes({'status':'NOT_CONNECTED_OR_NOT_INITIALIZED','provider':grant.provider,
-                'error_code':getattr(error,'code','E_GATEWAY_RUNTIME'),'entry_authority':'DISARMED'}),Path(output)/'startup-failure.json')
+                'error_code':getattr(error,'code','E_GATEWAY_RUNTIME'),'exception':exception_record(error),
+                'entry_authority':'DISARMED'}),Path(output)/'startup-failure.json')
         if kernel is not None:
             kernel.pause();kernel.wait_idle()
             if session is None or not session._primed:
                 try:
                     publish_new_bytes(canonical_bytes({'status':'CONNECTED_BUT_NOT_PRIMED','provider':grant.provider,
                         'error_code':getattr(error,'code','E_GATEWAY_RUNTIME'),'error_type':type(error).__name__,
-                        'detail':str(error) if isinstance(error,TraderError) else None,'entry_authority':'DISARMED'}),
+                        'exception':exception_record(error),'entry_authority':'DISARMED'}),
                         Path(output)/'startup-failure.json')
                 except OSError:pass
             # Closing a controller cannot terminate existing execution protection.
@@ -541,7 +719,7 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
 
 def _claim_run_output(output, grant):
     """Claim the output once, including when different accounts start concurrently."""
-    records = ('comparison-*', 'strategy-log.jsonl', 'phase-[0-9][0-9][0-9][0-9]*.json',
+    records = ('comparison-*', 'run-identity.json', 'strategy-log.jsonl', 'phase-[0-9][0-9][0-9][0-9]*.json',
                'result.json', 'startup-failure.json', 'auto-offsets-starting.json',
                'auto-offsets-completed.json', 'market-latency.jsonl*', 'workbench-latency-*', 'final-relogin.json',
                'final-money-report.json')
@@ -665,7 +843,7 @@ def prepare(scope,profile_path,calendar_path,output,*,dsv_config=None,dsv_log_di
             'scope_hash':grant.content_hash,'profile_hash':profile.content_hash,'calendar_hash':calendar.content_hash,
             'account_key':grant.account_key,'contracts':grant.value['contracts'],
             'provider':grant.provider,'dsv_settings_verified':dsv_config is not None,
-            'dsv_log_directory_attached':dsv_log_dir is not None,'maximum_windows_clock_skew_ms':1000,
+            'dsv_log_directory_attached':dsv_log_dir is not None,'clock_policy':'SYSTEM_WALL_CLOCK_NTP_DIAGNOSTIC_ONLY',
             'scope_schema':grant.value['schema_version'],'trading_days':grant.trading_days,
             'manual_workbench':grant.manual_workbench,
             'external_allocation_allowed':grant.external_allocation_allowed,

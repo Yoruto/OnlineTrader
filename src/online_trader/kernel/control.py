@@ -14,7 +14,7 @@ from online_trader.contracts.codec import canonical_bytes, content_hash, payload
 from online_trader.contracts.validation import validate_message
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import identifier
-from online_trader.errors import TraderError
+from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.ports import UnavailablePort
 
 
@@ -43,6 +43,7 @@ class ControlProtocol:
         self.native_cancel_results={}
         self._polling = False
         self.preserve_open_orders_revision = None
+        self.entry_stop_generation = 0
         self.symbol_entries={};self._symbol_staged={}
         for row in kernel.ledger.query("SELECT command_id,payload_hash,payload_json,result_json FROM operator_commands"):
             self.states[row["command_id"]] = {"body": strict_loads(row["payload_json"]), "digest": row["payload_hash"], "receipt": strict_loads(row["result_json"]), "metadata": {}}
@@ -227,6 +228,9 @@ class ControlProtocol:
             self.kernel.contexts.validate(body["context_id"],peer_id,"OPERATOR_COMMAND",operation,scope_id,
                 kernel_boot_id=self.kernel.boot_id,kernel_epoch=body["kernel_epoch"],revisions=body["expected_revisions"])
             if body["expected_revisions"] != self.kernel.revisions: raise TraderError("E_REVISION_CONFLICT", "Relevant state changed")
+            if operation in {"PAUSE_NEW_ENTRIES", "STOP_DSV_STRATEGY", "ENTER_MAINTENANCE",
+                             "FLATTEN_THEN_STOP", "BEGIN_TAKEOVER"} and scope["scope_type"] == "ACCOUNT":
+                self.entry_stop_generation += 1
             self._dispatch(binding)
             if not binding.get("bound"):
                 self._stage([], "TX_AUTH", "CONTROL_COMMAND")
@@ -446,6 +450,7 @@ class ControlProtocol:
             if changed:cycles.append(cycle)
         def send_prepared():
             results={}
+            exceptions=[]
             for cycle_id,order_id in prepared:
                 cycle=results.setdefault(cycle_id,copy.deepcopy(k._staged[cycle_id]))
                 order=next(o for o in cycle["orders"] if o["child_order_id"]==order_id)
@@ -453,8 +458,15 @@ class ControlProtocol:
                 try:
                     k.port.cancel({"child_order_id":order_id,"account_key":k.account_key})
                     order["cancel_status"]="CALL_RETURNED"
-                except Exception:order["cancel_status"]="UNKNOWN"
-            if results:self._stage(list(results.values()),"TX_CANCEL","CONTROL_CANCEL_RESULT")
+                except Exception as error:
+                    order["cancel_status"] = "UNKNOWN"
+                    exceptions.append(exception_record(error) | {'child_order_id': order_id})
+            if results:
+                def diagnostic():
+                    if exceptions:
+                        k._submit("TX_CANCEL", "CONTROL_CANCEL_ERRORS", {"exceptions": exceptions},
+                                  lambda conn, seq: None)
+                self._stage(list(results.values()), "TX_CANCEL", "CONTROL_CANCEL_RESULT", after=diagnostic)
         self._stage(cycles,"TX_CANCEL","CONTROL_CANCEL_PREPARED",after=send_prepared)
 
     def _request_reconciliation(self,binding):

@@ -1,9 +1,13 @@
 """DSV simulation owner: same ledger/OMS, separate finite capability."""
 import copy
+from datetime import datetime, timedelta, timezone
 
+from online_trader.configuration.rollover import CHINA_TIME
 from online_trader.contracts.codec import strict_loads
+from online_trader.domain.orders import OrderState
 from online_trader.errors import TraderError
 from online_trader.kernel.simulation import OnlineSimulation
+from online_trader.kernel.statistics import strategy_open_counts
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.protection.reducer import DsvSimulationPlanPermit
 
@@ -90,7 +94,7 @@ class OnlineDsvSimulation(OnlineSimulation):
     def authority_policy(self):
         return {'allowed_origins':['MANUAL' if self.grant.manual_workbench else 'STRATEGY'],'execution_scope':'ONLINE_SIMULATION','provider':self.grant.provider,
                 'grant_hash':self.grant.content_hash,'automatic_strategy':not self.grant.manual_workbench,
-                'max_order_quantity':self.grant.value['max_order_quantity'],'opening_attempts':self.grant.value['opening_attempts']}
+                'max_order_quantity':self.grant.value['max_order_quantity'], **self.grant.opening_limit}
 
     def permit(self,plan):
         grant = self.approved_grant(plan['approval_record_id'])
@@ -100,7 +104,32 @@ class OnlineDsvSimulation(OnlineSimulation):
         return DsvSimulationPlanPermit.issue(plan, grant)
 
     def consumed(self):
-        return self.opening_attempt_count()>=self.grant.value['opening_attempts']
+        if self.grant.daily_targets_per_contract is not None:
+            # The per-contract quota is checked at admission and dispatch.
+            return False
+        return self.opening_attempt_count() >= self.grant.value['opening_attempts']
+
+    def can_resume_entries(self, snapshot):
+        k = self.kernel
+        try:
+            self._validate_snapshot(snapshot)
+            if (self.grant.manual_workbench or self.port.fault or not self.days.ready(snapshot['trading_day'])
+                    or k._has_unknown() or k.recovery_required or not k.control.can_increase()
+                    or snapshot['funds'].get('available') is None):
+                return False
+            return not any(
+                OrderState.from_dict(order).potential_remaining and
+                (order['effect'] == 'OPEN' or order.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'})
+                for cycle in k._staged.values() for order in cycle['orders'])
+        except TraderError:
+            return False
+
+    def target_quota(self, contract, day, *, existing=None):
+        limit = self.grant.daily_targets_per_contract
+        if limit is None:
+            return self.opening_attempt_count() + (existing is None) <= self.grant.value['opening_attempts']
+        counts = strategy_open_counts(self.kernel._staged.values(), day, reserve=True, exclude_decision=existing)
+        return counts.get(contract, 0) < limit
 
     def opening_attempt_count(self):
         # All prepared attempts consume the finite scope, including unknown,
@@ -109,9 +138,8 @@ class OnlineDsvSimulation(OnlineSimulation):
 
     def arm(self):
         k=self.kernel;scheduler=getattr(k,'_scheduled_runtime',None)
-        self.comparison_gate()
         if not self.port.entry_clock_ready():
-            raise TraderError('E_CLOCK','Windows and the reference clock differ by more than one second')
+            raise TraderError('E_CLOCK','A valid Windows wall clock is required to enable new entries')
         if (scheduler is None or not scheduler._enabled or scheduler._fault
                 or scheduler.calendar.content_hash!=self.grant.value['calendar_hash']
                 or scheduler.strategy.epoch!=k.active_epoch or not k.control.can_increase()
@@ -123,12 +151,15 @@ class OnlineDsvSimulation(OnlineSimulation):
         if manual!=self.grant.manual_workbench or plan.get('approval_record_id') != self.grant.value['grant_id']:
             raise TraderError('E_ONLINE_SCOPE','This scope does not authorize the requested entry origin')
         self.permit(plan)
-        self.comparison_gate()
         if not self.port.entry_clock_ready():
-            raise TraderError('E_CLOCK','Synchronize Windows before opening comparable DSV/SimNow entries')
-        if (not self._configured or self.consumed() or not self.grant.in_window(self.port.clock.now())
-                or self.port.fault or not self.port.complete()):
-            raise TraderError('E_ONLINE_SCOPE','DSV window, finite attempt budget or full-sync gate blocks entry')
+            raise TraderError('E_CLOCK','A valid Windows wall clock is required for DSV/SimNow entries')
+        if not self._configured or self.port.fault or not self.port.complete():
+            raise TraderError('E_GATEWAY_SYNC', '当前柜台事实未完整同步。')
+        if not self.grant.in_window(self.port.clock.now()):
+            raise TraderError('E_ENTRY_WINDOW_EXPIRED', '当前时刻超出已确认的开仓窗口。')
+        if not self.target_quota(plan['contract_id'], plan['trading_day']):
+            code = 'DAILY_ORDER_LIMIT' if self.grant.daily_targets_per_contract is not None else 'E_ENTRY_ATTEMPT_LIMIT'
+            raise TraderError(code, '本次授权允许的开仓额度已用完。')
         runtime=getattr(self.kernel,'_dsv_runtime',None)
         if runtime is None or runtime.profile.content_hash!=self.grant.value['profile_hash']:
             raise TraderError('E_ONLINE_SCOPE','The active strategy profile differs from its original scope')
@@ -183,20 +214,6 @@ class OnlineDsvSimulation(OnlineSimulation):
         child=k.admit_entry(plan,decision,price,context_id=context_id,peer_id=peer_id,_manual=metadata)
         return plan['position_cycle_id'],child
 
-    def comparison_gate(self):
-        if getattr(self.kernel,'_comparison_fault',None):
-            raise TraderError('E_COMPARISON','Comparison capture requires repair before new entries')
-        path=getattr(self.kernel,'_comparison_profile_source',None)
-        if path is not None:
-            from online_trader.runtime.comparison import verify_dsv_profile
-            source=getattr(self.kernel,'_auto_source_profile',None);effective=self.kernel._dsv_runtime.profile
-            current=verify_dsv_profile(path,effective,source_profile=source)
-            if source is not None:
-                from online_trader.configuration.offsets import dsv_startup_profile
-                self.kernel._auto_parameter_wait=dsv_startup_profile(current).content_hash!=dsv_startup_profile(effective).content_hash
-                if self.kernel._auto_parameter_wait:
-                    raise TraderError('E_NOT_READY','DSV must use the same calculated effective parameters before comparison entries can start')
-
     def mark_fill(self,cycle,order):
         # Advanced protection is source-bound; the old one-minute manual-test
         # deadline must never be silently attached to an automatic DSV cycle.
@@ -228,20 +245,35 @@ class OnlineDsvSimulation(OnlineSimulation):
                     raise
         return native_day(calendar, code, stamp)
 
+    def _validate_native_time(self, proof):
+        scheduler = getattr(self.kernel, '_scheduled_runtime', None)
+        if scheduler is not None and scheduler._fault:
+            # Native identity and the original calendar still prove received
+            # facts when Windows wall time cannot validate the arrival time.
+            return
+        now = self.port.clock.now()
+        quote = self.port.quotes.get(proof['contract_id'])
+        try:
+            source = datetime.fromisoformat(quote.datetime)
+            if source.tzinfo is None:
+                source = source.replace(tzinfo=CHINA_TIME)
+            source_utc = source.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+            if self.port.calendar.query(proof['contract_id'], source_utc)['is_trading']:
+                now = max(now, source)
+        except (AttributeError, ValueError, TraderError):
+            pass
+        upper_ns = int((now + timedelta(seconds=1)).timestamp() * 1_000_000) * 1000
+        if int(proof['source_time_ns']) > upper_ns:
+            raise TraderError('E_FACT_BARRIER', 'Native timestamp is ahead of current time evidence')
+
     def fill_day(self,observation,fill):
         proof=self.native_day_proof(observation['child_order_id'],observation['contract_id'],fill['source_time_ns'],fill=True)
         if fill.get('native_day_evidence')!=proof or fill.get('trading_day')!=proof['trading_day']:
             raise TraderError('E_FACT_BARRIER','Native fill day is not proved by the original bound calendar')
-        # Night sessions can belong to the next civil day. Compare exact time,
-        # never the host's local date or the grant's requested day.
-        from datetime import datetime,timezone,timedelta
-        seconds,nanos=divmod(int(fill['source_time_ns']),1_000_000_000)
-        at=datetime(1970,1,1,tzinfo=timezone.utc)+timedelta(seconds=seconds,microseconds=nanos//1000)
-        if at>self.port.clock.now()+timedelta(seconds=1):
-            raise TraderError('E_FACT_BARRIER','Native fill time is ahead of the verified reference')
-        origin=observation.get('order_day_evidence')
-        if origin is None or proof['trading_day']<origin['trading_day']:
-            raise TraderError('E_FACT_BARRIER','Native fill cannot belong to a cabinet day before its original order')
+        self._validate_native_time(proof)
+        origin = observation.get('order_day_evidence')
+        if origin is None or proof['trading_day'] < origin['trading_day']:
+            raise TraderError('E_FACT_BARRIER', 'Native fill belongs to a day before its original order')
         return proof['trading_day']
 
     def validate_native_order(self,observation):
@@ -252,11 +284,7 @@ class OnlineDsvSimulation(OnlineSimulation):
         order=next(o for o in cycle['orders'] if o['child_order_id']==observation['child_order_id'])
         if proof['trading_day']!=order.get('native_trading_day',cycle['plan']['trading_day']):
             raise TraderError('E_SCOPE','Native order day differs from the committed original child')
-        from datetime import datetime,timezone,timedelta
-        seconds,nanos=divmod(int(proof['source_time_ns']),1_000_000_000)
-        at=datetime(1970,1,1,tzinfo=timezone.utc)+timedelta(seconds=seconds,microseconds=nanos//1000)
-        if at>self.port.clock.now()+timedelta(seconds=1):
-            raise TraderError('E_FACT_BARRIER','Native order time is ahead of the verified reference')
+        self._validate_native_time(proof)
 
     def prepare_order(self,cycle,order):
         exchange=cycle['plan']['contract_id'].split('.')[0]
@@ -329,6 +357,8 @@ class OnlineDsvSimulation(OnlineSimulation):
             except TraderError as error:
                 if error.code not in {'E_FACT_BARRIER','E_OWNERSHIP'}:raise
         if self.port.fault and not self.grant.multi_day:
+            self.days.ready_day = snapshot['trading_day']
+            self.days.ready_epoch = self.port.source_epoch
             # Account sync and original order reconciliation are distinct.
             # An unresolved cycle stays blocked without freezing unrelated exits.
             self.capture('ONLINE_DSV_GATEWAY_RESYNCED',{'snapshot':snapshot,'entry_authority':'DISARMED',

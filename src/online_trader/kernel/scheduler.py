@@ -71,7 +71,8 @@ class ScheduledRuntime:
         result=self.strategy.activate();self._enabled=True;self.preflight();return result
 
     def preflight(self):
-        if not self._enabled or self._busy:return
+        if not self._enabled or self._busy or self._fault:
+            return
         try:
             observed=self.guard.observe(self.clock.sample())
             if observed['valid']:self._sample=ClockSample.from_record({'now_utc':observed['now_utc'],'monotonic_ns':observed['monotonic_ns']})
@@ -82,9 +83,8 @@ class ScheduledRuntime:
             if self._fault is None:self._fault=['CLOCK_SOURCE_FAILED']
         if self._fault:
             k=self.kernel;k._armed=False;k.contexts.revoke_all()
-            if not self._fault_written:
-                k._recovery_pending.update(c['position_cycle_id'] for c in k._staged.values() if c['lifecycle']!='CLOSED')
-                k.recovery_required=bool(k._recovery_pending)
+            k._recovery_pending.update(c['position_cycle_id'] for c in k._staged.values() if c['lifecycle']!='CLOSED')
+            k.recovery_required |= bool(k._recovery_pending)
 
     def quote_age_ns(self,received):
         real=max(0,time.monotonic_ns()-int(received));anchor=self._ages.get(str(received))
@@ -138,7 +138,8 @@ class ScheduledRuntime:
         age=_ms(sample.utc-source)
         if age < -self.max_wall_drift_ms:
             raise TraderError('E_FACT_BARRIER','Quote source time is not fresh against the clock evidence')
-        if age>self.kernel.max_quote_age_ms:
+        if age > self.kernel.max_quote_age_ms and not (
+                self.strategy.online and _allow_entry and event["path_complete"]):
             raise ExpiredMarketQuote()
         contract=event['contract_id'];previous=self._quotes.get(contract)
         signature=(event['source_epoch'],event['sequence'],content_hash(event))
@@ -228,6 +229,9 @@ class ScheduledRuntime:
             'source_epoch':epoch,'sequence':seq,'elapsed_ms':quantity(elapsed),'trading_day':at['trading_day'] or cycle['plan']['trading_day'],
             'close_due':close_due,'market':market,'calendar_hash':self.calendar.content_hash,
             'observed_at_utc':sample.to_record()['now_utc']}
+        if (self.strategy.online and cycle.get('entry_origin') == 'STRATEGY'
+                and ((cycle.get('strategy_metadata') or {}).get('candidate') or {}).get('entry_kind') == 'NORMAL'):
+            result['ordinary_entry_fresh'] = not self.strategy.ordinary_quote_stale(event, now=sample.utc)
         if 'native_time_ns' in event:
             result['market_identity']={'contract_id':event['contract_id'],'native_time_ns':event['native_time_ns'],
                 'native_tick_id':event['native_tick_id'],'quote_hash':content_hash({key:event[key] for key in
@@ -242,7 +246,8 @@ class ScheduledRuntime:
     def _block(self,reason,cid=None):
         k=self.kernel;k._armed=False;k.contexts.revoke_all()
         ids=[cid] if cid else [c['position_cycle_id'] for c in k._staged.values() if c['lifecycle']!='CLOSED']
-        k._recovery_pending.update(ids);k.recovery_required=bool(k._recovery_pending)
+        k._recovery_pending.update(ids)
+        k.recovery_required |= bool(k._recovery_pending)
         k._state_revision+=1;k._authority_revision+=1;authority=k._authority()
         return k._submit('TX_RECONCILE','SCHEDULER_FACT_BARRIER',{'reasons':[reason],'cycles_affected':ids,
             'clock':None if self._sample is None else self._sample.to_record(),'authority':authority},
@@ -312,16 +317,26 @@ class ScheduledRuntime:
                                   'clock':self._sample.to_record(),'gap_ms':gap}
         k._stage_cycle(cycle,'TX_PROTECT','SCHEDULED_DATA_GAP',after=lambda:k._progress_exits(cycle['position_cycle_id']))
 
-    def reset_clock(self):
+    def reset_clock(self, *, sample=None):
         k=self.kernel;k._writable()
         if k._pending or k.recovery_required or k._has_unknown():raise TraderError('E_FACT_BARRIER','Reconcile original management facts before resetting the clock')
-        self.guard.reset(self.clock.sample());self._fault=None;self._fault_written=False
+        sample = self.clock.sample() if sample is None else sample
+        ClockSample.from_record(sample)
         self._quotes.clear();self._ages.clear();self._anchors.clear();self._driven.clear();self._gaps.clear()
         self.strategy._latest.clear()
-        k._armed=False;k.contexts.revoke_all()
-        authority=k._authority()
-        return k._submit('TX_RECONCILE','CLOCK_RESET_REQUIRES_FRESH_FACTS',{'authority':authority},
-                         lambda conn,seq:k._write_authority(conn,seq,authority))
+        k._armed = False
+        k.contexts.revoke_all()
+        k._authority_revision += 1
+        authority = k._authority()
+
+        def accepted():
+            self.guard.reset(sample)
+            self._sample = ClockSample.from_record(sample)
+            self._fault = None
+            self._fault_written = False
+
+        return k._submit('TX_RECONCILE', 'CLOCK_RESET_REQUIRES_FRESH_FACTS', {'authority': authority},
+                         lambda conn, seq: k._write_authority(conn, seq, authority), after=accepted)
 
     def status(self):
         return {'enabled':self._enabled,'clock_fault':copy.deepcopy(self._fault),'calendar_hash':self.calendar.content_hash,

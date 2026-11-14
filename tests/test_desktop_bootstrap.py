@@ -87,7 +87,9 @@ class DesktopBootstrapTests(unittest.TestCase):
         self.assertEqual(grant.value['trading_days'], ['2026-11-13'])
         self.assertFalse(grant.value['resume_entries_on_day_change'])
         self.assertEqual(grant.value['not_after_utc'], '2026-11-13T07:00:00Z')
-        self.assertEqual(grant.value['opening_attempts'], 1000)
+        self.assertEqual(grant.value['schema_version'], 'SIMNOW_DSV_DESKTOP/1')
+        self.assertEqual(grant.value['daily_targets_per_contract'], 200)
+        self.assertNotIn('opening_attempts', grant.value)
         self.assertEqual(grant.value['risk_budget'], '23400')
         white = effective.to_record()['settings']['symbols'][-1]
         self.assertEqual([white[k] for k in ('open_offset', 'stop_offset', 'profit_offset')], ['100', '15', '60'])
@@ -217,13 +219,15 @@ class DesktopBootstrapTests(unittest.TestCase):
         for name, value in (('scope', grant.value), ('profile', profile.to_record()), ('calendar', calendar.to_record())):
             path = self.root / (name + '.json'); path.write_bytes(canonical_bytes(value)); files.append(path)
         reference = self.store.credential_reference(self.row['account_id'])
-        with AccountLock('offline-wrong-account') as wrong, patch('online_trader.runtime.dsv_simulation.measure_reference') as clock:
+        with AccountLock('offline-wrong-account') as wrong, patch('online_trader.runtime.dsv_simulation.Thread') as clock:
             with self.assertRaises(TraderError):
                 run(files[0], reference, files[1], files[2], self.root / 'wrong', _execution_lock=wrong)
             clock.assert_not_called()
         lease = AccountLock(self.row['account_key'])
-        with patch('online_trader.runtime.dsv_simulation.measure_reference', side_effect=TraderError('E_CLOCK', 'Offline clock failure')):
-            self.assertEqual(run(files[0], reference, files[1], files[2], self.root / 'clock-failure', _execution_lock=lease), 2)
+        with (patch('online_trader.runtime.dsv_simulation.Thread'),
+              patch('online_trader.runtime.dsv_simulation.strategy_port') as port):
+            port.return_value.connect.side_effect = TraderError('E_GATEWAY_CONNECT', 'Offline connection failure')
+            self.assertEqual(run(files[0], reference, files[1], files[2], self.root / 'connection-failure', _execution_lock=lease), 2)
         self.assertFalse(lease.matches(self.row['account_key']))
         with AccountLock(self.row['account_key']):
             pass

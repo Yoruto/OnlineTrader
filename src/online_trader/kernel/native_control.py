@@ -1,6 +1,6 @@
 """Broker-account control using only the current owner's synchronized native facts."""
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
-from online_trader.errors import TraderError
+from online_trader.errors import TraderError, exception_record
 
 
 def _native_order_identity(order):
@@ -137,6 +137,7 @@ def _commit_native_cancel(control,binding,snapshot,orders,owned,recheck,event_ty
 
     def send():
         attempts={}
+        exceptions=[]
         epoch=snapshot['source_epoch']
         try:
             current_snapshot,current=recheck()
@@ -152,10 +153,11 @@ def _commit_native_cancel(control,binding,snapshot,orders,owned,recheck,event_ty
                 else:
                     owner.port.cancel_external(order,snapshot['trading_day'])
                     attempts[oid]='CALL_RETURNED'
-            except Exception:
+            except Exception as error:
                 attempts[oid]='UNKNOWN'
+                exceptions.append(exception_record(error) | {'native_order_id': oid})
         data={'command_id':binding['body']['command_id'],'attempts':attempts,
-              'source_epoch':epoch}
+              'source_epoch':epoch,'exceptions':exceptions}
         k._submit('TX_CANCEL','NATIVE_ACCOUNT_CANCEL_RESULTS',data,lambda conn,seq:None,
             after=lambda:control.native_cancel_results.__setitem__(data['command_id'],attempts))
 
@@ -199,6 +201,25 @@ def record_reconciliation(control,binding,run_id):
     k=control.kernel;owner=k.simulation;scope=binding['body']['scope']
     snapshot=owner.port.snapshot()
     owner._validate_snapshot(snapshot)
+    scheduler = getattr(k, '_scheduled_runtime', None)
+    clock_recovery = scope['scope_type'] == 'ACCOUNT' and scheduler is not None and scheduler._fault
+    if clock_recovery:
+        from online_trader.scheduling.clock import ClockSample
+        clock_sample = scheduler.clock.sample()
+        ClockSample.from_record(clock_sample)
+        command = k._command_binding
+        k._command_binding = None
+        try:
+            observations = owner.observe_native_orders()
+            k.wait_idle()
+            owner.recover_working(observations)
+            k.wait_idle()
+        finally:
+            k._command_binding = command
+        if k._has_unknown() or k.recovery_required or k._recovery_pending or owner.port.fault:
+            raise TraderError('E_FACT_BARRIER', '原委托及持仓仍待核对，时钟保护状态未解除。')
+        snapshot = owner.port.snapshot()
+        owner._validate_snapshot(snapshot)
     recover_flat=False
     if (getattr(owner,'strategy_enabled',False) and not owner.grant.manual_workbench
             and k.recovery_required and not k._armed and not k._staged
@@ -215,8 +236,11 @@ def record_reconciliation(control,binding,run_id):
                 ORDER BY event_seq DESC LIMIT 1""",(k.boot_id,))
             recover_flat=bool(last and last[0]['event_type']=='ONLINE_DSV_FACT_BARRIER' and
                 strict_loads(last[0]['payload_json'])['data']['conflict']['error_code']=='E_FACT_BARRIER')
-    reason=('Same-day flat facts verified; entry authority remains disabled'
-            if recover_flat else 'Four synchronized native ranges saved; existing ownership and recovery gates retained')
+    if clock_recovery:
+        reason = '已核对柜台事实，时钟恢复后等待新行情及 F5 启动。'
+    else:
+        reason = ('Same-day flat facts verified; entry authority remains disabled'
+                  if recover_flat else 'Four synchronized native ranges saved; existing ownership and recovery gates retained')
     binding.update(initial_status='SUCCEEDED',error_code='NONE',
         reason=reason,evidence_ids=[run_id])
 
@@ -231,7 +255,10 @@ def record_reconciliation(control,binding,run_id):
                  0,canonical_bytes(snapshot[part.lower()]).decode()))
 
     def accepted():
-        if recover_flat:k.recovery_required=False
+        if recover_flat:
+            k.recovery_required = False
+        if clock_recovery:
+            scheduler.reset_clock(sample=clock_sample)
 
     control._stage([], 'TX_RECONCILE',
         'CONTROL_NATIVE_FLAT_RECOVERY' if recover_flat else 'CONTROL_NATIVE_ACCOUNT_QUERY_COMPLETED',

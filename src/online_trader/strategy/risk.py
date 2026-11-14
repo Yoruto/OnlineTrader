@@ -159,13 +159,21 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
     if price <= 0:reject("PRICE_NOT_POSITIVE")
     if (margin_amount is None or margin_amount <= 0) and last <= 0:
         reject("MARGIN_REFERENCE_PRICE_NOT_POSITIVE")
-    required_values = ("equity", "available", "margin", "frozen_margin", "pending_margin", "symbol_margin")
-    if any(values[key] is None for key in required_values) or (requested_qty == 0 and values["risk_ratio"] is None):
+    fixed = requested_qty > 0
+    required_values = ("available",) if fixed else (
+        "equity", "available", "margin", "frozen_margin", "pending_margin", "symbol_margin", "risk_ratio")
+    missing = [key for key in required_values if values[key] is None]
+    if missing:
+        metrics["missing_fields"] = missing
         reject("ACCOUNT_VALUES_UNKNOWN")
-    if any(values[key] is not None and values[key] < 0 for key in ("margin", "frozen_margin", "pending_margin", "symbol_margin", "risk_ratio")):
-        reject("ACCOUNT_VALUES_INVALID")
-    if values["equity"] is not None and values["equity"] <= 0:reject("EQUITY_NOT_POSITIVE")
-    if values["available"] is not None and values["available"] < 0:reject("AVAILABLE_NOT_POSITIVE")
+    if not fixed:
+        if any(values[key] is not None and values[key] < 0
+               for key in ("margin", "frozen_margin", "pending_margin", "symbol_margin", "risk_ratio")):
+            reject("ACCOUNT_VALUES_INVALID")
+        if values["equity"] is not None and values["equity"] <= 0:
+            reject("EQUITY_NOT_POSITIVE")
+    if values["available"] is not None and values["available"] < 0:
+        reject("AVAILABLE_NOT_POSITIVE")
     if metadata["tick_size"] is None or metadata["tick_size"] <= 0 or metadata["multiplier"] is None or metadata["multiplier"] <= 0:
         reject("INSTRUMENT_VALUES_UNKNOWN")
     if metadata["lower_limit"] is None or metadata["upper_limit"] is None:
@@ -193,37 +201,38 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
 
     with localcontext() as context:
         context.prec = 80
-        equity, available = values["equity"], values["available"]
-        cap = min(Decimal(trade["max_risk_ratio"]), Decimal(trade["total_margin_cap"]), Decimal(1))
-        used = values["margin"] + values["frozen_margin"] + values["pending_margin"]
+        available = values["available"]
         per_lot = margin_amount if margin_amount is not None and margin_amount > 0 else last * metadata["multiplier"] * Decimal("0.15")
-        configured_stops = {symbol for symbol in stopped if symbol in rows}
-        participating = max(1, len(rows) - len(configured_stops))
-        symbol_ratio = cap / participating
-        symbol_budget = equity * symbol_ratio - values["symbol_margin"]
-        total_budget = equity * cap - used
-        risk_per_lot = stop * metadata["multiplier"]
-        risk_budget = equity * Decimal(trade["risk_per_trade_ratio"])
-        # DSV performs the arithmetic in binary64 before converting to whole lots.
-        # Converting the already-computed Decimal budgets would change that boundary.
-        dsv_equity, dsv_available, dsv_cap = map(float, (equity, available, cap))
         multiplier = float(metadata["multiplier"])
+        dsv_available = float(available)
         dsv_per_lot = (float(margin_amount) if margin_amount is not None and margin_amount > 0
                        else float(last) * multiplier * 0.15)
-        risk_volume = _dsv_lots(dsv_equity * float(trade["risk_per_trade_ratio"]), float(stop) * multiplier)
-        metrics.update({"effective_risk_cap": decimal_text(cap), "used_margin": decimal_text(used),
-            "margin_per_lot": decimal_text(per_lot), "margin_source": "QUOTE_MARGIN" if margin_amount is not None and margin_amount > 0 else "PRICE_MULTIPLIER_15_PERCENT",
-            "participating_configured_symbols": participating, "symbol_margin_budget": decimal_text(symbol_budget),
-            "account_margin_budget": decimal_text(total_budget), "risk_per_lot": decimal_text(risk_per_lot),
-            "single_trade_risk_budget": decimal_text(risk_budget), "risk_based_quantity": risk_volume,
-            "min_one_lot_used": False})
-        if requested_qty > 0:
-            # DSV's fixed branch intentionally precedes the automatic risk gates.
+        metrics.update({
+            "margin_per_lot": decimal_text(per_lot),
+            "margin_source": "QUOTE_MARGIN" if margin_amount is not None and margin_amount > 0 else "PRICE_MULTIPLIER_15_PERCENT",
+            "min_one_lot_used": False,
+        })
+        if fixed:
             quantity = min(requested_qty, trade["max_volume"], _floor(available / per_lot),
                            _dsv_lots(dsv_available, dsv_per_lot))
             metrics["sizing_branch"] = "FIXED"
         else:
-            metrics["sizing_branch"] = "AUTO"
+            equity = values["equity"]
+            cap = min(Decimal(trade["max_risk_ratio"]), Decimal(trade["total_margin_cap"]), Decimal(1))
+            used = values["margin"] + values["frozen_margin"] + values["pending_margin"]
+            configured_stops = {symbol for symbol in stopped if symbol in rows}
+            participating = max(1, len(rows) - len(configured_stops))
+            symbol_budget = equity * (cap / participating) - values["symbol_margin"]
+            total_budget = equity * cap - used
+            risk_per_lot = stop * metadata["multiplier"]
+            risk_budget = equity * Decimal(trade["risk_per_trade_ratio"])
+            dsv_equity, dsv_cap = float(equity), float(cap)
+            risk_volume = _dsv_lots(dsv_equity * float(trade["risk_per_trade_ratio"]), float(stop) * multiplier)
+            metrics.update({"sizing_branch": "AUTO", "effective_risk_cap": decimal_text(cap),
+                "used_margin": decimal_text(used), "participating_configured_symbols": participating,
+                "symbol_margin_budget": decimal_text(symbol_budget), "account_margin_budget": decimal_text(total_budget),
+                "risk_per_lot": decimal_text(risk_per_lot), "single_trade_risk_budget": decimal_text(risk_budget),
+                "risk_based_quantity": risk_volume})
             if values["risk_ratio"] >= cap:
                 reject("EFFECTIVE_RISK_CAP")
                 quantity = 0

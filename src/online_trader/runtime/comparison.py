@@ -14,14 +14,14 @@ import time
 import uuid
 
 from online_trader.configuration.dsv import DsvProfile
+from online_trader.configuration.instrument_rules import EXCHANGE_LABELS
 from online_trader.configuration.offsets import dsv_startup_profile
 from online_trader.configuration.files import publish_new_bytes
 from online_trader.contracts.codec import canonical_bytes,content_hash,strict_loads
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
-from online_trader.runtime.strategy_log import COMMITTED_EVENT_TYPES, DsvEntryLog
-from online_trader.scheduling.reference import clock_observation
+from online_trader.scheduling.reference import LocalWallClock, clock_observation
 
 
 def read_dsv_profile(path):
@@ -41,7 +41,7 @@ def verify_dsv_profile(path,profile,*,source_profile=None):
     return current
 
 
-_CODE=re.compile(r'\(((?:DCE|SHFE|INE|CZCE)\.[A-Za-z]+[0-9]+)\)')
+_CODE = re.compile(r'\(([A-Za-z]+)\.([A-Za-z]+[0-9]+)\)')
 _TIME=re.compile(r'^((?:\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]\s*)+)')
 _START_HEADER=re.compile(r'^启动时间[:：]\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})\s*$')
 _NUMBER=r'([0-9]+(?:\.[0-9]+)?)'
@@ -68,12 +68,16 @@ def dsv_log_category(message):
 def parse_dsv_line(line,civil_date,*,directions=None):
     """Only documented business text; retain both cached and inner timestamps."""
     clocks=_TIME.match(line);contract=_CODE.search(line)
-    if not clocks or not contract:return None
+    if not clocks or not contract or contract[1].upper() not in EXCHANGE_LABELS:
+        return None
     stamps=re.findall(r'\[([0-9:]+)\]',clocks[0])
     try:
         at=datetime.fromisoformat(civil_date+'T'+stamps[-1]+'+08:00')
     except ValueError:raise TraderError('E_COMPARISON_LOG','Invalid DSV civil log timestamp') from None
-    code=contract[1];directions={} if directions is None else directions
+    exchange = contract[1].upper()
+    symbol = contract[2].upper() if exchange in {'CFFEX', 'CZCE'} else contract[2].lower()
+    code = f'{exchange}.{symbol}'
+    directions = {} if directions is None else directions
     message = line[clocks.end():].strip()
     category = dsv_log_category(message)
     row={'side':'DSV_KQ','contract_id':code,'source_time_utc':at.astimezone(timezone.utc).isoformat().replace('+00:00','Z'),
@@ -118,6 +122,7 @@ def parse_dsv_line(line,civil_date,*,directions=None):
 class DsvLogTail:
     def __init__(self,directory):
         self.directory=Path(directory);self.offsets={};self.directions={};self.identities={};self.dates={}
+        self.parse_counts = {}
 
     def poll(self):
         rows=[]
@@ -169,6 +174,14 @@ class DsvLogTail:
                                           'civil_date_source':source,
                                           'midnight_rollovers_inferred':context['rollovers'],'timestamp_ambiguous':regression,
                                           'cabinet_day_inferred_from_filename':False})
+                    elif (contract := _CODE.search(line)) is not None:
+                        reason = ('DSV_EXCHANGE_UNKNOWN' if contract[1].upper() not in EXCHANGE_LABELS
+                                  else 'DSV_CONTRACT_LINE_UNPARSED')
+                        self.parse_counts[reason] = self.parse_counts.get(reason, 0) + 1
+                        rows.append({'kind': 'DSV_LOG_UNPARSED', 'reason': reason, 'file': path.name,
+                                     'byte_offset': str(offset), 'line': line.rstrip('\r\n'),
+                                     'line_sha256': hashlib.sha256(raw).hexdigest(),
+                                     'reason_count': self.parse_counts[reason]})
                 self.offsets[path.name]=stream.tell()
         return rows
 
@@ -178,10 +191,11 @@ class ComparisonRecorder:
         self.kernel=kernel;self.profile=profile;self.calendar=calendar
         self.source_profile=getattr(kernel,'_auto_source_profile',None)
         self._last_dsv_profile_hash=None
+        self.profile_warning = None
+        self.log_warning = None
         self.dsv_config=None if dsv_config is None else Path(dsv_config)
         self.tail=None if dsv_log_dir is None else DsvLogTail(dsv_log_dir)
         self.last_seq=0;self.last_clock=0;self.last_profile_check=0
-        self.last_slow_loop_ns = None
         self.directory=Path(output)/('comparison-'+uuid.uuid4().hex[:12]);self.directory.mkdir(parents=True)
         self.path=self.directory/'events.jsonl';self.stream=self.path.open('xb');self.closed=False
         self.manifest={'schema_version':'DSV_COMPARISON/1','run_id':self.directory.name,
@@ -200,7 +214,6 @@ class ComparisonRecorder:
                 effective_profile_hash=profile.content_hash,automatic_offsets=True,
                 dsv_effective_parameters_verified=False)
         try:
-            self.entry_log = DsvEntryLog(kernel, output, profile)
             self.write('RUN_START',self.manifest|{'profile':profile.to_record(),'calendar':calendar.to_record()})
             publish_new_bytes(canonical_bytes(self.manifest),self.directory/'manifest.json')
             if self.source_profile is not None:
@@ -223,37 +236,6 @@ class ComparisonRecorder:
         self.write('PRODUCT_MARKET_DECISION',{'event':event,'account':account,'instrument':instrument,
             'decision':decision,'durable_seq':str(self.kernel._durable_seq),
             'source_epoch':self.kernel.port.source_epoch,'profile_hash':self.profile.content_hash})
-        self.entry_log.market(event, decision)
-
-    def monitor(self, monitor, loop_start, timings):
-        now_ns = time.monotonic_ns()
-        summary = monitor.summary(now_ns)
-        now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-        rows = []
-        if monitor.recoveries:
-            threshold = Decimal(self.entry_log.trade.get('resume_gap_seconds', '60'))
-            cycles = self.kernel._committed.values()
-            for code, gap in monitor.recoveries.items():
-                if Decimal(str(gap)) <= threshold:
-                    continue
-                position = self.kernel.port.position(code)
-                owned = [cycle for cycle in cycles if cycle['plan']['contract_id'] == code and cycle['lifecycle']!='CLOSED']
-                if not (position['long'] or position['short'] or any(
-                        OrderState.from_dict(order).potential_remaining for cycle in owned for order in cycle['orders'])):
-                    continue
-                rows.append({'observed_at_utc':now, 'kind':'QUOTE_RESUMED', 'tag':'恢复', 'contract_id':code,
-                    'trading_day':monitor.trading_day,
-                    'message':f'{code} 行情断档 {gap:.0f} 秒后恢复：对账结果 账户多{position["long"]}/空{position["short"]}'})
-        if summary:
-            rows.append({'observed_at_utc': now, 'kind': 'TICK_DIAGNOSTIC', 'tag': '行情诊断',
-                         'message': '60 秒行情更新 · ' + summary})
-        if now_ns - loop_start > 2_000_000_000 and (
-                self.last_slow_loop_ns is None or now_ns - self.last_slow_loop_ns >= 60_000_000_000):
-            self.last_slow_loop_ns = now_ns
-            detail = '，'.join(f'{name} {span/1e9:.3f} 秒' for name, span in timings.items())
-            rows.append({'observed_at_utc': now, 'kind': 'SLOW_DSV_LOOP', 'tag': '慢',
-                         'message': f'本轮耗时 {(now_ns-loop_start)/1e9:.1f} 秒' + (f'（{detail}）' if detail else '')})
-        self.entry_log.write(rows)
 
     def poll(self):
         k=self.kernel
@@ -263,21 +245,30 @@ class ComparisonRecorder:
             self.write('PRODUCT_COMMITTED_EVENT',{'event_seq':str(row['event_seq']),'event_type':row['event_type'],
                 'kernel_boot_id':row['kernel_boot_id'],'payload':payload})
             self.last_seq = row['event_seq']
-            if row['kernel_boot_id'] == k.boot_id and row['event_type'] in COMMITTED_EVENT_TYPES:
-                self.entry_log.committed(row['event_type'], row['event_seq'], row['observed_at_utc'], payload['data'])
         now=time.monotonic()
-        if now-self.last_clock>=1:
+        if now-self.last_clock>=1 and not isinstance(k.port.clock, LocalWallClock):
             self.write('CLOCK',clock_observation(k.port.clock)|{'source_epoch':k.port.source_epoch,
-                'entry_clock_gate_enforced':k.port.broker_connected});self.last_clock=now
+                'entry_clock_gate_enforced':False});self.last_clock=now
         if self.tail is not None:
-            for item in self.tail.poll():
+            try:
+                items = self.tail.poll() if self.tail.directory.is_dir() else None
+            except (OSError, TraderError):
+                items = None
+            self.log_warning = None if items is not None else 'E_COMPARISON_LOG_UNAVAILABLE'
+            for item in items or ():
                 if item.get('source_time_utc'):
                     at=self.calendar.query(item['contract_id'],item['source_time_utc'])
                     item['trading_day']=at.get('trading_day') if at['complete'] and at['is_trading'] else None
                 self.write('DSV_LOG',item)
         if self.dsv_config is not None and now-self.last_profile_check>=5:
             self.last_profile_check=now
-            current=verify_dsv_profile(self.dsv_config,self.profile,source_profile=self.source_profile)
+            try:
+                current = read_dsv_profile(self.dsv_config)
+            except (OSError, TraderError, UnicodeError, ValueError):
+                self.profile_warning = 'E_COMPARISON_SETTINGS_UNAVAILABLE'
+                return
+            matches = dsv_startup_profile(current).content_hash == dsv_startup_profile(self.profile).content_hash if self.source_profile else current.content_hash == self.profile.content_hash
+            self.profile_warning = None if matches else 'E_COMPARISON_SETTINGS'
             if current.content_hash!=self._last_dsv_profile_hash:
                 self.write('DSV_PARAMETER_BINDING',{'dsv_saved_profile_hash':current.content_hash,
                     'effective_profile_hash':self.profile.content_hash,
@@ -490,11 +481,13 @@ def build_report(manifest_path,output,*,tolerance_ms=2000,dsv_trades=None,dsv_so
         'clock_samples':len(clocks),'clock_alignment_enforced':bool(clocks) and all(c['entry_clock_gate_enforced'] for c in clocks),
         'source_coverage':{'product_market_decisions':sum(r['kind']=='PRODUCT_MARKET_DECISION' for r in records),
             'committed_product_events':sum(r['kind']=='PRODUCT_COMMITTED_EVENT' for r in records),
-            'recognized_dsv_business_lines_in_window':sum(row.get('kind')!='OPERATOR_LOG' for row in dsv)},
+            'recognized_dsv_business_lines_in_window':sum(row.get('kind') in {
+                'ENTRY_ORDER', 'ENTRY_FILL', 'EXIT_DECISION', 'ENTRY_FILTER'} for row in dsv)},
         'maximum_observed_system_skew_ms':str(max((abs(Decimal(c['reference_minus_system_ms'])) for c in clocks),default=Decimal(0))),
         'dsv_exit_decisions':[r for r in dsv if r.get('kind')=='EXIT_DECISION'],
         'dsv_filters':[r for r in dsv if r.get('kind')=='ENTRY_FILTER'],
         'dsv_log_gaps':[r for r in dsv if r.get('kind')=='DSV_LOG_GAP'],
+        'dsv_unparsed_lines':[r for r in dsv if r.get('kind')=='DSV_LOG_UNPARSED'],
         'complete_native_dsv_trades_available':False,'automatic_correctness_verdict':False,
         'parameter_bindings':[r['data'] for r in records if r['kind']=='DSV_PARAMETER_BINDING'],
         'dsv_native_csv':None if dsv_trades is None else native_totals(dsv_trades,dsv_source_account,manifest,all_product),

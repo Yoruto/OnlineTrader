@@ -56,18 +56,20 @@ class SimNowComparisonTests(unittest.TestCase):
         x.quote(price=1080, high=1300, milliseconds=60_000)
         self.assertEqual(self.read_strategy_log(), rows)
         x.quote(price=1081, high=1300, milliseconds=1)
-        self.assertEqual([row['kind'] for row in self.read_strategy_log()[3:]], ['TRIGGER_HINT'])
+        self.assertIn('CANDLE_OPPORTUNITY_CONSUMED', [row['kind'] for row in self.read_strategy_log()[3:]])
+        self.assertIn('TRIGGER_HINT', [row['kind'] for row in self.read_strategy_log()[3:]])
         x.quote(price=1082, high=1300, milliseconds=59_999)
-        self.assertEqual(len(self.read_strategy_log()), 4)
+        self.assertEqual(sum(row['kind'] == 'TRIGGER_HINT' for row in self.read_strategy_log()), 2)
         x.quote(price=1083, high=1300, milliseconds=1)
-        self.assertEqual([row['kind'] for row in self.read_strategy_log()[3:]], ['TRIGGER_HINT', 'TRIGGER_HINT'])
+        self.assertEqual(sum(row['kind'] == 'TRIGGER_HINT' for row in self.read_strategy_log()), 3)
 
         x.quote(price=1083, high=1300, milliseconds=479_998)
-        self.assertEqual(len(self.read_strategy_log()), 5)
+        self.assertEqual(sum(row['kind'] == 'LONG:NO_CHASE_AFTER_ACT' for row in self.read_strategy_log()), 1)
         x.quote(price=1083, high=1300, milliseconds=1)
         rows = self.read_strategy_log()
-        self.assertEqual([row['kind'] for row in rows[5:]], ['LONG:NO_CHASE_AFTER_ACT'])
-        self.assertEqual(datetime.fromisoformat(rows[-1]['observed_at_utc']) - first, timedelta(seconds=600))
+        activation = [row for row in rows if row['kind'] == 'LONG:NO_CHASE_AFTER_ACT']
+        self.assertEqual(len(activation), 2)
+        self.assertEqual(datetime.fromisoformat(activation[-1]['observed_at_utc']) - first, timedelta(seconds=600))
         self.assertEqual(sum(row['kind'] == 'GEOMETRY_BLOCK' for row in rows), 1)
         self.assertEqual(x.api.inserted, [])
 
@@ -97,14 +99,14 @@ class SimNowComparisonTests(unittest.TestCase):
         self.assertEqual([row['kind'] for row in self.read_strategy_log()], ['OPENING_WAIT'])
         x.quote(price=1080, high=1300, milliseconds=1)
         self.assertEqual([row['kind'] for row in self.read_strategy_log()[1:]],
-                         ['GEOMETRY_BLOCK', 'TRIGGER_HINT', 'LONG:NO_CHASE_AFTER_ACT'])
+                         ['GEOMETRY_BLOCK', 'TRIGGER_HINT', 'LONG:NO_CHASE_AFTER_ACT', 'ENTRY_BLOCK_CLEARED'])
         until_close = datetime.fromisoformat('2026-11-10T06:50:00Z') - x.clock.now()
         x.quote(price=1080, high=1300, milliseconds=round(until_close.total_seconds() * 1000))
-        self.assertEqual([row['kind'] for row in self.read_strategy_log()[4:]], ['CLOSE_SESSION_NO_OPEN'])
+        self.assertEqual([row['kind'] for row in self.read_strategy_log()[5:]], ['CLOSE_SESSION_NO_OPEN'])
         x.quote(price=1080, high=1300, milliseconds=299_999)
-        self.assertEqual(len(self.read_strategy_log()), 5)
+        self.assertEqual(len(self.read_strategy_log()), 6)
         x.quote(price=1080, high=1300, milliseconds=1)
-        self.assertEqual([row['kind'] for row in self.read_strategy_log()[4:]], ['CLOSE_SESSION_NO_OPEN'] * 2)
+        self.assertEqual([row['kind'] for row in self.read_strategy_log()[5:]], ['CLOSE_SESSION_NO_OPEN'] * 2)
         self.assertEqual(x.api.inserted, [])
 
     def test_scope_and_adapter_identities_cannot_cross_kq_and_simnow(self):
@@ -140,7 +142,7 @@ class SimNowComparisonTests(unittest.TestCase):
         self.start();x=self.x;root=Path(x.temp.name)
         for name,value in [('scope',x.grant.value),('profile',x.profile.to_record()),('calendar',x.calendar.to_record())]:
             (root/(name+'.json')).write_bytes(canonical_bytes(value))
-        with (patch('online_trader.runtime.dsv_simulation.measure_reference',side_effect=AssertionError('NTP forbidden')),
+        with (patch('online_trader.runtime.dsv_simulation.Thread',side_effect=AssertionError('NTP forbidden')),
               patch('online_trader.gateway.simnow.credentials',side_effect=AssertionError('credential forbidden'))):
             result=prepare(root/'scope.json',root/'profile.json',root/'calendar.json',root/'prepare')
         self.assertEqual(result['provider'],'TQ_SIMNOW');self.assertFalse(result['broker_connected'])
@@ -167,28 +169,38 @@ class SimNowComparisonTests(unittest.TestCase):
             self.assertTrue(final_relogin(x.kernel,x.session,'never-read'))
         self.assertTrue(connect.call_args.kwargs['read_only']);self.assertEqual(reader_api.inserted,[])
 
-    def test_clock_gate_blocks_new_entries_but_retains_owned_exit(self):
-        self.start(trade={'half_close_enabled':False,'protect_80_enabled':False});x=self.x
-        x.quote();order=x.api.inserted[0];x.api.fill(order['order_id'],order['volume'],1055);x.session.step()
-        x.port.entry_clock_ready=lambda:False
-        with self.assertRaises(TraderError):x.kernel.simulation.arm()
-        x.quote(1030);self.assertFalse(x.kernel._armed)
-        self.assertEqual(len(x.api.inserted),2);self.assertEqual(x.api.inserted[-1]['offset'],'CLOSE')
+    def test_ntp_diagnostic_failure_retains_owned_exit_and_entry_authority(self):
+        self.start(trade={'half_close_enabled': False, 'protect_80_enabled': False})
+        x = self.x
+        x.quote()
+        order = x.api.inserted[0]
+        x.api.fill(order['order_id'], order['volume'], 1055)
+        x.session.step()
+        with patch('online_trader.runtime.dsv_simulation.LocalWallClock', type(x.clock)):
+            with patch.object(x.clock, 'begin_turn', create=True), patch.object(x.clock, 'end_turn', create=True):
+                x.session._next_clock_check = float('inf')
+                x.session._ntp_results.put({'code': 'NTP_UNAVAILABLE', 'message': 'Offline NTP sample unavailable'})
+                x.quote(1030, milliseconds=301_000)
+        self.assertTrue(x.kernel._armed)
+        self.assertEqual(x.kernel._dsv_diagnostics['ntp'], 'NTP_UNAVAILABLE')
+        self.assertEqual(len(x.api.inserted), 2)
+        self.assertEqual(x.api.inserted[-1]['offset'], 'CLOSE')
 
-    def test_comparison_disk_error_pauses_entry_and_still_sends_original_exit(self):
+    def test_comparison_disk_error_retains_entry_authority_and_original_exit(self):
         self.start(trade={'half_close_enabled':False,'protect_80_enabled':False});x=self.x
         x.quote();order=x.api.inserted[0];x.api.fill(order['order_id'],order['volume'],1055);x.session.step()
         with patch.object(x.session.comparison,'write',side_effect=OSError('offline injected disk failure')):x.quote(1030)
-        self.assertEqual(len(x.api.inserted),2);self.assertFalse(x.kernel._armed)
+        self.assertEqual(len(x.api.inserted),2);self.assertTrue(x.kernel._armed)
         self.assertEqual(x.session.comparison_error,'E_COMPARISON_WRITE')
-        with self.assertRaises(TraderError):x.kernel.simulation.arm()
+        self.assertIn('comparison', x.kernel._dsv_diagnostics)
 
     def test_status_file_failure_does_not_interrupt_owned_exit(self):
         self.start(trade={'half_close_enabled':False,'protect_80_enabled':False});x=self.x
         x.quote();order=x.api.inserted[0];x.api.fill(order['order_id'],order['volume'],1055);x.session.step()
-        x.session.phase=None
+        x.session._status_signature = None
         with patch.object(x.session,'write',side_effect=OSError('injected output failure')):x.quote(1030)
-        self.assertEqual(len(x.api.inserted),2);self.assertFalse(x.kernel._armed)
+        self.assertEqual(len(x.api.inserted),2);self.assertTrue(x.kernel._armed)
+        self.assertEqual(x.kernel._dsv_diagnostics['status'], 'E_SESSION_STATUS_WRITE')
 
     def test_native_csv_includes_exit_totals_without_importing_foreign_trades(self):
         from online_trader.runtime.comparison import native_totals

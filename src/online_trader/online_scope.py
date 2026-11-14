@@ -73,7 +73,12 @@ class DsvSimulationGrant:
         required={'schema_version','grant_id','account_fingerprint','ledger_path','contracts','trading_day',
                   'not_before_utc','not_after_utc','max_order_quantity','opening_attempts','risk_budget',
                   'profile_hash','calendar_hash','authorization_reference'}
-        multi_day_schemas={'KQ_DSV_SIM/2','SIMNOW_DSV_SIM/1','SIMNOW_DSV_AUTO/1','KQ_WORKBENCH_SIM/1','SIMNOW_WORKBENCH_SIM/1'}
+        target_schemas = {'KQ_DSV_DESKTOP/1', 'SIMNOW_DSV_DESKTOP/1'}
+        multi_day_schemas = target_schemas | {'KQ_DSV_SIM/2', 'SIMNOW_DSV_SIM/1', 'SIMNOW_DSV_AUTO/1',
+                                             'KQ_WORKBENCH_SIM/1', 'SIMNOW_WORKBENCH_SIM/1'}
+        if schema in target_schemas:
+            required.remove('opening_attempts')
+            required.add('daily_targets_per_contract')
         if schema in multi_day_schemas:
             required=required|{'trading_days','resume_entries_on_day_change'}
             if 'allow_external_allocation' in value:
@@ -103,7 +108,8 @@ class DsvSimulationGrant:
             if policy['last_completed_day']>=policy['as_of_date']:
                 raise TraderError('E_ONLINE_SCOPE','The completed daily cutoff must precede the strategy cabinet day')
         # No default amount, retry allowance, profile, calendar or standing scope.
-        for field in ('max_order_quantity','opening_attempts'):
+        quota_field = 'daily_targets_per_contract' if schema in target_schemas else 'opening_attempts'
+        for field in ('max_order_quantity', quota_field):
             if type(value[field]) is not int or not 1<=value[field]<=2147483647:
                 raise TraderError('E_ONLINE_SCOPE','Explicit positive strategy limits are required')
         decimal_value(value['risk_budget'],positive=True)
@@ -148,7 +154,14 @@ class DsvSimulationGrant:
     @property
     def account_key(self):return ('SIM:SIMNOW:' if self.provider=='TQ_SIMNOW' else 'SIM:KQ:')+self.value['account_fingerprint']
     @property
-    def provider(self):return 'TQ_SIMNOW' if self.value['schema_version'] in {'SIMNOW_DSV_SIM/1','SIMNOW_DSV_AUTO/1','SIMNOW_WORKBENCH_SIM/1'} else 'TQKQ'
+    def provider(self):return 'TQ_SIMNOW' if self.value['schema_version'].startswith('SIMNOW_') else 'TQKQ'
+    @property
+    def daily_targets_per_contract(self):return self.value.get('daily_targets_per_contract')
+    @property
+    def opening_limit(self):
+        if self.daily_targets_per_contract is not None:
+            return {'daily_targets_per_contract': self.daily_targets_per_contract}
+        return {'opening_attempts': self.value['opening_attempts']}
     @property
     def manual_workbench(self):return self.value['schema_version'] in {'KQ_WORKBENCH_SIM/1','SIMNOW_WORKBENCH_SIM/1'}
     @property

@@ -203,10 +203,14 @@ class StatisticsEdgeTests(unittest.TestCase):
         expected=t.runtime.strategy.evaluate(prior,event)['candidates']
         self.assertTrue(any(c['decision_key']==candidate['decision_key'] for c in expected))
         self.assertTrue(t.runtime._risk(candidate,t.runtime._latest[(CONTRACT,t.day)])['allowed'])
-        self.assertFalse(t.runtime._final_gate(candidate,prior,3,cycle['instrument']))
+        review = t.runtime._final_gate(candidate, prior, 3, cycle['instrument'])
+        self.assertFalse(review['allowed'])
+        self.assertIn('NET_LOSS_LIMIT', review['reason_codes'])
         order=OrderState('local-stop-child',cycle['orders'][0]['intent_id'],'local-stop-attempt',
             'OPEN',3,'1056',kernel_boot_id=t.kernel.boot_id)
-        self.assertIsNone(t.runtime.prepare_replacement(cycle,order))
+        replacement = t.runtime.prepare_replacement(cycle, order)['recheck']
+        self.assertFalse(replacement['allowed'])
+        self.assertIn('NET_LOSS_LIMIT', replacement['reason_codes'])
 
     def test_session_exit_books_quote_points_without_normal_exit_counts(self):
         t=self.env;t.start();t.open()

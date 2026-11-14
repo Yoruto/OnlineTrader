@@ -97,7 +97,7 @@ def main(argv=None):
         for name in ('prepare','run'):
             command=dsv_actions.add_parser(name)
             for field in ('scope','profile','calendar','output'):command.add_argument('--'+field,type=Path,required=True)
-            command.add_argument('--dsv-config',type=Path,help='核对原DSV当前业务设置的哈希；运行中变化会暂停新开')
+            command.add_argument('--dsv-config',type=Path,help='诊断原 DSV 业务设置是否与当前运行参数一致')
             command.add_argument('--dsv-log-dir',type=Path,help='只读跟踪DSV原日志，自动记录至本次对比目录')
             if name=='run':
                 credential_source=command.add_mutually_exclusive_group(required=True)

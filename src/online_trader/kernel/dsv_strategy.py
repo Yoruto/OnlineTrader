@@ -23,7 +23,9 @@ from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
 from online_trader.gateway.ports import UnavailablePort
 from online_trader.kernel.strategy import StrategyCoordinator
-from online_trader.strategy.entry import CHINA_TIME, DsvEntryStrategy, epoch_milliseconds, is_night_session
+from online_trader.strategy.entry import (
+    CHINA_TIME, DsvEntryStrategy, epoch_milliseconds, is_night_session, ordinary_quote_age,
+)
 from online_trader.strategy.risk import evaluate_entry
 
 
@@ -53,9 +55,25 @@ class DsvStrategyRuntime:
         self._continuation_seconds=float(trade['chase_window_minutes'])*60 if trade['continuation_entry'] else None
         self._quote_age_limit = Decimal(trade['max_quote_age_seconds'])
         self._states={};self._stop_states={};self._latest={};self._rebuilds={};self._pending=None;self.epoch=None;self._account_revision=0
-        def restore_state(state):
+        def restore_state(state, *, trusted_consumption=False):
             if state is None:return
             state=copy.deepcopy(state)
+            state.update(first_minute_blocks=[], open_half_reached=False, need_hyst=False,
+                         hysteresis_armed={"LONG": False, "SHORT": False})
+            if not trusted_consumption and state.get("last_signal_bar") is not None:
+                key = state["contract_id"], state["trading_day"]
+                previous = self._states.get(key)
+                if previous is None or previous["last_signal_bar"] != state["last_signal_bar"]:
+                    # Keep an ambiguous historical consumption as a one-minute
+                    # barrier until the feed proves a distinct live candle.
+                    state["unproved_consumed_bar"] = state["last_signal_bar"]
+                    state["last_signal_bar"] = previous["last_signal_bar"] if previous else None
+            if not trusted_consumption:
+                previous = self._states.get((state["contract_id"], state["trading_day"]))
+                if previous is not None:
+                    state["last_signal_bar"] = previous["last_signal_bar"]
+                    if previous.get("unproved_consumed_bar"):
+                        state.setdefault("unproved_consumed_bar", previous["unproved_consumed_bar"])
             if state.get("profile_hash")!=self.profile.content_hash:
                 # A new development profile cannot erase an already consumed
                 # bar or turn the former parameter path into complete evidence.
@@ -69,13 +87,19 @@ class DsvStrategyRuntime:
                 proof=data["rebuild_proof"]
                 self._rebuilds[proof["evidence_id"]]=proof|{"profile_hash":proof.get("profile_hash",self._baseline_profile_hash),
                     "status":"OBSERVATION_REBUILT","armed":False,"durable_seq":str(row["event_seq"])}
-            restore_state(state)
+            report = data.get("report", {})
+            live = row["event_type"] == "DSV_STRATEGY_OBSERVED" and (
+                report.get("event_mode") == "LIVE" or
+                "OBSERVATION_ONLY_BACKLOG" not in report.get("reasons", []))
+            if state is not None and report.get("event_mode") == "OBSERVATION":
+                live = False
+            restore_state(state, trusted_consumption=live or bool(state and state.get("consumption_version") == 1))
             stops=data.get("dsv_strategy_stops")
             if stops is not None:self._stop_states[(stops["state"]["contract_id"],stops["state"]["trading_day"])]=stops
             cycle=data.get("cycle")
             if row["event_type"]=="ENTRY_PREPARED" and cycle and cycle.get("strategy_metadata",{}):
                 state=cycle["strategy_metadata"].get("strategy_state")
-                restore_state(state)
+                restore_state(state, trusted_consumption=True)
                 stops=cycle["strategy_metadata"].get("stop_result")
                 if stops is not None:self._stop_states[(stops["state"]["contract_id"],stops["state"]["trading_day"])]=stops
         kernel._dsv_runtime=self
@@ -323,35 +347,107 @@ class DsvStrategyRuntime:
                 reasons.append("OWNED_EXPOSURE_EXISTS")
         return list(dict.fromkeys(reasons))
 
-    def _final_gate(self,original,pre_state,quantity,frozen_instrument):
-        key=(original["contract_id"],original["trading_day"])
-        facts=self._latest.get(key)
-        if (facts is None or facts["account"]["revision"]<self._account_revision
-                or self.kernel._quote_age_ns(facts["received_ns"])>self.kernel.max_quote_age_ms*1_000_000):return False
-        event=facts["event"]
-        if any(facts["instrument"].get(key)!=frozen_instrument.get(key) for key in ("tick_size","multiplier")):return False
-        stops=facts.get("stop_result")
-        if stops is not None and (not stops["allow_new_entries"] or
-                (original.get("entry_kind")=="CONTINUATION" and not stops["allow_continuation"])):return False
-        if self._blocked(event,exclude_decision=original["decision_key"]):return False
-        if self.kernel.statistics.entry_reasons(event['contract_id'],event['trading_day'],profile=self.profile,
-                direction=original['direction'],entry_kind=original.get('entry_kind','NORMAL'),now_utc=event['source_time_utc']):return False
-        current=self._evaluate_entry(pre_state,event,stops,exclude_decision=original["decision_key"])
-        candidates=[candidate for candidate in current["candidates"] if all(candidate[k]==original[k] for k in
-            ("direction","theoretical_price","limit_price","decision_key","profile_hash","entry_kind"))]
-        if not candidates:return False
-        result=self._risk(candidates[0],facts,exclude_decision=original["decision_key"],
-                          previous_attempt=pre_state.get('last_ordinary_attempt'))
-        return result["allowed"] and result["quantity"]>=quantity
+    def ordinary_quote_age(self, event, *, now=None):
+        return ordinary_quote_age(now or self.kernel.port.strategy_wall_time(), event['source_time_utc'])
 
-    def _evaluate_entry(self,state,event,stops,*,exclude_decision=None):
-        decision_time=self.kernel.port.strategy_wall_time() if self.online else None
+    def ordinary_quote_stale(self, event, *, now=None):
+        return self._quote_age_limit > 0 and self.ordinary_quote_age(event, now=now) > self._quote_age_limit
+
+    def _entry_recheck(self, original, facts, *, cycle=None):
+        k = self.kernel
+        event = facts["event"] if facts is not None else {}
+        result = {"allowed": True, "reason_codes": [], "details": {},
+                  "quote_id": event.get("native_tick_id", event.get("sequence")),
+                  "source_epoch": event.get("source_epoch"),
+                  "account_revision": str(facts["account"]["revision"]) if facts else None,
+                  "authority_revision": str(k._authority_revision)}
+
+        def fail(reasons, **details):
+            return result | {"allowed": False, "reason_codes": list(reasons), "details": details}
+
+        if facts is None:
+            return fail(["ENTRY_RECHECK_QUOTE_MISSING"])
+        if facts["account"]["revision"] < self._account_revision:
+            return fail(["ENTRY_RECHECK_ACCOUNT_CHANGED"], expected=str(self._account_revision),
+                        observed=str(facts["account"]["revision"]))
+        age = k._quote_age_ns(facts["received_ns"])
+        if self.online and original.get("entry_kind") == "NORMAL":
+            limit = self._quote_age_limit
+            source_age = self.ordinary_quote_age(event)
+            if limit > 0 and source_age > limit:
+                return fail(["DSV_QUOTE_AGE_EXCEEDED"], expected=str(limit), observed=str(source_age))
+        elif age > k.max_quote_age_ms * 1_000_000:
+            return fail(["ENTRY_RECHECK_QUOTE_STALE"], expected=k.max_quote_age_ms, observed=age // 1_000_000)
+        if cycle is not None:
+            expected = (self.epoch, str(k._config_revision), k._configuration["payload_hash"])
+            observed = (cycle["strategy_epoch"], cycle["plan"]["config_revision"], cycle["plan"]["config_hash"])
+            if observed != expected:
+                return fail(["ENTRY_RECHECK_CONFIGURATION_CHANGED"], expected=list(expected), observed=list(observed))
+            moment = datetime.fromisoformat(event["source_time_utc"])
+            if (not datetime.fromisoformat(event["session_open_utc"]) <= moment < datetime.fromisoformat(event["session_close_utc"])
+                    or event["session_id"] != original["session_id"] or not event["is_trading"]):
+                return fail(["ENTRY_RECHECK_SESSION_CHANGED"], expected=original["session_id"], observed=event["session_id"])
+            if event["quality"] != "CONTIGUOUS" or not event["path_complete"] or not event["calendar_complete"]:
+                return fail(["ENTRY_RECHECK_PATH_INCOMPLETE"], observed=event["quality"])
+        stops = facts.get("stop_result")
+        if stops is not None and (not stops["allow_new_entries"] or
+                (original.get("entry_kind") == "CONTINUATION" and not stops["allow_continuation"])):
+            return fail(stops["reasons"] or ["ENTRY_RECHECK_STOP_ACTIVE"])
+        decision_key = cycle["decision_key"] if cycle else original["decision_key"]
+        reasons = self._blocked(event, exclude_decision=decision_key)
+        reasons += k.statistics.entry_reasons(event["contract_id"], event["trading_day"], profile=self.profile,
+            direction=original["direction"], entry_kind=original.get("entry_kind", "NORMAL"), now_utc=event["source_time_utc"])
+        if reasons:
+            return fail(dict.fromkeys(reasons))
+        return result
+
+    @staticmethod
+    def _instrument_recheck(result, current, frozen):
+        if not result["allowed"]:
+            return result
+        keys = ("tick_size", "multiplier")
+        expected, observed = ({key: source.get(key) for key in keys} for source in (frozen, current))
+        if observed != expected:
+            return result | {"allowed": False, "reason_codes": ["ENTRY_RECHECK_INSTRUMENT_CHANGED"],
+                             "details": {"expected": expected, "observed": observed}}
+        return result
+
+    @staticmethod
+    def _quantity_recheck(result, risk, quantity):
+        if risk["allowed"] and risk["quantity"] >= quantity:
+            return result
+        return result | {"allowed": False, "reason_codes": risk["reasons"] or ["ENTRY_RECHECK_QUANTITY_CHANGED"],
+                         "details": {"expected": quantity, "observed": risk["quantity"]}}
+
+    def _final_gate(self, original, pre_state, quantity, frozen_instrument):
+        key = original["contract_id"], original["trading_day"]
+        facts = self._latest.get(key)
+        result = self._entry_recheck(original, facts)
+        if not result["allowed"]:
+            return result
+        result = self._instrument_recheck(result, facts["instrument"], frozen_instrument)
+        if not result["allowed"]:
+            return result
+        current = self._evaluate_entry(pre_state, facts["event"], facts.get("stop_result"),
+                                       exclude_decision=original["decision_key"])
+        keys = ("direction", "theoretical_price", "limit_price", "decision_key", "profile_hash", "entry_kind")
+        expected = {key: original[key] for key in keys}
+        observed = [{key: candidate[key] for key in keys} for candidate in current["candidates"]]
+        if expected not in observed:
+            return result | {"allowed": False, "reason_codes": ["ENTRY_RECHECK_CANDIDATE_CHANGED", *current["reasons"]],
+                             "details": {"expected": expected, "observed": observed}}
+        candidate = current["candidates"][observed.index(expected)]
+        risk = self._risk(candidate, facts, exclude_decision=original["decision_key"],
+                          previous_attempt=pre_state.get("last_ordinary_attempt"))
+        return self._quantity_recheck(result, risk, quantity)
+
+    def _evaluate_entry(self,state,event,stops,*,exclude_decision=None,decision_time=None):
+        if self.online and decision_time is None:
+            decision_time = self.kernel.port.strategy_wall_time()
         ordinary_quote_stale = False
         current=decision_time or datetime.fromisoformat(event['source_time_utc'])
-        if decision_time is not None and self._quote_age_limit > 0:
-            elapsed = current - datetime.fromisoformat(event['source_time_utc']).replace(microsecond=0)
-            age = Decimal(elapsed.days * 86400 + elapsed.seconds) + Decimal(elapsed.microseconds).scaleb(-6)
-            ordinary_quote_stale = age > self._quote_age_limit
+        if decision_time is not None:
+            ordinary_quote_stale = self.ordinary_quote_stale(event, now=decision_time)
         timing={'ordinary_quote_stale':ordinary_quote_stale,'decision_time':decision_time}
         if self._continuation_seconds is None or (state.get('night_reference') is None and event.get('night_reference') is None):
             return self.strategy.evaluate(state,event,**timing)
@@ -393,27 +489,20 @@ class DsvStrategyRuntime:
         """Issue a fresh development entry context for an original target remainder."""
         k=self.kernel;candidate=copy.deepcopy(cycle['strategy_metadata']['candidate'])
         def ready():
-            facts=self._latest.get((cycle['plan']['contract_id'],cycle['plan']['trading_day']))
-            if (facts is None or facts['account']['revision']<self._account_revision or
-                    k._quote_age_ns(facts['received_ns'])>k.max_quote_age_ms*1_000_000):return False
-            if (cycle['strategy_epoch']!=self.epoch or cycle['plan']['config_revision']!=str(k._config_revision)
-                    or cycle['plan']['config_hash']!=k._configuration['payload_hash']):return False
-            event=facts['event'];frozen=cycle.get('instrument',{})
-            moment=datetime.fromisoformat(event['source_time_utc'])
-            if not datetime.fromisoformat(event['session_open_utc'])<=moment<datetime.fromisoformat(event['session_close_utc']):return False
-            if (event['session_id']!=candidate['session_id'] or event['quality']!='CONTIGUOUS' or
-                    not event['path_complete'] or not event['calendar_complete'] or not event['is_trading']):return False
-            if any(facts['instrument'].get(key)!=frozen.get(key) for key in ('tick_size','multiplier')):return False
-            if self._blocked(event,exclude_decision=cycle['decision_key']):return False
-            if k.statistics.entry_reasons(event['contract_id'],event['trading_day'],profile=self.profile,
-                    direction=candidate['direction'],entry_kind=candidate.get('entry_kind','NORMAL'),now_utc=event['source_time_utc']):return False
-            stop=facts.get('stop_result')
-            if stop is not None and (not stop['allow_new_entries'] or
-                    (candidate.get('entry_kind')=='CONTINUATION' and not stop['allow_continuation'])):return False
-            candidate['limit_price']=order.limit_price
-            risk=self._risk(candidate,facts,exclude_attempt=order.attempt_id,counted_target=cycle['decision_key'])
-            return risk['allowed'] and risk['quantity']>=order.original_qty
-        if not ready():return None
+            facts = self._latest.get((candidate["contract_id"], candidate["trading_day"]))
+            result = self._entry_recheck(candidate, facts, cycle=cycle)
+            if not result["allowed"]:
+                return result
+            result = self._instrument_recheck(result, facts["instrument"], cycle.get("instrument", {}))
+            if not result["allowed"]:
+                return result
+            risk = self._risk(candidate | {"limit_price": order.limit_price}, facts,
+                              exclude_attempt=order.attempt_id, counted_target=cycle["decision_key"])
+            return self._quantity_recheck(result, risk, order.original_qty)
+
+        review = ready()
+        if not review["allowed"]:
+            return {"recheck": review}
         peer='dsv-owner-'+str(self.epoch)
         context=k.contexts.issue(peer,'ENTRY_PROPOSAL','DSV_ENTRY',cycle['plan']['contract_id'],
             kernel_epoch=str(k.kernel_epoch),strategy_epoch=str(self.epoch),revisions=k.revisions,issued_event_seq=str(k._durable_seq))
@@ -473,12 +562,10 @@ class DsvStrategyRuntime:
                     or event.get("quality")!="CONTIGUOUS" or not event.get("path_complete") or not event.get("day_range_complete")
                     or not event.get("calendar_complete")):
                 raise TraderError("E_FACT_BARRIER","Replay does not prove a complete single source path")
-            evaluated=self.strategy.evaluate(state,event,continuation_allowed=False);new=evaluated["state"]
-            if new["coverage_lost"] or new["last_sequence"]!=event["sequence"] or state["last_sequence"]==new["last_sequence"]:
+            evaluated = self.strategy.evaluate(state, event, observation_only=True)
+            new = evaluated["state"]
+            if new["coverage_lost"] or new["last_sequence"] != event["sequence"] or state["last_sequence"] == new["last_sequence"]:
                 raise TraderError("E_FACT_BARRIER","Replay is incomplete, repeated or out of order")
-            if self.online and (evaluated["candidates"] or any(
-                    reason.endswith(':NO_CHASE_AFTER_ACT') for reason in evaluated['entry_log'])):
-                new["last_signal_bar"]=state["last_signal_bar"]
             state=new
         if not extend:observed_from=first["source_time_utc"]
         if old is not None:
@@ -487,11 +574,13 @@ class DsvStrategyRuntime:
                 raise TraderError("E_REVISION_CONFLICT","Replay cannot move accepted source facts backwards")
             if state["source_epoch"]==old["source_epoch"] and state["last_sequence"]<old["last_sequence"]:
                 raise TraderError("E_REVISION_CONFLICT","Replay ends before the accepted source boundary")
-            state["first_minute_blocks"]=sorted(set(old["first_minute_blocks"])|set(state["first_minute_blocks"]))
-            if events[-1]["candle_id"]==old["last_signal_bar"]:state["last_signal_bar"]=old["last_signal_bar"]
+            state["last_signal_bar"] = old["last_signal_bar"]
+            if old.get("unproved_consumed_bar"):
+                state["unproved_consumed_bar"] = old["unproved_consumed_bar"]
             if old.get('night_close_fallback_cleared'):state['night_close_fallback_cleared']=True
             if old.get('last_ordinary_attempt') is not None:
                 state['last_ordinary_attempt']=copy.deepcopy(old['last_ordinary_attempt'])
+        state["consumption_version"] = 1
         result=Future();self._pending=result
         proof={"evidence_id":evidence_id,"event_count":len(events),"path_hash":path_hash,"profile_hash":self.profile.content_hash,
                "contract_id":key[0],"trading_day":key[1],"source_epoch":str(state["source_epoch"]),
@@ -523,12 +612,14 @@ class DsvStrategyRuntime:
             raise TraderError("E_FACT_BARRIER","Accept the preceding owner transaction before processing another market fact")
         key=(event["contract_id"],event["trading_day"])
         previous=copy.deepcopy(self._states.get(key) or self.strategy.initial_state(k.account_key,*key))
-        stop_result=self._latest[key].get("stop_result")
-        decision=(self._evaluate_entry(previous,event,stop_result) if _allow_entry
-                  else self.strategy.evaluate(previous,event,continuation_allowed=False))
-        if self.online and not _allow_entry and (decision["candidates"] or any(
-                reason.endswith(':NO_CHASE_AFTER_ACT') for reason in decision['entry_log'])):
-            decision["state"]["last_signal_bar"]=previous["last_signal_bar"]
+        stop_result = self._latest[key].get("stop_result")
+        ambiguous = previous.get("unproved_consumed_bar")
+        wait_next = _allow_entry and ambiguous == event["candle_id"]
+        decision_time = self.kernel.port.strategy_wall_time() if self.online else None
+        decision = (self._evaluate_entry(previous, event, stop_result, decision_time=decision_time)
+                    if _allow_entry and not wait_next else self.strategy.evaluate(previous, event, observation_only=True))
+        if wait_next:
+            decision["reasons"].append("LEGACY_MINUTE_CONSUMPTION_UNPROVED")
         # Existing owned positions get the quote before any new entry decision.
         # This stages their protection on the same owner/writer without waiting
         # in a broker loop or delegating protection to the strategy worker. A
@@ -571,27 +662,55 @@ class DsvStrategyRuntime:
                     if k._pending:k.wait_idle()
                     if scheduler is not None:
                         execution_event=scheduler.execution_event(cycle,event,instrument)
-                        k.execution.tick(cycle['position_cycle_id'],execution_event,_market_received_ns=scheduler.received_for(event['contract_id']))
+                        k.execution.tick(cycle['position_cycle_id'], execution_event,
+                                         _observe_quote=execution_event['market']['fresh'],
+                                         _market_received_ns=scheduler.received_for(event['contract_id']))
                     else:k.execution_tick(cycle['position_cycle_id'],execution_event)
                     if not mixed:break
                 elif cycle['protection']['owned_qty']:
                     k.observe(cycle['position_cycle_id'],event['last'],bid1=event['bid1'],ask1=event['ask1'],valid=event['quality']=='CONTIGUOUS',observed_at_utc=event['source_time_utc'],
                               _adapter_token=k.port.callback_token if self.online else None)
         money_account=k.simulation.money_fact(k.port.snapshot()) if self.online else k.money.account_from_risk(event,account)
-        state=decision["state"];report={"status":"OBSERVED","candidates":decision["candidates"],
+        state = decision["state"]
+        if _allow_entry and not wait_next and not stale.intersection(decision["reasons"]):
+            state.pop("unproved_consumed_bar", None)
+        state["consumption_version"] = 1
+        decision_id = "dsv-decision-" + content_hash({
+            "boot": k.boot_id, "contract": event["contract_id"], "day": event["trading_day"],
+            "epoch": event["source_epoch"], "sequence": event["sequence"]})
+        report={"status":"OBSERVED","candidates":decision["candidates"],
+            "event_mode": "LIVE" if _allow_entry else "OBSERVATION",
             "reasons":list(decision["reasons"]),"source_notes":decision.get("source_notes",[]),
             "profile_hash":self.profile.content_hash,"child_order_id":None}
+        report["decision_id"] = decision_id
+        report["authority_revision"] = str(k._authority_revision)
+        report["account_revision"] = str(account["revision"])
+        if _allow_entry and (decision["touched_triggers"] or decision["candidates"]):
+            report["opportunity"] = {
+                "trigger_prices": decision["touched_triggers"],
+                "market": {field: event.get(field) for field in
+                           ("source_epoch", "sequence", "native_tick_id", "source_time_utc", "candle_id",
+                            "session_id", "last", "bid1", "ask1")},
+                "decision_time_utc": (decision_time or datetime.fromisoformat(event["source_time_utc"])).isoformat(),
+                "last_signal_bar_before": previous["last_signal_bar"],
+                "last_signal_bar_after": state["last_signal_bar"],
+                "account_revision": str(account["revision"]),
+            }
         if stop_result is not None:report["stops"]=copy.deepcopy(stop_result)
-        if state==previous and not decision["candidates"] and stop_result==self._stop_states.get(key):return _ready(report)
+        if state == previous and not decision["candidates"] and stop_result == self._stop_states.get(key):
+            return _ready(report)
         result=Future();self._pending=result
         proposal_id="dsv-proposal-"+uuid4().hex;persisted={"report":None}
         context=k.contexts.issue("dsv-owner-"+str(self.epoch),"ENTRY_PROPOSAL","DSV_ENTRY",event["contract_id"],
             kernel_epoch=str(k.kernel_epoch),strategy_epoch=str(self.epoch),revisions=k.revisions,issued_event_seq=str(k._durable_seq))
         def mutate(conn,seq):
-            frozen_report=persisted["report"]
+            frozen_report=copy.deepcopy(persisted["report"])
             intent=None;candidate=decision["candidates"][0] if decision["candidates"] else None
             if frozen_report["status"]=="ENTRY_COMMITTED":
                 intent=conn.execute("SELECT intent_id FROM order_intents WHERE decision_key=?",(candidate["decision_key"],)).fetchone()[0]
+                frozen_report["child_order_id"] = conn.execute(
+                    "SELECT child_order_id FROM child_orders WHERE intent_id=? ORDER BY ordinal LIMIT 1",
+                    (intent,)).fetchone()[0]
             conn.execute("INSERT INTO strategy_proposals VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (proposal_id,"DECISION" if intent else "STATE_UPDATE",candidate["decision_key"] if intent else None,self.epoch,
                  context["context_id"],content_hash({"state":state,"report":frozen_report}),
@@ -636,9 +755,11 @@ class DsvStrategyRuntime:
                         rule_set_id=k._configuration["rule_set_id"],quantity=risk["quantity"],execution_version='1.2',
                         plan_id="dsv-plan-"+uuid4().hex,position_cycle_id="dsv-cycle-"+uuid4().hex,**online_values)
                     report["status"]="ENTRY_COMMITTED"
+                    report["checks"] = {"strategy": "PASSED", "owner": "PASSED", "risk": "PASSED"}
                     persisted["report"]=copy.deepcopy(report)
                     hook={"epoch":self.epoch,"money_account":money_account,"metadata":{"profile_hash":self.profile.content_hash,"candidate":candidate,
-                        "strategy_state":state,"stop_result":stop_result,"margin_per_lot":risk["metrics"]["margin_per_lot"],"instrument":copy.deepcopy(instrument)},
+                        "strategy_state":state,"stop_result":stop_result,"margin_per_lot":risk["metrics"]["margin_per_lot"],
+                        "instrument":copy.deepcopy(instrument),"decision_id":decision_id},"report":report,
                         "gate":lambda frozen=copy.deepcopy(instrument):self._final_gate(candidate,previous,risk["quantity"],frozen),"mutate":mutate,"accepted":accepted}
                     if self.online:hook['initial_market']={'event':event,'received_ns':self._latest[key]['received_ns']}
                     if candidate['entry_kind']=='NORMAL':
@@ -657,6 +778,8 @@ class DsvStrategyRuntime:
             report["reasons"]=list(dict.fromkeys(report["reasons"]+reasons))
         except TraderError as error:
             report["status"]="OBSERVED";report["reasons"].append(error.code)
+        report["checks"] = {"strategy": "CANDIDATE" if report["candidates"] else "NO_CANDIDATE",
+                            "owner": "EVALUATED", "risk": "EVALUATED" if "risk" in report else "SKIPPED"}
         persisted["report"]=copy.deepcopy(report)
         try:
             k._submit("TX_OBSERVATION","DSV_STRATEGY_OBSERVED",{"dsv_strategy_state":state,"dsv_strategy_stops":stop_result,"report":report,'money_account':money_account},mutate,after=accepted)

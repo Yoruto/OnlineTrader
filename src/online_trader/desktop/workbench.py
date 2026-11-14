@@ -493,7 +493,15 @@ class WorkbenchWindow(StatusWindow):
         self._tray.set_status('error' if c['fault'] or c['recovery_required'] or c['clock_fault'] else
                               'running' if v['entry_authority']=='ARMED' else 'idle')
         authority_label='人工开仓权限' if v['configuration'].get('manual_workbench') else '自动开仓权限'
-        self.connection_detail.setText(f"账户连接：{'已连接' if c['broker_connected'] else '未连接'} · 事实同步：{'完整' if c['synchronized'] else '不完整'} · 通道：{'故障' if c['fault'] else '无已知故障'} · 持仓核对：{'待处理' if c['recovery_required'] else '无未决屏障'} · 时钟：{'故障' if c['clock_fault'] else '无已知故障'} · {authority_label}：{v['entry_authority']}")
+        diagnostics = v['configuration'].get('strategy_diagnostics', {})
+        diagnostic_notice = ''
+        if diagnostics.get('comparison'):
+            diagnostic_notice += ' · DSV 对照不可用或参数不一致'
+        if diagnostics.get('ntp') in {'NTP_UNAVAILABLE', 'NTP_SKEW'}:
+            diagnostic_notice += ' · 请核对本机时钟'
+        if any(diagnostics.get(key) for key in ('operation_log', 'status', 'run_identity')):
+            diagnostic_notice += ' · 诊断日志写入失败'
+        self.connection_detail.setText(f"账户连接：{'已连接' if c['broker_connected'] else '未连接'} · 事实同步：{'完整' if c['synchronized'] else '不完整'} · 通道：{'故障' if c['fault'] else '无已知故障'} · 持仓核对：{'待处理' if c['recovery_required'] else '无未决屏障'} · 时钟：{'故障' if c['clock_fault'] else '无已知故障'} · {authority_label}：{v['entry_authority']}" + diagnostic_notice)
         for name,table in self.tables.items():
             rows=v['cycles'] if name=='protection' else v.get(name,[]);table.setRowCount(len(rows))
             for i,row in enumerate(rows):
@@ -566,11 +574,6 @@ class WorkbenchWindow(StatusWindow):
             if config.get('strategy_stop_requested'):
                 self.show_home_feedback(config.get('strategy_stop_wait') or '正在核对原策略的退出条件。')
                 return
-            if self.dashboard.dsv_config is not None and config.get('scoped_contracts') and not config.get('manual_workbench'):
-                from online_trader.configuration.offsets import dsv_startup_profile
-                expected = dsv_startup_profile(self.current_start_profile()).content_hash
-                if config.get('strategy_profile_hash') != expected:
-                    raise TraderError('E_COMPARISON_SETTINGS', '原执行器绑定的参数无法确认为当前参数，请查看执行参数并按原账本恢复流程处理。')
             self.send('ARM_ENTRIES',{'scope_type':'ACCOUNT','scope_ids':[]},
                 {'authority_policy_id':policy,'rule_set_id':identity[-2],'config_revision':identity[-1]})
         self._action(action)

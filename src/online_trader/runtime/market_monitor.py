@@ -10,7 +10,7 @@ from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
 from online_trader.gateway.dsv_facts import utc
 from online_trader.gateway.tqkq import number
-from online_trader.scheduling.reference import clock_observation
+from online_trader.scheduling.reference import LocalWallClock, clock_observation
 from online_trader.strategy.entry import CHINA_TIME
 
 
@@ -194,6 +194,8 @@ class DsvMarketMonitor:
 
 
 def diagnostic_clock(clock, *, wall, monotonic_ns):
+    if isinstance(clock, LocalWallClock):
+        return None
     try:
         observation = clock_observation(clock)
         elapsed = int(observation['monotonic_ns']) - monotonic_ns

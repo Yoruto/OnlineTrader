@@ -5,7 +5,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
 from online_trader.contracts.codec import canonical_bytes, strict_loads
 from online_trader.configuration.files import publish_new_bytes
-from online_trader.errors import TraderError
+from online_trader.errors import TraderError, exception_record
 
 
 START_ERRORS = {
@@ -14,7 +14,7 @@ START_ERRORS = {
     'E_DEPENDENCY': '交易连接组件不可用，请检查本机已配置的交易环境。',
     'E_CREDENTIALS': '账号或密码未保存完整，请到「账号信息 → 账户管理」核对。',
     'E_GATEWAY_CONNECT': '模拟盘连接失败，请核对账号、密码及网络后重试。',
-    'E_CLOCK': '本机时间与交易参考时间不一致，请先校准 Windows 时间。',
+    'E_CLOCK': 'Windows 时间证据不可用，请核对本机时间。',
     'E_ACCOUNT_LOCKED': '该账号已有运行程序，请先查看原来的运行状态。',
     'E_INSTANCE_EXISTS': '该账号已有运行程序，请先查看原来的运行状态。',
     'E_INSTANCE_LOCK': '账号状态暂时无法锁定，请稍后重试。',
@@ -53,9 +53,9 @@ class _StartWorker(QThread):
             result = launch_bootstrap(request_path, output)
             self.started_run.emit({'run_directory': str(output), 'launch': result})
         except (TraderError, OSError, ValueError) as error:
-            self.failed.emit({'code': getattr(error, 'code', 'E_DEPENDENCY')})
-        except Exception:
-            self.failed.emit({'code': 'E_STARTUP'})
+            self.failed.emit({'code': getattr(error, 'code', 'E_DEPENDENCY'), 'exception': exception_record(error)})
+        except Exception as error:
+            self.failed.emit({'code': 'E_STARTUP', 'exception': exception_record(error)})
 
 
 class QuoteReferenceWorker(QThread):

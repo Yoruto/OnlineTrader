@@ -26,7 +26,10 @@ def scope_for(path,profile,calendar,**changes):
         'not_before_utc':'2026-11-10T01:00:00Z','not_after_utc':'2026-11-10T07:00:00Z',
         'max_order_quantity':10,'opening_attempts':20,'risk_budget':'1000000','profile_hash':profile.content_hash,
         'calendar_hash':calendar.content_hash,'authorization_reference':'OFFLINE_INJECTED_FACTS_NO_ACCOUNT_AUTHORITY'}
-    value.update(changes);return DsvSimulationGrant.parse(canonical_bytes(value))
+    value.update(changes)
+    if 'daily_targets_per_contract' in value:
+        del value['opening_attempts']
+    return DsvSimulationGrant.parse(canonical_bytes(value))
 
 
 def day_calendar(code='DCE.p2701'):
@@ -205,7 +208,7 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertEqual(self.session.last_decisions[self.code]['status'],'ENTRY_COMMITTED')
 
     def test_quote_expiring_while_building_facts_keeps_entry_authority(self):
-        self.start(max_quote_age_ms=5000)
+        self.start(max_quote_age_ms=5000, trade={'max_quote_age_seconds': 5})
         self.clock.advance(1000);self.api.tick(self.code,last=1055)
         self.clock.advance(4900)
         facts=self.session.feed.facts
@@ -222,6 +225,76 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertFalse(self.kernel.snapshot()['recovery_required'])
         self.quote(price=1055)
         self.assertEqual(len(self.api.inserted),1)
+
+    def test_replayed_chase_rejection_preserves_the_live_candle(self):
+        self.start()
+        self.clock.advance(1000)
+        self.api.tick(self.code, last=1058, ask=0)
+        self.quote(1055)
+        self.assertEqual(len(self.api.inserted), 1)
+        self.assertTrue(self.kernel._armed)
+        decision = self.session.last_decisions[self.code]
+        self.assertIsNone(decision['opportunity']['last_signal_bar_before'])
+        self.assertEqual(decision['opportunity']['last_signal_bar_after'],
+                         decision['opportunity']['market']['candle_id'])
+
+    def test_first_live_tick_after_same_day_reconnect_restores_prior_authority(self):
+        self.start()
+        self.api._data['notify']['disconnect'] = {'code': 2019112910}
+        self.session.step()
+        self.assertFalse(self.kernel._armed)
+        self.api._data['notify']['reconnect'] = {'code': 2019112902}
+        self.session.step()
+        self.assertFalse(self.kernel._armed)
+        self.quote()  # First new-epoch fact establishes the restored path.
+        self.assertFalse(self.kernel._armed)
+        self.assertEqual(self.api.inserted, [])
+        self.quote()
+        self.assertTrue(self.kernel._armed)
+        self.assertEqual(len(self.api.inserted), 1)
+
+    def test_clock_jump_still_accepts_owned_fill_and_reconciles_disarmed(self):
+        from datetime import timedelta
+        from types import SimpleNamespace
+        from tests.test_control import ControlTests
+
+        self.start(trade={'half_close_enabled': False})
+        self.quote()
+        order = self.api.inserted[0]
+        self.clock.value += timedelta(seconds=4)
+        self.api.fill(order['order_id'], 5, 1055)
+        self.session.step()
+        self.assertEqual(self.cycle()['protection']['owned_qty'], 5)
+        self.assertFalse(self.kernel._armed)
+        self.assertTrue(self.session.driver._fault)
+
+        self.clock.advance(1000)
+        self.api.tick(self.code, last=1055)
+        message = ControlTests.message(SimpleNamespace(kernel=self.kernel, account=self.kernel.account_key),
+            'REQUEST_RECONCILIATION', {'requested_scope': 'FULL_ACCOUNT', 'position_cycle_id': None})
+        self.kernel.poll()  # An IPC turn can elapse between context and command.
+        future = self.kernel.execute_command(message, 'desktop')
+        self.kernel.wait_idle()
+        self.assertEqual(future.result()['status'], 'SUCCEEDED')
+        self.assertIsNone(self.session.driver._fault)
+        self.assertFalse(self.kernel._armed)
+        self.quote(1030)
+        self.assertEqual(self.api.inserted[-1]['offset'], 'CLOSE')
+
+    def test_desktop_target_count_allows_replacement_at_daily_cap(self):
+        self.start(trade={'max_daily_orders': 1}, grant_changes={
+            'schema_version': 'KQ_DSV_DESKTOP/1', 'trading_days': ['2026-11-10'],
+            'resume_entries_on_day_change': False, 'daily_targets_per_contract': 1})
+        self.quote()
+        opening = self.api.inserted[0]['order_id']
+        self.quote(1056)
+        self.assertIn(opening, self.api.cancelled)
+        self.api.terminal(opening)
+        self.quote(1056)
+        self.assertEqual(len(self.api.inserted), 2)
+        from online_trader.kernel.statistics import strategy_open_counts
+        self.assertEqual(strategy_open_counts(self.kernel._committed.values(), '2026-11-10'), {self.code: 1})
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(), 2)
 
     def test_missing_margin_is_zero_only_for_proved_flat_contract(self):
         self.start()

@@ -210,13 +210,26 @@ class AutoOffsetRuntimeTests(unittest.TestCase):
         self.calculate();path=self.root/'dsv-config.json';path.write_text(dsv_startup_profile(self.profile).to_json(),encoding='utf-8')
         verify_dsv_profile(path,self.effective,source_profile=self.profile)
 
-    def test_comparison_waits_for_matching_effective_dsv_parameters_before_arm(self):
-        self.owner();path=self.root/'dsv-config.json';path.write_text(self.profile.to_json(),encoding='utf-8')
-        self.kernel._comparison_profile_source=path
-        with self.assertRaises(TraderError) as error:self.kernel.simulation.arm()
-        self.assertEqual(error.exception.code,'E_NOT_READY');self.assertTrue(self.kernel._auto_parameter_wait)
-        path.write_text(self.effective.to_json(),encoding='utf-8');self.kernel.simulation.arm();self.kernel.wait_idle()
-        self.assertFalse(self.kernel._auto_parameter_wait);self.assertTrue(self.kernel._armed)
+    def test_comparison_warns_on_mismatch_without_changing_authority(self):
+        from online_trader.runtime.comparison import ComparisonRecorder
+
+        self.owner()
+        path = self.root / 'dsv-config.json'
+        path.write_text(self.profile.to_json(), encoding='utf-8')
+        output = self.root / 'comparison'
+        output.mkdir()
+        recorder = ComparisonRecorder(self.kernel, output, self.effective, self.calendar, dsv_config=path)
+        try:
+            self.assertEqual(recorder.profile_warning, 'E_COMPARISON_SETTINGS')
+            self.kernel.simulation.arm()
+            self.kernel.wait_idle()
+            self.assertTrue(self.kernel._armed)
+            path.write_text(self.effective.to_json(), encoding='utf-8')
+            recorder.last_profile_check = 0
+            recorder.poll()
+            self.assertIsNone(recorder.profile_warning)
+        finally:
+            recorder.close()
 
     def test_offline_prepare_reports_pending_data_and_fixed_silver_stop_without_connection(self):
         for name,value in [('scope',self.source.value),('profile',self.profile.to_record()),('calendar',self.calendar.to_record())]:
@@ -233,8 +246,7 @@ class AutoOffsetRuntimeTests(unittest.TestCase):
         class Server:
             def __init__(self,kernel,pipe):captured.append(kernel)
             def serve(self,stop,**kwargs):stop.set()
-        with (patch('online_trader.runtime.dsv_simulation.measure_reference',return_value=self.clock),
-              patch('online_trader.runtime.dsv_simulation.clock_observation',return_value={'system_aligned':True}),
+        with (patch('online_trader.runtime.dsv_simulation.Thread'),
               patch.object(SimNowDsvPort,'connect',return_value=self.port) as connect,
               patch('online_trader.kernel.server.ControlServer',Server)):
             run(self.root/'scope.json','NEVER_READ',self.root/'profile.json',self.root/'calendar.json',self.root/'run',pipe='offline-auto')

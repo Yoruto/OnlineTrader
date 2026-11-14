@@ -278,7 +278,7 @@ class SessionLaunchTests(unittest.TestCase):
             self.assertIsNone(dialog.scheduled_request)
         finally:dialog.close()
     def test_existing_owner_refuses_second_login_before_reference_and_credential_reads(self):
-        with AccountLock(self.row['account_key']),patch('online_trader.runtime.dsv_simulation.measure_reference') as reference,patch.object(TqKqDsvPort,'connect') as connect:
+        with AccountLock(self.row['account_key']),patch('online_trader.runtime.dsv_simulation.Thread') as reference,patch.object(TqKqDsvPort,'connect') as connect:
             with self.assertRaises(TraderError):run(self.paths[0],'never-read',self.paths[1],self.paths[2],self.root/'no-run')
             reference.assert_not_called();connect.assert_not_called()
     def test_account_dialog_saves_without_retaining_secret_in_widgets(self):

@@ -253,24 +253,26 @@ class DsvEntryTests(unittest.TestCase):
         self.assertEqual(hysteresis_ready("SHORT", "1051", "1035", "16", False), (True, True))
         self.assertEqual(hysteresis_ready("SHORT", "1035", "1035", "16", True), (True, True))
 
-    def test_first_minute_observer_uses_both_absolute_distances_and_stops_whole_day(self):
+    def test_first_minute_uses_shipped_control_flow_even_with_legacy_latch(self):
         strategy, state = self.setup_strategy(profile(no_open_after_open=False, participate_auction=True))
-        result = strategy.evaluate(state, event(source_time_utc="2026-11-09T01:00:20Z", last="1010", bid1="1009", ask1="1011"))
-        self.assertIn("FIRST_MINUTE_JUMP_DAY_STOP", result["reasons"])
-        self.assertEqual(result["state"]["first_minute_blocks"], ["LONG", "SHORT"])
-        later = strategy.evaluate(result["state"], event(sequence=2, candle_id="20261109-0106", source_time_utc="2026-11-09T01:06:00Z"))
-        self.assertIn("FIRST_MINUTE_JUMP_DAY_STOP", later["reasons"])
+        state["first_minute_blocks"] = ["LONG", "SHORT"]
+        state["need_hyst"] = True
+        state["hysteresis_armed"]["LONG"] = True
+        for elapsed in (0, 60, 61):
+            with self.subTest(elapsed=elapsed):
+                minute, second = divmod(elapsed, 60)
+                result = strategy.evaluate(state, event(source_time_utc=f"2026-11-09T01:{minute:02}:{second:02}Z"))
+                self.assertEqual([row["direction"] for row in result["candidates"]], ["LONG"])
+                self.assertNotIn("FIRST_MINUTE_JUMP_DAY_STOP", result["reasons"])
+                self.assertEqual(bool(result["source_notes"]), elapsed <= 60)
 
-    def test_need_hysteresis_is_session_observer_state_and_zero_falls_back_to_stop(self):
-        settings = profile(no_open_after_open=False, participate_auction=True).to_settings();settings["symbols"][0]["stop_offset"] = 30
-        strategy, state = self.setup_strategy(DsvProfile.from_settings(settings))
-        first = strategy.evaluate(state, event(source_time_utc="2026-11-09T01:00:20Z", day_high="1080", last="1026", bid1="1025", ask1="1027"))
-        self.assertIn("LONG:HYSTERESIS_NOT_READY", first["reasons"])
-        self.assertTrue(first["state"]["need_hyst"])
-        second = strategy.evaluate(first["state"], event(sequence=2, candle_id="20261109-0101", source_time_utc="2026-11-09T01:01:01Z",
-            day_high="1080", last="1025", bid1="1024", ask1="1026"))
-        self.assertTrue(second["state"]["need_hyst"])
-        self.assertTrue(second["state"]["hysteresis_armed"]["LONG"])
+    def test_zero_jump_ratio_and_shared_hysteresis_helper_boundaries(self):
+        self.assertTrue(opening_jump_block("1055", "1055", "50", "0"))
+        self.assertTrue(opening_jump_block("1095", "1055", "50", "0.8"))
+        self.assertFalse(opening_jump_block("1094", "1055", "50", "0.8"))
+        ready, armed = hysteresis_ready("LONG", "1039", "1055", "16", False)
+        self.assertEqual((ready, armed), (True, True))
+        self.assertEqual(hysteresis_ready("SHORT", "1035", "1035", "16", armed), (True, True))
 
     def test_same_trigger_after_stop_is_allowed_when_dsv_switch_false(self):
         strategy, state = self.setup_strategy()

@@ -7,7 +7,6 @@ from online_trader import __version__
 from online_trader.contracts.codec import content_hash,canonical_bytes,strict_loads
 from online_trader.configuration.files import publish_new_bytes
 from online_trader.errors import TraderError
-from online_trader.runtime.comparison import verify_dsv_profile
 from online_trader.runtime.dsv_simulation import load_inputs
 from online_trader.runtime.executable import bundled_cli
 
@@ -43,25 +42,28 @@ class SessionLauncher:
         if len(raw)>8192:raise TraderError('E_ONLINE_SCOPE','Desktop launch reference exceeds its size bound')
         return strict_loads(raw)
 
-    def _simnow_binding(self,grant,profile):
+    def _simnow_binding(self, grant):
         reference=self._record(self.packet/'simnow-credentials.json')
         if (grant.provider!='TQ_SIMNOW' or grant.manual_workbench or grant.automatic_offsets
                 or reference!={'schema_version':'SIMNOW_CREDENTIAL_REFERENCE/1',
                                'account_fingerprint':grant.value['account_fingerprint']}
                 or Path(grant.value['ledger_path']).resolve()!=self.packet/'ledger.db'):
             raise TraderError('E_SCOPE','Desktop SimNow packet must bind its own ledger, reference and fixed strategy settings')
-        comparison=self._record(self.packet/'dsv-comparison.json')
-        if (type(comparison) is not dict or set(comparison)!={'config','log_dir'}
-                or any(type(path) is not str or not Path(path).is_absolute() for path in comparison.values())):
-            raise TraderError('E_COMPARISON_LOG','Desktop comparison needs explicit DSV config and log paths')
-        verify_dsv_profile(comparison['config'],profile)
-        if not Path(comparison['log_dir']).is_dir():raise TraderError('E_COMPARISON_LOG','DSV log directory is missing')
-        return {'pipe':'OnlineTrader.SimNow.'+reference['account_fingerprint'],
-                'dsv_config':comparison['config'],'dsv_log_dir':comparison['log_dir']}
+        result = {'pipe': 'OnlineTrader.SimNow.' + reference['account_fingerprint']}
+        try:
+            comparison = self._record(self.packet / 'dsv-comparison.json')
+        except (OSError, TraderError):
+            comparison = None
+        if (type(comparison) is dict and set(comparison) == {'config', 'log_dir'}
+                and all(isinstance(path, str) and Path(path).is_absolute() for path in comparison.values())):
+            result.update(dsv_config=comparison['config'], dsv_log_dir=comparison['log_dir'])
+        else:
+            result['comparison_warning'] = 'E_COMPARISON_SETTINGS_UNAVAILABLE'
+        return result
 
     def review(self):
         grant,profile,calendar=load_inputs(*self.paths)
-        if self.packet is not None:binding=self._simnow_binding(grant,profile)
+        if self.packet is not None:binding=self._simnow_binding(grant)
         else:
             row=self.store.get(self.account_id)
             if self.store.read()['selected_id']!=self.account_id:
@@ -77,7 +79,7 @@ class SessionLauncher:
             'calendar_hash':calendar.content_hash,'contracts':value['contracts'],'trading_day':value['trading_day'],
             'not_before_utc':value['not_before_utc'],'not_after_utc':value['not_after_utc'],
             'login_from_utc':login_from.isoformat(),
-            'opening_attempts':value['opening_attempts'],'max_order_quantity':value['max_order_quantity'],
+            **grant.opening_limit, 'max_order_quantity':value['max_order_quantity'],
             'scope_schema':value['schema_version'],'trading_days':grant.trading_days,
             'manual_workbench':grant.manual_workbench,
             'resume_entries_on_day_change':value.get('resume_entries_on_day_change',False),
@@ -155,7 +157,10 @@ class SessionLauncher:
         if self.packet is not None:
             reference={'schema_version':'SIMNOW_CREDENTIAL_REFERENCE/1','account_fingerprint':grant.value['account_fingerprint']}
             credentials=publish_new_bytes(canonical_bytes(reference),directory/'reviewed-credential-reference.json')
-            connection=['simnow','run','--credentials',str(credentials),'--dsv-config',review['dsv_config'],'--dsv-log-dir',review['dsv_log_dir']]
+            connection = ['simnow', 'run', '--credentials', str(credentials)]
+            for field in ('dsv_config', 'dsv_log_dir'):
+                if field in review:
+                    connection.extend(('--' + field.replace('_', '-'), review[field]))
         else:
             provider='simnow' if grant.provider=='TQ_SIMNOW' else 'dsv'
             connection=[provider,'run','--account-store',str(self.store.directory),'--account-id',self.account_id]

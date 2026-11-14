@@ -83,13 +83,6 @@ class NativeDailyFeed:
                 lead=(datetime.fromisoformat(upcoming['open_utc'])-now).total_seconds()
                 if 0<lead<=900:deadline=max(deadline,time.monotonic()+lead+timeout_seconds)
         while True:
-            if self.port.broker_connected and time.monotonic()-self.port.clock.monotonic_anchor>120:
-                # No owner/owned execution exists at this preparation stage.
-                # Refresh on this same thread; never create another SDK client.
-                from online_trader.scheduling.reference import measure_reference,clock_observation
-                clock=measure_reference()
-                if not clock_observation(clock)['system_aligned']:raise TraderError('E_CLOCK','Windows/reference clock alignment was lost during startup')
-                self.port.clock=clock
             try:return self.snapshot()
             except TraderError as error:
                 if error.code!='E_NOT_READY' or time.monotonic()>=deadline:raise

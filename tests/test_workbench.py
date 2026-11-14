@@ -129,9 +129,9 @@ class WorkbenchClientTests(unittest.TestCase):
 class WorkbenchOwnerTests(unittest.TestCase):
     def setUp(self):self.case=dsv_fixtures.OnlineDsvTests();self.case.setUp()
     def tearDown(self):self.case.tearDown()
-    def test_observation_rebuild_keeps_last_quote_and_its_original_age(self):
+    def test_delayed_latest_quote_is_visible_with_its_original_age_and_entry_reason(self):
         x = self.case
-        x.start(max_quote_age_ms=5000)
+        x.start(max_quote_age_ms=5000, trade={'max_quote_age_seconds': 5})
         before = workbench_view(x.kernel)['markets'][0]
         self.assertTrue(before['fresh'])
         x.clock.advance(1000)
@@ -140,10 +140,10 @@ class WorkbenchOwnerTests(unittest.TestCase):
         x.session.step()
 
         market = workbench_view(x.kernel)['markets'][0]
-        self.assertEqual((market['last'], market['source_time_utc']), (before['last'], before['source_time_utc']))
+        self.assertEqual(market['last'], '1055')
+        self.assertGreater(market['source_time_utc'], before['source_time_utc'])
         self.assertFalse(market['fresh'])
-        self.assertNotIn('WAITING_FRESH_QUOTE', market['entry_reasons'])
-        self.assertNotIn((x.code, before['trading_day']), x.session.driver.strategy._latest)
+        self.assertIn('DSV_QUOTE_AGE_EXCEEDED', x.session.last_decisions[x.code]['reasons'])
         self.assertEqual(x.api.inserted, [])
 
         x.quote(price=1048)

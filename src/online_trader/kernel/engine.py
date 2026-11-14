@@ -20,7 +20,7 @@ from online_trader.contracts.context import ContextRegistry
 from online_trader.contracts.validation import validate_plan
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_value, decimal_text, identifier, order_price, quantity
-from online_trader.errors import TraderError
+from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.ports import UnavailablePort, OnlineSimulationPort
 from online_trader.ledger.store import Ledger
 from online_trader.protection import initial_state, reduce_event, ProtectionState
@@ -432,7 +432,9 @@ class Kernel:
             cycle['statistics_observed_at_utc']=_strategy['metadata']['candidate']['source_time_utc']
         if scheduler is not None and cycle['strategy_metadata'] is not None:
             cycle['schedule_binding']=scheduler.binding_for(plan,entry_time_utc=cycle['strategy_metadata']['candidate']['source_time_utc'])
-        if _strategy is not None:self._entry_gates[order.attempt_id]=_strategy["gate"]
+        if _strategy is not None:
+            self._entry_gates[order.attempt_id] = _strategy["gate"]
+            cycle['strategy_target_accepted'] = True
         self._decision_keys.add(decision_key)
         self._risk_revision += 1
         self._state_revision += 1
@@ -441,10 +443,11 @@ class Kernel:
             self._dispatch(cycle_id, order.child_order_id)
         self._stage_cycle(cycle, "TX_INTENT", "ENTRY_PREPARED", after=accepted,
                           extra_mutate=None if _strategy is None else _strategy["mutate"],
-                          money_account=None if _strategy is None else _strategy.get('money_account'))
+                          money_account=None if _strategy is None else _strategy.get('money_account'),
+                          evidence=None if _strategy is None else {'report': _strategy['report'] | {'child_order_id': order.child_order_id}})
         return order.child_order_id
 
-    def _stage_cycle(self, cycle, kind, event_type, *, fill=None, after=None,extra_mutate=None,nominal_statistics=None,money_account=None):
+    def _stage_cycle(self, cycle, kind, event_type, *, fill=None, after=None,extra_mutate=None,nominal_statistics=None,money_account=None,evidence=None):
         if self.simulation:cycle['native_order_keys']={order['child_order_id']:self.port.order_id(order['child_order_id']) for order in cycle['orders']}
         self._writable()
         self.statistics.freeze_exit(cycle)
@@ -453,6 +456,8 @@ class Kernel:
         frozen = copy.deepcopy(cycle)
         authority = self._authority()
         data = {"cycle": frozen, "authority": authority}
+        if evidence is not None:
+            data.update(copy.deepcopy(evidence))
         if fill is not None:
             data["fill"] = copy.deepcopy(fill)
         if nominal_statistics is not None:
@@ -655,11 +660,16 @@ class Kernel:
             self._entry_gates.pop(order["attempt_id"],None)
             return
         checks = {}
+        review_details = {}
         checks['ORIGINAL_BOOT'] = order.get("kernel_boot_id") == self.boot_id
         scheduler=getattr(self,'_scheduled_runtime',None)
         if scheduler is not None and checks['ORIGINAL_BOOT']:
-            checks['CURRENT_SESSION'] = scheduler.scope_current(cycle['plan']['contract_id'],
-                order.get('native_trading_day',cycle['plan']['trading_day']))
+            expected_day = order.get('native_trading_day', cycle['plan']['trading_day'])
+            checks['CURRENT_SESSION'] = scheduler.scope_current(cycle['plan']['contract_id'], expected_day)
+            if not checks['CURRENT_SESSION']:
+                review_details['CURRENT_SESSION'] = {'expected_trading_day': expected_day,
+                                                      'clock_fault': scheduler._fault}
+        gate_result = None
         if order["effect"]=="OPEN":
             authorization=cycle["entry_authorization"]
             try:
@@ -671,11 +681,25 @@ class Kernel:
                 if all(checks.values()):
                     checks['RISK_BUDGET'] = self._exposure() <= self.budget
                     if checks['RISK_BUDGET']:
-                        checks['NOMINAL_DAY_STOP'] = not self.statistics.entry_reasons(
-                            cycle['plan']['contract_id'], cycle['plan']['trading_day'])
+                        for reason in self.statistics.entry_reasons(cycle['plan']['contract_id'], cycle['plan']['trading_day']):
+                            checks[reason] = False
+                    else:
+                        review_details['RISK_BUDGET'] = {'expected_maximum': decimal_text(self.budget),
+                                                         'observed': decimal_text(self._exposure())}
                 if strategy and all(checks.values()):
                     gate=self._entry_gates.get(order["attempt_id"])
-                    checks['STRATEGY_RECHECK'] = self.active_epoch==cycle["strategy_epoch"] and gate is not None and bool(gate())
+                    if self.active_epoch != cycle["strategy_epoch"]:
+                        checks['STRATEGY_EPOCH_REVOKED'] = False
+                    elif gate is None:
+                        checks['ENTRY_RECHECK_UNAVAILABLE'] = False
+                    else:
+                        gate_result = gate()
+                        if isinstance(gate_result, dict):
+                            for reason in gate_result['reason_codes']:
+                                checks[reason] = False
+                        else:
+                            checks['STRATEGY_RECHECK'] = bool(gate_result)
+                            gate_result = None
             except TraderError as error:
                 checks[error.code] = False
         else:
@@ -692,6 +716,9 @@ class Kernel:
         if self.execution.active(cycle):
             priced=self.execution.price(cycle,order['effect'])
             checks['EXECUTION_PRICE']=priced['allowed'] and priced['price']==order['limit_price']
+            if not checks['EXECUTION_PRICE']:
+                review_details['EXECUTION_PRICE'] = {'expected': order['limit_price'],
+                    'observed': priced['price'], 'reason_codes': priced['reasons']}
         try:order_price(order["limit_price"],cycle.get("instrument",{}).get("tick_size",self.tick_size))
         except TraderError as error:checks[error.code]=False
         request=copy.deepcopy(order) | {"position_cycle_id":cid,"account_key":self.account_key}
@@ -705,22 +732,32 @@ class Kernel:
             order["terminal_confirmed"] = True
             order["reported_fill_qty"] = order["filled_qty"]
             if getattr(self.simulation, 'strategy_enabled', False):
-                cycle["last_dispatch_abort"] = {"child_order_id": child_id,
-                    "reasons": [check for check, passed in checks.items() if not passed]}
+                cycle["last_dispatch_abort"] = {
+                    "child_order_id": child_id,
+                    "decision_id": (cycle.get("strategy_metadata") or {}).get("decision_id"),
+                    "reasons": [check for check, passed in checks.items() if not passed],
+                    "recheck": gate_result,
+                    "checks": checks,
+                    "details": review_details,
+                    "expected_authority_revision": (cycle.get("entry_authorization") or {}).get("authority_revision"),
+                    "authority_revision": self._authority_revision,
+                }
             cycle["revision"] += 1
             self._stage_cycle(cycle,"TX_ORDER","SEND_ABORTED",after=(lambda:self._progress_exits(cid)) if order["effect"]=="REDUCE" else None)
             return
         self._dispatched.add(order["attempt_id"])
         self._entry_gates.pop(order["attempt_id"],None)
+        evidence = None
         try:
             self.port.send(request)
             order["send_state"] = "CALL_RETURNED"
-        except Exception:
+        except Exception as error:
             order["send_state"] = "UNKNOWN"
             self._armed = False
+            evidence = {"exception": exception_record(error), "child_order_id": child_id}
         cycle["revision"] += 1
         order["revision"] += 1
-        self._stage_cycle(cycle,"TX_ORDER","SEND_RESULT")
+        self._stage_cycle(cycle,"TX_ORDER","SEND_RESULT", evidence=evidence)
         if self.simulation and order['send_state']=='UNKNOWN':self.pause()
 
     def record_fill(self, child_id: str, trade_key: str, qty: int, price: str, *, observed_at_utc=None,
@@ -964,13 +1001,16 @@ class Kernel:
         def send_cancel():
             updated,_ = self._find(child_id)
             item = next(o for o in updated["orders"] if o["child_order_id"]==child_id)
+            evidence = None
             try:
                 self.port.cancel({"child_order_id":child_id,"account_key":self.account_key})
                 item["cancel_status"]="CALL_RETURNED"
-            except Exception:
+            except Exception as error:
                 item["cancel_status"]="UNKNOWN"
+                evidence = {"exception": exception_record(error), "child_order_id": child_id}
             updated["revision"]+=1
-            self._stage_cycle(updated,"TX_CANCEL","CANCEL_RESULT",after=lambda:self._progress_exits(cycle['position_cycle_id']))
+            self._stage_cycle(updated,"TX_CANCEL","CANCEL_RESULT", evidence=evidence,
+                              after=lambda:self._progress_exits(cycle['position_cycle_id']))
         self._stage_cycle(cycle,"TX_CANCEL","CANCEL_PREPARED",after=send_cancel)
 
     def confirm_terminal(self, child_id: str, status: str, cumulative_fill_qty: int,*,_adapter_token=None,_historical_recovery=False):

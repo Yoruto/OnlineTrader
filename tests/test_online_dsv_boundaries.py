@@ -46,7 +46,7 @@ class DsvScopeBoundaryTests(unittest.TestCase):
                 DsvSimulationGrant.parse(canonical_bytes(self.grant.value|changes))
 
     def test_offline_prepare_does_not_read_credentials_connect_or_arm(self):
-        with patch('online_trader.runtime.dsv_simulation.measure_reference') as ntp,patch.object(TqKqDsvPort,'connect') as connect,redirect_stdout(StringIO()) as stdout:
+        with patch('online_trader.runtime.dsv_simulation.Thread') as ntp,patch.object(TqKqDsvPort,'connect') as connect,redirect_stdout(StringIO()) as stdout:
             code=main(['dsv','prepare','--scope',str(self.root/'scope.json'),'--profile',str(self.root/'profile.json'),
                        '--calendar',str(self.root/'calendar.json'),'--output',str(self.root/'preparation')])
         self.assertEqual(code,0);connect.assert_not_called();ntp.assert_not_called()
@@ -56,7 +56,7 @@ class DsvScopeBoundaryTests(unittest.TestCase):
 
     def test_wrong_profile_is_refused_before_reference_or_account_connection(self):
         value=self.grant.value|{'profile_hash':'0'*64};(self.root/'scope.json').write_bytes(canonical_bytes(value))
-        with patch('online_trader.runtime.dsv_simulation.measure_reference') as ntp,patch.object(TqKqDsvPort,'connect') as connect:
+        with patch('online_trader.runtime.dsv_simulation.Thread') as ntp,patch.object(TqKqDsvPort,'connect') as connect:
             with self.assertRaises(TraderError):run(self.root/'scope.json','unused',self.root/'profile.json',self.root/'calendar.json',self.root/'out')
         ntp.assert_not_called();connect.assert_not_called()
 
@@ -65,7 +65,7 @@ class DsvScopeBoundaryTests(unittest.TestCase):
         output.mkdir()
         prior = output / 'strategy-log.jsonl'
         prior.write_bytes(b'old log')
-        with (patch('online_trader.runtime.dsv_simulation.measure_reference') as clock,
+        with (patch('online_trader.runtime.dsv_simulation.Thread') as clock,
               patch('online_trader.runtime.dsv_simulation.strategy_port') as port):
             with self.assertRaises(TraderError) as error:
                 run(self.root/'scope.json', 'unused', self.root/'profile.json', self.root/'calendar.json', output)

@@ -336,6 +336,9 @@ def workbench_view(kernel):
         'blocks':[r for r in records if r['record_type']=='BLOCK']+[{'reason_code':e,'active':True} for e in snapshot['errors'][-64:]]+exit_blocks,
         'commands':commands,'policies':policies,'truncated':False}
     result['symbol_entry_switches']=copy.deepcopy(kernel.control.symbol_entries)
+    diagnostics = getattr(kernel, '_dsv_diagnostics', None)
+    if diagnostics:
+        result['configuration']['strategy_diagnostics'] = diagnostics.copy()
     run_directory = getattr(kernel, '_dsv_run_directory', None)
     if run_directory is not None:
         result['configuration']['run_directory'] = run_directory

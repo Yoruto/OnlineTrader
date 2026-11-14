@@ -76,7 +76,11 @@ class SessionDialog(QDialog):
         request=(self.launcher,self.fields['python'].text(),self.fields['output'].text(),review['review_hash'],armed)
         beijing=timezone(timedelta(hours=8))
         def local(key):return datetime.fromisoformat(review[key]).astimezone(beijing).strftime('%m-%d %H:%M')
-        text=f"账户 {review['account_key']}\n{'、'.join(review['contracts'])}\n北京时间 {local('login_from_utc')} 起可连接\n策略入场范围 {local('not_before_utc')} 至 {local('not_after_utc')}\n柜台交易日 {', '.join(review['trading_days'])}\n最多 {review['opening_attempts']} 个开仓子单、每单最多 {review['max_order_quantity']} 手\n请求首次策略入场权：{'是' if armed else '否'}"
+        if 'daily_targets_per_contract' in review:
+            quota = f"每品种每柜台日最多 {review['daily_targets_per_contract']} 个策略开仓目标"
+        else:
+            quota = f"最多 {review['opening_attempts']} 个开仓子单"
+        text=f"账户 {review['account_key']}\n{'、'.join(review['contracts'])}\n北京时间 {local('login_from_utc')} 起可连接\n策略入场范围 {local('not_before_utc')} 至 {local('not_after_utc')}\n柜台交易日 {', '.join(review['trading_days'])}\n{quota}、每单最多 {review['max_order_quantity']} 手\n请求首次策略入场权：{'是' if armed else '否'}"
         if schedule:
             schedule_settings=review['schedule']
             if schedule_settings['enabled']:

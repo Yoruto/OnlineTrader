@@ -25,7 +25,7 @@ from online_trader.configuration.rollover import expiry_date, expiry_warning, fu
 from online_trader.configuration.symbol_csv import ALIASES, PRODUCT_NAMES
 from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.reports import EquityChart
-from online_trader.desktop.runtime_logs import JsonLogTail, comparison_file, executor_log_path, resolve_run, startup_only
+from online_trader.desktop.runtime_logs import JsonLogTail, comparison_file, executor_log_path, matches_run_identity, resolve_run
 from online_trader.errors import TraderError
 from online_trader.runtime.comparison import dsv_log_category
 
@@ -71,10 +71,10 @@ LOG_PHASES = {
     'DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION': '柜台换日，等待核对原委托及持仓',
     'DSV_STOPPING': '已停止开仓，继续保护并等待核对',
     'DSV_STOPPED': '策略已停止',
-    'COMPARISON_REQUIRES_ATTENTION': '对照记录需核对',
+    'DSV_CLOCK_FAULT': 'Windows 时间或交易时段待核对，保留原持仓退出目标',
+    'DSV_ENTRY_RECOVERY_PENDING': '等待柜台核对和实时行情，开仓权限暂挂',
     'CLOCK_REFRESH_RETRY_PROTECTION_ACTIVE': '参考时钟暂不可用，继续保护已有持仓',
     'DSV_CONTROLLER_INTERRUPTED_ORIGINAL_PROTECTION_CONTINUES': '控制连接中断，继续管理原持仓',
-    'AUTO_OFFSETS_WAITING_MATCHING_DSV_PARAMETERS': '等待两端有效偏移一致',
 }
 
 
@@ -1812,15 +1812,12 @@ class WorkbenchLayout:
         archive = None
         if same_binding and self.log_directory is not None:
             archive = comparison_file(self.log_directory, identity) if identity is not None else None
-            if archive == self.log_comparison and (archive is not None or
-                    (identity is None and startup_only(self.log_directory))):
+            if archive == self.log_comparison and self.log_source_matches(self.log_directory, archive):
                 return self.log_directory
         elif same_binding and now - self.log_resolution_at < 2.5:
             return self.log_directory
         directory = resolve_run(view, candidates, account_root, paired_root, finished=finished)
         archive = comparison_file(directory, identity) if directory is not None and identity is not None else None
-        if identity is not None and archive is None:
-            directory = None
         if (directory != self.log_directory or archive != self.log_comparison
                 or (self.log_binding and self.log_binding[0] != identity)):
             self.log_tails.clear()
@@ -1831,15 +1828,17 @@ class WorkbenchLayout:
         return directory
 
     def log_source_matches(self, run, archive):
-        if archive is None:
-            return startup_only(run)
-        return comparison_file(run, self.log_binding[0]) == archive
+        identity = self.log_binding[0]
+        if identity is None:
+            return run in self.log_binding[3]
+        return matches_run_identity(run, identity) and comparison_file(run, identity) == archive
 
     def log_paths(self, run):
-        paths = [executor_log_path(run), run/'startup-failure.json', *sorted(run.glob('phase-*-bootstrap.json'))]
+        paths = [executor_log_path(run), run/'startup-failure.json', *sorted(run.glob('phase-*.json'))]
         comparison = self.log_comparison
+        paths.append(run / 'strategy-log.jsonl')
         if comparison is not None:
-            paths.extend((run/'strategy-log.jsonl', comparison))
+            paths.append(comparison)
         return paths
 
     def log_tail(self, path):
@@ -1852,7 +1851,7 @@ class WorkbenchLayout:
     def logged_strategy_reasons(self, run):
         result = {}
         archive = self.log_comparison
-        if run is not None and archive is not None:
+        if run is not None:
             path = run/'strategy-log.jsonl'
             for record in self.log_tail(path).read(path):
                 kind = record.get('kind')
@@ -1866,7 +1865,7 @@ class WorkbenchLayout:
 
     def executor_log(self, run):
         phases = []
-        for path in (executor_log_path(run), *sorted(run.glob('phase-*-bootstrap.json'))):
+        for path in (executor_log_path(run), *sorted(run.glob('phase-*.json'))):
             for record in self.log_tail(path).read(path):
                 phase = record.get('phase')
                 if not isinstance(phase, str):
@@ -1878,12 +1877,15 @@ class WorkbenchLayout:
                 error = record.get('error_code')
                 if isinstance(error, str):
                     message += ' · ' + error
+                exception = record.get('exception')
+                if isinstance(exception, dict) and exception.get('exception_id'):
+                    message += ' · ' + exception['exception_id']
                 phases.append(WorkbenchLogLine(f'[{at}] [执行器] {message}', 'error' if error else None, stamp))
         failure = run/'startup-failure.json'
         for record in self.log_tail(failure).read(failure):
-            phases.append(WorkbenchLogLine(f"[执行器] {record.get('message','启动失败')} · {record.get('error_code','—')}", 'error'))
-        if self.log_comparison is None:
-            return phases
+            identity = (record.get('exception') or {}).get('exception_id')
+            suffix = f' · {identity}' if identity else ''
+            phases.append(WorkbenchLogLine(f"[执行器] {record.get('message','启动失败')} · {record.get('error_code','—')}{suffix}", 'error'))
         path = run/'strategy-log.jsonl'
         for record in self.log_tail(path).read(path):
             stamp = record.get('native_time_utc') or record.get('observed_at_utc')

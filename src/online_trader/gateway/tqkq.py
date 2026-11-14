@@ -108,25 +108,25 @@ class TqKqPort(OnlineSimulationPort):
 
     def complete(self):return self._transport_up and not self.api._account._get_trade_more_data(self.api._data)
 
-    def fresh(self,code):
+    def fresh(self, code, *, check_age=True):
         try:
             q=self.quotes[code];at=datetime.fromisoformat(q.datetime).replace(tzinfo=timezone(timedelta(hours=8)))
             age=(self.clock.now()-at).total_seconds()
             values=(q.bid_price1,q.ask_price1,q.last_price,q.price_tick,q.lower_limit,q.upper_limit)
-            return not q.expired and -1<=age<=5 and all(math.isfinite(v) and v>0 for v in values) and q.lower_limit<=q.bid_price1<=q.ask_price1<=q.upper_limit and q.bid_volume1>0 and q.ask_volume1>0
+            return not q.expired and -1 <= age and (not check_age or age <= 5) and all(math.isfinite(v) and v>0 for v in values) and q.lower_limit<=q.bid_price1<=q.ask_price1<=q.upper_limit and q.bid_volume1>0 and q.ask_volume1>0
         except (KeyError,AttributeError,TypeError,ValueError,TraderError):return False
 
     def fresh_manual_reduction(self,code):
         """Validate a current native quote for a frozen manual reduction limit."""
         return self._fresh_last(code)
 
-    def _fresh_last(self,code):
+    def _fresh_last(self, code, *, check_age=True):
         try:
             q = self.quotes[code]
             stamp = datetime.fromisoformat(q.datetime).replace(tzinfo=timezone(timedelta(hours=8)))
             age = (self.clock.now()-stamp).total_seconds()
             values = (q.last_price,q.price_tick,q.lower_limit,q.upper_limit)
-            return (not q.expired and -1<=age<=5 and all(math.isfinite(v) and v>0 for v in values)
+            return (not q.expired and -1 <= age and (not check_age or age <= 5) and all(math.isfinite(v) and v>0 for v in values)
                     and q.lower_limit<=q.last_price<=q.upper_limit)
         except (KeyError,AttributeError,TypeError,ValueError,TraderError):
             return False

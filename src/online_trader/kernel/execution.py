@@ -79,6 +79,7 @@ class ExecutionCoordinator:
                    'close_start_ms':None,'force_start_ms':None,'last_action':'WAIT'}
         ex.update(event_id=event['event_id'],source_epoch=event['source_epoch'],sequence=event['sequence'],
                   event_hash=digest,elapsed_ms=event['elapsed_ms'],market=copy.deepcopy(event['market']))
+        ex['ordinary_entry_fresh'] = event.get('ordinary_entry_fresh')
         ex['context_id']=event.get('context_id');ex['peer_id']=event.get('peer_id','qa')
         cycle['execution']=ex
         # Validate quote grammar before freezing a clock-driven exit reference.
@@ -235,7 +236,13 @@ class ExecutionCoordinator:
 
     def price(self,cycle,effect,*,manual_mode=None,elapsed_ms=0):
         ex=cycle['execution'];market=copy.deepcopy(ex['market']);quote=cycle.get('last_quote');k=self.kernel
-        if not quote or quote['kernel_boot_id']!=k.boot_id or k._quote_age_ns(quote['received_ns'])>k.max_quote_age_ms*1_000_000:
+        if effect == 'OPEN' and ex.get('ordinary_entry_fresh') is not None:
+            runtime = k._dsv_runtime
+            plan = cycle['plan']
+            facts = runtime._latest.get((plan['contract_id'], plan['trading_day']))
+            market['fresh'] = bool(ex['ordinary_entry_fresh'] and facts and
+                                   k.port.fresh_strategy_entry(plan['contract_id'], self.side(cycle, effect), facts['event']))
+        elif not quote or quote['kernel_boot_id']!=k.boot_id or k._quote_age_ns(quote['received_ns'])>k.max_quote_age_ms*1_000_000:
             market['fresh']=False
         else:market.update(last=quote['price'],bid1=quote.get('bid1'),ask1=quote.get('ask1'))
         side=self.side(cycle,effect)
@@ -354,7 +361,17 @@ class ExecutionCoordinator:
                 runtime=getattr(k,'_dsv_runtime',None)
                 if runtime is None:return
                 prepared=runtime.prepare_replacement(cycle,order)
-                if prepared is None:return
+                if prepared is None:
+                    return
+                if 'recheck' in prepared:
+                    review = prepared['recheck']
+                    prior = cycle.get('last_replacement_block', {})
+                    if prior.get('reason_codes') != review['reason_codes']:
+                        cycle['last_replacement_block'] = review
+                        cycle['revision'] += 1
+                        k._stage_cycle(cycle, 'TX_ORDER', 'REPLACEMENT_BLOCKED')
+                    return
+                cycle.pop('last_replacement_block', None)
                 cycle['entry_authorization']=prepared['authorization'];k._entry_gates[order.attempt_id]=prepared['gate']
             else:
                 ex=cycle['execution'];context=ex.get('context_id')

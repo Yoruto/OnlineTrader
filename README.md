@@ -1,6 +1,6 @@
 # OnlineTrader
 
-[DSV 行为基准、源码落点与验收交接](docs/dsv-behavior-baseline-20261113.md)
+[DSV 行为基准、源码落点与验收交接](docs/dsv-behavior-baseline-20261113.md) · [F01–F17 修复与验收摘要](docs/dsv-audit-repair-20261114.md)
 
 11 月 13 日完成 DSV 与 OnlineTrader 的定向离线联合验证。两边用同一份旧格式配置载入的五合约字段及归档偏移重算结果一致。国债尾盘、首分钟零比例及缺资金字段的处理仍有差异，原 DSV EXE 的完整启动和两边在线交易待验。[联合验证报告](output/validation/20261113-dsv-onlinetrader-joint/test-report.md)
 
@@ -37,7 +37,7 @@ OnlineTrader/
 
 ## Windows 校时
 
-在管理员 PowerShell 中执行 `& 'E:\online-trader\scripts\sync-clock-once.ps1' -Watch`，每 60 秒检查一次。偏差超过产品使用的 1 秒门槛时，脚本等待 DSV 程序和 OnlineTrader 交易执行器退出，再调用一次 Windows Time 同步，复测并退出。省略 `-Watch` 可在开盘前执行一次检查，时钟对齐时直接返回。加 `-WhatIf` 可查看拟执行的校时操作。测量和同步记录保存在 `output/clock-sync/`。
+在管理员 PowerShell 中执行 `& 'E:\online-trader\scripts\sync-clock-once.ps1' -Watch`，每 60 秒检查一次。偏差超过脚本使用的 1 秒提示阈值时，脚本等待 DSV 程序和 OnlineTrader 交易执行器退出，再调用一次 Windows Time 同步，复测并退出。省略 `-Watch` 可在开盘前执行一次检查，时钟对齐时直接返回。加 `-WhatIf` 可查看拟执行的校时操作。测量和同步记录保存在 `output/clock-sync/`。DSV 策略运行时使用 Windows 时间。启动及运行中每小时进行 NTP 诊断，结果可在操作日志查看。Windows 时间跳变后，在「交易详情 → 请求完整核对」核对原持仓和委托。核对完成后，按 F5 恢复策略开仓。
 
 独立 Windows 交易软件的开发候选。当前实现G1内核底座、DSV全业务参数编辑、离线偏移计算、交易模板/品种CSV、正式入场/风控、半仓/二阶段/保本、撤改追单、显式日历与保护调度、名义点数停开闭环、确认成交资金报表，以及外部CSV成交对照与经审查的匹配费用登记。dev13新增独立显式授权的一手快期在线模拟路径；默认运行仍禁开，核心环境没有交易SDK。资金未知就显示未知，业务确认与实际交易权分别管理。
 

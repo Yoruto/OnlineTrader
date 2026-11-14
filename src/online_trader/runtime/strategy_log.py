@@ -2,15 +2,45 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+import time
 
-from online_trader.contracts.codec import canonical_bytes
+from online_trader.domain.orders import OrderState
+
+from online_trader.contracts.codec import canonical_bytes, strict_loads
 
 
 BEIJING = timezone(timedelta(hours=8))
 TIMING_CHECKS = {'OPENING_WAIT', 'CLOSE_SESSION_NO_OPEN', 'DSV_QUOTE_AGE_EXCEEDED'}
-NO_ENTRY_LOG = {'ENTRY_AUTHORITY_DISARMED', 'RECONCILIATION_REQUIRED', 'CONTROL_BARRIER',
-                'STRATEGY_EPOCH_REVOKED', 'SCHEDULE_CURRENT_SESSION_UNPROVEN', 'OBSERVATION_ONLY_BACKLOG',
-                'OWNED_EXPOSURE_EXISTS'}
+WAIT_REASONS = {'OBSERVATION_ONLY_BACKLOG', 'TRIGGER_NOT_REACHED', 'DUPLICATE_MARKET_EVENT',
+                'OUT_OF_ORDER_MARKET_EVENT', 'OUT_OF_ORDER_SOURCE_TIME'}
+BLOCK_MESSAGES = {
+    'ENTRY_AUTHORITY_DISARMED': '尚未启用策略开仓',
+    'RECONCILIATION_REQUIRED': '等待柜台委托和持仓核对',
+    'CONTROL_BARRIER': '操作或维护限制新增',
+    'STRATEGY_EPOCH_REVOKED': '策略运行身份失效',
+    'SCHEDULE_CURRENT_SESSION_UNPROVEN': '当前交易时段待核实',
+    'OWNED_EXPOSURE_EXISTS': '当前品种已有仓位或未结开仓单',
+    'ACCOUNT_VALUES_UNKNOWN': '账户资金字段缺失',
+    'PRICE_LIMITS_UNKNOWN': '涨跌停价格缺失',
+    'MARKET_PATH_INCOMPLETE': '当前盘段行情路径不完整',
+    'CANDLE_OPPORTUNITY_CONSUMED': '当前分钟机会已使用',
+    'QUOTE_NOT_TICK_ALIGNED': '报价未对齐最小变动价位',
+    'LEGACY_MINUTE_CONSUMPTION_UNPROVED': '旧记录的分钟消费来源待核实，等待下一根实时分钟',
+    'ENTRY_RECHECK_QUOTE_MISSING': '复核时缺少最新行情',
+    'ENTRY_RECHECK_ACCOUNT_CHANGED': '复核时账户数据版本已变化',
+    'ENTRY_RECHECK_QUOTE_STALE': '复核时行情已过期',
+    'ENTRY_RECHECK_CONFIGURATION_CHANGED': '复核时策略配置已变化',
+    'ENTRY_RECHECK_SESSION_CHANGED': '复核时交易时段已变化',
+    'ENTRY_RECHECK_PATH_INCOMPLETE': '复核时行情路径不完整',
+    'ENTRY_RECHECK_INSTRUMENT_CHANGED': '复核时合约乘数或最小价位已变化',
+    'ENTRY_RECHECK_CANDIDATE_CHANGED': '复核时方向、触发价或报单价已变化',
+    'ENTRY_RECHECK_QUANTITY_CHANGED': '复核时可开手数已变化',
+    'DSV_QUOTE_AGE_EXCEEDED': '报价年龄超过配置值',
+    'E_NATIVE_QUOTE_NOT_CURRENT': '原生报价已变动或无有效价量',
+    'E_GATEWAY_SYNC': '当前柜台数据未同步',
+    'E_ENTRY_WINDOW_EXPIRED': '已超过开仓授权时间',
+    'E_ENTRY_ATTEMPT_LIMIT': '本次授权的子单额度已用完',
+}
 DAY_STOPS = {'DAY_STOP_ACTIVE', 'MONTH_STOP_ACTIVE', 'PROTECTION_DAY_STOP', 'DSV_PERSISTED_DAY_OR_MONTH_STOP'}
 ENTRY_FILTERS = {
     'STOP_COOLDOWN': ('跳过', '止损后同方向冷却中，本次不开仓', 300),
@@ -41,6 +71,10 @@ SESSION_EVENTS = {
     'CONTROL_PAUSED': ('执行', '已暂停开仓'),
     'ONLINE_GATEWAY_DISCONTINUITY': ('警告', '行情或交易连接中断'),
     'ONLINE_DSV_GATEWAY_RESYNCED': ('执行', '连接已恢复，柜台状态已同步'),
+    'ONLINE_DSV_ENTRY_RECOVERY_PENDING': ('等待', '开仓暂挂，等待柜台核对与实时行情'),
+    'ONLINE_DSV_ENTRIES_RESUMED': ('恢复', '柜台和行情已核清，恢复原开仓权限'),
+    'SCHEDULER_FACT_BARRIER': ('警告', '时钟或盘次证据异常，原持仓目标待核对'),
+    'CLOCK_RESET_REQUIRES_FRESH_FACTS': ('恢复', '时钟已重新核对，等待新行情及 F5 启动'),
     'ONLINE_DSV_DAY_CHANGE_REQUIRES_RECONCILIATION': ('警告', '柜台换日，等待核对原持仓及委托'),
     'ONLINE_DSV_FACT_BARRIER': ('警告', '柜台事实待核对'),
     'ONLINE_ARCHIVED_ORDER_CHANGED': ('警告', '历史委托收到不同的柜台回报，已暂停新增并保留原委托身份'),
@@ -50,6 +84,8 @@ COMMITTED_EVENT_TYPES = frozenset(SESSION_EVENTS) | {
     'ENTRY_PREPARED', 'EXIT_PREPARED', 'REPLACEMENT_PREPARED', 'FILL_CONFIRMED',
     'SEND_RESULT', 'SEND_ABORTED', 'ORDER_TERMINAL', 'EXECUTION_CANCEL_TIMEOUT',
     'CANCEL_PREPARED', 'CANCEL_RESULT', 'CANCEL_UNSENT', 'ONLINE_SIMULATION_RECONCILED',
+    'ONLINE_WORKING_ORDER_PROVED', 'REPLACEMENT_BLOCKED', 'NATIVE_ACCOUNT_CANCEL_RESULTS',
+    'CONTROL_CANCEL_RESULT', 'CONTROL_CANCEL_ERRORS', 'SCHEDULER_FACT_BARRIER', 'CLOCK_RESET_REQUIRES_FRESH_FACTS',
     'EXECUTION_OBSERVATION', 'PROTECTION_OBSERVATION', 'SCHEDULED_DATA_GAP',
 }
 
@@ -65,8 +101,22 @@ class DsvEntryLog:
         self.geometry_days = set()
         self.last_time = {}
         self.last_hint = {}
+        self.active_blocks = {}
         self.cycle_markers = {}
         self.order_markers = {}
+        self.last_slow_loop_ns = None
+        self.last_event_seq = getattr(kernel, '_durable_seq', 0)
+
+    def poll(self):
+        rows = self.kernel.ledger.query(
+            'SELECT event_seq,event_type,observed_at_utc,payload_json FROM event_journal '
+            'WHERE kernel_boot_id=? AND event_seq>? AND event_seq<=? ORDER BY event_seq LIMIT 1000',
+            (self.kernel.boot_id, self.last_event_seq, self.kernel._durable_seq))
+        for row in rows:
+            if row['event_type'] in COMMITTED_EVENT_TYPES:
+                data = strict_loads(row['payload_json'])
+                self.committed(row['event_type'], row['event_seq'], row['observed_at_utc'], data.get('data', data))
+            self.last_event_seq = row['event_seq']
 
     def write(self, rows):
         if rows:
@@ -82,37 +132,71 @@ class DsvEntryLog:
 
     def market(self, event, decision):
         checks = decision.get('entry_log', ())
-        reasons = set(decision.get('reasons', ()))
-        if reasons & NO_ENTRY_LOG or not (checks or reasons):
-            return
+        reasons = dict.fromkeys(decision.get('reasons', ()))
         code, day = event['contract_id'], event['trading_day']
         symbol = self.symbols[code]
         now = self.kernel.port.strategy_wall_time()
         prefix = f"{symbol['name']}({code})"
         rows = []
+        observation = decision.get('event_mode') == 'OBSERVATION' or 'OBSERVATION_ONLY_BACKLOG' in reasons
+        if observation:
+            return
 
-        def append(kind, tag, message):
+        def append(kind, tag, message, **details):
             rows.append({'observed_at_utc': now.isoformat(), 'contract_id': code, 'trading_day': day,
-                         'kind': kind, 'tag': tag, 'origin': '策略', 'message': f'{prefix} {message}'})
+                         'kind': kind, 'tag': tag, 'origin': '策略', 'message': f'{prefix} {message}',
+                         'decision_id': decision.get('decision_id'), 'authority_revision': decision.get('authority_revision'),
+                         'account_revision': decision.get('account_revision'),
+                         'reason_code': kind, **details})
 
-        if 'NET_LOSS_LIMIT' in reasons:
-            if self.due((code, 'NET_LOSS_LIMIT'), now, 600):
-                stop_state = (decision.get('stops') or {}).get('state')
-                if stop_state is None:
-                    stop_state = (self.kernel.statistics.snapshot(code, day) or {}).get('state')
-                if stop_state is not None:
-                    loss = Decimal(stop_state['net_loss_points'])
-                    threshold = Decimal(symbol['stop_offset']) * self.trade['max_net_loss_stops']
-                    append('NET_LOSS_LIMIT', '规则', f'当前净亏 {loss:.0f} 点 已达阈值 {threshold:.0f} 点 → **本次不开仓**')
-        elif checks and checks[0] in TIMING_CHECKS:
-            self.timing_message(code, checks[0], now, event, append)
-        else:
-            if checks and not reasons & DAY_STOPS:
-                self.trigger_messages(code, day, symbol, now, event, checks, append)
-            for reason in decision.get('reasons', ()):
+        previous = self.active_blocks.get(code, {})
+        active = {}
+        for reason in reasons:
+            kind = reason.split(':')[-1]
+            if kind in WAIT_REASONS or kind == 'GEOMETRY_BLOCK' or kind.endswith('NO_CHASE_AFTER_ACT'):
+                continue
+            if kind == 'NET_LOSS_LIMIT':
+                stop = (decision.get('stops') or self.kernel.statistics.snapshot(code, day) or {}).get('state')
+                message = (f'当前净亏 {Decimal(stop["net_loss_points"]):.0f} 点，达到停开阈值'
+                           if stop else '达到净亏停开阈值')
+            else:
+                message = BLOCK_MESSAGES.get(kind)
+                if kind == 'ACCOUNT_VALUES_UNKNOWN':
+                    missing = (decision.get('risk') or {}).get('metrics', {}).get('missing_fields', [])
+                    if missing:
+                        message += ' · ' + '、'.join(missing)
+            old = previous.get(reason)
+            if old and old['day'] == day:
+                repeats = old['repeats'] + 1
+                interval = 300 if kind in {'OPENING_WAIT', 'CLOSE_SESSION_NO_OPEN'} else 60
+                if (now - old['written']).total_seconds() >= interval:
+                    append(reason, '等待', f'仍受阻 · {message or kind}，累计 {repeats} 次',
+                           repeat_count=repeats)
+                    active[reason] = {'day': day, 'written': now, 'repeats': repeats}
+                else:
+                    active[reason] = old | {'repeats': repeats}
+                continue
+            if kind in TIMING_CHECKS:
+                self.last_time.pop((code, kind), None)
+                self.timing_message(code, kind, now, event, append)
+            elif message:
+                append(reason, '等待', message)
+            else:
                 self.filter_message(code, day, reason, now, event, symbol, decision, append)
+            active[reason] = {'day': day, 'written': now, 'repeats': 1}
 
+        for reason, old in previous.items():
+            if reason not in active:
+                label = BLOCK_MESSAGES.get(reason.split(':')[-1], reason)
+                append('ENTRY_BLOCK_CLEARED', '恢复', f'已解除 · {label}',
+                       cleared_reason_code=reason, repeat_count=old['repeats'])
+
+        if checks and checks[0] not in TIMING_CHECKS and not reasons.keys() & DAY_STOPS:
+            hint_rows = len(rows)
+            self.trigger_messages(code, day, symbol, now, event, checks, append)
+            rows = rows[hint_rows:] + rows[:hint_rows]
         self.write(rows)
+        self.active_blocks[code] = active
 
     def timing_message(self, code, kind, now, event, append):
         if kind == 'OPENING_WAIT' and self.due((code, kind), now, 300):
@@ -159,16 +243,7 @@ class DsvEntryLog:
         side = {'LONG': '多头', 'SHORT': '空头'}.get(direction, '')
         rule = ENTRY_FILTERS.get(kind)
         if rule is not None:
-            tag, message, interval = rule
-            # A quote can be repeated by the SDK. Non-throttled DSV filters
-            # consume an opportunity or emit on a distinct accepted tick.
-            if interval == 'day':
-                key = (code, day, kind)
-                if key in self.last_time:
-                    return
-                self.last_time[key] = now
-            elif interval is not None and not self.due((code, kind), now, interval):
-                return
+            tag, message, _ = rule
             if kind == 'EFFECTIVE_RISK_CAP':
                 cap = (decision.get('risk') or {}).get('metrics', {}).get('effective_risk_cap')
                 if cap is not None:
@@ -178,7 +253,14 @@ class DsvEntryLog:
             opening = Decimal(symbol['open_offset'])
             is_long = direction == 'LONG'
             trigger = Decimal(event['day_low']) + opening if is_long else Decimal(event['day_high']) - opening
-            opponent = Decimal(event['ask1' if is_long else 'bid1'])
+            raw = event.get('ask1' if is_long else 'bid1')
+            try:
+                opponent = Decimal(str(raw))
+            except ArithmeticError:
+                opponent = Decimal(0)
+            present = opponent.is_finite() and opponent > 0
+            label = f'{opponent:.1f}' if present else '缺失'
+            opponent = opponent if present else Decimal(0)
             last = Decimal(event['last'])
             started = datetime.fromisoformat(event['session_open_utc'])
             elapsed = (now - started).total_seconds()
@@ -188,8 +270,41 @@ class DsvEntryLog:
             ratio = self.trade['chase_slip_ratio' if opening_session and 0 <= elapsed <= window else 'entry_slip_ratio']
             cap = max(1, round(opening * Decimal(ratio)))
             over = max(opponent, last) - trigger - cap if is_long else trigger - min(opponent, last) - cap
-            append(reason, '跳过', f'{side} 对手价 {opponent:.1f} / 最新价 {last:.1f}，触发价 {trigger:.1f}，'
+            append(reason, '跳过', f'{side} 对手价 {label} / 最新价 {last:.1f}，触发价 {trigger:.1f}，'
                    f'超出上限 {over:.1f} 点（单边上限 {cap:.1f} 点，有利方向除外），本次不开仓')
+
+        else:
+            append(reason, '等待', f'开仓条件受阻 · {reason}')
+
+    def monitor(self, monitor, loop_start, timings):
+        now_ns = time.monotonic_ns()
+        summary = monitor.summary(now_ns)
+        now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        rows = []
+        if monitor.recoveries:
+            threshold = Decimal(self.trade.get('resume_gap_seconds', '60'))
+            cycles = self.kernel._committed.values()
+            for code, gap in monitor.recoveries.items():
+                if Decimal(str(gap)) <= threshold:
+                    continue
+                position = self.kernel.port.position(code)
+                owned = [cycle for cycle in cycles if cycle['plan']['contract_id'] == code and cycle['lifecycle']!='CLOSED']
+                if not (position['long'] or position['short'] or any(
+                        OrderState.from_dict(order).potential_remaining for cycle in owned for order in cycle['orders'])):
+                    continue
+                rows.append({'observed_at_utc':now, 'kind':'QUOTE_RESUMED', 'tag':'恢复', 'contract_id':code,
+                    'trading_day':monitor.trading_day,
+                    'message':f'{code} 行情断档 {gap:.0f} 秒后恢复：对账结果 账户多{position["long"]}/空{position["short"]}'})
+        if summary:
+            rows.append({'observed_at_utc': now, 'kind': 'TICK_DIAGNOSTIC', 'tag': '行情诊断',
+                         'message': '60 秒行情更新 · ' + summary})
+        if now_ns - loop_start > 2_000_000_000 and (
+                self.last_slow_loop_ns is None or now_ns - self.last_slow_loop_ns >= 60_000_000_000):
+            self.last_slow_loop_ns = now_ns
+            detail = '，'.join(f'{name} {span/1e9:.3f} 秒' for name, span in timings.items())
+            rows.append({'observed_at_utc': now, 'kind': 'SLOW_DSV_LOOP', 'tag': '慢',
+                         'message': f'本轮耗时 {(now_ns-loop_start)/1e9:.1f} 秒' + (f'（{detail}）' if detail else '')})
+        self.write(rows)
 
     def committed(self, kind, event_seq, observed_at_utc, data):
         """Describe an event once from committed state, preserving its provenance."""
@@ -209,6 +324,17 @@ class DsvEntryLog:
         cycle = data.get('cycle')
         if isinstance(cycle, dict):
             self.cycle_event(kind, cycle, data.get('fill'), append)
+        exceptions = data.get('exceptions', [])
+        if data.get('exception'):
+            exceptions = [data['exception']]
+        for item in exceptions:
+            metadata = (cycle.get('strategy_metadata') or {}) if cycle else {}
+            plan = cycle['plan'] if cycle else {}
+            append('警告', f"{item['stack'][0]['type']} · {item['exception_id']}",
+                   code=plan.get('contract_id'), day=plan.get('trading_day'), category='error',
+                   child_order_id=item.get('child_order_id', data.get('child_order_id')),
+                   native_order_id=item.get('native_order_id'), decision_id=metadata.get('decision_id'),
+                   exception_id=item['exception_id'], exception=item)
         self.write(rows)
 
     def cycle_event(self, kind, cycle, fill, append):
@@ -222,7 +348,14 @@ class DsvEntryLog:
         self.cycle_markers[identity] = current
 
         def report(tag, text, **fields):
-            append(tag, text, code=code, day=day, **fields)
+            decision_id = (cycle.get('strategy_metadata') or {}).get('decision_id')
+            append(tag, text, code=code, day=day, decision_id=decision_id, **fields)
+
+        if kind == 'REPLACEMENT_BLOCKED':
+            review = cycle['last_replacement_block']
+            reasons = review['reason_codes']
+            report('等待', '重报受阻 · ' + ' / '.join(BLOCK_MESSAGES.get(reason, reason) for reason in reasons),
+                   reason_codes=reasons, recheck=review, category='error')
 
         if current[0] is not None and previous[0] != current[0]:
             settings = plan['profit_protection']
@@ -300,9 +433,13 @@ class DsvEntryLog:
                           'ORIGINAL_EXIT_QUANTITY':'原平仓可用手数变化', 'EXECUTION_PRICE':'委托价格复核未通过',
                           'E_CLOCK':'时钟偏差超限', 'E_OWNERSHIP':'柜台归属待核对',
                           'E_FACT_BARRIER':'柜台同步待核对', 'E_GATEWAY_SCOPE':'行情、时窗或范围条件未通过'}
-                status += ' · ' + ' / '.join(dict.fromkeys(labels.get(reason,'发送校验未通过') for reason in abort['reasons']))
+                status += ' · ' + ' / '.join(dict.fromkeys(
+                    labels.get(reason, BLOCK_MESSAGES.get(reason, reason)) for reason in abort['reasons']))
+                fields.update(reason_codes=abort['reasons'], recheck=abort.get('recheck'))
             report('执行' if current[0] == 'CALL_RETURNED' else '警告', f'{details}，{status}',
                    origin='执行器', category=category if current[0] == 'CALL_RETURNED' else 'error', **fields)
+        if kind == 'ONLINE_WORKING_ORDER_PROVED' and current[0] == 'CONFIRMED' and previous[0] != 'CONFIRMED':
+            report('柜台委托', f'{details}，柜台确认活动委托', origin='柜台', category=category, **fields)
         if current[1] != previous[1] and current[1] in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}:
             status = {'SEND_POSSIBLE':'准备撤单', 'CALL_RETURNED':'撤单请求已提交',
                       'UNKNOWN':'撤单结果待核对'}[current[1]]

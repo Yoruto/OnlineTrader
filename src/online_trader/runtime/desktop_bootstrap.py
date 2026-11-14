@@ -18,7 +18,7 @@ from online_trader.configuration.files import publish_new_bytes
 from online_trader.configuration.offsets import dsv_startup_profile
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.domain.values import decimal_text, decimal_value, identifier
-from online_trader.errors import TraderError
+from online_trader.errors import TraderError, exception_record
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime import dsv_simulation
 from online_trader.runtime.instance import AccountLock
@@ -51,7 +51,7 @@ ERROR_MESSAGES = {
     'E_STARTUP_METADATA_TIMEOUT': '读取交易日历或合约资料超时，请检查行情网络后重新启动。',
     'E_STARTUP_METADATA_CLOSE': '行情资料连接未正常关闭，策略启动已停止。',
     'E_DEPENDENCY': '模拟运行组件不可用，请检查已安装的程序环境。',
-    'E_CLOCK': '本机时间与参考时钟偏差超过允许范围，请先核对系统时间。',
+    'E_CLOCK': 'Windows 时间证据不可用，请核对本机时间。',
 }
 
 
@@ -106,9 +106,9 @@ def _limits(profile):
     maximum = settings['trade']['max_volume']
     per_contract = settings['trade']['max_daily_orders']
     count = len(settings['symbols'])
-    if not 1 <= count <= 11 or maximum <= 0 or per_contract <= 0 or per_contract * count > 2147483647:
+    if not 1 <= count <= 11 or maximum <= 0 or per_contract <= 0 or per_contract > 2147483647:
         raise TraderError('E_DESKTOP_START_LIMITS', ERROR_MESSAGES['E_DESKTOP_START_LIMITS'])
-    return maximum, per_contract * count
+    return maximum, per_contract
 
 
 def build_start_request(store, account_id, profile, *, arm=True, now=None, timed_trigger=None):
@@ -228,7 +228,7 @@ def compile_start_scope(request, store, metadata, *, now=None):
         if not _utc(record['coverage_from_utc']) <= instant < end <= _utc(record['coverage_to_utc']):
             raise ValueError()
         effective = dsv_startup_profile(source_profile)
-        maximum, attempts = _limits(effective)
+        maximum, targets = _limits(effective)
         components = []
         for symbol in effective.to_record()['settings']['symbols']:
             multiplier = decimal_value(metadata['instruments'][symbol['code']]['multiplier'], positive=True)
@@ -240,12 +240,12 @@ def compile_start_scope(request, store, metadata, *, now=None):
         decimal_value(risk_budget, positive=True)
     except (KeyError, TypeError, ValueError, TraderError):
         raise TraderError('E_CALENDAR_INCOMPLETE', ERROR_MESSAGES['E_CALENDAR_INCOMPLETE']) from None
-    value = {'schema_version': 'SIMNOW_DSV_SIM/1' if row['provider'] == 'TQ_SIMNOW' else 'KQ_DSV_SIM/2',
+    value = {'schema_version': 'SIMNOW_DSV_DESKTOP/1' if row['provider'] == 'TQ_SIMNOW' else 'KQ_DSV_DESKTOP/1',
         'grant_id': request['request_id'], 'account_fingerprint': row['account_key'].split(':')[-1],
         'ledger_path': str(store.ledger_path(row)), 'contracts': codes, 'trading_day': day,
         'trading_days': [day], 'resume_entries_on_day_change': False,
         'not_before_utc': _stamp(instant), 'not_after_utc': _stamp(end),
-        'max_order_quantity': maximum, 'opening_attempts': attempts, 'risk_budget': risk_budget,
+        'max_order_quantity': maximum, 'daily_targets_per_contract': targets, 'risk_budget': risk_budget,
         'profile_hash': effective.content_hash, 'calendar_hash': calendar.content_hash,
         'authorization_reference': 'DESKTOP_CONFIRM:' + content_hash(request)}
     grant = DsvSimulationGrant.parse(canonical_bytes(value))
@@ -254,7 +254,7 @@ def compile_start_scope(request, store, metadata, *, now=None):
         'effective_profile_hash': effective.content_hash, 'calendar_hash': calendar.content_hash,
         'trading_day': day, 'provider': row['provider'], 'nominal_risk_ceiling': risk_budget,
         'nominal_risk_components': components, 'max_order_quantity_source': 'DSV max_volume',
-        'opening_attempts_source': 'DSV max_daily_orders per contract times configured contract count',
+        'daily_targets_source': 'DSV max_daily_orders per contract and cabinet day',
         'startup_offset_policy': 'DSV original integer conversion and zero repair 100/15/60',
         'metadata_observed_at_utc': metadata['observed_at_utc'],
         'calendar_source': metadata.get('source', 'Injected metadata for offline verification'),
@@ -314,6 +314,7 @@ def run_desktop_start(request_path, output, *, now=None):
     except Exception as error:
         code = error.code if isinstance(error, TraderError) else 'E_DESKTOP_START'
         failure = {'status': 'STARTUP_FAILED', 'error_code': code, 'entry_authority': 'DISARMED',
+            'exception': exception_record(error),
             'message': ERROR_MESSAGES.get(code, '启动未完成，请检查网络与模拟连接状态后重试。')}
         path = directory / 'startup-failure.json'
         if not path.exists():

@@ -19,41 +19,47 @@ def _missing_book_price(value):
 
 class TqKqDsvPort(TqKqPort):
     def entry_clock_ready(self):
-        if not self.broker_connected:return True  # injected QA facts have their own clock
-        from online_trader.scheduling.reference import clock_observation
-        return clock_observation(self.clock)['system_aligned']
-
-    def strategy_wall_time(self):
-        return datetime.now(timezone.utc) if self.broker_connected else self.clock.now()
-
-    def fresh_strategy_entry(self, code, side, event):
-        """Verify the exact native last used when the order's opponent is absent."""
-        if event is None:
-            return False
-        field = 'ask1' if side == 'BUY' else 'bid1'
-        if event[field] is not None:
-            return self.fresh(code)
-        if not self._fresh_last(code):
-            return False
-        quote = self.quotes[code]
-        stamp = datetime.fromisoformat(quote.datetime).replace(tzinfo=CHINA_TIME)
-        if stamp != datetime.fromisoformat(event['source_time_utc']) or number(quote.last_price) != event['last']:
-            return False
-        opponent, other, volume = ((getattr(quote,'ask_price1',None), getattr(quote,'bid_price1',None),
-                                    getattr(quote,'bid_volume1',None)) if side == 'BUY'
-                                   else (getattr(quote,'bid_price1',None), getattr(quote,'ask_price1',None),
-                                         getattr(quote,'ask_volume1',None)))
-        if not _missing_book_price(opponent):
-            return False
-        if not _missing_book_price(other) and not (type(other) in (int, float) and math.isfinite(other)
-                and quote.lower_limit <= other <= quote.upper_limit and type(volume) in (int, float)
-                and math.isfinite(volume) and volume > 0):
-            return False
         try:
-            order_price(event['last'], number(quote.price_tick))
-        except TraderError:
+            self.clock.now()
+        except TraderError as error:
+            if error.code != 'E_CLOCK':
+                raise
             return False
         return True
+
+    def strategy_wall_time(self):
+        return self.clock.now()
+
+    def fresh_strategy_entry(self, code, side, event):
+        """Use the strategy age rule and verify the exact legal native quote."""
+        if event is None:
+            return False
+        runtime = getattr(getattr(self, 'kernel', None), '_dsv_runtime', None)
+        try:
+            quote = self.quotes[code]
+            stamp = datetime.fromisoformat(quote.datetime).replace(tzinfo=CHINA_TIME)
+            source = datetime.fromisoformat(event['source_time_utc'])
+            if (stamp != source or number(quote.last_price) != event['last'] or
+                    (runtime is not None and runtime.ordinary_quote_stale(event))):
+                return False
+            field = 'ask1' if side == 'BUY' else 'bid1'
+            opponent, other, volume = ((getattr(quote,'ask_price1',None), getattr(quote,'bid_price1',None),
+                                        getattr(quote,'bid_volume1',None)) if side == 'BUY' else
+                                       (getattr(quote,'bid_price1',None), getattr(quote,'ask_price1',None),
+                                        getattr(quote,'ask_volume1',None)))
+            if event[field] is not None:
+                return (number(quote.ask_price1) == event['ask1'] and number(quote.bid_price1) == event['bid1']
+                        and self.fresh(code, check_age=runtime is None))
+            if not self._fresh_last(code, check_age=runtime is None) or not _missing_book_price(opponent):
+                return False
+            if not _missing_book_price(other) and not (type(other) in (int, float) and math.isfinite(other)
+                    and quote.lower_limit <= other <= quote.upper_limit and type(volume) in (int, float)
+                    and math.isfinite(volume) and volume > 0):
+                return False
+            order_price(event['last'], number(quote.price_tick))
+            return True
+        except (TraderError, KeyError, AttributeError, TypeError, ValueError):
+            return False
 
     def __init__(self,api,account,grant,clock):
         if type(grant) is not DsvSimulationGrant:
@@ -303,7 +309,7 @@ class TqKqDsvPort(TqKqPort):
         else:
             fresh = self.fresh(code) or (direct and self.fresh_manual_reduction(code))
         if not fresh:
-            raise TraderError('E_GATEWAY_SCOPE','A current native quote is required before sending')
+            raise TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '报单需要当前有效的原生报价。')
         expected='BUY' if (cycle['plan']['direction']=='LONG')==(order['effect']=='OPEN') else 'SELL'
         if request['direction']!=expected:raise TraderError('E_OWNERSHIP','Native order direction differs from the original cycle')
         position=self.position(request['contract_id'])
@@ -317,19 +323,23 @@ class TqKqDsvPort(TqKqPort):
         if request['effect']=='OPEN':
             if (cycle['entry_origin']=='MANUAL')!=self.grant.manual_workbench:
                 raise TraderError('E_GATEWAY_SCOPE','Native opening origin differs from the finite scope')
-            kernel.simulation.comparison_gate()
             if not self.entry_clock_ready():
-                raise TraderError('E_CLOCK','Windows clock alignment is required immediately before native opening send')
+                raise TraderError('E_CLOCK','A valid Windows wall clock is required immediately before native opening send')
             current=datetime.fromisoformat(self.quotes[request['contract_id']].datetime).replace(tzinfo=timezone(timedelta(hours=8)))
             if facts is None or current!=datetime.fromisoformat(facts['event']['source_time_utc']):
                 raise TraderError('E_GATEWAY_SCOPE','The entry proposal does not reflect the latest native quote')
             if cycle.get('manual_limit_order'):
                 kernel.simulation.manual_entry_facts(cycle['strategy_metadata']['candidate'],request['original_qty'],
                     exclude_decision=cycle['decision_key'])
-            if (not self.grant.in_window(self.clock.now()) or kernel.recovery_required
-                    or kernel.simulation.opening_attempt_count()>value['opening_attempts']
-                    or any(o['order_id']!=self.order_id(request['child_order_id']) for o in self.active_orders(request['contract_id']))):
-                raise TraderError('E_GATEWAY_SCOPE','New risk exceeds its original window, quota or account gate')
+            if not self.grant.in_window(self.clock.now()):
+                raise TraderError('E_ENTRY_WINDOW_EXPIRED', '当前时刻超出已确认的开仓窗口。')
+            if kernel.recovery_required:
+                raise TraderError('RECONCILIATION_REQUIRED', '原委托和持仓需要核对。')
+            if not kernel.simulation.target_quota(code, request['trading_day'], existing=cycle['decision_key']):
+                reason = 'DAILY_ORDER_LIMIT' if self.grant.daily_targets_per_contract is not None else 'E_ENTRY_ATTEMPT_LIMIT'
+                raise TraderError(reason, '本次授权允许的开仓额度已用完。')
+            if any(o['order_id'] != self.order_id(request['child_order_id']) for o in self.active_orders(code)):
+                raise TraderError('OWNED_EXPOSURE_EXISTS', '已有活动委托。')
         elif request['original_qty']>owned['long' if expected=='SELL' else 'short']:
             raise TraderError('E_OWNERSHIP','Native reduction exceeds the proved owned side')
         if request['effect']=='REDUCE':

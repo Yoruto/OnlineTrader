@@ -33,10 +33,6 @@ def comparison_file(directory, identity):
     return None
 
 
-def startup_only(directory):
-    return not (directory / 'strategy-log.jsonl').exists() and not _comparison_runs(directory)
-
-
 def supplied_run_directory(view):
     supplied = view['configuration'].get('run_directory')
     if isinstance(supplied, str) and 0 < len(supplied) <= 4096 and '\0' not in supplied:
@@ -46,26 +42,36 @@ def supplied_run_directory(view):
     return None
 
 
+def matches_run_identity(directory, identity):
+    record = read_record(directory / 'run-identity.json')
+    if record is not None:
+        try:
+            return (record.get('schema_version') == 'DSV_RUN_IDENTITY/1'
+                    and (record.get('account_key'), record.get('kernel_boot_id')) == identity
+                    and Path(record['run_directory']).resolve() == directory.resolve())
+        except (KeyError, TypeError, ValueError, OSError):
+            return False
+    return comparison_file(directory, identity) is not None
+
+
 def resolve_run(view, launch_paths, account_root=None, paired_root=None, *, finished=None):
     if view is None:
         if finished is not None:
             account, boot, directory = finished
-            if comparison_file(directory, (account, boot)) is not None:
-                return directory
-            return None
-        # Before attachment, a launch receipt can identify startup messages.
-        # The execution archive is usable after the boot ID is known.
-        return next((path for path in launch_paths if startup_only(path)), None)
+            return directory if matches_run_identity(directory, (account, boot)) else None
+        # Paths from the current desktop launch receipt belong to the selected
+        # account even if comparison files already exist or startup has failed.
+        return next(iter(launch_paths), None)
     identity = (view['account_key'], view['kernel_boot_id'])
     directory = supplied_run_directory(view)
-    if directory is not None and comparison_file(directory, identity) is not None:
+    if directory is not None and matches_run_identity(directory, identity):
         return directory
     candidates = list(launch_paths)
     if account_root is not None:
         candidates.extend(account_root.glob('desktop-*/run'))
     if paired_root is not None:
         candidates.extend(paired_root.glob('*'))
-    matched = [path for path in dict.fromkeys(candidates) if comparison_file(path, identity) is not None]
+    matched = [path for path in dict.fromkeys(candidates) if matches_run_identity(path, identity)]
     return matched[0] if len(matched) == 1 else None
 
 

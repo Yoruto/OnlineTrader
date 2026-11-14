@@ -41,7 +41,8 @@ def strategy_open_counts(cycles, day, *, reserve=False, exclude_decision=None):
         if (plan['trading_day'] != day or cycle.get('entry_origin') != 'STRATEGY'
                 or (exclude_decision is not None and cycle['decision_key'] == exclude_decision)):
             continue
-        if any(order['effect'] == 'OPEN' and order['send_state'] in sent for order in cycle['orders']):
+        if (cycle.get('strategy_target_accepted') or
+                any(order['effect'] == 'OPEN' and order['send_state'] in sent for order in cycle['orders'])):
             code = plan['contract_id']
             counts[code] = counts.get(code, 0) + 1
     return counts

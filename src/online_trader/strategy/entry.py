@@ -41,6 +41,11 @@ def _seconds(delta):
     return Decimal(delta.days * 86400 + delta.seconds) + Decimal(delta.microseconds) / 1_000_000
 
 
+def ordinary_quote_age(now, source_time):
+    """DSV uses the source timestamp truncated to a civil second."""
+    return _seconds(now - _utc(source_time).replace(microsecond=0))
+
+
 def epoch_milliseconds(moment):
     elapsed = moment - UNIX_EPOCH
     return (elapsed.days * 86400 + elapsed.seconds) * 1000 + elapsed.microseconds // 1000
@@ -88,7 +93,7 @@ def market_fingerprint(event, opening_session):
 def opening_jump_block(last_price, trigger, profit_distance, ratio):
     """DSV gui.opening_jump_block: absolute distance, with inclusive boundary."""
     price, line, take, factor = map(Decimal, (last_price, trigger, profit_distance, ratio))
-    return price > 0 and line > 0 and take > 0 and factor > 0 and abs(price - line) >= take * factor
+    return price > 0 and line > 0 and take > 0 and abs(price - line) >= take * factor
 
 
 def hysteresis_ready(direction, last_price, trigger, distance, armed):
@@ -277,18 +282,23 @@ class DsvEntryStrategy:
         return tick, start, current, end, opening_session
 
     def evaluate(self, state, event, *, continuation_allowed=True, continuation_attempted=False,
-                 fallback_direction=None, ordinary_quote_stale=False, decision_time=None):
+                 fallback_direction=None, ordinary_quote_stale=False, decision_time=None, observation_only=False):
         if decision_time is not None and (not isinstance(decision_time, datetime) or decision_time.tzinfo is None):
             raise TraderError("E_SCHEMA", "Expected a timezone-aware entry decision time")
         with localcontext() as context:
             context.prec = 80
-            return self._evaluate(state, event, continuation_allowed, continuation_attempted,
-                                  fallback_direction, ordinary_quote_stale, decision_time)
+            result = self._evaluate(state, event, continuation_allowed and not observation_only,
+                                    continuation_attempted, fallback_direction, ordinary_quote_stale, decision_time)
+        if observation_only:
+            result["state"]["last_signal_bar"] = state["last_signal_bar"]
+            result["candidates"] = []
+        return result
 
     def _evaluate(self, state, event, continuation_allowed, continuation_attempted,
                   fallback_direction, ordinary_quote_stale, decision_time):
         tick, start, current, end, opening_session = self._validate(state, event)
-        result = {"state": copy.deepcopy(state), "candidates": [], "reasons": [], "source_notes": [], "entry_log": []}
+        result = {"state": copy.deepcopy(state), "candidates": [], "reasons": [], "source_notes": [],
+                  "entry_log": [], "touched_triggers": {}}
         updated, reasons = result["state"], result["reasons"]
         fingerprint = market_fingerprint(event, opening_session)
         if event["source_epoch"] == state["source_epoch"]:
@@ -318,12 +328,16 @@ class DsvEntryStrategy:
         if symbol is None:reasons.append("CONTRACT_NOT_CONFIGURED");return result
         O, S, T = (Decimal(symbol[k]) for k in ("open_offset", "stop_offset", "profit_offset"))
         if min(O, S, T) <= 0:reasons.append("SYMBOL_OFFSETS_INCOMPLETE");return result
-        if reasons:return result
-        trade = self._settings["trade"]
-        updated["night_reference"] = self._night_reference(updated, event, start, current)
         last, high, low = (Decimal(event[k]) for k in ("last", "day_high", "day_low"))
         lines = {"LONG": low + O, "SHORT": high - O}
         updated["last_trigger_prices"] = {d: decimal_text(price) for d, price in lines.items()}
+        result["touched_triggers"] = {side: decimal_text(lines[side]) for side, reached in
+                                      (("LONG", last >= lines["LONG"]), ("SHORT", last <= lines["SHORT"]))
+                                      if reached}
+        if reasons:
+            return result
+        trade = self._settings["trade"]
+        updated["night_reference"] = self._night_reference(updated, event, start, current)
         # Live DSV tests the local decision clock. An archived market replay
         # supplies no live clock and reconstructs observations on source time.
         decided_at = decision_time or current
@@ -332,7 +346,6 @@ class DsvEntryStrategy:
             return result
         elapsed = _seconds(decided_at - start)
         remaining = _seconds(end - decided_at)
-        first_minute = 0 <= _seconds(current - start) <= 60
         policy=event.get('session_policy')
         wait_limit=Decimal(trade['no_open_after_open_minutes'])*60
         geometry_limit = 2 * O - S
@@ -397,28 +410,10 @@ class DsvEntryStrategy:
                     return result
         if geometry_block:
             return result
-        if updated["first_minute_blocks"]:
-            reasons.append("FIRST_MINUTE_JUMP_DAY_STOP");return result
-        # DSV's source intent uses this observation block only after the opening
-        # wait gate. Its local/global _secs_o mismatch is repaired using the
-        # explicit session clock and is reported rather than hidden.
-        if first_minute and opening_session and not updated["need_hyst"]:
-            result["source_notes"].append("DSV_UNDEFINED_FIRST_MINUTE_CLOCK_REPAIRED")
-            if any(opening_jump_block(last, line, T, trade["open_jump_block_ratio"]) for line in lines.values()):
-                updated["first_minute_blocks"] = list(DIRECTIONS)
-                reasons.append("FIRST_MINUTE_JUMP_DAY_STOP");return result
-            if last >= lines["LONG"] + T / 2 or last <= lines["SHORT"] - T / 2:
-                updated["open_half_reached"] = True
-            if not updated["open_half_reached"] and any(abs(last - line) <= tick * Decimal("1.5") for line in lines.values()):
-                updated["need_hyst"] = True
-        if updated["need_hyst"]:
-            probe = "LONG" if last < (lines["LONG"] + lines["SHORT"]) / 2 else "SHORT"
-            h = Decimal(symbol["hysteresis_points"]) or S
-            ready, armed = hysteresis_ready(probe, last, lines[probe], h, updated["hysteresis_armed"][probe])
-            updated["hysteresis_armed"][probe] = armed
-            if not ready:
-                updated["last_signal_bar"] = event["candle_id"]
-                reasons.append(probe + ":HYSTERESIS_NOT_READY");return result
+        # The shipped DSV catches the undefined _secs_o lookup in this block.
+        # Its ordinary signal selection proceeds without latching a day stop.
+        if opening_session and 0 <= elapsed <= 60:
+            result["source_notes"].append("DSV_FIRST_MINUTE_BLOCK_SKIPPED")
         recent_open = opening_session and Decimal(0) <= elapsed <= Decimal(trade["chase_window_minutes"]) * 60
         ratio = Decimal(trade["chase_slip_ratio"] if recent_open else trade["entry_slip_ratio"])
         cap = max(Decimal(1), Decimal(round(O * ratio)))
