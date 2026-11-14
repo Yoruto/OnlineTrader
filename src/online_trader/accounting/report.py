@@ -96,7 +96,11 @@ def add_close_point_checks(trades, cycles, issues):
         if row['effect']=='REDUCE':
             reductions.setdefault(row['position_cycle_id'], []).append(row)
     for cid, fills in reductions.items():
-        cycle = cycles[cid]
+        cycle = cycles.get(cid)
+        if cycle is None:
+            # A rollback archive supplies settled executions and nominal
+            # totals. Exact execution-plan diagnostics remain on its source.
+            continue
         exit_fact = cycle.get('nominal_exit') or {}
         reference = exit_fact.get('nominal_exit_price')
         if (cycle.get('lifecycle') != 'CLOSED' or not cycle.get('statistics_close_id')

@@ -33,21 +33,7 @@ def _check_reset(db, state, receipt, calendar, blockers):
         blockers.add('NO_NEW_CABINET_DAY')
     if not data['complete'] or not contracts <= by_contract.keys():
         blockers.add('CALENDAR_SCOPE_UNPROVED')
-    if state['running'] or not state['synchronized']:
-        blockers.add('TARGET_NOT_STOPPED_AND_SYNCHRONIZED')
-    if any(row['position'] or row.get('detached_positions') or row.get('native_conflicts')
-           for row in state['symbols'].values()):
-        blockers.add('TARGET_OWNERSHIP_UNRESOLVED')
-    if any(not terminal(order) or order.get('terminal_conflict') for order in state['orders'].values()):
-        blockers.add('TARGET_ORDER_UNRESOLVED')
-    # A lost call response, including a crash before writing it, can be
-    # superseded by independently received terminal evidence for the child.
-    pending = db.execute("SELECT child FROM effects WHERE result IS NULL OR result='UNKNOWN'")
-    native_orders = {child: (day, identity) for child, day, identity in db.execute(
-        'SELECT child,trading_day,native_id FROM native_orders')}
-    for (child,) in pending:
-        if child not in state['orders'] or not terminal(state['orders'][child]) or child not in native_orders:
-            blockers.add('TARGET_EFFECT_UNRESOLVED')
+    native_orders = _check_terminal(db, state, blockers)
 
     current_round = boundary = None
     previous_day = origin
@@ -105,6 +91,24 @@ def _check_reset(db, state, receipt, calendar, blockers):
     if ledger_check != 'ok':
         blockers.add('TARGET_STORAGE_CHECK_FAILED')
     return boundary, current_round, count
+
+
+def _check_terminal(db, state, blockers):
+    if state['running'] or not state['synchronized']:
+        blockers.add('TARGET_NOT_STOPPED_AND_SYNCHRONIZED')
+    if any(row['position'] or row.get('detached_positions') or row.get('native_conflicts')
+           for row in state['symbols'].values()):
+        blockers.add('TARGET_OWNERSHIP_UNRESOLVED')
+    if any(not terminal(order) or order.get('terminal_conflict') for order in state['orders'].values()):
+        blockers.add('TARGET_ORDER_UNRESOLVED')
+    # A lost call response can be superseded by the exact original terminal evidence.
+    pending = db.execute("SELECT child FROM effects WHERE result IS NULL OR result='UNKNOWN'")
+    native_orders = {child: (day, identity) for child, day, identity in db.execute(
+        'SELECT child,trading_day,native_id FROM native_orders')}
+    for (child,) in pending:
+        if child not in state['orders'] or not terminal(state['orders'][child]) or child not in native_orders:
+            blockers.add('TARGET_EFFECT_UNRESOLVED')
+    return native_orders
 
 
 def _check_allocations(db, state, native_orders, blockers):
@@ -190,7 +194,7 @@ def rehearse(source, candidate, calendar_record, target=None):
     return result
 
 
-def _publish(legacy, db, target, receipt):
+def _publish(legacy, db, target, receipt, *, convert=None):
     target = Path(os.path.abspath(target))
     target.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=target.parent, prefix='.dsv-rollback-rehearsal-') as location:
@@ -202,6 +206,11 @@ def _publish(legacy, db, target, receipt):
                 original.backup(copy)
                 if copy.execute('PRAGMA quick_check').fetchone()[0] != 'ok' or _source_digest(copy) != _source_digest(original):
                     raise TraderError('E_DSV_ROLLBACK', 'Rehearsal snapshot verification failed')
+                if convert is not None and name == 'legacy-snapshot.sqlite':
+                    convert(copy)
+                    if copy.execute('PRAGMA quick_check').fetchone()[0] != 'ok' or copy.execute(
+                            'PRAGMA foreign_key_check').fetchone() is not None:
+                        raise TraderError('E_DSV_ROLLBACK', 'Converted legacy snapshot is inconsistent')
             digest = sha256()
             with path.open('rb+') as stream:
                 for block in iter(lambda: stream.read(64 * 1024), b''):

@@ -66,10 +66,14 @@ def initial_state(trading_day, contracts):
 class DsvSession:
     """Public synchronous offline runtime. Pass complete scoped snapshots and ordered native changes."""
 
-    def __init__(self, database, *, account_key, provider, trading_day, profile, port):
-        if (not identifier(account_key).startswith('DEV:') or provider != 'OFFLINE' or
-                isinstance(port, OnlineSimulationPort)):
-            raise TraderError('E_DSV_SCOPE', 'The replacement runner only accepts an offline development account and port')
+    def __init__(self, database, *, account_key, provider, trading_day, profile, port, _execution_lock=None):
+        identifier(account_key)
+        offline = account_key.startswith('DEV:') and provider == 'OFFLINE' and not isinstance(port, OnlineSimulationPort)
+        if not offline:
+            from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
+            if (type(port) is not DsvSdkAdapter or not port.matches_online_scope(account_key, provider)
+                    or type(_execution_lock) is not AccountLock or not _execution_lock.matches(account_key)):
+                raise TraderError('E_DSV_SCOPE', 'The SDK session requires its explicitly bound account, adapter and owner lock')
         if not isinstance(profile, DsvProfile):
             raise TraderError('E_DSV_SCOPE', 'Expected a normalized DSV business profile')
         _day(trading_day)
@@ -77,7 +81,9 @@ class DsvSession:
         self._closed = False
         self._failed = False
         self._busy = False
-        self._lock = AccountLock(account_key)
+        self._lock = _execution_lock if _execution_lock is not None else AccountLock(account_key)
+        self._owns_lock = _execution_lock is None
+        self._sdk_port = port if not offline else None
         self._scope = {'account_key': account_key, 'provider': provider, 'trading_day': trading_day,
                        'configuration_id': profile.content_hash}
         settings = profile.to_record()['settings']
@@ -87,6 +93,8 @@ class DsvSession:
         try:
             self._journal = Journal(database, self._scope, initial)
             self._state = self._journal.load()
+            if not offline:
+                self._bind_sdk_grant()
             self._state.setdefault('trading_day', trading_day)
             self._state.setdefault('synchronized', True)
             self._state.setdefault('retired_positions', {})
@@ -98,8 +106,19 @@ class DsvSession:
         except BaseException:
             if hasattr(self, '_journal'):
                 self._journal.close()
-            self._lock.close()
+            if self._owns_lock:
+                self._lock.close()
             raise
+
+    def _bind_sdk_grant(self):
+        grant = self._sdk_port.grant
+        binding = {'grant_id': grant.value['grant_id'], 'grant_hash': grant.content_hash}
+        with self._journal.transaction():
+            existing = self._journal.sdk_scope_grant()
+            if existing is None:
+                self._journal.event('SDK_SCOPE_BOUND', binding)
+            elif existing != binding:
+                raise TraderError('E_DSV_SDK_SCOPE', 'Replacement facts already bind a different finite grant')
 
     def __enter__(self):
         return self
@@ -121,7 +140,8 @@ class DsvSession:
         try:
             self._journal.close()
         finally:
-            self._lock.close()
+            if self._owns_lock:
+                self._lock.close()
             self._closed = True
 
     def snapshot(self):
@@ -174,6 +194,10 @@ class DsvSession:
             raise TraderError('E_DSV_STORE', 'Connection loss could not be recorded; owner requires restart') from error
         self._state = state
         return {'synchronized': False, 'running': state['running']}
+
+    def disable_entries_on_restart(self):
+        self._check_owner()
+        self.command({'id': 'sdk-startup-stop-' + uuid4().hex, 'action': 'STOP'})
 
     @staticmethod
     def _mark_unsynchronized(state):
@@ -359,6 +383,8 @@ class DsvSession:
             if frame.get('synchronized') is not True:
                 raise TraderError('E_DSV_SCOPE', 'Day rollover requires an explicit cabinet-day snapshot')
             self._roll_day(state, day)
+            if self._sdk_port is not None:
+                state['running'] = False
         needs_sync = not state['synchronized']
         pending = {child for child, order in state['orders'].items() if not terminal(order)} if needs_sync else set()
         self._controller.accept_native(state, frame['native'])
@@ -367,6 +393,11 @@ class DsvSession:
         if needs_sync and frame.get('synchronized') is True:
             self._synchronize(state, frame, pending)
         state.update(sequence=frame['sequence'], monotonic_ms=mono, session_id=frame['session_id'])
+        if self._sdk_port is not None and not self._sdk_port.opening_window(day, _utc(frame['wall_time'])):
+            state['running'] = False
+            for row in state['symbols'].values():
+                if position := row['position']:
+                    position.update(entry_stopped=True, preserve_open_on_stop=False)
         market_rows = {market['contract_id']: market for market in frame['market']}
         decisions, effects = [], []
         for contract, spec in self._symbols.items():
@@ -396,6 +427,12 @@ class DsvSession:
                         observed = observed | {'allow_new_order': False}
                     effects.extend(self._controller.plan(state, row, observed, now))
             else:
+                if self._sdk_port is not None:
+                    position = row['position']
+                    if position is not None and position['entry_stopped'] and not position.get('preserve_open_on_stop'):
+                        for order in self._controller.child_orders(state, position, 'OPEN'):
+                            if request := self._controller.cancel(order, 'TARGET_REDUCED'):
+                                effects.append(request)
                 self._controller.settle(state, row)
         return decisions, effects
 
@@ -519,6 +556,10 @@ class DsvSession:
             return [{'reason': 'UNOWNED_POSITION', 'rule_ids': ['I01', 'I02']}]
         if row.get('month_stop') == state['trading_day'][:7]:
             return [{'reason': 'MONTH_STOP', 'rule_ids': ['D10']}]
+        if self._sdk_port is not None:
+            reason = self._sdk_port.opening_limit(state, market, spec, _utc(frame['wall_time']))
+            if reason:
+                return [{'reason': reason, 'rule_ids': ['I02']}]
         rows = tuple(state['symbols'].values())
         active = sum(not candidate['day_stop'] for candidate in rows)
         # Source counts established strategy directions, independent of requested quantity.
@@ -546,11 +587,16 @@ class DsvSession:
             goal = decision['target']
             row.update(last_order_ms=goal['order_ms'], last_order_direction=goal['direction'])
             row['target_count'] += 1
+            if self._sdk_port is not None:
+                state['sdk_scope_targets'] = state.get('sdk_scope_targets', 0) + 1
             row['position'] = goal | {'id': 'position-' + uuid4().hex, 'owned': 0, 'entry_filled': 0,
                                       'entry_notional': '0', 'children': [], 'entry_stopped': False,
                                       'peak': '0', 'protected': False, 'half_stage': 0, 'exit_target': None,
                                       'open_day': state['trading_day'], 'fills': [],
-                                      'entry_kind': decision['reason']}
+                                      'entry_kind': decision['reason'], 'contract_id': market['contract_id'],
+                                      'multiplier': market.get('multiplier')}
+            if self._sdk_port is not None:
+                row['position']['sdk_multiplier'] = market['multiplier']
         return [decision | {'rule_ids': rules}]
 
     def _maintain_position(self, row, position, market, frame, spec):
@@ -567,6 +613,8 @@ class DsvSession:
                 cap = max(2.0, float(position['stop']) * float(self._trade['entry_slip_abort_ratio']))
                 if slip > cap:
                     tighten_target(position, 0)
+                    position['rollback_exit'] = {'reason': 'ADVERSE_SLIPPAGE', 'at': frame['wall_time'],
+                                                 'price': None, 'slip': str(slip)}
                     row['net_loss'] = decimal_text(Decimal(row['net_loss']) + Decimal(str(slip)))
                     if self._trade['entry_slip_abort_stop_day']:
                         row.update(day_stop=True, day_stop_reason='ADVERSE_SLIPPAGE')
@@ -576,6 +624,7 @@ class DsvSession:
         if self._stale_position(row, position, market, frame):
             clock = row['quote_clock']
             position['gap_exit'] = {'last_native_time': clock['native_time'], 'day_stop': self._trade['stale_close_day_stop']}
+            position['rollback_exit'] = {'reason': 'DATA_GAP_EXIT', 'at': frame['wall_time'], 'price': None, 'slip': None}
             tighten_target(position, 0)
             return [{'reason': 'DATA_GAP_EXIT', 'remaining': 0, 'rule_ids': ['D10', 'I01']}]
         now = _utc(market.get('wall_reads', {}).get('pending', frame['wall_time'])).timestamp()
@@ -605,10 +654,15 @@ class DsvSession:
                 if position.get('entry_kind') == 'CONTINUATION_ENTRY' and self._trade['cont_stop_day_stop']:
                     row.update(continuation_stopped=True, day_stop=True)
                 cooldown = float(self._trade['stop_cooldown_minutes']) * 60
-                protection_now = _utc(market.get('wall_reads', {}).get('protection', frame['wall_time'])).timestamp()
+                stop_at = market.get('wall_reads', {}).get('protection', frame['wall_time'])
+                protection_now = _utc(stop_at).timestamp()
                 row['last_stop'] = {'direction': position['direction'], 'theory': position['theory'],
-                                    'until': str(protection_now + cooldown) if cooldown > 0 else None}
+                                    'until': str(protection_now + cooldown)
+                                    if self._trade['stop_cooldown_enabled'] and cooldown > 0 else None}
             if result.get('remaining') == 0:
+                position['rollback_exit'] = {'reason': reason,
+                                             'at': market.get('wall_reads', {}).get('protection', frame['wall_time']),
+                                             'price': market['tick']['last'], 'slip': None}
                 if reason in {'TAKE_PROFIT', 'TRAILING_STOP', 'PROTECTED_FLOOR'}:
                     row['stop_streak'] = 0
                 loss = (Decimal(position['stop']) if reason == 'STOP_LOSS' else
@@ -643,18 +697,30 @@ class DsvSession:
         first = 'close_started' not in position
         if first:
             position['close_started'] = str(now)
+            position['rollback_exit'] = {'reason': 'SESSION_CLOSE',
+                                         'at': market.get('wall_reads', {}).get('close', frame['wall_time']),
+                                         'price': market['tick']['last'], 'slip': None}
             if is_night_session(_utc(market['session_open'])) and row.get('night_reference'):
                 row['night_reference']['fallback'] = position['direction']
         if first or now - float(position['close_refresh']) >= 3:
             remaining_ms = window * 1000 - int((now - float(position['close_started'])) * 1000)
             position.update(close_mode=scheduled_close_mode(remaining_ms), close_refresh=str(now))
         tighten_target(position, 0)
+        if first:
+            last = price_value(market['tick'].get('last'))
+            if last is not None:
+                movement = Decimal(str(last)) - Decimal(position['theory'])
+                if position['direction'] == 'SHORT':
+                    movement = -movement
+                row['net_loss'] = decimal_text(Decimal(row['net_loss']) - movement)
         return {'reason': 'SCHEDULED_CLOSE' if first else 'SCHEDULED_CLOSE_PENDING',
                 'remaining': 0, 'price_mode': position['close_mode'], 'rule_ids': ['D06', 'D11']}
 
     def _operate(self, state, command):
         action = command['action']
         if action in {'START', 'STOP'}:
+            if action == 'START' and self._sdk_port is not None:
+                self._sdk_port.check_start(state)
             state['running'] = action == 'START'
             effects = []
             if action == 'STOP':
@@ -688,6 +754,8 @@ class DsvSession:
             if position['exit_target'] is not None:
                 target = min(target, position['exit_target'])
             tighten_target(position, target, new_request=True)
+            if target == 0 and not position.get('rollback_exit'):
+                position['rollback_exit'] = {'reason': 'MANUAL_EXIT', 'at': None, 'price': None, 'slip': None}
             return [{'reason': 'USER_REDUCE', 'remaining': target, 'rule_ids': ['I01', 'I02']}], []
         if action == 'REDUCE_DETACHED':
             row = state['symbols'].get(command['contract_id'])

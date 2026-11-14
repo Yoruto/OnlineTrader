@@ -7,7 +7,6 @@ from online_trader.contracts.codec import strict_loads
 from online_trader.domain.orders import OrderState
 from online_trader.errors import TraderError
 from online_trader.kernel.simulation import OnlineSimulation
-from online_trader.kernel.statistics import strategy_open_counts
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.protection.reducer import DsvSimulationPlanPermit
 
@@ -128,7 +127,7 @@ class OnlineDsvSimulation(OnlineSimulation):
         limit = self.grant.daily_targets_per_contract
         if limit is None:
             return self.opening_attempt_count() + (existing is None) <= self.grant.value['opening_attempts']
-        counts = strategy_open_counts(self.kernel._staged.values(), day, reserve=True, exclude_decision=existing)
+        counts = self.kernel.statistics.opening_counts(self.kernel._staged.values(), day, reserve=True, exclude_decision=existing)
         return counts.get(contract, 0) < limit
 
     def opening_attempt_count(self):

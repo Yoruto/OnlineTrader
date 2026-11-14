@@ -186,7 +186,9 @@ class OfflineWorkbench(QMainWindow):
         else:
             status = '策略运行中' if state['running'] else '已停止新增'
         self.status.setText(status)
-        self.account.setText(f"{state['scope']['account_key']} · {state['trading_day']} · 离线回放")
+        mode = 'SDK 模拟' if state.get('sdk_connection') else '离线回放'
+        self.setWindowTitle(f'OnlineTrader · DSV {"SDK 模拟工作台" if state.get("sdk_connection") else "离线工作台"}')
+        self.account.setText(f"{state['scope']['account_key']} · {state['trading_day']} · {mode}")
         positions = [(contract, data['position']) for contract, data in state['symbols'].items()
                      if data['position'] and data['position']['owned']]
         entries = [(contract, (contract, '多' if position['direction'] == 'LONG' else '空',

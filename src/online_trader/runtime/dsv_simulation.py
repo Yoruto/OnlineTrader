@@ -761,6 +761,8 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
         _execution_lock=None):
     """Future explicitly scoped connection path. Offline tests never call it."""
     grant,profile,calendar=load_inputs(scope,profile_path,calendar_path)
+    if grant.replacement:
+        raise TraderError('E_ONLINE_SCOPE','A replacement grant requires the replacement SDK startup')
     if grant.manual_workbench and (arm or not pipe):
         raise TraderError('E_ONLINE_SCOPE','Manual workbench runs need a control pipe and explicit arming after attachment')
     source_grant,source_profile=grant,profile;automatic=grant.automatic_offsets;preparation=None

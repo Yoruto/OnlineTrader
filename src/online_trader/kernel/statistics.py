@@ -12,6 +12,7 @@ import time
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import content_hash, strict_loads
 from online_trader.errors import TraderError
+from online_trader.ledger.dsv_rollback import EVENT
 from online_trader.scheduling.clock import ClockSample
 from online_trader.strategy.statistics import initial_state, apply_event, rollover_day, cooldown_gate
 from online_trader.strategy.stops import evaluate_stops
@@ -52,11 +53,53 @@ class StatisticsOwner:
     def __init__(self,kernel):
         self.kernel=kernel;self._committed={};self._staged={};self._receipts={};self._profiles={};self._calendars={}
         self._restoring=True
-        for row in kernel.ledger.query('SELECT payload_json FROM event_journal ORDER BY event_seq'):
+        self._rollback_quantities = {}
+        self._rollback_stops = {}
+        self._rollback_stop_anchors = {}
+        for row in kernel.ledger.query('SELECT event_seq,event_type,payload_json FROM event_journal ORDER BY event_seq'):
             data=strict_loads(row['payload_json']);data=data.get('data',data)
+            if row['event_type'] == EVENT:
+                self._restore_rollback(data['dsv_rollback'], row['event_seq'])
             update=data.get('nominal_statistics')
             if update:self.accept(update)
         self._restoring=False
+
+    def _restore_rollback(self, material, seq):
+        profile = DsvProfile.from_record(material['profile'])
+        self._profiles[profile.content_hash] = profile
+        for contract, mapped in material['symbols'].items():
+            state = mapped['statistics']
+            key = contract, material['trading_day']
+            update = {'state': state, 'stop_result': mapped['stops'], 'profile': material['profile'],
+                      'prepared_sequence': seq, 'trading_days': [], 'scope': 'SAME_DAY_ROLLBACK'}
+            self._committed[key] = copy.deepcopy(update)
+            self._staged[key] = copy.deepcopy(update)
+            for item in state['receipts'].values():
+                receipt = item['receipt']
+                self._receipts[(receipt['position_cycle_id'], receipt['type'])] = copy.deepcopy(receipt)
+            self._rollback_quantities[key] = (mapped['confirmed_entry_quantity'], mapped['confirmed_exit_quantity'])
+            self._rollback_stops[key] = mapped['last_stop']
+            self._rollback_stop_anchors.pop(contract, None)
+
+    def rollback_last_stop(self, contract, day):
+        # Any later legacy stop takes precedence over the imported anchor.
+        keys = [key for key in self._rollback_stops if key[0] == contract and key[1] <= day]
+        if not keys:
+            return None
+        key = max(keys)
+        last = self._rollback_stops[key]
+        later = self._rollback_stop_anchors.get(contract)
+        if later is not None and later['trading_day'] <= day:
+            return {'direction': later['direction'], 'theory': later['theoretical_entry_price']}
+        return last
+
+    def opening_counts(self, cycles, day, *, reserve=False, exclude_decision=None):
+        counts = strategy_open_counts(cycles, day, reserve=reserve, exclude_decision=exclude_decision)
+        for material in self.kernel._dsv_rollback:
+            if material['trading_day'] == day:
+                for contract, row in material['symbols'].items():
+                    counts[contract] = counts.get(contract, 0) + row['added_targets']
+        return counts
 
     def enroll(self,cycle):
         if cycle.get('entry_origin')!='STRATEGY':return
@@ -229,6 +272,9 @@ class StatisticsOwner:
         if self._staged.get(key,{}).get('prepared_sequence',0)<=update.get('prepared_sequence',0):
             self._staged[key]=copy.deepcopy(update)
         receipt=update['receipt'];self._receipts[(receipt['position_cycle_id'],receipt['type'])]=copy.deepcopy(receipt)
+        if receipt.get('exit_reason') in {'STOP_LOSS', 'BREAK_EVEN'} and any(
+                code == receipt['contract_id'] and day <= receipt['trading_day'] for code, day in self._rollback_stops):
+            self._rollback_stop_anchors[receipt['contract_id']] = copy.deepcopy(receipt)
         profile=DsvProfile.from_record(update['profile']);self._profiles[profile.content_hash]=profile
         if self._restoring or state['contract_id'] not in self._calendars:
             self._calendars[state['contract_id']]=copy.deepcopy(update.get('trading_days',[]))
@@ -264,8 +310,9 @@ class StatisticsOwner:
         if row is None:return None
         result=copy.deepcopy(row);result.pop('profile',None)
         cycles=[c for c in self.kernel._committed.values() if c['plan']['contract_id']==contract and c['plan']['trading_day']==day and c.get('statistics_profile')]
-        result['actual_confirmed_entry_quantity']=sum(c['protection']['entry_filled_qty'] for c in cycles)
-        result['actual_confirmed_exit_quantity']=sum(c['protection']['exit_filled_qty'] for c in cycles)
+        extra_entry, extra_exit = self._rollback_quantities.get((contract, day), (0, 0))
+        result['actual_confirmed_entry_quantity']=extra_entry+sum(c['protection']['entry_filled_qty'] for c in cycles)
+        result['actual_confirmed_exit_quantity']=extra_exit+sum(c['protection']['exit_filled_qty'] for c in cycles)
         result['receipts']=[copy.deepcopy(value) for (cid,kind),value in self._receipts.items() if value['contract_id']==contract and value['trading_day']==day]
         result['currency_pnl']=None
         return result

@@ -15,13 +15,13 @@ import time
 from uuid import uuid4
 
 from online_trader.configuration.baseline import load_confirmed_baseline
-from online_trader.kernel.statistics import strategy_open_counts
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
 from online_trader.gateway.ports import UnavailablePort
+from online_trader.ledger.dsv_rollback import EVENT
 from online_trader.kernel.strategy import StrategyCoordinator
 from online_trader.strategy.entry import (
     CHINA_TIME, DsvEntryStrategy, epoch_milliseconds, is_night_session, ordinary_quote_age,
@@ -54,6 +54,7 @@ class DsvStrategyRuntime:
         trade=self.profile.to_record()['settings']['trade']
         self._continuation_seconds=float(trade['chase_window_minutes'])*60 if trade['continuation_entry'] else None
         self._quote_age_limit = Decimal(trade['max_quote_age_seconds'])
+        self._converted = {}
         self._states={};self._stop_states={};self._latest={};self._rebuilds={};self._pending=None;self.epoch=None;self._account_revision=0
         def restore_state(state, *, trusted_consumption=False):
             if state is None:return
@@ -82,6 +83,13 @@ class DsvStrategyRuntime:
             self._states[(state["contract_id"],state["trading_day"])]=state
         for row in kernel.ledger.query("SELECT event_seq,event_type,payload_json FROM event_journal ORDER BY event_seq"):
             material=strict_loads(row["payload_json"]);data=material.get("data",material)
+            if row['event_type'] == EVENT:
+                handoff = data['dsv_rollback']
+                for code, mapped in handoff['symbols'].items():
+                    key = code, handoff['trading_day']
+                    self._converted[key] = mapped
+                    restore_state(mapped['entry'], trusted_consumption=True)
+                    self._stop_states[key] = copy.deepcopy(mapped['stops'])
             state=data.get("dsv_strategy_state")
             if data.get("rebuild_proof"):
                 proof=data["rebuild_proof"]
@@ -197,7 +205,10 @@ class DsvStrategyRuntime:
         self.kernel._check_owner()
         return {"profile_hash":self.profile.content_hash,
                 "entry_states":[copy.deepcopy(value) for _,value in sorted(self._states.items())],
-                "stop_states":[copy.deepcopy(value) for _,value in sorted(self._stop_states.items())]}
+                "stop_states":[copy.deepcopy(value) for _,value in sorted(self._stop_states.items())]} | (
+                    {'rollback_state': [{'contract_id': code, 'trading_day': day, **{field: mapped[field] for field in
+                                ('added_targets', 'target_count', 'continuation_attempted', 'night_close_direction', 'last_stop')}}
+                               for (code, day), mapped in sorted(self._converted.items())]} if self._converted else {})
 
     def poll(self):
         self.kernel._check_owner()
@@ -292,7 +303,7 @@ class DsvStrategyRuntime:
                     if cycle['plan']['contract_id']==candidate['contract_id']:symbol_extra+=per_lot*uncovered
         account["pending_margin"]=decimal_text(Decimal(account["pending_margin"])+pending) if account["pending_margin"] is not None else None
         account["symbol_margin"]=decimal_text(Decimal(account["symbol_margin"])+symbol_extra) if account["symbol_margin"] is not None else None
-        counts=strategy_open_counts(self.kernel._staged.values(),account['trading_day'],reserve=True,
+        counts=self.kernel.statistics.opening_counts(self.kernel._staged.values(),account['trading_day'],reserve=True,
                                     exclude_decision=counted_target or exclude_decision)
         account["orders_today"]=counts.get(candidate['contract_id'],0) if candidate.get('entry_kind')!='MANUAL' else 0
         account["active_symbols"]=sorted(active)
@@ -452,6 +463,10 @@ class DsvStrategyRuntime:
         if decision_time is not None:
             ordinary_quote_stale = self.ordinary_quote_stale(event, now=decision_time)
         timing={'ordinary_quote_stale':ordinary_quote_stale,'decision_time':decision_time}
+        mapped = self._converted.get((event['contract_id'], event['trading_day']), {})
+        stop = self.kernel.statistics.rollback_last_stop(event['contract_id'], event['trading_day'])
+        if stop and self.profile.to_record()['settings']['trade']['require_trigger_update']:
+            event = dict(event, stop_trigger_prices={stop['direction']: stop['theory']})
         if self._continuation_seconds is None or (state.get('night_reference') is None and event.get('night_reference') is None):
             return self.strategy.evaluate(state,event,**timing)
         opening=datetime.fromisoformat(event['session_open_utc'])
@@ -461,11 +476,11 @@ class DsvStrategyRuntime:
         k=self.kernel
         contract,day=event['contract_id'],event['trading_day']
         day_key=self.strategy.continuation_key(event)
-        attempted=day_key!=exclude_decision and day_key in k._decision_keys
+        attempted=mapped.get('continuation_attempted', False) or day_key!=exclude_decision and day_key in k._decision_keys
         allowed=(stops is None or stops['allow_continuation']) and not (
             self._blocked(event,exclude_decision=exclude_decision,resuming=resuming) or k.statistics.entry_reasons(
                 contract,day,profile=self.profile,entry_kind='CONTINUATION',now_utc=event['source_time_utc']))
-        fallback=None
+        fallback=mapped.get('night_close_direction')
         if allowed and not attempted:
             latest_close=None
             for cycle in k._staged.values():

@@ -62,6 +62,9 @@ class Journal:
     def load(self):
         return self._read('SELECT payload FROM checkpoint WHERE id=1')
 
+    def sdk_scope_grant(self):
+        return self._read("SELECT payload FROM events WHERE kind='SDK_SCOPE_BOUND' ORDER BY seq LIMIT 1")
+
     def _upgrade_native_facts(self, day):
         for name, ddl in zip(('native_orders', 'native_trades'), _SCHEMA[3:5]):
             self._db.execute(f'ALTER TABLE {name} RENAME TO {name}_v1')

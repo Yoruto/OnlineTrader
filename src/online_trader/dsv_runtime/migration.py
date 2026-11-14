@@ -1,6 +1,6 @@
 """Read-only legacy-ledger conversion and offline rollback review."""
 
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from hashlib import sha256
 from importlib.resources import files
 import os
@@ -16,6 +16,7 @@ from online_trader.dsv_runtime.runner import _day, _utc, initial_state
 from online_trader.dsv_storage.journal import Journal, _APPLICATION_ID
 from online_trader.errors import TraderError
 from online_trader.kernel.statistics import strategy_open_counts
+from online_trader.ledger.dsv_rollback import EVENT as REVERSE_EVENT
 from online_trader.runtime.instance import AccountLock
 from online_trader.strategy.entry import is_night_session
 
@@ -29,8 +30,8 @@ _COLD_CHECKS = {
         broker_state NOT IN ('FILLED','CANCELLED','REJECTED') OR terminal_evidence_json IS NULL OR
         (SELECT COALESCE(SUM(f.quantity),0) FROM fill_facts f LEFT JOIN broker_order_links l USING(broker_order_key)
          WHERE l.child_order_id=c.child_order_id OR
-               (l.child_order_id IS NULL AND f.gateway_identity='DEV' AND f.broker_order_key=c.child_order_id
-                AND json_extract(c.terminal_evidence_json,'$.development_only')=1)) != confirmed_fill_qty""",
+               (f.broker_order_key=c.child_order_id AND json_extract(f.raw_fact_json,'$.child_order_id')=c.child_order_id))
+         != confirmed_fill_qty""",
     'LEGACY_SEND_UNKNOWN': "SELECT 1 FROM send_attempts WHERE send_state NOT IN ('DEFINITELY_NOT_SENT','CONFIRMED')",
     'LEGACY_CANCEL_PENDING': "SELECT 1 FROM cancel_actions WHERE status NOT IN ('CONFIRMED','REJECTED','NOT_NEEDED')",
     'LEGACY_RESERVATION_PENDING': "SELECT 1 FROM reservations WHERE status IN ('HELD','UNKNOWN')",
@@ -71,6 +72,35 @@ def _source_digest(db):
     return digest.hexdigest()
 
 
+def _selected_native_history(db, contracts):
+    """Return previous owned native order/trade evidence from legacy projections."""
+    orders = {}
+    for (raw,) in db.execute('SELECT payload_json FROM event_journal ORDER BY event_seq'):
+        data = strict_loads(raw)['data']
+        for cycle in ([data['cycle']] if data.get('cycle') else []) + data.get('cycles', []):
+            if cycle['plan']['contract_id'] not in contracts:
+                continue
+            for child, native in cycle.get('native_order_keys', {}).items():
+                orders[child] = native
+    history = {}
+    for order in db.execute('SELECT c.child_order_id,p.contract_id,c.confirmed_fill_qty,c.limit_price,'
+                            'c.original_qty,c.offset_kind,p.direction,i.effect FROM child_orders c '
+                            'JOIN order_intents i USING(intent_id) JOIN position_cycles p USING(position_cycle_id)'):
+        if order['contract_id'] not in contracts or order['child_order_id'] not in orders:
+            continue
+        side = 'BUY' if (order['direction'] == 'LONG') == (order['effect'] == 'OPEN') else 'SELL'
+        history[orders[order['child_order_id']]] = {
+            'contract_id': order['contract_id'], 'filled': order['confirmed_fill_qty'], 'direction': side,
+            'limit_price': order['limit_price'], 'quantity': order['original_qty'], 'fills': {}, 'offset': {
+                'CLOSE_TODAY': 'CLOSETODAY', 'CLOSE_YESTERDAY': 'CLOSE'}.get(order['offset_kind'], order['offset_kind'])}
+    for (raw,) in db.execute('SELECT raw_fact_json FROM fill_facts'):
+        fact = strict_loads(raw)
+        native = orders.get(fact['child_order_id'])
+        if native in history and (trade := fact.get('native_trade_id')):
+            history[native]['fills'][trade] = {key: fact[key] for key in ('quantity', 'price')}
+    return history
+
+
 def _business_state(state):
     volatile = {'tick', 'tick_session', 'quote_clock'}
     return {'day': state['trading_day'], 'orders': state['orders'], 'retired': state['retired_positions'],
@@ -88,14 +118,20 @@ def _scope(manifest):
         raise TraderError('E_DSV_MIGRATION', 'Source event watermark must be canonical')
     header = manifest['session']
     if (type(header) is not dict or set(header) - {'type', 'account_key', 'provider', 'trading_day', 'profile'}
-            or header.get('type', 'session') != 'session' or header['provider'] != 'OFFLINE'
-            or not identifier(header['account_key']).startswith('DEV:')):
-        raise TraderError('E_DSV_MIGRATION', 'Migration requires a separately named offline development destination')
+            or header.get('type', 'session') != 'session'):
+        raise TraderError('E_DSV_MIGRATION', 'Expected a bound destination session')
     profile = DsvProfile.from_record(header['profile'])
     day = _day(header['trading_day'])
     scope = {key: header[key] for key in ('account_key', 'provider', 'trading_day')}
-    if scope['account_key'] == manifest['source_account_key']:
-        raise TraderError('E_DSV_MIGRATION', 'Use separate account identities for the rehearsal and legacy owner')
+    identifier(scope['account_key'])
+    sim_prefix = {'TQKQ': 'SIM:KQ:', 'TQ_SIMNOW': 'SIM:SIMNOW:'}.get(scope['provider'])
+    if sim_prefix:
+        if (scope['account_key'] != manifest['source_account_key'] or not scope['account_key'].startswith(sim_prefix)
+                or manifest['source_environment'] != 'ONLINE_SIM' or manifest['source_broker_identity'] != scope['provider']):
+            raise TraderError('E_DSV_MIGRATION', 'Simulation migration must preserve the original account binding')
+    elif (scope['provider'] != 'OFFLINE' or not scope['account_key'].startswith('DEV:')
+          or scope['account_key'] == manifest['source_account_key']):
+        raise TraderError('E_DSV_MIGRATION', 'Use a distinct development identity for offline rehearsal')
     scope['configuration_id'] = profile.content_hash
     return scope, profile
 
@@ -105,11 +141,14 @@ def _material(db, state, scope, manifest, profile, blockers):
     keys = set(state['symbols'])
     cycles, entries, stops, statistics, stop_receipts = {}, {}, {}, {}, {}
     closed_statistics = set()
+    state_evidence = set()
     for record in db.execute('SELECT event_type,payload_json,payload_hash FROM event_journal ORDER BY event_seq'):
         raw = record['payload_json'].encode('utf-8')
         if sha256(raw).hexdigest() != record['payload_hash']:
             raise TraderError('E_DSV_MIGRATION_SCHEMA', 'Legacy journal payload hash is inconsistent')
         data = strict_loads(raw)['data']
+        if record['event_type'] == REVERSE_EVENT:
+            blockers.add('LEGACY_REVERSE_HANDOFF_REQUIRES_REVIEW')
         cycle = data.get('cycle')
         if cycle:
             cycles[cycle['position_cycle_id']] = cycle
@@ -120,6 +159,7 @@ def _material(db, state, scope, manifest, profile, blockers):
             entry = metadata.get('strategy_state') or entry
             stop = metadata.get('stop_result') or stop
         if entry and entry['contract_id'] in keys and entry['trading_day'] == day:
+            state_evidence.add((entry['contract_id'], 'ENTRY'))
             if entry['account_key'] != manifest['source_account_key'] or entry['profile_hash'] != scope['configuration_id']:
                 blockers.add('LEGACY_ENTRY_PROFILE_MISMATCH')
             if entry.get('last_signal_bar') is not None and entry.get('consumption_version') != 1:
@@ -212,6 +252,13 @@ def _material(db, state, scope, manifest, profile, blockers):
             if until is not None or trade['require_trigger_update']:
                 row['last_stop'] = {'direction': direction, 'theory': stop['theoretical_entry_price'],
                                     'until': str(_utc(until).timestamp()) if until else None}
+    for block in db.execute('SELECT scope_key,reason_code FROM day_blocks WHERE trading_day=? AND status=\'ACTIVE\'', (day,)):
+        code, reason = block
+        if (reason == 'PROTECTION_LOCK' and code in state['symbols'] and
+                ((code, 'ENTRY') in state_evidence or (code, day) in statistics)):
+            state['symbols'][code].update(day_stop=True, day_stop_reason=reason)
+        elif code in keys or code == manifest['source_account_key']:
+            blockers.add('LEGACY_DAY_BLOCKS_UNMAPPED')
 
 
 def migrate(source, manifest, target=None):
@@ -238,9 +285,10 @@ def migrate(source, manifest, target=None):
                     for code in state['symbols']]
         if (type(native) is not list or sorted(map(content_hash, native)) != sorted(map(content_hash, expected))):
             blockers.add('NATIVE_FLAT_SCOPE_UNPROVED')
-        for table in ('business_counters', 'day_blocks'):
-            if db.execute(f'SELECT 1 FROM {table} WHERE trading_day >= ?', (scope['trading_day'],)).fetchone():
-                blockers.add(f'LEGACY_{table.upper()}_UNMAPPED')
+        if db.execute('SELECT 1 FROM business_counters WHERE trading_day>=?', (scope['trading_day'],)).fetchone():
+            blockers.add('LEGACY_BUSINESS_COUNTERS_UNMAPPED')
+        if db.execute("SELECT 1 FROM day_blocks WHERE trading_day>? AND status='ACTIVE'", (scope['trading_day'],)).fetchone():
+            blockers.add('LEGACY_DAY_BLOCKS_UNMAPPED')
         if db.execute('SELECT 1 FROM position_cycles WHERE trading_day > ?', (scope['trading_day'],)).fetchone():
             blockers.add('LEGACY_NEWER_TRADING_DAY')
         _material(db, state, scope, manifest, profile, blockers)
@@ -256,12 +304,17 @@ def migrate(source, manifest, target=None):
             for code, row in state['symbols'].items()}
         profile_trade = profile.to_record()['settings']['trade']
         receipt['reset_policy'] = {key: profile_trade[key] for key in ('require_trigger_update', 'stop_cooldown_enabled')}
+        if scope['provider'] != 'OFFLINE':
+            receipt['legacy_native_orders'] = _selected_native_history(db, set(state['symbols']))
         receipt['migration_id'] = content_hash(receipt)
         receipt['blockers'] = sorted(blockers)
         receipt['mode'] = 'PREFLIGHT'
         if target is not None and not blockers:
-            with AccountLock(scope['account_key']):
+            if scope['account_key'] == manifest['source_account_key']:
                 _publish(target, scope, state, receipt)
+            else:
+                with AccountLock(scope['account_key']):
+                    _publish(target, scope, state, receipt)
             receipt['mode'] = 'IMPORTED'
         return receipt
 
@@ -282,16 +335,7 @@ def _publish(target, scope, state, receipt):
 @contextmanager
 def rollback_snapshots(source, target):
     with _readonly(target) as db:
-        signature = (db.execute('PRAGMA application_id').fetchone()[0], db.execute('PRAGMA user_version').fetchone()[0])
-        if signature != (_APPLICATION_ID, 2):
-            raise TraderError('E_DSV_ROLLBACK', 'Expected a migrated DSV fact store')
-        found = db.execute("SELECT payload FROM events WHERE seq=1 AND kind='LEGACY_MIGRATION'").fetchone()
-        if not found:
-            raise TraderError('E_DSV_ROLLBACK', 'Target has no legacy conversion receipt')
-        receipt = strict_loads(found[0])
-        identity = {key: value for key, value in receipt.items() if key not in {'blockers', 'mode', 'migration_id'}}
-        if receipt['mode'] != 'IMPORTED' or receipt['blockers'] or content_hash(identity) != receipt['migration_id']:
-            raise TraderError('E_DSV_ROLLBACK', 'Target conversion receipt is inconsistent')
+        receipt = read_migration_receipt(db)
     scope = receipt['target_scope']
     blockers = set()
     with _readonly(source) as legacy:
@@ -299,7 +343,9 @@ def rollback_snapshots(source, target):
         account = legacy.execute('SELECT account_key FROM ledger_scope WHERE singleton=1').fetchone()
     if account is None or content_hash(account[0]) != receipt['source_account_hash']:
         raise TraderError('E_DSV_MIGRATION_SCOPE', 'Legacy account differs from the conversion receipt')
-    with AccountLock(account[0]), AccountLock(scope['account_key']), _readonly(target) as db, _readonly(source) as legacy:
+    with (AccountLock(account[0]),
+          nullcontext() if account[0] == scope['account_key'] else AccountLock(scope['account_key']),
+          _readonly(target) as db, _readonly(source) as legacy):
         _source_schema(legacy)
         if _source_digest(legacy) != receipt['source_digest']:
             blockers.add('SOURCE_CHANGED')
@@ -310,6 +356,20 @@ def rollback_snapshots(source, target):
             blockers.add('TARGET_SCOPE_CHANGED')
         state = strict_loads(db.execute('SELECT payload FROM checkpoint').fetchone()[0])
         yield legacy, db, receipt, state, blockers
+
+
+def read_migration_receipt(db):
+    signature = (db.execute('PRAGMA application_id').fetchone()[0], db.execute('PRAGMA user_version').fetchone()[0])
+    if signature != (_APPLICATION_ID, 2):
+        raise TraderError('E_DSV_ROLLBACK', 'Expected a migrated DSV fact store')
+    found = db.execute("SELECT payload FROM events WHERE seq=1 AND kind='LEGACY_MIGRATION'").fetchone()
+    if not found:
+        raise TraderError('E_DSV_ROLLBACK', 'Target has no legacy conversion receipt')
+    receipt = strict_loads(found[0])
+    identity = {key: value for key, value in receipt.items() if key not in {'blockers', 'mode', 'migration_id'}}
+    if receipt['mode'] != 'IMPORTED' or receipt['blockers'] or content_hash(identity) != receipt['migration_id']:
+        raise TraderError('E_DSV_ROLLBACK', 'Target conversion receipt is inconsistent')
+    return receipt
 
 
 def rollback_review(source, target):

@@ -183,6 +183,29 @@ class MoneyBook:
         nominal=data.get('nominal_statistics')
         if nominal is not None:
             state=nominal['state'];self.nominal[(state['contract_id'],state['trading_day'])]=copy.deepcopy(state)
+        if converted := data.get('dsv_rollback'):
+            self._accept_dsv_rollback(converted, event_seq)
+
+    def _accept_dsv_rollback(self, converted, event_seq):
+        if converted['account_key'] != self.account_key:
+            raise TraderError('E_SCOPE', 'Converted fact belongs to another legacy account')
+        for code, row in converted['symbols'].items():
+            self.nominal[(code, converted['trading_day'])] = copy.deepcopy(row['statistics'])
+        for cycle, trades in converted['trades'].items():
+            plan = converted['closed_cycles'][cycle]
+            for trade in trades:
+                key = 'reverse-trade-' + content_hash([converted['migration_id'], trade['trading_day'],
+                                                       trade['order_id'], trade['trade_id']])
+                fact = {field: trade[field] for field in ('child_order_id', 'contract_id', 'quantity', 'effect',
+                                                        'price', 'trading_day', 'observed_at_utc')}
+                fact.update(trade_key=key, fill_id='fill-' + key, position_cycle_id=cycle,
+                            direction=plan['direction'], multiplier=plan['multiplier'], currency='CNY',
+                            theoretical_entry_price=decimal_text(Decimal(plan['theory'])), event_seq=event_seq,
+                            time_basis='ORIGINAL_NATIVE_TIMESTAMP' if trade['source_time_ns'] else 'EXPLICIT_OBSERVATION',
+                            original_fee=None)
+                if key in self.fills and self.fills[key] != fact:
+                    raise TraderError('E_DUPLICATE_CONFLICT', 'Converted trade has contradictory history')
+                self.fills[key] = fact
 
     def report(self,*,checkpoint_event_seq,as_of_utc=None,valuation_boot_id=None):
         from online_trader.accounting.report import add_close_point_checks, build_report

@@ -136,6 +136,8 @@ class Kernel:
                 self._money_fact_meta[fill["trade_key"]] = fill
         for row in self.ledger.query("SELECT decision_key FROM order_intents WHERE effect='OPEN'"):
             self._decision_keys.add(row["decision_key"])
+        from online_trader.ledger.dsv_rollback import read_handoffs
+        self._dsv_rollback = tuple(read_handoffs(self.ledger, self.account_key))
         current_orders = {r["child_order_id"]: r for r in self.ledger.query(
             "SELECT c.child_order_id,a.send_state FROM child_orders c JOIN send_attempts a ON a.child_order_id=c.child_order_id")}
         for cycle in self._committed.values():
@@ -297,7 +299,8 @@ class Kernel:
                               "maintenance_state":self._maintenance_state,
                               "active_strategy_epoch": None if self.active_epoch is None else str(self.active_epoch),
                               "funds":self.money.account_projection() if hasattr(self,'money') else None,
-                              "errors": self._errors, "cycles": list(self._committed.values())})
+                              "errors": self._errors, "cycles": list(self._committed.values())}
+                             | ({'dsv_rollback': self._dsv_rollback[-1]['candidate_digest']} if self._dsv_rollback else {}))
 
     def _write_authority(self, conn, seq, authority):
         conn.execute("UPDATE authority SET new_open_status=?, grant_id=?, grant_policy_json=?, state_revision=?, risk_revision=?, authority_revision=?,config_revision=?, updated_event_seq=? WHERE singleton=1",

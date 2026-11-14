@@ -13,7 +13,7 @@ from online_trader.transport.named_pipe import PipeListener, connect
 
 
 _PROTOCOL = 'DSV_OFFLINE/1'
-_OPS = {'snapshot', 'command', 'round', 'receipt', 'disconnect'}
+_OPS = {'snapshot', 'command', 'round', 'receipt', 'disconnect', 'shutdown'}
 _TIMEOUT = {'E_TIMEOUT', 'E_PIPE', 'E_PIPE_CLOSED', 'E_PIPE_TIMEOUT'}
 
 
@@ -61,10 +61,13 @@ def _snapshot(session, *, detail=False):
     return state
 
 
-def _handle(session, request):
+def _handle(session, request, *, sdk=None):
     body, op = request['body'], request['op']
     if op == 'snapshot':
-        return _snapshot(session, detail=body.get('detail') is True)
+        result = _snapshot(session, detail=body.get('detail') is True)
+        if sdk is not None:
+            result['sdk_connection'] = True
+        return result
     if op == 'receipt':
         session.verify_scope(body.get('expected_scope'))
         return session.command_receipt(body['id'])
@@ -73,12 +76,31 @@ def _handle(session, request):
         previous = session.command_receipt(body['id'])
         if previous is None:
             session.verify_day(body.get('expected_day'))
-        return session.command(body)
+        return session.command(body) if sdk is None else sdk.command(session, body)
+    if sdk is not None:
+        raise TraderError('E_DSV_PROTOCOL', 'Only the SDK owner supplies market and native facts')
     if op == 'round':
         return session.apply_round(body)
     if op == 'disconnect':
         return session.disconnect()
     raise TraderError('E_DSV_PROTOCOL', 'Expected an offline request')
+
+
+def serve_request(listener, handle, *, timeout=0.25):
+    try:
+        with listener.accept(timeout=timeout) as pipe:
+            request = pipe.recv(timeout=1.0)
+            try:
+                result = handle(request)
+                reply = {'protocol': _PROTOCOL, 'op': 'reply', 'body': {'value': result}}
+                encode_frame(reply)
+            except (KeyError, TypeError, TraderError) as error:
+                reply = {'protocol': _PROTOCOL, 'op': 'error', 'body': {
+                    'code': getattr(error, 'code', 'E_DSV_PROTOCOL'), 'message': str(error)}}
+            pipe.send(reply, timeout=1.0)
+    except TraderError as error:
+        if error.code not in _TIMEOUT | {'E_AUTH', 'E_DSV_PROTOCOL', 'E_FRAME', 'E_VERSION', 'E_SCHEMA'}:
+            raise
 
 
 def serve(pipe_name, database, header, *, ready_file=None):
@@ -93,20 +115,7 @@ def serve(pipe_name, database, header, *, ready_file=None):
             ready_file.write_text(json.dumps({'pipe': pipe_name, 'offline': True}), encoding='utf-8')
         print('DSV 离线执行器已启动', flush=True)
         while True:
-            try:
-                with listener.accept(timeout=0.25) as pipe:
-                    request = pipe.recv(timeout=1.0)
-                    try:
-                        result = _handle(session, request)
-                        reply = {'protocol': _PROTOCOL, 'op': 'reply', 'body': {'value': result}}
-                        encode_frame(reply)
-                    except (KeyError, TypeError, TraderError) as error:
-                        reply = {'protocol': _PROTOCOL, 'op': 'error', 'body': {
-                            'code': getattr(error, 'code', 'E_DSV_PROTOCOL'), 'message': str(error)}}
-                    pipe.send(reply, timeout=1.0)
-            except TraderError as error:
-                if error.code not in _TIMEOUT | {'E_AUTH', 'E_DSV_PROTOCOL', 'E_FRAME', 'E_VERSION', 'E_SCHEMA'}:
-                    raise
+            serve_request(listener, lambda request: _handle(session, request))
 
 
 def cli(args):
@@ -123,6 +132,11 @@ def cli(args):
         elif args.offline_action == 'rollback-rehearse':
             from online_trader.dsv_runtime.rollback import rehearse
             result = rehearse(args.source, args.db, value, args.target)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result['eligible'] else 2
+        elif args.offline_action == 'rollback-same-day':
+            from online_trader.dsv_runtime.same_day_rollback import convert_same_day
+            result = convert_same_day(args.source, args.db, value, args.target)
             print(json.dumps(result, ensure_ascii=False))
             return 0 if result['eligible'] else 2
         elif args.offline_action == 'migrate':

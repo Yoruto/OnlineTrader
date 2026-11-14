@@ -74,7 +74,8 @@ class DsvSimulationGrant:
                   'not_before_utc','not_after_utc','max_order_quantity','opening_attempts','risk_budget',
                   'profile_hash','calendar_hash','authorization_reference'}
         target_schemas = {'KQ_DSV_DESKTOP/1', 'SIMNOW_DSV_DESKTOP/1'}
-        multi_day_schemas = target_schemas | {'KQ_DSV_SIM/2', 'SIMNOW_DSV_SIM/1', 'SIMNOW_DSV_AUTO/1',
+        replacement_schemas = {'KQ_DSV_REPLACEMENT/1', 'SIMNOW_DSV_REPLACEMENT/1'}
+        multi_day_schemas = target_schemas | replacement_schemas | {'KQ_DSV_SIM/2', 'SIMNOW_DSV_SIM/1', 'SIMNOW_DSV_AUTO/1',
                                              'KQ_WORKBENCH_SIM/1', 'SIMNOW_WORKBENCH_SIM/1'}
         if schema in target_schemas:
             required.remove('opening_attempts')
@@ -98,6 +99,8 @@ class DsvSimulationGrant:
             for day in days:_day(day)
             if value['schema_version'] in {'KQ_WORKBENCH_SIM/1','SIMNOW_WORKBENCH_SIM/1'} and value['resume_entries_on_day_change']:
                 raise TraderError('E_ONLINE_SCOPE','Manual workbench authority must be granted again after a cabinet-day change')
+            if schema in replacement_schemas and (value['resume_entries_on_day_change'] or 'allow_external_allocation' in value):
+                raise TraderError('E_ONLINE_SCOPE','Replacement requires explicit restart and owned-only execution')
         if value['schema_version']=='SIMNOW_DSV_AUTO/1':
             policy=value['auto_offsets']
             if (type(policy) is not dict or policy.keys()!={'schema_version','as_of_date','last_completed_day'}
@@ -164,6 +167,8 @@ class DsvSimulationGrant:
         return {'opening_attempts': self.value['opening_attempts']}
     @property
     def manual_workbench(self):return self.value['schema_version'] in {'KQ_WORKBENCH_SIM/1','SIMNOW_WORKBENCH_SIM/1'}
+    @property
+    def replacement(self):return self.value['schema_version'] in {'KQ_DSV_REPLACEMENT/1','SIMNOW_DSV_REPLACEMENT/1'}
     @property
     def external_allocation_allowed(self):return self.value.get('allow_external_allocation',self.manual_workbench)
     @property

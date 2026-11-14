@@ -42,11 +42,12 @@ def main(argv=None):
     rollback=offline_actions.add_parser('rollback-review',help='只读核对离线迁移是否允许恢复原状态')
     rollback.add_argument('--source',type=Path,required=True)
     rollback.add_argument('--db',type=Path,required=True)
-    rehearse=offline_actions.add_parser('rollback-rehearse',help='在有成交后审查合法交易日复位并生成隔离演练副本')
-    rehearse.add_argument('--source',type=Path,required=True)
-    rehearse.add_argument('--db',type=Path,required=True)
-    rehearse.add_argument('--input',type=Path,required=True,help='完整的柜台交易日历')
-    rehearse.add_argument('--target',type=Path,help='新的隔离输出目录')
+    for action, label in (('rollback-rehearse', '审查交易日复位'), ('rollback-same-day', '转换同日已闭合的订单、成交与业务状态')):
+        rehearse=offline_actions.add_parser(action,help=label)
+        rehearse.add_argument('--source',type=Path,required=True)
+        rehearse.add_argument('--db',type=Path,required=True)
+        rehearse.add_argument('--input',type=Path,required=True,help='完整的柜台交易日历' if action=='rollback-rehearse' else '相同的有效业务参数')
+        rehearse.add_argument('--target',type=Path,help='新的隔离输出目录')
     archive=offline_actions.add_parser('archive-log',help='从旧账本重建指定运行日志到新目录')
     archive.add_argument('--source',type=Path,required=True)
     archive.add_argument('--runs-root',type=Path,required=True)
@@ -108,6 +109,7 @@ def main(argv=None):
         command.add_argument('--authorization-reference',required=True)
         command.add_argument('--manual-workbench',action='store_true',help='生成独立人工交易与外部持仓接管范围')
         command.add_argument('--allow-external-allocation',action='store_true',help='允许在工作台明确复核并登记外部持仓归属调整')
+        command.add_argument('--replacement',action='store_true',help='为新控制器生成独立的模拟范围')
         if provider=='dsv':
             command.add_argument('--account-store',type=Path,required=True)
             command.add_argument('--account-id',required=True)
@@ -122,18 +124,21 @@ def main(argv=None):
             command.add_argument('--last-completed-day',help='自动计算明确使用的最后完整日线交易日')
             command=dsv_actions.add_parser('profile',help='只读提取DSV业务设置，不导出账户密码')
             command.add_argument('--dsv-config',type=Path,required=True);command.add_argument('--output',type=Path,required=True)
-        for name in ('prepare','run'):
+        for name in ('prepare','run','replacement-prepare','replacement-run'):
             command=dsv_actions.add_parser(name)
             for field in ('scope','profile','calendar','output'):command.add_argument('--'+field,type=Path,required=True)
+            if name.startswith('replacement-'):
+                command.add_argument('--db',type=Path,required=True)
             command.add_argument('--dsv-config',type=Path,help='诊断原 DSV 业务设置是否与当前运行参数一致')
             command.add_argument('--dsv-log-dir',type=Path,help='只读跟踪DSV原日志，自动记录至本次对比目录')
-            if name=='run':
+            if name in {'run','replacement-run'}:
                 credential_source=command.add_mutually_exclusive_group(required=True)
                 credential_source.add_argument('--credentials',type=Path)
                 credential_source.add_argument('--account-store',type=Path)
                 command.add_argument('--account-id')
-                command.add_argument('--pipe')
-                command.add_argument('--arm',action='store_true',help='仅首次新范围显式开启策略；重启只管理原退出')
+                command.add_argument('--pipe',required=name=='replacement-run')
+                if name=='run':
+                    command.add_argument('--arm',action='store_true',help='仅首次新范围显式开启策略；重启只管理原退出')
     compare=commands.add_parser('compare',help='双侧对比记录和时钟核对；不登录交易账户')
     compare_actions=compare.add_subparsers(dest='compare_action',required=True)
     command=compare_actions.add_parser('report')
@@ -287,6 +292,10 @@ def main(argv=None):
                         'as_of_date':args.trading_day[0],'last_completed_day':args.last_completed_day})
                 elif getattr(args,'last_completed_day',None) is not None:
                     raise TraderError('E_AUTO_OFFSETS','The completed daily date belongs to an explicit automatic calculation scope')
+                if args.replacement:
+                    if args.manual_workbench or getattr(args,'automatic_offsets',False):
+                        raise TraderError('E_ONLINE_SCOPE','Replacement requires a normalized fixed strategy profile')
+                    value['schema_version']='SIMNOW_DSV_REPLACEMENT/1' if args.action=='simnow' else 'KQ_DSV_REPLACEMENT/1'
                 grant=DsvSimulationGrant.parse(canonical_bytes(value))
                 dsv_simulation.validate_inputs(grant,profile,calendar)
                 publish_new_bytes(canonical_bytes(value),args.output)
@@ -302,6 +311,12 @@ def main(argv=None):
             grant,_,_=dsv_simulation.load_inputs(args.scope,args.profile,args.calendar)
             if (args.action=='simnow')!=(grant.provider=='TQ_SIMNOW'):
                 raise TraderError('E_ONLINE_SCOPE','Use the connection command matching this scope provider')
+            if grant.replacement != args.dsv_action.startswith('replacement-'):
+                raise TraderError('E_ONLINE_SCOPE','Use the startup command matching the grant controller')
+            if args.dsv_action=='replacement-prepare':
+                from online_trader.dsv_runtime.sdk_startup import prepare
+                result=prepare(args.scope,args.profile,args.calendar,args.db,args.output)
+                print(json.dumps(result,ensure_ascii=False,indent=2));return 0
             if args.dsv_action=='prepare':
                 result=dsv_simulation.prepare(args.scope,args.profile,args.calendar,args.output,
                     dsv_config=args.dsv_config,dsv_log_dir=args.dsv_log_dir)
@@ -318,6 +333,9 @@ def main(argv=None):
                     raise TraderError('E_SCOPE','Selected account and original ledger differ from the explicit scope')
                 credential=store.credential_reference(account_id)
                 if grant.manual_workbench and pipe is None:pipe=store.pipe_name(row)
+            if args.dsv_action=='replacement-run':
+                from online_trader.dsv_runtime.sdk_startup import run
+                return run(args.scope,credential,args.profile,args.calendar,args.db,args.output,pipe=pipe)
             return dsv_simulation.run(args.scope,credential,args.profile,args.calendar,args.output,pipe=pipe,arm=args.arm,
                 dsv_config=args.dsv_config,dsv_log_dir=args.dsv_log_dir)
         elif args.action=='simulation':

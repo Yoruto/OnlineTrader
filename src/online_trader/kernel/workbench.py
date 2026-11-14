@@ -12,7 +12,6 @@ from online_trader.contracts.codec import canonical_bytes, strict_loads
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text
 from online_trader.kernel.projection import projection_batch
-from online_trader.kernel.statistics import strategy_open_counts
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import number
 
@@ -25,7 +24,7 @@ def monitor_symbols(kernel, decisions):
     settings = runtime.profile.to_record()['settings']
     names = {row['code']: row['name'] for row in settings['symbols']}
     cycles = kernel._committed.values()
-    counts = strategy_open_counts(cycles, day)
+    counts = kernel.statistics.opening_counts(cycles, day)
     trade = settings['trade']
     maximum = trade['max_daily_orders']
     by_code = {}
@@ -399,7 +398,7 @@ def workbench_view(kernel):
                     'intervals':{code:rows[:16] for code,rows in schedules.items()},
                     'truncated':any(len(rows)>16 for rows in schedules.values())}
             funds=native['funds']
-            opening_orders=sum(strategy_open_counts(snapshot['cycles'], day).values())
+            opening_orders=sum(kernel.statistics.opening_counts(snapshot['cycles'], day).values())
             result['account_metrics']={key:funds.get(key) for key in
                 ('balance','available','margin','risk_ratio','pre_balance','close_profit','position_profit','float_profit','commission')}
             result['account_metrics'].update(trading_day=day,opening_orders=opening_orders)
