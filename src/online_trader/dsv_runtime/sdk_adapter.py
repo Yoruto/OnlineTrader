@@ -154,7 +154,9 @@ class DsvSdkAdapter:
         trades = self.api.get_trade(account=self.account)
         native = self._order_facts(orders, bindings)
         foreign_orders = self._foreign_orders(orders, bindings)
-        details, foreign_trades = self._trade_facts(trades, bindings, day, needs_recovery=bool(state['orders']))
+        accepted = {self.order_id(order['child_order_id']): order.get('native_order_time_ns') for order in state['orders'].values()}
+        accepted.update({fact['native_order_id']: fact['source_time_ns'] for fact in native if 'source_time_ns' in fact})
+        details, foreign_trades = self._trade_facts(trades, bindings, day, accepted, needs_recovery=bool(state['orders']))
         funds = self.api.get_account(account=self.account)
         markets = [self._market(code, day, now, funds, state['symbols'][code],
                                 code in foreign_orders or code in foreign_trades, state['orders'])
@@ -164,7 +166,8 @@ class DsvSdkAdapter:
         sequence = state['sequence'] + 1
         frame = {'id': f'sdk-{self.epoch}-{sequence}', 'sequence': sequence, 'session_id': self.epoch,
                  'wall_time': utc(now), 'monotonic_ms': str(mono), 'trading_day': day,
-                 'trading_days': self.trading_days, 'synchronized': True, 'market': markets,
+                 'trading_days': self.trading_days, 'calendar_hash': self.calendar.content_hash,
+                 'synchronized': True, 'market': markets,
                  'sync_orders': [fact['child_order_id'] for fact in native], 'native': native + details}
         return frame, {row['contract_id']: row for row in markets}
 
@@ -197,7 +200,7 @@ class DsvSdkAdapter:
             result.append(self._fact('ORDER', binding, native_id) | {'status': status, 'filled_qty': filled} | temporal)
         return result
 
-    def _trade_facts(self, trades, bindings, day, *, needs_recovery):
+    def _trade_facts(self, trades, bindings, day, accepted, *, needs_recovery):
         facts, foreign = [], {}
         for native_trade, trade in trades.items():
             binding = bindings.get(trade.order_id)
@@ -212,6 +215,13 @@ class DsvSdkAdapter:
             stamp = trade.trade_date_time
             if type(stamp) is not int:
                 raise TraderError('E_DSV_SDK_FACT', 'SDK trade needs an exact nanosecond timestamp')
+            ordered = accepted.get(trade.order_id)
+            if ordered is not None and stamp < int(ordered):
+                raise TraderError('E_DSV_SDK_FACT', 'Native trade precedes its original order timestamp')
+            if ordered is None:
+                # The account trade map can change before the original order
+                # image arrives. Its next snapshot will supply the same trade.
+                continue
             proof = native_day(self.calendar, binding['contract_id'], str(stamp))
             if proof['trading_day'] > day:
                 raise TraderError('E_DSV_SDK_FACT', 'SDK trade belongs to an unobserved future cabinet day')

@@ -78,6 +78,9 @@ def _check_reset(db, state, receipt, calendar, blockers):
             not _native_flat(boundary[1], contracts) or not _native_flat(current_round[1], contracts)):
         blockers.add('RESET_NATIVE_FLAT_UNPROVED')
     if boundary and current_round and contracts <= by_contract.keys() and data['complete']:
+        if any(frame.get('calendar_hash', calendar.content_hash) != calendar.content_hash
+               for _, frame in (boundary[:2], current_round)):
+            blockers.add('RESET_CALENDAR_BINDING_CHANGED')
         _calendar_boundary(boundary, current_round, by_contract, contracts, calendar, day, blockers)
 
     carry = receipt.get('reset_carry')

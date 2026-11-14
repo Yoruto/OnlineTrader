@@ -72,6 +72,10 @@ class ExplicitOrderController:
                 raise TraderError('E_DSV_NATIVE_FACT', 'Native contract, side or offset differs from the child')
             native_id = _bind_native(order, fact['native_order_id'])
             if fact['kind'] == 'ORDER':
+                if stamp := fact.get('source_time_ns'):
+                    if order.get('native_order_time_ns', stamp) != stamp:
+                        raise TraderError('E_DSV_NATIVE_FACT', 'Original native order timestamp changed')
+                    order['native_order_time_ns'] = stamp
                 self._order_update(order, fact)
                 self.journal.event('NATIVE_ORDER', fact)
             else:
@@ -115,6 +119,9 @@ class ExplicitOrderController:
             raise TraderError('E_DSV_SCOPE', 'Fill day is outside its order and observed cabinet days')
         if order_day != state['trading_day'] and 'fill_day' not in fact:
             raise TraderError('E_DSV_SCOPE', 'Late trade requires the original fill day')
+        if 'source_time_ns' in fact and 'native_order_time_ns' in order:
+            if int(fact['source_time_ns']) < int(order['native_order_time_ns']):
+                raise TraderError('E_DSV_NATIVE_FACT', 'Native trade precedes its original order timestamp')
         separated = order['contract_id'].split('.')[0] in {'SHFE', 'INE'}
         if fill_day != order_day and separated and order['effect'] == 'REDUCE':
             raise TraderError('E_DSV_NATIVE_FACT', 'A split-offset child cannot spend lots on a different cabinet day')
