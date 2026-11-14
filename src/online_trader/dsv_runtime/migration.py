@@ -251,6 +251,11 @@ def migrate(source, manifest, target=None):
                    'target_business_digest': content_hash(_business_state(state)), 'native_digest': content_hash(native),
                    'mapped_fields': _MAPPED, 'archive_only': ['fills', 'fees', 'closed_cycles', 'logs', 'execution_authority'],
                    'historical_fills': str(db.execute('SELECT COUNT(*) FROM fill_facts').fetchone()[0])}
+        receipt['reset_carry'] = {
+            code: {key: row.get(key) for key in ('last_stop', 'month_stop', 'stop_days')}
+            for code, row in state['symbols'].items()}
+        profile_trade = profile.to_record()['settings']['trade']
+        receipt['reset_policy'] = {key: profile_trade[key] for key in ('require_trigger_update', 'stop_cooldown_enabled')}
         receipt['migration_id'] = content_hash(receipt)
         receipt['blockers'] = sorted(blockers)
         receipt['mode'] = 'PREFLIGHT'
@@ -274,7 +279,8 @@ def _publish(target, scope, state, receipt):
             raise TraderError('E_DUPLICATE_CONFLICT', 'Migration destination already exists') from error
 
 
-def rollback_review(source, target):
+@contextmanager
+def rollback_snapshots(source, target):
     with _readonly(target) as db:
         signature = (db.execute('PRAGMA application_id').fetchone()[0], db.execute('PRAGMA user_version').fetchone()[0])
         if signature != (_APPLICATION_ID, 2):
@@ -303,6 +309,11 @@ def rollback_review(source, target):
         if strict_loads(db.execute('SELECT payload FROM scope').fetchone()[0]) != scope:
             blockers.add('TARGET_SCOPE_CHANGED')
         state = strict_loads(db.execute('SELECT payload FROM checkpoint').fetchone()[0])
+        yield legacy, db, receipt, state, blockers
+
+
+def rollback_review(source, target):
+    with rollback_snapshots(source, target) as (_, db, receipt, state, blockers):
         if content_hash(_business_state(state)) != receipt['target_business_digest']:
             blockers.add('TARGET_BUSINESS_CHANGED')
         if any(db.execute(f'SELECT 1 FROM {table}').fetchone() for table in ('effects', 'native_orders', 'native_trades')):

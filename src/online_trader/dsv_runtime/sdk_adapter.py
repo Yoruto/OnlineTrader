@@ -1,0 +1,354 @@
+"""Bridge the explicit DSV owner to an already constructed TqSdk-shaped API."""
+
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, localcontext
+from hashlib import sha256
+from threading import get_ident
+import time
+from uuid import uuid4
+
+from online_trader.configuration.dsv import DsvProfile
+from online_trader.configuration.rollover import expiry_date
+from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
+from online_trader.dsv_runtime.controller import legal_price, terminal
+from online_trader.errors import TraderError
+from online_trader.gateway.dsv_facts import native_integer, utc
+from online_trader.gateway.native_days import native_day
+from online_trader.gateway.tqkq import number
+from online_trader.runtime.startup_metadata import SDK_VERSION
+from online_trader.scheduling.calendar import TradingCalendar
+from online_trader.strategy.entry import is_night_session
+
+
+_BEIJING = timezone(timedelta(hours=8))
+_PRICE_FIELDS = {'last': 'last_price', 'day_high': 'highest', 'day_low': 'lowest', 'bid1': 'bid_price1',
+                 'ask1': 'ask_price1', 'tick_size': 'price_tick', 'lower_limit': 'lower_limit', 'upper_limit': 'upper_limit'}
+_POSITION = {'long_qty': 'pos_long', 'short_qty': 'pos_short',
+             'long_today': 'pos_long_today', 'long_historical': 'pos_long_his',
+             'short_today': 'pos_short_today', 'short_historical': 'pos_short_his'}
+
+
+def _amount(value, *, rounding=None):
+    text = number(value)
+    if text is None:
+        return None
+    try:
+        return decimal_text(decimal_value(text))
+    except TraderError:
+        amount = Decimal(text)
+        if rounding is None or abs(amount) >= 10**18:
+            return None
+        with localcontext() as ctx:
+            ctx.prec = 64
+            return decimal_text(amount.quantize(Decimal('0.000000000001'), rounding=rounding))
+
+
+class DsvSdkAdapter:
+    """Read SDK final objects once per wait_update and send only committed child effects.
+
+    Account authentication and synchronization proof belong to the caller.
+    The replacement session currently only binds an OFFLINE account.
+    """
+
+    def __init__(self, api, account, *, account_key, profile, calendar, sdk_version, clock=None):
+        if sdk_version != SDK_VERSION or not isinstance(profile, DsvProfile) or not isinstance(calendar, TradingCalendar):
+            raise TraderError('E_DSV_SDK_SCOPE', 'Expected the pinned SDK, normalized profile and explicit calendar')
+        if not identifier(account_key).startswith('DEV:') or account is None:
+            raise TraderError('E_DSV_SDK_SCOPE', 'Offline SDK rehearsal requires a bound account object and development identity')
+        self.api, self.account, self.account_key = api, account, account_key
+        self.profile, self.calendar = profile, calendar
+        self.contracts = tuple(row['code'] for row in profile.to_record()['settings']['symbols'])
+        calendar_record = calendar.to_record()
+        self.periods = {row['contract_id']: row['sessions'] for row in calendar_record['contracts']}
+        if not calendar_record['complete'] or any(not self.periods.get(code) for code in self.contracts):
+            raise TraderError('E_DSV_SDK_SCOPE', 'The calendar must cover every selected contract')
+        day_sets = [{period['trading_day'] for period in self.periods[code]} for code in self.contracts]
+        self.trading_days = sorted(set.intersection(*day_sets)) if day_sets else []
+        self.clock = clock if clock is not None else lambda: (datetime.now(timezone.utc), time.monotonic_ns() // 1_000_000)
+        self.owner = get_ident()
+        self.session = None
+        self.epoch = uuid4().hex
+        self.enabled = False
+        self.synchronized = False
+        self.dispatch_market = {}
+        self._seen_effects = set()
+        self._foreign_trades = None
+        self.quotes = {code: api.get_quote(code) for code in self.contracts}
+        self.minutes = {code: api.get_kline_serial(code, 60, data_length=500) for code in self.contracts}
+
+    @staticmethod
+    def order_id(child):
+        return 'otdsv' + sha256(identifier(child).encode('ascii')).hexdigest()[:27]
+
+    def _bind(self, session):
+        if get_ident() != self.owner or session._controller.port is not self:
+            raise TraderError('E_DSV_SDK_OWNER', 'SDK calls must use the bound DSV owner thread and port')
+        state = session.snapshot()
+        scope = state['scope']
+        if (scope['account_key'] != self.account_key or scope['provider'] != 'OFFLINE' or
+                scope['configuration_id'] != self.profile.content_hash or self.session not in (None, session)):
+            raise TraderError('E_DSV_SDK_SCOPE', 'The session does not match the adapter scope')
+        if self.session is None:
+            session.disconnect('SDK_ATTACHED')
+            self.session = session
+            return session.snapshot()
+        return state
+
+    def disconnect(self, session):
+        self._bind(session)
+        self.enabled = False
+        self.synchronized = False
+        self.dispatch_market = {}
+        self.epoch = uuid4().hex
+        session.disconnect('SDK_DISCONNECTED')
+
+    def command(self, session, command):
+        """Run a user command through the same owner and committed effect path."""
+        state = self._bind(session)
+        self.enabled = self.synchronized and state['synchronized']
+        try:
+            return session.command(command)
+        finally:
+            self.enabled = False
+
+    def step(self, session, *, trading_day, complete):
+        state = self._bind(session)
+        self.enabled = False
+        try:
+            self.api.wait_update(deadline=time.time() + 0.5)
+            synchronized = complete() if callable(complete) else complete
+            if type(synchronized) is not bool:
+                raise TraderError('E_DSV_SDK_SYNC', 'SDK synchronization must be supplied as a complete fact')
+            now, mono = self.clock()
+            if not isinstance(now, datetime) or now.utcoffset() is None or type(mono) is not int or mono < 0:
+                raise TraderError('E_DSV_SDK_CLOCK', 'Expected an explicit wall and monotonic clock sample')
+            now = now.astimezone(timezone.utc)
+            if not synchronized:
+                self.disconnect(session)
+                return {'type': 'DISCONNECTED', 'synchronized': False}
+            frame, market = self._frame(state, now, mono, trading_day)
+            self.enabled = True
+            self.dispatch_market = market
+            receipt = session.apply_round(frame)
+            self.synchronized = session.snapshot()['synchronized']
+            return receipt
+        except BaseException:
+            self.synchronized = False
+            self.dispatch_market = {}
+            self.epoch = uuid4().hex
+            if not session._failed:
+                session.disconnect('SDK_ROUND_FAILED')
+            raise
+        finally:
+            self.enabled = False
+
+    def _frame(self, state, now, mono, day):
+        if day not in self.trading_days or day < state['trading_day']:
+            raise TraderError('E_DSV_SDK_SCOPE', 'Cabinet day is outside of the selected calendar')
+        active_days = {window['trading_day'] for code in self.contracts
+                       if (window := self.calendar.query(code, utc(now)))['is_trading']}
+        if active_days and active_days != {day} or day != state['trading_day'] and not active_days:
+            raise TraderError('E_DSV_SDK_SCOPE', 'A cabinet-day change requires a matching active calendar session')
+        bindings = {self.order_id(child): order for child, order in state['orders'].items()}
+        orders = self.api.get_order(account=self.account)
+        trades = self.api.get_trade(account=self.account)
+        native = self._order_facts(orders, bindings)
+        foreign_orders = self._foreign_orders(orders, bindings)
+        details, foreign_trades = self._trade_facts(trades, bindings, day, needs_recovery=bool(state['orders']))
+        funds = self.api.get_account(account=self.account)
+        markets = [self._market(code, day, now, funds, state['symbols'][code],
+                                code in foreign_orders or code in foreign_trades, state['orders'])
+                   for code in self.contracts]
+        if any(row.get('native_coverage') is False for row in markets):
+            raise TraderError('E_DSV_SDK_SCOPE', 'Wall time is outside the complete calendar coverage')
+        sequence = state['sequence'] + 1
+        frame = {'id': f'sdk-{self.epoch}-{sequence}', 'sequence': sequence, 'session_id': self.epoch,
+                 'wall_time': utc(now), 'monotonic_ms': str(mono), 'trading_day': day,
+                 'trading_days': self.trading_days, 'synchronized': True, 'market': markets,
+                 'sync_orders': [fact['child_order_id'] for fact in native], 'native': native + details}
+        return frame, {row['contract_id']: row for row in markets}
+
+    def _order_facts(self, orders, bindings):
+        result = []
+        for native_id, binding in bindings.items():
+            order = orders.get(native_id)
+            if order is None or not order.volume_orign or not order.status:
+                continue
+            if (order.order_id != native_id or self._contract(order) != binding['contract_id'] or
+                    order.direction != binding['direction'] or order.offset != binding['native_offset'] or
+                    native_integer(order.volume_orign, minimum=1) != binding['original_qty'] or
+                    number(order.limit_price) != binding['limit_price']):
+                raise TraderError('E_DSV_SDK_FACT', 'SDK order differs from the durable original child')
+            filled = binding['original_qty'] - native_integer(order.volume_left)
+            rejected = getattr(order, 'is_error', None) is True
+            stamp = getattr(order, 'insert_date_time', None)
+            if type(stamp) is int and stamp > 0:
+                actual = native_day(self.calendar, binding['contract_id'], str(stamp))['trading_day']
+                if actual != binding['native_trading_day']:
+                    raise TraderError('E_DSV_SDK_FACT', 'SDK order belongs to a different cabinet day')
+            elif not rejected:
+                raise TraderError('E_DSV_SDK_FACT', 'SDK order is missing its native acceptance time')
+            if not 0 <= filled <= binding['original_qty'] or order.status not in {'ALIVE', 'FINISHED'} or (
+                    rejected and (filled or order.status != 'FINISHED')):
+                raise TraderError('E_DSV_SDK_FACT', 'SDK order cumulative status is contradictory')
+            status = ('REJECTED' if rejected else 'FILLED' if filled == binding['original_qty'] else 'CANCELLED'
+                      ) if order.status == 'FINISHED' else 'ALIVE'
+            temporal = {'source_time_ns': str(stamp)} if type(stamp) is int and stamp > 0 else {}
+            result.append(self._fact('ORDER', binding, native_id) | {'status': status, 'filled_qty': filled} | temporal)
+        return result
+
+    def _trade_facts(self, trades, bindings, day, *, needs_recovery):
+        facts, foreign = [], {}
+        for native_trade, trade in trades.items():
+            binding = bindings.get(trade.order_id)
+            if binding is None:
+                code = self._contract(trade)
+                if code in self.contracts:
+                    foreign[native_trade] = code, getattr(trade, 'trade_date_time', None)
+                continue
+            if (trade.trade_id != native_trade or self._contract(trade) != binding['contract_id'] or
+                    trade.direction != binding['direction'] or trade.offset != binding['native_offset']):
+                raise TraderError('E_DSV_SDK_FACT', 'SDK trade does not match the durable original child')
+            stamp = trade.trade_date_time
+            if type(stamp) is not int:
+                raise TraderError('E_DSV_SDK_FACT', 'SDK trade needs an exact nanosecond timestamp')
+            proof = native_day(self.calendar, binding['contract_id'], str(stamp))
+            if proof['trading_day'] > day:
+                raise TraderError('E_DSV_SDK_FACT', 'SDK trade belongs to an unobserved future cabinet day')
+            price = number(trade.price)
+            decimal_value(price, positive=True)
+            facts.append((stamp, self._fact('TRADE', binding, trade.order_id) | {
+                'native_trade_id': native_trade, 'quantity': native_integer(trade.volume, minimum=1), 'price': price,
+                'fill_day': proof['trading_day'], 'source_time_ns': str(stamp)}))
+        if self._foreign_trades is None:
+            self._foreign_trades = set()
+            for identity, (code, stamp) in foreign.items():
+                if not needs_recovery:
+                    self._foreign_trades.add(identity)
+                elif type(stamp) is int and stamp > 0:
+                    try:
+                        dated = native_day(self.calendar, code, str(stamp))['trading_day']
+                    except TraderError:
+                        continue
+                    if dated < day and not any(order['contract_id'] == code and order['native_trading_day'] <= dated
+                                               for order in bindings.values()):
+                        self._foreign_trades.add(identity)
+        return [fact for _, fact in sorted(facts, key=lambda item: item[0])], {
+            code for native_trade, (code, _) in foreign.items() if native_trade not in self._foreign_trades}
+
+    def _foreign_orders(self, orders, bindings):
+        result = set()
+        for native_id, order in orders.items():
+            if native_id not in bindings and order.status == 'ALIVE' and order.volume_left:
+                result.add(self._contract(order))
+        return result
+
+    def _fact(self, kind, order, native_id):
+        return {'kind': kind, 'account_key': self.account_key, 'provider': 'OFFLINE',
+                'contract_id': order['contract_id'], 'direction': order['direction'], 'native_offset': order['native_offset'],
+                'child_order_id': order['child_order_id'], 'native_order_id': native_id, 'trading_day': order['native_trading_day']}
+
+    @staticmethod
+    def _contract(item):
+        return item.exchange_id + '.' + item.instrument_id
+
+    def _market(self, code, day, now, funds, previous, external, orders):
+        window = self.calendar.query(code, utc(now))
+        periods = [period for period in self.periods[code] if period['trading_day'] == day]
+        session = window['session'] if window['is_trading'] else next(
+            (period for period in periods if datetime.fromisoformat(period['open_utc']) > now), periods[-1])
+        position = self.api.get_position(code, account=self.account)
+        quote = self.quotes[code]
+        tick = self._tick(code, quote, session, now) if window['is_trading'] else None
+        result = {'contract_id': code, 'session_open': session['open_utc'], 'session_close': session['close_utc'],
+                  'opening_session': session['is_opening_session'], 'ticks': [] if tick is None else [tick],
+                  'external_orders': external, 'native_coverage': window['complete']}
+        for field, native in _POSITION.items():
+            result[field] = native_integer(getattr(position, native))
+        if window['is_trading']:
+            end_hour = datetime.fromisoformat(session['close_utc']).astimezone(_BEIJING).hour
+            if end_hour == 15 or end_hour >= 21 or end_hour < 3:
+                result['entry_close'] = session['close_utc']
+            if session['force_close_at_end']:
+                result['liquidation_at'] = session['close_utc']
+        if (tick and (night := previous.get('night_reference')) and not night['complete']
+                and not is_night_session(datetime.fromisoformat(session['open_utc']))
+                and self.calendar.query(code, night['native_time'])['trading_day'] == day):
+            result['night_boundary'] = night['native_time']
+        result.update(available=_amount(funds.available, rounding=ROUND_FLOOR), equity=_amount(funds.balance, rounding=ROUND_FLOOR),
+                      margin=_amount(funds.margin, rounding=ROUND_CEILING), frozen_margin=_amount(funds.frozen_margin, rounding=ROUND_CEILING),
+                      margin_per_lot=_amount(getattr(quote, 'margin', None), rounding=ROUND_CEILING),
+                      multiplier=_amount(getattr(quote, 'volume_multiple', None)),
+                      symbol_margin=_amount(getattr(position, 'margin', None), rounding=ROUND_CEILING))
+        if result['symbol_margin'] is None and not (result['long_qty'] or result['short_qty']):
+            result['symbol_margin'] = '0'
+        risk = number(funds.risk_ratio)
+        if risk is not None and -1 < Decimal(risk) < 10**16:
+            result['risk_ratio'] = decimal_text(Decimal(risk).quantize(Decimal('0.000000000001'), rounding=ROUND_FLOOR))
+        # SDK frozen margin covers native-acknowledged children; calls still
+        # invisible to the SDK reserve local margin until they are reconciled.
+        pending = '0'
+        for order in orders.values():
+            if order['effect'] == 'OPEN' and not terminal(order) and order['send_state'] != 'NATIVE_SEEN':
+                pending = None
+                break
+        result['pending_margin'] = pending
+        expiry = expiry_date(getattr(quote, 'expire_datetime', None))
+        if expiry is not None:
+            result['days_to_expiry'] = str((expiry - now.astimezone(_BEIJING).date()).days)
+        for field, native in (('min_order_qty', 'min_limit_order_volume'), ('max_order_qty', 'max_limit_order_volume')):
+            value = getattr(quote, native, None)
+            if value is not None and window['is_trading']:
+                result[field] = native_integer(value, minimum=1)
+        return result
+
+    def _tick(self, code, quote, session, now):
+        stamp = getattr(quote, 'datetime', None)
+        if not stamp:
+            return None
+        try:
+            moment = datetime.fromisoformat(stamp)
+        except ValueError as error:
+            raise TraderError('E_DSV_SDK_FACT', 'Invalid SDK quote time') from error
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=_BEIJING)
+        start, end = map(datetime.fromisoformat, (session['open_utc'], session['close_utc']))
+        if moment > now or not start <= moment < end:
+            return None
+        serial = self.minutes[code]
+        try:
+            tail = serial.iloc[-1]['datetime']
+            minute = int(tail)
+            candle = str(minute) if minute > 0 and minute == tail else None
+        except (IndexError, KeyError, TypeError, ValueError, OverflowError):
+            candle = None
+        return {'native_time': utc(moment.astimezone(timezone.utc)), 'candle_id': candle, 'native_quote_stamp': stamp,
+                **{name: _amount(getattr(quote, field, None)) for name, field in _PRICE_FIELDS.items()}}
+
+    def _authorized(self, effect, kind):
+        if get_ident() != self.owner or not self.enabled or self.session is None or self.session._closed:
+            raise TraderError('E_DSV_SDK_OWNER', 'SDK dispatch requires a synchronized, bound owner')
+        if (effect['kind'] != kind or effect['account_key'] != self.account_key or effect['provider'] != 'OFFLINE'
+                or effect['id'] in self._seen_effects or
+                not self.session._journal.effect_is_prepared(effect)):
+            raise TraderError('E_DSV_SDK_SCOPE', 'SDK dispatch requires an unreplayed committed effect')
+        return self.order_id(effect['child_order_id'])
+
+    def send(self, effect):
+        native = self._authorized(effect, 'SEND')
+        market = self.dispatch_market[effect['contract_id']]
+        tick = market['ticks'][-1] if market['ticks'] else None
+        if (tick is None or market['external_orders'] or
+                legal_price(tick, Decimal(effect['limit_price'])) != effect['limit_price']):
+            raise TraderError('E_DSV_SDK_SCOPE', 'A native dispatch requires a legal price and current scoped quote')
+        self._seen_effects.add(effect['id'])
+        return self.api.insert_order(symbol=effect['contract_id'], direction=effect['direction'],
+                                     offset=effect['native_offset'], volume=quantity(effect['quantity'], positive=True),
+                                     limit_price=float(Decimal(effect['limit_price'])), order_id=native, account=self.account)
+
+    def cancel(self, effect):
+        native = self._authorized(effect, 'CANCEL')
+        if native != effect['native_order_id']:
+            raise TraderError('E_DSV_SDK_SCOPE', 'SDK cancellation requires the original native order identity')
+        self._seen_effects.add(effect['id'])
+        return self.api.cancel_order(native, account=self.account)

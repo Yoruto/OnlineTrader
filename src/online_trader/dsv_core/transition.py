@@ -1,7 +1,7 @@
 """Ordinary-session decisions for the DSV round contract."""
 
 from datetime import datetime, timedelta, timezone
-from online_trader.dsv_core.entry_rules import continuation_direction, geometry_limit, trigger_prices
+from online_trader.dsv_core.entry_rules import continuation_direction, geometry_limit, hysteresis_ready, opening_jump_block, trigger_prices
 from online_trader.dsv_core.protection_rules import half_close_target, trailing_floor
 from online_trader.dsv_core.sizing_rules import auto_lots, margin_lots
 
@@ -68,6 +68,36 @@ def _clock(frame, market, name):
 
 def _profit_activation(settings):
     return float(settings['protect_80_ratio']) or 0.8
+
+
+def _opening_observation(state, market, start, last, lines, stop, profit, spec, settings):
+    if state.get('opening_observation_start') != market['session_open']:
+        state.update(opening_observation_start=market['session_open'], open_half_reached=False,
+                     need_hyst=False, hyst_armed=False)
+    observed = market.get('wall_reads', {}).get('opening_observation')
+    if observed is None:
+        return {}, None
+    seconds = (datetime.fromisoformat(observed) - start).total_seconds()
+    long, short = lines['LONG'], lines['SHORT']
+    jump = False
+    if 0 <= seconds <= 60 and not state['need_hyst']:
+        ratio = float(settings['open_jump_block_ratio'])
+        jump = any(opening_jump_block(last, line, profit, ratio) for line in (long, short))
+        if last >= long + profit * 0.5 or last <= short - profit * 0.5:
+            state['open_half_reached'] = True
+        elif not state['open_half_reached']:
+            step = price_value(market['tick'].get('tick_size')) or 1.0
+            state['need_hyst'] = any(abs(last - line) <= step * 1.5 for line in (long, short))
+    meta = {}
+    if jump:
+        meta.update(day_stop=True, day_stop_reason='FIRST_MINUTE_JUMP_DAY_STOP')
+    if state['need_hyst']:
+        direction = 'LONG' if last < (long + short) / 2 else 'SHORT'
+        distance = float(spec['hysteresis_points']) or stop
+        ready, state['hyst_armed'] = hysteresis_ready(direction, last, lines[direction], distance, state['hyst_armed'])
+        if not ready:
+            return meta, 'HYSTERESIS_NOT_READY'
+    return meta, None
 
 
 def continuation_entry(state, frame, market, spec, settings, *, active_symbols, open_symbols):
@@ -168,6 +198,17 @@ def ordinary_entry(state, frame, market, spec, settings, *, active_symbols, open
     if settings['no_chase_after_act'] and activation > 0:
         if long_hit and high >= lines['LONG'] + activation or short_hit and low <= lines['SHORT'] - activation:
             return {'reason': 'NO_CHASE_AFTER_ACT', 'consume': bar}
+    meta, blocked = _opening_observation(state, market, local_start, last, lines, stop, profit, spec, settings)
+    if blocked:
+        return {'reason': blocked, 'consume': bar, **meta}
+    return meta | _ordinary_target(state, frame, market, spec, settings, active_symbols, open_symbols,
+                                   local_start, last, lines, long_hit, short_hit, opening, stop, profit)
+
+
+def _ordinary_target(state, frame, market, spec, settings, active_symbols, open_symbols,
+                     local_start, last, lines, long_hit, short_hit, opening, stop, profit):
+    tick = market['tick']
+    bar = tick['candle_id']
     direction = 'LONG' if long_hit else 'SHORT' if short_hit else None
     if direction is None:
         return {'reason': 'TRIGGER_NOT_REACHED'}
@@ -182,7 +223,7 @@ def ordinary_entry(state, frame, market, spec, settings, *, active_symbols, open
         if settings['require_trigger_update'] and abs(float(previous_stop['theory']) - theory) < 1e-6:
             return {'reason': 'STOP_TRIGGER_UNCHANGED', 'consume': bar}
     elapsed_chase = (_clock(frame, market, 'chase') - local_start).total_seconds()
-    near_open = opening_session and 0 <= elapsed_chase <= float(settings['chase_window_minutes']) * 60
+    near_open = market['opening_session'] and 0 <= elapsed_chase <= float(settings['chase_window_minutes']) * 60
     cap_distance = max(1, round(opening * float(settings['chase_slip_ratio'] if near_open else settings['entry_slip_ratio'])))
     buy = direction == 'LONG'
     opponent = price_value(tick.get('ask1' if buy else 'bid1')) or 0.0

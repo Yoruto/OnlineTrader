@@ -120,6 +120,11 @@ def cli(args):
         if args.offline_action == 'archive-log':
             from online_trader.dsv_runtime.log_archive import archive_log
             print(json.dumps(archive_log(args.source, args.runs_root, args.boot_id, value, args.target), ensure_ascii=False))
+        elif args.offline_action == 'rollback-rehearse':
+            from online_trader.dsv_runtime.rollback import rehearse
+            result = rehearse(args.source, args.db, value, args.target)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result['eligible'] else 2
         elif args.offline_action == 'migrate':
             from online_trader.dsv_runtime.migration import migrate
             result = migrate(args.source, value, args.target)

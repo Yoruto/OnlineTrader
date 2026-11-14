@@ -120,6 +120,8 @@ class ExplicitOrderController:
             raise TraderError('E_DSV_NATIVE_FACT', 'A split-offset child cannot spend lots on a different cabinet day')
         normalized = {key: fact[key] for key in ('kind', 'child_order_id', 'native_order_id', 'native_trade_id', 'quantity', 'price')}
         normalized['fill_day'] = fill_day
+        if 'source_time_ns' in fact:
+            normalized['source_time_ns'] = fact['source_time_ns']
         if not self.journal.record_trade(order_day, native_id, trade_id, normalized):
             return
         row = state['symbols'][order['contract_id']]

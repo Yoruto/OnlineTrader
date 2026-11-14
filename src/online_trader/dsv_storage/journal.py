@@ -102,6 +102,12 @@ class Journal:
         if stored is not None:
             if 'fill_day' not in stored:
                 stored['fill_day'] = order_day
+            if 'source_time_ns' in fact and 'source_time_ns' not in stored and stored == {
+                    key: value for key, value in fact.items() if key != 'source_time_ns'}:
+                self._db.execute('UPDATE native_trades SET payload=? WHERE trading_day=? AND native_order=? AND native_trade=?',
+                                 (canonical_bytes(fact), *identity))
+                self.event('NATIVE_TRADE_TIME_PROVED', fact)
+                return False
             if stored != fact:
                 raise TraderError('E_DSV_DUPLICATE_CONFLICT', 'Native trade identity has contradictory facts')
             return False
@@ -111,6 +117,9 @@ class Journal:
     def prepare(self, effect):
         self._db.execute('INSERT INTO effects VALUES(?,?,?,?,NULL)',
                          (effect['id'], effect['child_order_id'], effect['kind'], canonical_bytes(effect)))
+
+    def effect_is_prepared(self, effect):
+        return self._read('SELECT request FROM effects WHERE id=? AND result IS NULL', (effect['id'],)) == effect
 
     def resolve(self, effect, result):
         self._db.execute('UPDATE effects SET result=? WHERE id=?', (result, effect['id']))

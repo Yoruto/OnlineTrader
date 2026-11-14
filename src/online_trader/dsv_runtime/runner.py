@@ -22,7 +22,7 @@ from online_trader.strategy.entry import is_night_session
 
 
 _CLOCK_READS = {'session', 'opening', 'entry_close', 'quote_age', 'cooldown', 'chase', 'submit',
-                'close', 'pending', 'protection', 'pending_start', 'price_context', 'stale'}
+                'close', 'pending', 'protection', 'pending_start', 'price_context', 'stale', 'opening_observation'}
 _PRICE_FIELDS = ('last', 'day_high', 'day_low', 'bid1', 'ask1', 'tick_size', 'lower_limit', 'upper_limit')
 _FUNDS_FIELDS = ('available', 'margin_per_lot', 'multiplier', 'equity', 'risk_ratio', 'margin',
                  'frozen_margin', 'pending_margin', 'symbol_margin')
@@ -239,6 +239,8 @@ class DsvSession:
                            'decisions': decisions, 'effects': effects}
                 if kind == 'ROUND':
                     receipt['evaluated_at'] = source['wall_time']
+                    if 'trading_day' in source:
+                        receipt['trading_day'] = state['trading_day']
                 self._journal.event(kind, {'input': source, 'receipt': receipt})
                 self._journal.save(state)
                 self._journal.record_receipt(kind, identity, digest, receipt)
@@ -317,8 +319,10 @@ class DsvSession:
                 raise TraderError('E_DSV_ROUND', 'External order presence must be explicit when supplied')
             for tick in market['ticks']:
                 _utc(tick['native_time'])
-                if type(tick['candle_id']) is not str:
+                if tick['candle_id'] is not None and type(tick['candle_id']) is not str:
                     raise TraderError('E_DSV_ROUND', 'Expected the opaque minute-bar identity')
+                if 'native_quote_stamp' in tick and (type(tick['native_quote_stamp']) is not str or not tick['native_quote_stamp']):
+                    raise TraderError('E_DSV_ROUND', 'Expected the original SDK quote timestamp')
                 for key in _PRICE_FIELDS:
                     if tick.get(key) not in (None, 'NaN'):
                         decimal_value(tick[key])
@@ -327,6 +331,11 @@ class DsvSession:
                 raise TraderError('E_DSV_ROUND', 'Unsupported native fact kind')
             if fact['kind'] == 'TRADE':
                 decimal_value(fact['price'], positive=True)
+            if 'source_time_ns' in fact:
+                stamp = fact['source_time_ns']
+                if (type(stamp) is not str or not stamp.isascii() or not stamp.isdecimal() or len(stamp) > 19
+                        or stamp.startswith('0') or int(stamp) > 9_223_372_036_854_775_807):
+                    raise TraderError('E_DSV_NATIVE_FACT', 'Expected a positive canonical nanosecond timestamp')
             for key in ('trading_day', 'fill_day'):
                 if key in fact:
                     _day(fact[key])
@@ -369,6 +378,9 @@ class DsvSession:
                 continue
             self._observe_market(row, market, frame)
             tick = row['tick'] if row['tick_session'] == frame['session_id'] else None
+            if (tick is not None and market.get('native_coverage') is True and
+                    not _utc(market['session_open']) <= _utc(tick['native_time']) < _utc(market['session_close'])):
+                tick = None
             observed = market | {'tick': tick}
             values = self._evaluate_symbol(state, row, observed, frame, spec)
             self._update_stops(row, contract, day, spec, frame.get('trading_days', []))
@@ -426,6 +438,8 @@ class DsvSession:
         clock = row.get('quote_clock')
         if clock is None or (clock['session'], clock['opening']) != (session, opening):
             clock = {'session': session, 'opening': opening, 'native_time': None, 'anchor': sample}
+            if market.get('native_coverage') is True:
+                row.update(tick=None, tick_session=None)
         previous = clock.get('previous')
         if previous is not None:
             wall_gap = (wall - datetime.fromisoformat(previous['wall'])).total_seconds()
@@ -435,8 +449,9 @@ class DsvSession:
         clock['previous'] = sample
         row['quote_clock'] = clock
         for tick in market['ticks']:
-            if tick['native_time'] != clock['native_time']:
-                clock.update(native_time=tick['native_time'], anchor=sample)
+            identity = tick.get('native_quote_stamp', tick['native_time'])
+            if identity != clock.get('quote_identity', clock['native_time']):
+                clock.update(native_time=tick['native_time'], quote_identity=identity, anchor=sample)
             if is_night_session(_utc(opening)):
                 self._observe_night(row, market, tick)
         if market['ticks']:
@@ -514,12 +529,19 @@ class DsvSession:
             row['continuation_attempted'] = True
             rules = ['D05', 'D07']
         else:
+            if tick['candle_id'] is None:
+                return [{'reason': 'MINUTE_BAR_UNAVAILABLE', 'rule_ids': ['D03']}]
             decision = ordinary_entry(row, frame, market, spec, self._trade, **sizes)
             rules = ['D01', 'D02', 'D04', 'D05', 'D06']
         if 'consume' in decision:
             row['last_signal_bar'] = decision['consume']
         if decision.get('day_stop'):
             row['day_stop'] = True
+            if decision.get('day_stop_reason'):
+                row['day_stop_reason'] = decision['day_stop_reason']
+                rules.append('D03')
+        elif decision['reason'] == 'HYSTERESIS_NOT_READY':
+            rules.append('D03')
         if 'target' in decision:
             goal = decision['target']
             row.update(last_order_ms=goal['order_ms'], last_order_direction=goal['direction'])

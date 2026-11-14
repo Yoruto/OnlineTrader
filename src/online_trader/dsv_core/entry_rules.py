@@ -32,13 +32,16 @@ def continuation_direction(price, night_last, night_high, night_low, offset, fal
 
 def opening_jump_block(last_price, trigger, profit_distance, ratio):
     """DSV gui.opening_jump_block uses an inclusive absolute distance."""
+    if all(type(value) is float for value in (last_price, trigger, profit_distance, ratio)):
+        return last_price > 0 and trigger > 0 and profit_distance > 0 and abs(last_price - trigger) >= profit_distance * ratio
     price, line, take, factor = map(Decimal, (last_price, trigger, profit_distance, ratio))
     return price > 0 and line > 0 and take > 0 and abs(price - line) >= take * factor
 
 
 def hysteresis_ready(direction, last_price, trigger, distance, armed):
     """A reverse excursion arms hysteresis before the later trigger check."""
-    price, line, hysteresis = map(Decimal, (last_price, trigger, distance))
+    values = last_price, trigger, distance
+    price, line, hysteresis = values if all(type(value) is float for value in values) else tuple(map(Decimal, values))
     if hysteresis <= 0 or armed:
         return True, bool(armed)
     reached = price <= line - hysteresis if direction == "LONG" else price >= line + hysteresis
