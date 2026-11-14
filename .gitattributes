@@ -1,0 +1,5 @@
+# These resources are checked against byte-level release fingerprints.
+src/online_trader/resources/*.json text eol=crlf
+src/online_trader/resources/dsv-baseline-20261109.json text eol=lf
+src/online_trader/resources/protection-plan.schema.json text eol=lf
+src/online_trader/resources/schema.sql text eol=lf
