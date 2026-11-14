@@ -21,13 +21,11 @@ def _validate(expected):
     records = expected[1:]
     if not records:
         raise TraderError('E_DSV_TRACE', 'Missing expected inputs')
-    ids = set()
     for record in records:
         identity = record.get('input_id')
-        if (not identity or identity in ids or record.get('type') not in {'ROUND', 'COMMAND', 'SNAPSHOT'}
+        if (type(identity) is not str or not identity or record.get('type') not in {'ROUND', 'COMMAND', 'SNAPSHOT'}
                 or not record.get('evidence')):
-            raise TraderError('E_DSV_TRACE', 'Every expected input needs a unique ID, type and independent evidence')
-        ids.add(identity)
+            raise TraderError('E_DSV_TRACE', 'Every expected input needs an ID, type and independent evidence')
         if 'pending' in record:
             if type(record['pending']) is not str or not record['pending']:
                 raise TraderError('E_DSV_TRACE', 'Pending expectations need an explicit evidence gap')
@@ -78,10 +76,10 @@ def compare(expected, candidate, *, input_sha256, candidate_release):
         right = candidate[index] if index < len(candidate) else None
         identity = right.get('input_id', 'snapshot') if right is not None else None
         if left is None or right is None or (left['input_id'], left['type']) != (identity, right['type']):
-            rows.append({'status': 'FAIL', 'input_id': left['input_id'] if left else identity,
+            rows.append({'status': 'FAIL', 'trace_index': index + 1, 'input_id': left['input_id'] if left else identity,
                          'difference': 'INPUT_ORDER', 'actual_input_id': identity})
             break
-        row = {'input_id': identity, 'evidence': left['evidence'], 'status': 'PASS'}
+        row = {'input_id': identity, 'trace_index': index + 1, 'evidence': left['evidence'], 'status': 'PASS'}
         if 'pending' in left:
             row.update(status='EXPECTATION_PENDING', reason=left['pending'])
         else:
