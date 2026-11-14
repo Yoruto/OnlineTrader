@@ -1,6 +1,6 @@
 # OnlineTrader：以 DSV 为唯一业务基准的减法重构计划
 
-版本：1.0｜编制日期：2026-11-14｜[首阶段实现与执行选型](05-offline-implementation.md) · [逐轮回放与显式执行](06-round-replay-and-controller.md)
+版本：1.0｜编制日期：2026-11-14｜[首阶段实现与执行选型](05-offline-implementation.md) · [逐轮回放与显式执行](06-round-replay-and-controller.md) · [离线工作台、恢复和今昨仓](07-offline-workbench-and-recovery.md)
 
 代码基线：`af8b53b16592bfbd5b09185e1eee48120b3ead34`。当前实施与验收范围见阶段记录。账户连接、交易、软件安装和系统校时使用当次授权。
 

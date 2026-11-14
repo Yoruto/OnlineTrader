@@ -25,6 +25,16 @@ def main(argv=None):
     workbench=commands.add_parser('workbench',help='完整工作台；只附着原内核，不建立交易连接')
     workbench.add_argument('--pipe');workbench.add_argument('--account-store',type=Path);workbench.add_argument('--account-id')
     workbench.add_argument('--dsv-config',type=Path,help='读取原 DSV 已保存的业务参数')
+    workbench.add_argument('--offline-pipe', help='附着 DSV 离线重构执行器')
+    offline=commands.add_parser('offline-dsv',help='运行或操作 DSV 离线执行器')
+    offline_actions=offline.add_subparsers(dest='offline_action',required=True)
+    for name in ('serve','request'):
+        mode=offline_actions.add_parser(name)
+        mode.add_argument('--pipe',required=True)
+        mode.add_argument('--input',type=Path,required=True)
+        if name=='serve':
+            mode.add_argument('--db',type=Path,required=True)
+            mode.add_argument('--ready-file',type=Path)
     desktop_start=commands.add_parser('desktop-start',help='执行桌面确认的本次模拟策略启动')
     desktop_start.add_argument('--request',type=Path,required=True)
     desktop_start.add_argument('--output',type=Path,required=True)
@@ -183,6 +193,11 @@ def main(argv=None):
             else:result=review_calendar(bounded_json(args.input),as_of_utc=args.as_of_utc)
             print(json.dumps(result,ensure_ascii=False,indent=2));return 0
         elif args.action=='workbench':
+            if args.offline_pipe is not None:
+                if any(value is not None for value in (args.pipe,args.account_store,args.account_id,args.dsv_config)):
+                    raise TraderError('E_DSV_SCOPE','离线工作台使用独立管道和账户')
+                from online_trader.desktop.offline_workbench import run as run_offline
+                return run_offline(args.offline_pipe)
             store=None;account_id=args.account_id;pipe=args.pipe
             if args.account_store is not None:
                 from online_trader.accounts import AccountStore
@@ -191,6 +206,9 @@ def main(argv=None):
             if pipe is None and store is None:raise TraderError('E_ACCOUNT','Select an account store or supply an existing owner pipe')
             from online_trader.desktop.workbench import run
             return run(pipe,store=store,account_id=account_id,dsv_config=args.dsv_config)
+        elif args.action=='offline-dsv':
+            from online_trader.dsv_runtime.offline_endpoint import cli
+            return cli(args)
         elif args.action=='compare':
             if args.compare_action=='report':
                 from online_trader.runtime.comparison import build_report

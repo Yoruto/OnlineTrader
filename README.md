@@ -6,6 +6,8 @@ DSV 架构重构的首阶段已开始。[实现记录](docs/refactor/dsv-parity-
 
 [逐轮回放与显式执行](docs/refactor/dsv-parity-20261114/06-round-replay-and-controller.md)记录冻结原版的轮次顺序、替代控制器、独立事实库及离线运行入口。
 
+[离线工作台](docs/refactor/dsv-parity-20261114/07-offline-workbench-and-recovery.md)可附着离线执行器做启停、减仓、撤单与跨日恢复核验。
+
 11 月 13 日完成 DSV 与 OnlineTrader 的定向离线联合验证。两边用同一份旧格式配置载入的五合约字段及归档偏移重算结果一致。国债尾盘、首分钟零比例及缺资金字段的处理仍有差异，原 DSV EXE 的完整启动和两边在线交易待验。[联合验证报告](output/validation/20261113-dsv-onlinetrader-joint/test-report.md)
 
 11 月 13 日源码继续对齐 DSV 的普通入场缺价回退、整手边界、账户选用、权益累计、日报和日志归档筛选。剩余差异及 Qt 单进程诊断均有独立复测证据。本轮保持离线，未打包。[剩余 20 项复测](output/validation/20261113-dsv-remaining-fixes/test-report.md) · [首轮优先修复复测](output/validation/20261113-dsv-priority-fixes/test-report.md) · [原 96 项验收](output/validation/20261113-dsv-item-acceptance/test-report.md)

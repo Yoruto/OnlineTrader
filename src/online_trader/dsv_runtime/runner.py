@@ -12,10 +12,10 @@ from online_trader.contracts.codec import content_hash
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
 from online_trader.dsv_core.transition import ordinary_entry, protect
 from online_trader.dsv_core.price_rules import scheduled_close_mode
-from online_trader.dsv_runtime.controller import ExplicitOrderController, terminal
+from online_trader.dsv_runtime.controller import ExplicitOrderController, terminal, tighten_target
 from online_trader.dsv_storage.journal import Journal
 from online_trader.errors import TraderError
-from online_trader.gateway.ports import OnlineSimulationPort, OrderPort
+from online_trader.gateway.ports import OnlineSimulationPort
 from online_trader.runtime.instance import AccountLock
 
 
@@ -24,6 +24,16 @@ _CLOCK_READS = {'session', 'opening', 'entry_close', 'quote_age', 'cooldown', 'c
 _PRICE_FIELDS = ('last', 'day_high', 'day_low', 'bid1', 'ask1', 'tick_size', 'lower_limit', 'upper_limit')
 _FUNDS_FIELDS = ('available', 'margin_per_lot', 'multiplier', 'equity', 'risk_ratio', 'margin',
                  'frozen_margin', 'pending_margin', 'symbol_margin')
+_BUCKETS = ('long_today', 'long_historical', 'short_today', 'short_historical')
+
+
+def _day(value):
+    try:
+        if date.fromisoformat(value).isoformat() == value:
+            return value
+    except (TypeError, ValueError):
+        pass
+    raise TraderError('E_DSV_SCOPE', 'Expected a canonical cabinet trading day')
 
 
 def _utc(value):
@@ -52,11 +62,7 @@ class DsvSession:
             raise TraderError('E_DSV_SCOPE', 'The replacement runner only accepts an offline development account and port')
         if not isinstance(profile, DsvProfile):
             raise TraderError('E_DSV_SCOPE', 'Expected a normalized DSV business profile')
-        try:
-            if date.fromisoformat(trading_day).isoformat() != trading_day:
-                raise ValueError(trading_day)
-        except (TypeError, ValueError) as error:
-            raise TraderError('E_DSV_SCOPE', 'Expected a canonical cabinet trading day') from error
+        _day(trading_day)
         self._owner = get_ident()
         self._closed = False
         self._failed = False
@@ -68,10 +74,18 @@ class DsvSession:
         self._trade = settings['trade']
         self._symbols = {item['code']: item for item in settings['symbols']}
         initial = {'running': False, 'sequence': 0, 'monotonic_ms': None, 'session_id': None,
-                   'symbols': {key: _initial_symbol() for key in self._symbols}, 'orders': {}}
+                   'trading_day': trading_day, 'synchronized': True, 'symbols': {key: _initial_symbol() for key in self._symbols},
+                   'orders': {}, 'retired_positions': {}}
         try:
             self._journal = Journal(database, self._scope, initial)
             self._state = self._journal.load()
+            self._state.setdefault('trading_day', trading_day)
+            self._state.setdefault('synchronized', True)
+            self._state.setdefault('retired_positions', {})
+            for row in self._state['symbols'].values():
+                position = row['position']
+                if position is not None and 'fills' not in position:
+                    position.update(open_day=trading_day, legacy_owned=position['owned'], fills=[])
             self._controller = ExplicitOrderController(self._scope, self._journal, port)
         except BaseException:
             if hasattr(self, '_journal'):
@@ -106,7 +120,51 @@ class DsvSession:
         self._check_owner()
         state = copy.deepcopy(self._state)
         state['scope'] = dict(self._scope)
+        for contract, row in state['symbols'].items():
+            position = row['position']
+            if position is not None:
+                position.update(self._controller.position_buckets(state, position, contract))
+            if detached := row.get('detached_positions'):
+                row['detached_owned'] = sum(state['retired_positions'][key]['owned'] for key in detached)
+        state.pop('retired_positions', None)
         return state
+
+    def command_receipt(self, command_id):
+        self._check_owner()
+        return self._journal.command_receipt(identifier(command_id))
+
+    def verify_scope(self, expected):
+        self._check_owner()
+        if expected is not None and expected != self._scope:
+            raise TraderError('E_DSV_SCOPE', 'The offline owner account or profile changed')
+
+    def verify_day(self, expected):
+        self._check_owner()
+        if expected is not None and expected != self._state['trading_day']:
+            raise TraderError('E_DSV_SCOPE', 'The observed cabinet trading day changed')
+
+    def disconnect(self, reason='FEED_DISCONNECTED'):
+        """Keep the last committed owner state; require a fresh complete round before effects."""
+        self._check_owner()
+        if self._busy:
+            raise TraderError('E_DSV_OWNER', 'Do not reenter the account owner from the order port')
+        state = copy.deepcopy(self._state)
+        self._mark_unsynchronized(state)
+        try:
+            with self._journal.transaction():
+                self._journal.event('DISCONNECTED', {'reason': reason})
+                self._journal.save(state)
+        except sqlite3.Error as error:
+            self._failed = True
+            raise TraderError('E_DSV_STORE', 'Connection loss could not be recorded; owner requires restart') from error
+        self._state = state
+        return {'synchronized': False, 'running': state['running']}
+
+    @staticmethod
+    def _mark_unsynchronized(state):
+        state['synchronized'] = False
+        for row in state['symbols'].values():
+            row.update(tick=None, tick_session=None)
 
     def prepare_shutdown(self):
         """Report unresolved child identities and owned lots without issuing commands."""
@@ -114,6 +172,10 @@ class DsvSession:
         orders = [order['child_order_id'] for order in self._state['orders'].values() if not terminal(order)]
         positions = {key: row['position']['owned'] for key, row in self._state['symbols'].items()
                      if row['position'] is not None and row['position']['owned']}
+        for contract, row in self._state['symbols'].items():
+            if detached := row.get('detached_positions'):
+                positions[contract] = positions.get(contract, 0) + sum(
+                    self._state['retired_positions'][key]['owned'] for key in detached)
         return {'ready': not orders and not positions, 'unresolved_children': orders, 'owned_lots': positions}
 
     def apply_round(self, frame):
@@ -174,6 +236,13 @@ class DsvSession:
         identifier(frame['session_id'])
         quantity(frame['sequence'], positive=True)
         _utc(frame['wall_time'])
+        if 'trading_day' in frame:
+            _day(frame['trading_day'])
+        if 'synchronized' in frame and type(frame['synchronized']) is not bool:
+            raise TraderError('E_DSV_ROUND', 'Synchronization status must be explicit')
+        if 'sync_orders' in frame and (type(frame['sync_orders']) is not list or
+                                       len(set(frame['sync_orders'])) != len(frame['sync_orders'])):
+            raise TraderError('E_DSV_ROUND', 'Expected an ordered unique list of synchronized child IDs')
         mono = frame['monotonic_ms']
         if type(mono) not in (str, int) or not str(mono).isascii() or not str(mono).isdecimal() or len(str(mono)) > 19:
             raise TraderError('E_DSV_ROUND', 'A round needs explicit nonnegative monotonic milliseconds')
@@ -186,6 +255,12 @@ class DsvSession:
         for market in frame['market']:
             for key in ('long_qty', 'short_qty'):
                 quantity(market[key])
+            if any(key in market for key in _BUCKETS):
+                for key in _BUCKETS:
+                    quantity(market[key])
+                if any(market[f'{side}_today'] + market[f'{side}_historical'] != market[f'{side}_qty']
+                       for side in ('long', 'short')):
+                    raise TraderError('E_DSV_OWNERSHIP', 'Native position totals disagree with today and historical buckets')
             if quantity(market.get('min_order_qty', 1), positive=True) > quantity(
                     market.get('max_order_qty', 2_147_483_647), positive=True):
                 raise TraderError('E_DSV_ROUND', 'Instrument order quantity bounds are inverted')
@@ -224,25 +299,46 @@ class DsvSession:
                 raise TraderError('E_DSV_ROUND', 'Unsupported native fact kind')
             if fact['kind'] == 'TRADE':
                 decimal_value(fact['price'], positive=True)
-            if any(key in fact and fact[key] != self._scope[key] for key in ('account_key', 'provider', 'trading_day')):
+            for key in ('trading_day', 'fill_day'):
+                if key in fact:
+                    _day(fact[key])
+            if any(key in fact and fact[key] != self._scope[key] for key in ('account_key', 'provider')):
                 raise TraderError('E_DSV_SCOPE', 'Native facts must match the account, provider and cabinet day')
 
     def _evaluate(self, state, frame):
         mono = str(frame['monotonic_ms'])
+        day = frame.get('trading_day', state['trading_day'])
         if frame['sequence'] != state['sequence'] + 1:
             raise TraderError('E_DSV_ROUND_SEQUENCE', 'Expected the next wait_update round')
-        if (state['session_id'] == frame['session_id'] and state['monotonic_ms'] is not None
+        if (day == state['trading_day'] and state['session_id'] == frame['session_id'] and state['monotonic_ms'] is not None
                 and int(mono) < int(state['monotonic_ms'])):
             raise TraderError('E_DSV_ROUND_SEQUENCE', 'Monotonic clock moved backward inside one session')
+        old_day = state['trading_day']
+        if day < old_day:
+            raise TraderError('E_DSV_SCOPE', 'Observed cabinet day cannot move backward')
+        if day != old_day:
+            if frame.get('synchronized') is not True:
+                raise TraderError('E_DSV_SCOPE', 'Day rollover requires an explicit cabinet-day snapshot')
+            self._roll_day(state, day)
+        needs_sync = not state['synchronized']
+        pending = {child for child, order in state['orders'].items() if not terminal(order)} if needs_sync else set()
         self._controller.accept_native(state, frame['native'])
+        if frame.get('synchronized') is False:
+            self._mark_unsynchronized(state)
+        if needs_sync and frame.get('synchronized') is True:
+            self._synchronize(state, frame, pending)
         state.update(sequence=frame['sequence'], monotonic_ms=mono, session_id=frame['session_id'])
         market_rows = {market['contract_id']: market for market in frame['market']}
         decisions, effects = [], []
         for contract, spec in self._symbols.items():
             row = state['symbols'][contract]
             market = market_rows[contract]
-            if market['ticks']:
+            if market['ticks'] and state['synchronized']:
                 row.update(tick=copy.deepcopy(market['ticks'][-1]), tick_session=frame['session_id'])
+            if not state['synchronized']:
+                decisions.append({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:0",
+                                  'reason': 'AWAITING_NATIVE_SYNC', 'rule_ids': ['I01', 'I02']})
+                continue
             tick = row['tick'] if row['tick_session'] == frame['session_id'] else None
             observed = market | {'tick': tick}
             values = self._evaluate_symbol(state, row, observed, frame, spec)
@@ -258,6 +354,33 @@ class DsvSession:
                 self._controller.settle(state, row)
         return decisions, effects
 
+    def _roll_day(self, state, day):
+        self._mark_unsynchronized(state)
+        state['trading_day'] = day
+        for row in state['symbols'].values():
+            position, last_stop = row['position'], row['last_stop']
+            row.update(_initial_symbol(), position=position, last_stop=last_stop)
+            if position is not None:
+                position.update(entry_stopped=True, preserve_open_on_stop=False)
+                for key in ('close_started', 'close_refresh', 'close_mode'):
+                    position.pop(key, None)
+
+    def _synchronize(self, state, frame, pending):
+        seen = {fact['child_order_id'] for fact in frame['native'] if fact['kind'] == 'ORDER'}
+        claimed = set(frame.get('sync_orders', []))
+        if not claimed <= seen:
+            raise TraderError('E_DSV_SYNC', 'Synchronization lists an order without an original snapshot in this round')
+        if any(child not in claimed and not terminal(state['orders'][child]) for child in pending):
+            return
+        for market in frame['market']:
+            row = state['symbols'][market['contract_id']]
+            position = row['position']
+            if row.get('detached_positions'):
+                continue
+            if position is not None and not self._controller.proves_position(state, position, market):
+                return
+        state['synchronized'] = True
+
     @staticmethod
     def _in_session(frame, market):
         now = _utc(market.get('wall_reads', {}).get('session', frame['wall_time']))
@@ -265,8 +388,12 @@ class DsvSession:
 
     def _evaluate_symbol(self, state, row, market, frame, spec):
         position, tick = row['position'], market['tick']
+        if row.get('detached_positions'):
+            return [{'reason': 'LATE_FILL_OWNERSHIP_REVIEW', 'rule_ids': ['I01', 'I02']}]
         if position is not None:
             return self._maintain_position(row, position, market, frame, spec)
+        if any(order['contract_id'] == market['contract_id'] and not terminal(order) for order in state['orders'].values()):
+            return [{'reason': 'UNRESOLVED_PRIOR_CHILD', 'rule_ids': ['I02']}]
         if not state['running']:
             return [{'reason': 'USER_STOPPED', 'rule_ids': ['D14']}]
         if tick is None:
@@ -288,7 +415,8 @@ class DsvSession:
             row['target_count'] += 1
             row['position'] = goal | {'id': 'position-' + uuid4().hex, 'owned': 0, 'entry_filled': 0,
                                       'entry_notional': '0', 'children': [], 'entry_stopped': False,
-                                      'peak': '0', 'protected': False, 'half_stage': 0, 'exit_target': None}
+                                      'peak': '0', 'protected': False, 'half_stage': 0, 'exit_target': None,
+                                      'open_day': state['trading_day'], 'fills': []}
         return [decision | {'rule_ids': ['D01', 'D02', 'D04', 'D05', 'D06']}]
 
     def _maintain_position(self, row, position, market, frame, spec):
@@ -305,8 +433,11 @@ class DsvSession:
             position.update(mode='CAP', context_at=str(now))
         if market['tick'] is None or not self._in_session(frame, market):
             return [{'reason': 'POSITION_WAITING_FOR_MARKET', 'rule_ids': ['D06']}]
+        previous_target = position['exit_target']
         position, results = protect(position, market['tick'], self._trade, spec)
         row['position'] = position
+        if position['exit_target'] != previous_target:
+            position['exit_revision'] = position.get('exit_revision', 0) + 1
         for result in results:
             reason = result['reason']
             if 'remaining' in result:
@@ -344,7 +475,7 @@ class DsvSession:
         if first or now - float(position['close_refresh']) >= 3:
             remaining_ms = window * 1000 - int((now - float(position['close_started'])) * 1000)
             position.update(close_mode=scheduled_close_mode(remaining_ms), close_refresh=str(now))
-        position.update(exit_target=0, entry_stopped=True)
+        tighten_target(position, 0)
         return {'reason': 'SCHEDULED_CLOSE' if first else 'SCHEDULED_CLOSE_PENDING',
                 'remaining': 0, 'price_mode': position['close_mode'], 'rule_ids': ['D06', 'D11']}
 
@@ -358,13 +489,15 @@ class DsvSession:
                     if row['position'] is not None:
                         row['position']['entry_stopped'] = True
                         row['position']['preserve_open_on_stop'] = not self._trade['cancel_on_stop']
-                        if not row['position']['preserve_open_on_stop']:
+                        if state['synchronized'] and not row['position']['preserve_open_on_stop']:
                             for order in self._controller.child_orders(state, row['position'], 'OPEN'):
                                 request = self._controller.cancel(order, 'USER_STOP')
                                 if request:
                                     effects.append(request)
             return [{'reason': action, 'rule_ids': ['D14']}], effects
         if action == 'CANCEL':
+            if not state['synchronized']:
+                raise TraderError('E_DSV_SYNC', 'Wait for a synchronized order and position snapshot before cancelling')
             order = state['orders'].get(command['child_order_id'])
             if order is None:
                 raise TraderError('E_DSV_NATIVE_ID', 'Manual cancellation requires an owned child')
@@ -376,9 +509,11 @@ class DsvSession:
             qty = quantity(command['quantity'], positive=True)
             if position is None or qty > position['owned']:
                 raise TraderError('E_DSV_OWNERSHIP', 'Manual reduction exceeds the owned position')
+            if row.get('detached_positions'):
+                raise TraderError('E_DSV_OWNERSHIP', 'Late fill from another cycle requires ownership review')
             target = position['owned'] - qty
             if position['exit_target'] is not None:
                 target = min(target, position['exit_target'])
-            position.update(exit_target=target, entry_stopped=True)
+            tighten_target(position, target, new_request=True)
             return [{'reason': 'USER_REDUCE', 'remaining': target, 'rule_ids': ['I01', 'I02']}], []
         raise TraderError('E_DSV_COMMAND', 'Unsupported offline command')

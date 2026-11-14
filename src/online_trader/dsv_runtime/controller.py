@@ -9,11 +9,20 @@ from online_trader.domain.values import decimal_text, quantity
 from online_trader.dsv_core.price_rules import strategy_price
 from online_trader.dsv_core.transition import entry_price, price_value
 from online_trader.errors import TraderError
+from online_trader.execution.close_routes import close_routes, replay_lots
 
 
 def terminal(order):
     return (order['terminal_confirmed'] and order['reported_fill_qty'] == order['filled_qty']
             and order['send_state'] not in {'UNKNOWN', 'SEND_POSSIBLE'})
+
+
+def tighten_target(position, remaining, *, new_request=False):
+    previous = position['exit_target']
+    target = remaining if previous is None else min(previous, remaining)
+    if target != previous or new_request:
+        position['exit_revision'] = position.get('exit_revision', 0) + 1
+    position.update(exit_target=target, entry_stopped=True)
 
 
 def _native_id(value):
@@ -56,6 +65,9 @@ class ExplicitOrderController:
             order = state['orders'].get(child_id)
             if order is None:
                 raise TraderError('E_DSV_NATIVE_ID', 'Native update lacks a prepared child')
+            order_day = order['native_trading_day']
+            if fact.get('trading_day', state['trading_day']) != order_day:
+                raise TraderError('E_DSV_SCOPE', 'Native update must identify its original order day')
             if any(key in fact and fact[key] != order[key] for key in ('contract_id', 'direction', 'native_offset')):
                 raise TraderError('E_DSV_NATIVE_FACT', 'Native contract, side or offset differs from the child')
             native_id = _bind_native(order, fact['native_order_id'])
@@ -77,14 +89,19 @@ class ExplicitOrderController:
         if order['terminal_confirmed']:
             if status == 'ALIVE' and filled <= order['reported_fill_qty']:
                 return
+            if status == order['broker_state'] == 'CANCELLED' and filled > order['reported_fill_qty']:
+                order.update(reported_fill_qty=filled, terminal_conflict=True)
+                return
             if (status, filled) != (order['broker_state'], order['reported_fill_qty']):
                 raise TraderError('E_DSV_NATIVE_FACT', 'Conflicting terminal order evidence')
             return
-        if status == 'ALIVE' and filled < (order['reported_fill_qty'] or 0):
+        if status == 'ALIVE' and filled < max(order['filled_qty'], order['reported_fill_qty'] or 0):
             return
         if status != 'ALIVE' and filled < max(order['filled_qty'], order['reported_fill_qty'] or 0):
             raise TraderError('E_DSV_NATIVE_FACT', 'Terminal quantity contradicts accepted fills')
         order.update(broker_state=status, terminal_confirmed=status != 'ALIVE', reported_fill_qty=filled)
+        if order.get('terminal_conflict') and terminal(order):
+            order.pop('terminal_conflict')
 
     def _trade_update(self, state, order, native_id, fact):
         trade_id = _native_id(fact['native_trade_id'])
@@ -92,14 +109,32 @@ class ExplicitOrderController:
         price = price_value(fact['price'])
         if price is None:
             raise TraderError('E_DSV_NATIVE_FACT', 'A fill needs a positive native price')
+        order_day = order['native_trading_day']
+        fill_day = fact.get('fill_day', order_day)
+        if not order_day <= fill_day <= state['trading_day']:
+            raise TraderError('E_DSV_SCOPE', 'Fill day is outside its order and observed cabinet days')
+        if order_day != state['trading_day'] and 'fill_day' not in fact:
+            raise TraderError('E_DSV_SCOPE', 'Late trade requires the original fill day')
+        separated = order['contract_id'].split('.')[0] in {'SHFE', 'INE'}
+        if fill_day != order_day and separated and order['effect'] == 'REDUCE':
+            raise TraderError('E_DSV_NATIVE_FACT', 'A split-offset child cannot spend lots on a different cabinet day')
         normalized = {key: fact[key] for key in ('kind', 'child_order_id', 'native_order_id', 'native_trade_id', 'quantity', 'price')}
-        if not self.journal.record_trade(native_id, trade_id, normalized):
+        normalized['fill_day'] = fill_day
+        if not self.journal.record_trade(order_day, native_id, trade_id, normalized):
             return
         row = state['symbols'][order['contract_id']]
         position = row['position']
         limit = order['reported_fill_qty'] if order['terminal_confirmed'] else order['original_qty']
+        if order['filled_qty'] + qty > order['original_qty']:
+            raise TraderError('E_DSV_NATIVE_FACT', 'Trade would exceed original child quantity')
+        if position is not None and position['id'] != order['position_id'] and order['effect'] == 'OPEN':
+            self._record_detached_late_open(state, row, position, order, qty, fact, fill_day)
+            return
+        was_within_terminal = order['terminal_confirmed'] and order['filled_qty'] + qty <= limit
         if position is None or position['id'] != order['position_id'] or order['filled_qty'] + qty > limit:
-            raise TraderError('E_DSV_NATIVE_FACT', 'Trade would exceed its bound order or position')
+            position = self._recover_late_trade(state, row, order, qty)
+            if was_within_terminal:
+                order['terminal_confirmed'] = True
         order['filled_qty'] += qty
         if order['effect'] == 'REDUCE':
             if qty > position['owned']:
@@ -109,20 +144,70 @@ class ExplicitOrderController:
             position['entry_filled'] += qty
             position['owned'] += qty
             position['entry_notional'] = decimal_text(Decimal(position['entry_notional']) + Decimal(fact['price']) * qty)
+        self._position_fill(position, order, fact, fill_day)
+        self.position_buckets(state, position, order['contract_id'])
+        if order.get('terminal_conflict') and terminal(order):
+            order.pop('terminal_conflict')
         self.journal.event('NATIVE_TRADE', fact)
 
-    def new_order(self, state, position, market, effect, qty, price):
+    @staticmethod
+    def _position_fill(position, order, fact, fill_day):
+        position['fills'].append({'event_seq': len(position['fills']) + 1, 'contract_id': order['contract_id'],
+                                  'direction': position['direction'],
+                                  'trade_key': [order['native_trading_day'], fact['native_order_id'], fact['native_trade_id']],
+                                  'trading_day': fill_day, 'quantity': fact['quantity'], 'effect': order['effect'],
+                                  'offset_kind': order['native_offset']})
+
+    def _record_detached_late_open(self, state, row, current, order, qty, fact, fill_day):
+        original = state['retired_positions'].get(order['position_id'])
+        if original is None:
+            raise TraderError('E_DSV_NATIVE_FACT', 'Terminal correction lacks its original strategy position')
+        if order['terminal_confirmed']:
+            order.update(terminal_confirmed=False, terminal_conflict=True)
+        order['filled_qty'] += qty
+        original['entry_filled'] += qty
+        original['owned'] += qty
+        original['entry_notional'] = decimal_text(Decimal(original['entry_notional']) + Decimal(fact['price']) * qty)
+        self._position_fill(original, order, fact, fill_day)
+        # Keep detached cycles distinct; the current position may be another side.
+        detached = row.setdefault('detached_positions', [])
+        if original['id'] not in detached:
+            detached.append(original['id'])
+        current.update(entry_stopped=True, preserve_open_on_stop=False)
+        self.journal.event('DETACHED_NATIVE_TRADE_REVIEW', fact)
+
+    def _recover_late_trade(self, state, row, order, qty):
+        position = row['position']
+        if not order['terminal_confirmed'] or position is not None and position['id'] != order['position_id']:
+            raise TraderError('E_DSV_NATIVE_FACT', 'Trade would exceed its bound order or position')
+        if position is None:
+            if order['effect'] != 'OPEN':
+                raise TraderError('E_DSV_NATIVE_FACT', 'Late closing trade has no remaining owned inventory')
+            position = state['retired_positions'].pop(order['position_id'], None)
+            if position is None:
+                raise TraderError('E_DSV_NATIVE_FACT', 'Terminal correction lacks its original strategy position')
+            row['position'] = position
+            tighten_target(position, 0)
+        order.update(terminal_confirmed=False, terminal_conflict=True)
+        position.update(entry_stopped=True, preserve_open_on_stop=False)
+        self.journal.event('NATIVE_TERMINAL_CONFLICT', {'child_order_id': order['child_order_id'],
+                                                     'reported_fill_qty': order['reported_fill_qty'],
+                                                     'new_fill_qty': order['filled_qty'] + qty})
+        return position
+
+    def new_order(self, state, position, market, effect, qty, price, offset):
         child_id = 'child-' + uuid4().hex
         opening = effect == 'OPEN'
         side = 'BUY' if (position['direction'] == 'LONG') == opening else 'SELL'
         contract = market['contract_id']
-        offset = 'OPEN' if opening else 'CLOSETODAY' if contract.split('.')[0] in {'SHFE', 'INE'} else 'CLOSE'
         chain = self.child_orders(state, position, effect)
         parent = chain[-1]['child_order_id'] if chain else None
         order = OrderState(child_id, position['id'] + '-' + effect.lower(), child_id, effect, qty, price,
                            parent_child_order_id=parent, ordinal=len(chain) + 1,
-                           native_offset=offset, native_trading_day=self.scope['trading_day']).to_dict()
+                           native_offset=offset, native_trading_day=state['trading_day']).to_dict()
         order.update(contract_id=contract, direction=side, position_id=position['id'], native_id=None, cancel_reason=None)
+        if not opening:
+            order['exit_revision'] = position.get('exit_revision', 0)
         state['orders'][child_id] = order
         position['children'].append(child_id)
         return self._prepare(order, 'SEND', quantity=qty, limit_price=price, native_offset=offset, direction=side)
@@ -137,15 +222,59 @@ class ExplicitOrderController:
         effect = {'id': order['child_order_id'] + '-' + kind.lower(), 'kind': kind,
                   'child_order_id': order['child_order_id'], 'contract_id': order['contract_id'],
                   'account_key': self.scope['account_key'], 'provider': self.scope['provider'],
-                  'trading_day': self.scope['trading_day'], **parameters}
+                  'trading_day': order['native_trading_day'], **parameters}
         self.journal.prepare(effect)
         return effect
 
     @staticmethod
-    def _proven_position(position, market):
+    def proves_position(state, position, market):
         own = 'long_qty' if position['direction'] == 'LONG' else 'short_qty'
         other = 'short_qty' if own == 'long_qty' else 'long_qty'
-        return market[own] == position['owned'] and not market[other] and not market.get('external_orders')
+        if market[own] != position['owned'] or market[other] or market.get('external_orders'):
+            return False
+        if not position['owned']:
+            return True
+        return bool(ExplicitOrderController._reduction_routes(state, position, market, position['owned']))
+
+    @staticmethod
+    def _position_fills(position, contract):
+        fills = [fill | {'trade_key': tuple(fill['trade_key'])} for fill in position['fills']]
+        if position.get('legacy_owned'):
+            fills.insert(0, {'contract_id': contract, 'direction': position['direction'],
+                             'trade_key': ('legacy-checkpoint', position['id']), 'trading_day': position['open_day'],
+                             'effect': 'OPEN', 'quantity': position['legacy_owned'], 'event_seq': 0})
+        # Backfilled prior-day fills keep their original acquisition bucket.
+        ordered = sorted(fills, key=lambda fill: (fill['trading_day'], fill['event_seq']))
+        return [fill | {'event_seq': index} for index, fill in enumerate(ordered)]
+
+    @staticmethod
+    def position_buckets(state, position, contract):
+        day = state['trading_day']
+        lots = replay_lots(contract, position['direction'], day,
+                           ExplicitOrderController._position_fills(position, contract), require_allocations=False)
+        today = sum(lot['quantity'] for lot in lots if lot['day'] == day and not lot['already_historical'])
+        return {'today': today, 'historical': sum(lot['quantity'] for lot in lots) - today}
+
+    @staticmethod
+    def _reduction_routes(state, position, market, needed):
+        day = state['trading_day']
+        side = position['direction'].lower()
+        today = market.get(f'{side}_today')
+        historical = market.get(f'{side}_historical')
+        if today is None or historical is None:
+            if position['open_day'] != day or any(fill['trading_day'] != day for fill in position['fills']):
+                return []
+            today, historical = position['owned'], 0
+        fills = ExplicitOrderController._position_fills(position, market['contract_id'])
+        try:
+            result = close_routes(contract_id=market['contract_id'], direction=position['direction'], current_day=day,
+                                  fills=fills, native={'today': today, 'historical': historical, 'total': today + historical},
+                                  orders=[], target_quantity=needed)
+        except TraderError as error:
+            if error.code in {'E_OWNERSHIP', 'E_FACT_BARRIER'}:
+                return []
+            raise
+        return result['routes']
 
     @staticmethod
     def _desired(position, market, effect, wall_time):
@@ -180,7 +309,16 @@ class ExplicitOrderController:
         tick = market.get('tick')
         if position is None or tick is None:
             return []
-        proven_position = self._proven_position(position, market)
+        proven_position = self.proves_position(state, position, market)
+        children = self.child_orders(state, position)
+        if row.get('detached_positions'):
+            return [request for order in children if order['effect'] == 'OPEN'
+                    and (request := self.cancel(order, 'TARGET_REDUCED'))]
+        if any(order['native_trading_day'] != state['trading_day'] and not terminal(order) for order in children):
+            return []
+        if any(order.get('terminal_conflict') and not terminal(order) for order in children):
+            return [request for order in children if not order.get('terminal_conflict')
+                    and (request := self.cancel(order, 'TARGET_REDUCED'))]
         effects = []
         for effect in ('OPEN', 'REDUCE'):
             previous = self.child_orders(state, position, effect)
@@ -214,9 +352,19 @@ class ExplicitOrderController:
             if previous and previous[-1]['filled_qty'] < previous[-1]['original_qty']:
                 old = previous[-1]
                 allowed_retry = old['cancel_reason'] in {'REPRICE', 'TARGET_REDUCED'}
-                if old['broker_state'] != 'CANCELLED' or not allowed_retry:
+                rolled_exit = not opening and old['native_trading_day'] != state['trading_day']
+                newer_target = not opening and position.get('exit_revision', 0) > old.get('exit_revision', 0)
+                if old['broker_state'] != 'CANCELLED' or not (
+                        allowed_retry or newer_target or rolled_exit and old['cancel_reason'] != 'USER_CANCEL'):
                     continue
-            effects.append(self.new_order(state, position, market, effect, min(needed, maximum), desired))
+            if opening:
+                effects.append(self.new_order(state, position, market, effect, needed, desired, 'OPEN'))
+            else:
+                routes = self._reduction_routes(state, position, market, needed)
+                if routes:
+                    route = routes[0]
+                    effects.append(self.new_order(state, position, market, effect,
+                                                  min(route['quantity'], maximum), desired, route['native_offset']))
         self.settle(state, row)
         return effects
 
@@ -232,6 +380,7 @@ class ExplicitOrderController:
             opens = self.child_orders(state, position, 'OPEN')
             if (position['entry_filled'] or position['entry_stopped'] or
                     opens[-1]['cancel_reason'] != 'REPRICE' or opens[-1]['broker_state'] != 'CANCELLED'):
+                state['retired_positions'][position['id']] = position
                 row['position'] = None
 
     def dispatch(self, state, effects):

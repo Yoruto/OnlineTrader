@@ -12,8 +12,8 @@ _SCHEMA = (
     'CREATE TABLE scope (id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL)',
     'CREATE TABLE checkpoint (id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL)',
     'CREATE TABLE receipts (kind TEXT, id TEXT, digest TEXT NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(kind,id))',
-    'CREATE TABLE native_orders (child TEXT PRIMARY KEY, native_id TEXT NOT NULL UNIQUE, payload BLOB NOT NULL)',
-    'CREATE TABLE native_trades (native_order TEXT, native_trade TEXT, payload BLOB NOT NULL, PRIMARY KEY(native_order,native_trade))',
+    'CREATE TABLE native_orders (child TEXT PRIMARY KEY, trading_day TEXT NOT NULL, native_id TEXT NOT NULL, payload BLOB NOT NULL, UNIQUE(trading_day,native_id))',
+    'CREATE TABLE native_trades (trading_day TEXT NOT NULL, native_order TEXT, native_trade TEXT, payload BLOB NOT NULL, PRIMARY KEY(trading_day,native_order,native_trade))',
     'CREATE TABLE effects (id TEXT PRIMARY KEY, child TEXT NOT NULL, kind TEXT NOT NULL, request BLOB NOT NULL, result TEXT)',
     'CREATE TABLE events (seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, payload BLOB NOT NULL)',
 )
@@ -30,13 +30,15 @@ class Journal:
                     for statement in _SCHEMA:
                         self._db.execute(statement)
                     self._db.execute(f'PRAGMA application_id={_APPLICATION_ID}')
-                    self._db.execute('PRAGMA user_version=1')
+                    self._db.execute('PRAGMA user_version=2')
                     self._db.execute('INSERT INTO scope VALUES(1,?)', (canonical_bytes(scope),))
                     self._db.execute('INSERT INTO checkpoint VALUES(1,?)', (canonical_bytes(initial),))
-                elif application != _APPLICATION_ID or version != 1:
-                    raise TraderError('E_DSV_STORE_VERSION', 'Expected a new database or DSV fact store version 1')
+                elif application != _APPLICATION_ID or version not in (1, 2):
+                    raise TraderError('E_DSV_STORE_VERSION', 'Expected a new database or a supported DSV fact store')
                 if self._read('SELECT payload FROM scope WHERE id=1') != scope:
                     raise TraderError('E_DSV_SCOPE', 'Fact store belongs to a different account, provider, day or profile')
+                if version == 1:
+                    self._upgrade_native_facts(scope['trading_day'])
             self._db.execute('PRAGMA synchronous=FULL')
         except BaseException:
             self.close()
@@ -60,6 +62,16 @@ class Journal:
     def load(self):
         return self._read('SELECT payload FROM checkpoint WHERE id=1')
 
+    def _upgrade_native_facts(self, day):
+        for name, ddl in zip(('native_orders', 'native_trades'), _SCHEMA[3:5]):
+            self._db.execute(f'ALTER TABLE {name} RENAME TO {name}_v1')
+            self._db.execute(ddl)
+        self._db.execute('INSERT INTO native_orders SELECT child,?,native_id,payload FROM native_orders_v1', (day,))
+        self._db.execute('INSERT INTO native_trades SELECT ?,native_order,native_trade,payload FROM native_trades_v1', (day,))
+        self._db.execute('DROP TABLE native_orders_v1')
+        self._db.execute('DROP TABLE native_trades_v1')
+        self._db.execute('PRAGMA user_version=2')
+
     def save(self, state):
         self._db.execute('UPDATE checkpoint SET payload=? WHERE id=1', (canonical_bytes(state),))
 
@@ -74,21 +86,26 @@ class Journal:
     def record_receipt(self, kind, identity, digest, value):
         self._db.execute('INSERT INTO receipts VALUES(?,?,?,?)', (kind, identity, digest, canonical_bytes(value)))
 
+    def command_receipt(self, identity):
+        return self._read("SELECT payload FROM receipts WHERE kind='COMMAND' AND id=?", (identity,))
+
     def record_order(self, child, native_id, fact):
         try:
-            self._db.execute('INSERT INTO native_orders VALUES(?,?,?) ON CONFLICT(child) DO UPDATE SET payload=excluded.payload',
-                             (child, native_id, canonical_bytes(fact)))
+            self._db.execute('INSERT INTO native_orders VALUES(?,?,?,?) ON CONFLICT(child) DO UPDATE SET payload=excluded.payload',
+                             (child, fact['native_trading_day'], native_id, canonical_bytes(fact)))
         except sqlite3.IntegrityError as error:
             raise TraderError('E_DSV_NATIVE_ID', 'A native order ID is already bound to another child') from error
 
-    def record_trade(self, native_order, native_trade, fact):
-        identity = (native_order, native_trade)
-        stored = self._read('SELECT payload FROM native_trades WHERE native_order=? AND native_trade=?', identity)
+    def record_trade(self, order_day, native_order, native_trade, fact):
+        identity = (order_day, native_order, native_trade)
+        stored = self._read('SELECT payload FROM native_trades WHERE trading_day=? AND native_order=? AND native_trade=?', identity)
         if stored is not None:
+            if 'fill_day' not in stored:
+                stored['fill_day'] = order_day
             if stored != fact:
                 raise TraderError('E_DSV_DUPLICATE_CONFLICT', 'Native trade identity has contradictory facts')
             return False
-        self._db.execute('INSERT INTO native_trades VALUES(?,?,?)', (*identity, canonical_bytes(fact)))
+        self._db.execute('INSERT INTO native_trades VALUES(?,?,?,?)', (*identity, canonical_bytes(fact)))
         return True
 
     def prepare(self, effect):

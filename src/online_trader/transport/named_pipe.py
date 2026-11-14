@@ -198,7 +198,7 @@ def _operation(handle: int, operation: str, data: bytes | None, deadline: float)
 
 class PipeConnection:
     def __init__(self, handle: int, *, server_side: bool, allowed_sid: str,
-                 expected_peer_pid: int | None = None) -> None:
+                 expected_peer_pid: int | None = None, validator=validate_message) -> None:
         self._handle = handle
         self._server_side = server_side
         self._closed = False
@@ -206,6 +206,7 @@ class PipeConnection:
         self._receive_lock = threading.Lock()
         self._decoder = FrameDecoder()
         self._ready: deque[dict] = deque()
+        self._validator = validator
         try:
             self.peer_pid, self.peer_sid = _peer(handle, server_side)
             allowed = {allowed_sid, "S-1-5-18"} if server_side else {allowed_sid}
@@ -220,7 +221,7 @@ class PipeConnection:
         return self._closed
 
     def send(self, message: dict, *, timeout: float = 5.0) -> None:
-        validate_message(message)
+        self._validator(message)
         frame = encode_frame(message)
         deadline = _deadline(timeout)
         with self._send_lock:
@@ -253,7 +254,7 @@ class PipeConnection:
                     raise
             message = self._ready.popleft()
             try:
-                validate_message(message)
+                self._validator(message)
             except TraderError:
                 self.close()
                 raise
@@ -275,13 +276,14 @@ class PipeConnection:
 class PipeListener:
     """One accept at a time, with a reserved server instance between accepts."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, *, validator=validate_message) -> None:
         _require_windows()
         self.name = _pipe_path(name)
         self.owner_sid = current_sid()
         self.security_sddl = f"D:P(A;;GA;;;SY)(A;;GA;;;{self.owner_sid})"
         self._closed = False
         self._accept_lock = threading.Lock()
+        self._validator = validator
         self._handle = self._create(first=True)
 
     def _create(self, *, first: bool) -> int:
@@ -317,7 +319,8 @@ class PipeListener:
                         _await(handle, overlap, deadline)
                     elif error != _PIPE_CONNECTED:
                         raise _error("E_PIPE_CLOSED", "Cannot accept pipe client")
-                connection = PipeConnection(handle, server_side=True, allowed_sid=self.owner_sid)
+                connection = PipeConnection(handle, server_side=True, allowed_sid=self.owner_sid,
+                                            validator=self._validator)
                 try:
                     self._handle = self._create(first=False)
                 except Exception:
@@ -347,7 +350,7 @@ class PipeListener:
 
 
 def connect(name: str, *, timeout: float = 5.0, expected_server_pid: int | None = None,
-            expected_server_sid: str | None = None) -> PipeConnection:
+            expected_server_sid: str | None = None, validator=validate_message) -> PipeConnection:
     _require_windows()
     path = _pipe_path(name)
     deadline = _deadline(timeout)
@@ -355,7 +358,7 @@ def connect(name: str, *, timeout: float = 5.0, expected_server_pid: int | None 
         handle = _k.CreateFileW(path, 0xC0000000, 0, None, 3, 0x40000000, None)
         if handle != _INVALID:
             return PipeConnection(handle, server_side=False, allowed_sid=expected_server_sid or current_sid(),
-                                  expected_peer_pid=expected_server_pid)
+                                  expected_peer_pid=expected_server_pid, validator=validator)
         error = ctypes.get_last_error()
         if error == 231:
             if not _k.WaitNamedPipeW(path, _milliseconds(deadline)):
