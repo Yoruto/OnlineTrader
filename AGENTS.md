@@ -3,6 +3,13 @@
 Independent Windows product. G0 source specifications are recorded in docs/spec-source.json.
 Preserve existing work; do not import V7, vnpy, DSV, their credentials, databases or environments.
 
+For the DSV subtraction refactor, use `docs/refactor/dsv-parity-20261114/` for scope,
+rule evidence and migration gates. Its first implementation extracts pure calculations
+under `online_trader.dsv_core`; keep their inputs explicit and their dependencies free of
+the legacy owner, SDK, UI, I/O and system clock. The new explicit controller design
+retains per-child pre-send durability. Existing owner and writer rules apply until the
+replacement passes its evidence, migration and cutover gates.
+
 Current implementation and evidence are indexed in [README](README.md) and the
 [96-item checklist](docs/功能实现与待办清单_20261110.md). The product has separate
 TqKq and SimNow simulation paths and a pinned optional SDK environment. Use the

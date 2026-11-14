@@ -118,6 +118,7 @@ class DsvStrategyRuntime:
             return self.status()
         reference=k.configurations.register_confirmed_baseline();k.wait_idle();reference.result()
         from online_trader.strategy import entry,risk,plan,stops,statistics
+        from online_trader.dsv_core import business_statistics, entry_rules, price_rules, protection_rules, sizing_rules
         from online_trader.protection import reducer
         from online_trader.contracts import validation
         from online_trader.execution import policy as execution_policy
@@ -128,6 +129,8 @@ class DsvStrategyRuntime:
         from importlib.resources import files
         code_hashes={name:hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
                      for name,module in (("entry",entry),("risk",risk),("plan",plan),("stops",stops),("statistics",statistics))}
+        for module in (business_statistics, entry_rules, price_rules, protection_rules, sizing_rules):
+            code_hashes[module.__name__] = hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
         code_hashes["runtime"]=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         code_hashes["protection"]=hashlib.sha256(Path(reducer.__file__).read_bytes()).hexdigest()
         code_hashes["validation"]=hashlib.sha256(Path(validation.__file__).read_bytes()).hexdigest()

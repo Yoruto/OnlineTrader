@@ -29,6 +29,7 @@ def main():
         ROOT/'requirements-desktop.lock',ROOT/'requirements-build.lock']+sorted((ROOT/'docs').glob('spec-*.json'))
     validation_before={str(path.relative_to(ROOT)):hashlib.sha256(path.read_bytes()).hexdigest() for path in validation_files}
     prohibited={"v7_trader","vnpy","wt9_v7","tqsdk","qa","tests","pickle"}
+    dsv_core = ROOT / "src/online_trader/dsv_core"
     violations=[]
     for path in (ROOT/"src").rglob("*.py"):
         tree=ast.parse(path.read_text(encoding="utf-8"))
@@ -43,6 +44,9 @@ def main():
                              and node.level==0 and {a.name for a in node.names}=={'TqApi','TqAuth','TqSim'}
                              and any(isinstance(parent,(ast.FunctionDef,ast.AsyncFunctionDef)) and parent.name=='_sdk_factory' and node in ast.walk(parent) for parent in ast.walk(tree)))))
                 if module.split(".")[0] in prohibited and not optional_sdk:violations.append(str(path.relative_to(ROOT))+":"+module)
+                if (path.is_relative_to(dsv_core) and module.startswith("online_trader.")
+                        and not module.startswith(("online_trader.dsv_core.", "online_trader.domain."))):
+                    violations.append("dsv-core-dependency:" + str(path.relative_to(ROOT)) + ":" + module)
     manifest=json.loads((ROOT/"docs/spec-source.json").read_text(encoding="utf-8"))
     workbench=json.loads((ROOT/"docs/spec-extension-workbench.json").read_text(encoding="utf-8"))
     extended=workbench.get("extends_copied_resources",{})

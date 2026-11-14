@@ -9,12 +9,13 @@ cannot enable an online plan. Network activity belongs to the execution owner.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
+from decimal import Decimal, InvalidOperation, localcontext
 import hashlib
 import json
 import re
 from typing import Any, Mapping
 
+from online_trader.dsv_core.protection_rules import half_close_target, trailing_floor
 from online_trader.errors import TraderError
 
 
@@ -392,8 +393,7 @@ def _dsv_partial(plan: Mapping[str, Any], state: ProtectionState) -> ProtectionS
     if base < 2:
         # The source gate does not consume a stage on a one-lot remainder.
         return replace(state, **{name: "NOT_TRIGGERED"})
-    close = min(max(int((Decimal(base) / 2).to_integral_value(rounding=ROUND_HALF_EVEN)), 1), base - 1)
-    target = base - close
+    target = half_close_target(base)
     state = replace(state, **{name: "TARGET_COMMITTED", f"phase{number}_target": target})
     return _target(state, target, f"PARTIAL_STAGE_{number}")
 
@@ -445,7 +445,7 @@ def _quote(plan: Mapping[str, Any], state: ProtectionState, event: Mapping[str, 
         if trailing["enabled"] and high >= _decimal(trailing["activation_ratio"]) * profit:
             value = _decimal(trailing["drawdown_value"])
             if trailing["drawdown_mode"] == "DSV_MAX_TP_AND_PEAK_RATIO":
-                floor = high - max(profit * value, high * value)
+                floor = trailing_floor(high, profit, value)
             else:
                 floor = high - value if trailing["drawdown_mode"] == "POINTS" else high * (1 - value)
             floor = max(floor, state.trailing_floor_move) if state.trailing_floor_move is not None else floor

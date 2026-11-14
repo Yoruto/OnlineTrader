@@ -1,0 +1,38 @@
+{
+  "schema": "DSV_PARITY_BASELINE/1",
+  "online_trader": {
+    "code_commit": "af8b53b16592bfbd5b09185e1eee48120b3ead34",
+    "code_tree": "75bd5b294bcbff1f8bcdd89fe0950b8ab0cd3937",
+    "plan_commit": "e148ab2ea9491dad016610a796696544af3fb143",
+    "python": "3.13.15",
+    "sdk_version": "3.10.4",
+    "sdk_target_task_sha256": "c2f4d06e2223542d3d25972139bdd457830b6fdc57d5f50a305ae581547f4a80",
+    "desktop_qt": "6.8.2.1",
+    "saved_business_reference": "docs/references/dsv-settings-20261109.json"
+  },
+  "dsv_reference": {
+    "archive_sha256": "3d1bb6935583f96e4a93652ca650708dddb10b123556219df1bb836b9b6b8278",
+    "exe_sha256": "aabeafd83d265ab9b1cf5cc3fd0e9b0f21963ddcc95daa70feefc209997269a3",
+    "gui_marshal_sha256": "07c82c9ada765284ed5a929227024cbf192f5f72192636900740d9a5764032ea",
+    "python_archive_version": 314,
+    "sdk_version": "3.10.2",
+    "sdk_version_file_sha256": "846a5b3a39664a374c814ebca5cd2a49c6199e88e0241d10034c0d29117932e5",
+    "sdk_target_task_sha256": "d88ed96d447dac01542f84acda4f1222f4a514a68863c9939deac3a325078beb",
+    "sdk_target_task_marshal_sha256": "5e5ab0e0727cc5f6467b7a95852781466ca7e2d790ed7a17cbab0ef7accbf7fe",
+    "gui_functions": {
+      "chase_within_cap": {"line": 1695, "bytecode_sha256": "0082e0197bb016cb9b4b92d4bb504f0ed282d5dc7341a09cd712d05a3d37edc5"},
+      "opening_jump_block": {"line": 1732, "bytecode_sha256": "d8b5bd3176d3d422079100e713bf612bce53fa90e208e65b8d2da7a4c42c633e"},
+      "hysteresis_ready": {"line": 1743, "bytecode_sha256": "a293345f242757dec804b1b79e751927c8e2031686e2470671aa05e80c704ab2"},
+      "half_close_lots": {"line": 1820, "bytecode_sha256": "70224ef1f2fd20ac5b35a593c7009b2c8e2a17f3eaffdbf7618a6c1d8879d29f"},
+      "StrategyThread._run": {"line": 3875, "bytecode_sha256": "19d2b437d5bb7312bd84a1cf7e02d86da1fc39083ed873bbb4e48fa742768761"},
+      "StrategyThread._run.<locals>.make_price_fn.<locals>._price_fn": {"line": 4850, "bytecode_sha256": "ade102b99b1a81d3e51b7543607dce7bf2019d29ff20f9f8f042a612334a8a16"},
+      "StrategyThread._run.<locals>.calc_volume": {"line": 5231, "bytecode_sha256": "1c7760bc60192d5aac8f3247cc9a161e2b425d5ea5f64b98ea209c3f41b294a7"},
+      "ManualTradeThread.run": {"line": 9113, "bytecode_sha256": "de0225449e28587967b7c99218e32ebdc6d2aaee052182d37a79c9e0dc211bdf"}
+    }
+  },
+  "capture": {
+    "time_zone": "Asia/Shanghai",
+    "windows_time_zone": "China Standard Time",
+    "extractor_python": "3.14.7"
+  }
+}

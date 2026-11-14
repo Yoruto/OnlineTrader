@@ -15,6 +15,10 @@ from decimal import Decimal, localcontext
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes, content_hash
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
+from online_trader.dsv_core.entry_rules import (
+    chase_within_cap, continuation_direction, geometry_limit, trigger_prices,
+    hysteresis_ready as hysteresis_ready, opening_jump_block as opening_jump_block,
+)
 from online_trader.errors import TraderError
 
 
@@ -70,54 +74,9 @@ def _native_tick_id(value):
     return int(value)
 
 
-def continuation_direction(price, night_last, night_high, night_low, offset, fallback=None):
-    """DSV continuation uses the overnight range and allows only favourable gaps."""
-    if price >= night_low + offset:
-        direction = "LONG"
-    elif price <= night_high - offset:
-        direction = "SHORT"
-    else:
-        direction = None
-    if price == night_last:
-        return direction or fallback
-    if (price > night_last and direction == "SHORT") or (price < night_last and direction == "LONG"):
-        return direction
-    return None
-
-
 def market_fingerprint(event, opening_session):
     return content_hash({key: event[key] for key in _REQUIRED} | {"is_opening_session": opening_session} |
                         ({"session_policy": event["session_policy"]} if "session_policy" in event else {}))
-
-
-def opening_jump_block(last_price, trigger, profit_distance, ratio):
-    """DSV gui.opening_jump_block: absolute distance, with inclusive boundary."""
-    price, line, take, factor = map(Decimal, (last_price, trigger, profit_distance, ratio))
-    return price > 0 and line > 0 and take > 0 and abs(price - line) >= take * factor
-
-
-def hysteresis_ready(direction, last_price, trigger, distance, armed):
-    """DSV reverse excursion arms once; the trigger condition is a separate gate."""
-    price, line, hysteresis = map(Decimal, (last_price, trigger, distance))
-    if hysteresis <= 0 or armed:return True, bool(armed)
-    reached = price <= line - hysteresis if direction == "LONG" else price >= line + hysteresis
-    return bool(reached), bool(reached)
-
-
-def chase_within_cap(direction, last_price, opponent_price, trigger, cap):
-    """DSV helper: one favourable price can override the other adverse price.
-
-    The caller separately checks that the market path and selected price are valid.
-    """
-    last, opponent, line, distance = map(Decimal, (last_price, opponent_price, trigger, cap))
-    values = (last, opponent)
-    if direction == "LONG":
-        adverse = any(price > line + distance for price in values)
-        favourable = any(0 < price <= line for price in values)
-    else:
-        adverse = any(0 < price < line - distance for price in values)
-        favourable = any(price >= line for price in values)
-    return not adverse or favourable
 
 
 class DsvEntryStrategy:
@@ -329,7 +288,7 @@ class DsvEntryStrategy:
         O, S, T = (Decimal(symbol[k]) for k in ("open_offset", "stop_offset", "profit_offset"))
         if min(O, S, T) <= 0:reasons.append("SYMBOL_OFFSETS_INCOMPLETE");return result
         last, high, low = (Decimal(event[k]) for k in ("last", "day_high", "day_low"))
-        lines = {"LONG": low + O, "SHORT": high - O}
+        lines = trigger_prices(high, low, O)
         updated["last_trigger_prices"] = {d: decimal_text(price) for d, price in lines.items()}
         result["touched_triggers"] = {side: decimal_text(lines[side]) for side, reached in
                                       (("LONG", last >= lines["LONG"]), ("SHORT", last <= lines["SHORT"]))
@@ -348,7 +307,7 @@ class DsvEntryStrategy:
         remaining = _seconds(end - decided_at)
         policy=event.get('session_policy')
         wait_limit=Decimal(trade['no_open_after_open_minutes'])*60
-        geometry_limit = 2 * O - S
+        max_geometry = geometry_limit(O, S)
         identity = {key: event[key] for key in ("account_key", "contract_id", "trading_day", "candle_id")}
         candle_key = "candle-" + content_hash(identity)
         night = updated["night_reference"]
@@ -360,7 +319,7 @@ class DsvEntryStrategy:
                 and day_open and 0 <= elapsed <= Decimal(trade["chase_window_minutes"]) * 60
                 and night is not None and night["boundary_proved"]):
             waits = trade["no_open_after_open"] and not trade["continuation_ignore_no_open"] and elapsed < wait_limit
-            if waits or (geometry_limit > 0 and high - low > geometry_limit):
+            if waits or (max_geometry > 0 and high - low > max_geometry):
                 # The source discards the closeout fallback, retaining the
                 # observed overnight range and last quote for a later signal.
                 updated["night_close_fallback_cleared"] = True
@@ -390,7 +349,7 @@ class DsvEntryStrategy:
         if reasons:
             entry_log.extend(reasons)
             return result
-        geometry_block = high - low > geometry_limit
+        geometry_block = high - low > max_geometry
         if geometry_block:
             reasons.append("GEOMETRY_BLOCK")
             entry_log.append("GEOMETRY_BLOCK")

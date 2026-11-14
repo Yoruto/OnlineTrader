@@ -8,6 +8,7 @@ from decimal import Decimal, localcontext
 
 from online_trader.contracts.codec import canonical_bytes
 from online_trader.domain.values import decimal_text, decimal_value, quantity
+from online_trader.dsv_core.price_rules import scheduled_close_mode, strategy_price
 from online_trader.errors import TraderError
 
 
@@ -69,21 +70,11 @@ def select_price(side, market, *, contexts=None):
     mode, reference = selected or ("ACTIVE", None)
     opponent = numbers["ask1" if side == "BUY" else "bid1"] or numbers["last"]
     tick = numbers["tick_size"]
-    sign = Decimal(1) if side == "BUY" else Decimal(-1)
+    low, high = numbers["lower_limit"], numbers["upper_limit"]
+    raw = strategy_price(side, mode, opponent=opponent, tick=tick,
+                         limit=high if side == "BUY" else low, reference=reference)
     with localcontext() as context:
         context.prec = 80
-        if mode == "PASSIVE":
-            raw = reference
-        elif mode == "MARKET":
-            raw = numbers["upper_limit" if side == "BUY" else "lower_limit"]
-            if raw is None and opponent is not None:
-                raw = opponent + sign * 10 * (tick or Decimal(1))
-        elif mode == "AGGR1":
-            raw = opponent + sign * (tick or Decimal(1)) if opponent is not None else None
-        elif mode == "CAP":
-            raw = (min(opponent, reference) if side == "BUY" else max(opponent, reference)) if opponent is not None else None
-        else:
-            raw = opponent
         reasons = []
         if (market.get("complete") is not True or market.get("fresh") is not True
                 or market.get("is_trading") is not True or market.get("quality") != "CONTIGUOUS"):
@@ -92,7 +83,6 @@ def select_price(side, market, *, contexts=None):
             reasons.append("PRICE_UNAVAILABLE")
         if tick is None:
             reasons.append("TICK_SIZE_UNKNOWN")
-        low, high = numbers["lower_limit"], numbers["upper_limit"]
         if low is None or high is None:
             reasons.append("PRICE_LIMITS_UNKNOWN")
         elif low > high:
@@ -116,7 +106,7 @@ def close_price_context(side, *, elapsed_close_ms, advance_seconds, last_context
     if last_context_age_ms is not None:
         _milliseconds(last_context_age_ms)
     remaining_ms = advance_seconds * 1000 - elapsed_close_ms
-    mode = "MARKET" if remaining_ms <= 5000 else "AGGR1" if remaining_ms <= 10_000 else "ACTIVE"
+    mode = scheduled_close_mode(remaining_ms)
     return {"refresh": last_context_age_ms is None or last_context_age_ms >= 3000,
             "mode": mode, "contexts": {} if mode == "ACTIVE" else {mode: {"side": side, "age_ms": 0}}}
 

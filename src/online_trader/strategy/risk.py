@@ -12,6 +12,7 @@ from decimal import Decimal, ROUND_FLOOR, localcontext
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes
 from online_trader.domain.values import MAX_QUANTITY, MAX_SEQUENCE, decimal_text, decimal_value, identifier, order_price
+from online_trader.dsv_core.sizing_rules import auto_lots, margin_lots
 from online_trader.errors import TraderError
 
 
@@ -64,10 +65,6 @@ def _identities(value):
 
 def _floor(value):
     return min(MAX_QUANTITY, max(0, int(value.to_integral_value(rounding=ROUND_FLOOR))))
-
-
-def _dsv_lots(budget, per_lot):
-    return min(MAX_QUANTITY, max(0, int(budget / per_lot)))
 
 
 def calculate_daily_loss(*, balance, pre_balance, close_profit, float_profit, commission):
@@ -214,7 +211,7 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
         })
         if fixed:
             quantity = min(requested_qty, trade["max_volume"], _floor(available / per_lot),
-                           _dsv_lots(dsv_available, dsv_per_lot))
+                           margin_lots(dsv_available, dsv_per_lot))
             metrics["sizing_branch"] = "FIXED"
         else:
             equity = values["equity"]
@@ -227,7 +224,7 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
             risk_per_lot = stop * metadata["multiplier"]
             risk_budget = equity * Decimal(trade["risk_per_trade_ratio"])
             dsv_equity, dsv_cap = float(equity), float(cap)
-            risk_volume = _dsv_lots(dsv_equity * float(trade["risk_per_trade_ratio"]), float(stop) * multiplier)
+            risk_volume = margin_lots(dsv_equity * float(trade["risk_per_trade_ratio"]), float(stop) * multiplier)
             metrics.update({"sizing_branch": "AUTO", "effective_risk_cap": decimal_text(cap),
                 "used_margin": decimal_text(used), "participating_configured_symbols": participating,
                 "symbol_margin_budget": decimal_text(symbol_budget), "account_margin_budget": decimal_text(total_budget),
@@ -244,11 +241,10 @@ def evaluate_entry(profile, *, direction, contract_id, stop_distance, limit_pric
                 dsv_budget = dsv_symbol_budget if trade["aggressive_mode"] else min(dsv_symbol_budget, dsv_total_budget)
                 # Exact monetary bounds still cap the compatible proposal and back its reservation.
                 margin_quantity = min(_floor(min(available, budget) / per_lot),
-                                      _dsv_lots(min(dsv_available, dsv_budget), dsv_per_lot))
+                                      margin_lots(min(dsv_available, dsv_budget), dsv_per_lot))
                 metrics["margin_based_quantity"] = margin_quantity
-                quantity = min(margin_quantity, trade["max_volume"])
-                if not trade["aggressive_mode"] and Decimal(trade["risk_per_trade_ratio"]) > 0 and 0 < risk_volume < quantity:
-                    quantity = risk_volume
+                quantity = auto_lots(margin_quantity, trade["max_volume"], aggressive=trade["aggressive_mode"],
+                                     risk_enabled=Decimal(trade["risk_per_trade_ratio"]) > 0, risk_quantity=risk_volume)
                 # A zero risk_volume does not shrink a positive margin quantity in
                 # the DSV implementation.  The fallback is a separate margin path.
                 if (quantity <= 0 and trade["min_one_lot_fallback"] and min(available, total_budget) >= per_lot

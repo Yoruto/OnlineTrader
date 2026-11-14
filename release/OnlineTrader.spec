@@ -8,6 +8,8 @@ package = root / 'src/online_trader'
 # PyInstaller's PYZ contains bytecode, so keep these files beside their modules.
 fingerprinted_sources = (
     'accounting/book.py', 'accounting/report.py', 'contracts/validation.py',
+    'dsv_core/business_statistics.py', 'dsv_core/entry_rules.py', 'dsv_core/price_rules.py',
+    'dsv_core/protection_rules.py', 'dsv_core/sizing_rules.py',
     'execution/policy.py', 'kernel/dsv_strategy.py', 'kernel/engine.py',
     'kernel/execution.py', 'kernel/money.py', 'kernel/scheduler.py',
     'kernel/statistics.py', 'protection/reducer.py', 'scheduling/calendar.py',
