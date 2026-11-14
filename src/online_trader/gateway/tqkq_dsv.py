@@ -30,6 +30,22 @@ class TqKqDsvPort(TqKqPort):
     def strategy_wall_time(self):
         return self.clock.now()
 
+    def _matches_strategy_quote(self, quote, event):
+        stamp = datetime.fromisoformat(quote.datetime).replace(tzinfo=CHINA_TIME)
+        return stamp == datetime.fromisoformat(event['source_time_utc']) and number(quote.last_price) == event['last']
+
+    def current_strategy_quote(self, event):
+        """Prove the current native last price before restoring entry authority."""
+        try:
+            code = event['contract_id']
+            quote = self.quotes[code]
+            if not self._matches_strategy_quote(quote, event) or not self._fresh_last(code, check_age=False):
+                return False
+            order_price(event['last'], number(quote.price_tick))
+            return True
+        except (TraderError, KeyError, AttributeError, TypeError, ValueError):
+            return False
+
     def fresh_strategy_entry(self, code, side, event):
         """Use the strategy age rule and verify the exact legal native quote."""
         if event is None:
@@ -37,9 +53,7 @@ class TqKqDsvPort(TqKqPort):
         runtime = getattr(getattr(self, 'kernel', None), '_dsv_runtime', None)
         try:
             quote = self.quotes[code]
-            stamp = datetime.fromisoformat(quote.datetime).replace(tzinfo=CHINA_TIME)
-            source = datetime.fromisoformat(event['source_time_utc'])
-            if (stamp != source or number(quote.last_price) != event['last'] or
+            if (not self._matches_strategy_quote(quote, event) or
                     (runtime is not None and runtime.ordinary_quote_stale(event))):
                 return False
             field = 'ask1' if side == 'BUY' else 'bid1'

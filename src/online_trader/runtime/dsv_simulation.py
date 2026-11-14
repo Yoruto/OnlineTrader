@@ -98,13 +98,14 @@ class DsvSimulationSession(SimulationSession):
         self._ntp_results = SimpleQueue()
         self._next_clock_check = 0
         self._clock_worker = None
-        self.entry_log = None
+        self.entry_log = DsvEntryLog(kernel, output, profile)
         self.comparison = None
         self.comparison_error = None
         try:
-            self.entry_log = DsvEntryLog(kernel, output, profile)
-        except (OSError, TraderError):
-            kernel._dsv_diagnostics['operation_log'] = 'E_OPERATION_LOG'
+            self.entry_log.start()
+            self.entry_log.find_prior_failures()
+        except Exception as error:
+            self.entry_log.failed('start', error, self.emit)
         try:
             self.comparison = ComparisonRecorder(kernel, output, profile, calendar,
                                                  dsv_config=dsv_config, dsv_log_dir=dsv_log_dir)
@@ -132,12 +133,10 @@ class DsvSimulationSession(SimulationSession):
                     self.kernel._dsv_diagnostics.pop('comparison', None)
 
     def _operation_log(self, method, *args):
-        if self.entry_log is None:
-            return
         try:
             getattr(self.entry_log, method)(*args)
-        except Exception:
-            self.kernel._dsv_diagnostics['operation_log'] = 'E_OPERATION_LOG'
+        except Exception as error:
+            self.entry_log.failed(method, error, self.emit)
 
     def _poll_clock_diagnostic(self):
         if not isinstance(self.port.clock, LocalWallClock):
@@ -148,7 +147,7 @@ class DsvSimulationSession(SimulationSession):
             pass
         else:
             self.kernel._dsv_diagnostics['ntp'] = result['code']
-            self._operation_log('write', [{
+            self._operation_log('auxiliary', [{
                 'observed_at_utc': utc(self.port.clock.now()), 'kind': result['code'],
                 'tag': '时钟', 'message': result['message']}])
         now = time.monotonic()
@@ -171,6 +170,7 @@ class DsvSimulationSession(SimulationSession):
     def close(self):
         super().close()
         self._operation_log('poll')
+        self._operation_log('close')
         self._comparison('poll')
         self._comparison('close')
 
@@ -357,7 +357,7 @@ class DsvSimulationSession(SimulationSession):
                 'trading_day': self._managed_day, 'source_epoch': self.port.source_epoch,
                 'reason': 'WAITING_FOR_NATIVE_RECONCILIATION_AND_LIVE_QUOTE'})
 
-    def _try_resume_entries(self, event):
+    def _try_resume_entries(self, event, account):
         if self._entry_resume is None:
             return
         k = self.kernel
@@ -368,24 +368,39 @@ class DsvSimulationSession(SimulationSession):
             self._entry_resume = None
             return
         key = event['contract_id'], event['trading_day']
-        state = self.driver.strategy._states.get(key)
+        strategy = self.driver.strategy
+        state = strategy._states.get(key)
         if (state is None or state['coverage_lost'] or state['session_id'] != event['session_id']
-                or state['source_epoch'] != event['source_epoch'] or state['last_sequence'] + 1 != event['sequence']
-                or not event['path_complete'] or not event['day_range_complete'] or self._quote_expired(event)
-                or not self.owner.can_resume_entries(self.port.snapshot())):
-            return
+                or state['source_epoch'] != event['source_epoch'] or event['source_epoch'] != self.port.source_epoch
+                or state['last_sequence'] + 1 != event['sequence'] or event['quality'] != 'CONTIGUOUS'
+                or not event['path_complete'] or not event['day_range_complete']):
+            return {'reason_code': 'ENTRY_RESUME_MARKET_PATH'}
+        if not self.driver.scope_current(key[0], key[1], event['session_id']) or not self.port.current_strategy_quote(event):
+            return {'reason_code': 'ENTRY_RESUME_NATIVE_QUOTE'}
+        if not self.owner.can_resume_entries(self.port.snapshot()):
+            return {'reason_code': 'ENTRY_RESUME_ACCOUNT_SYNC'}
+        # Preview the same continuation the armed strategy would evaluate.
+        # Its native freshness gate is independent of the ordinary age limit.
+        if strategy.ordinary_quote_stale(event, now=now) and (
+                self._quote_expired(event) or not strategy.continuation_ready_on_resume(
+                    state, self.driver._event(event), account, now=now)):
+            return {'reason_code': 'ENTRY_RESUME_QUOTE_AGE_POLICY',
+                    'age_seconds': str(strategy.ordinary_quote_age(event, now=now)),
+                    'limit_seconds': str(strategy.profile.to_record()['settings']['trade']['max_quote_age_seconds'])}
         try:
             self.owner.arm()
         except TraderError as error:
             if error.code != 'E_NOT_READY':
                 raise
-            return
+            return {'reason_code': 'ENTRY_RESUME_ACCOUNT_SYNC'}
         k.wait_idle()
         if k._armed:
             self._entry_resume = None
             self.owner.capture('ONLINE_DSV_ENTRIES_RESUMED', {
                 'trading_day': event['trading_day'], 'source_epoch': event['source_epoch'],
                 'quote_id': event.get('native_tick_id', event['sequence'])})
+            return
+        return {'reason_code': 'ENTRY_RESUME_ACCOUNT_SYNC'}
 
     def _quote_expired(self,event):
         age=(self.port.clock.now()-datetime.fromisoformat(event['source_time_utc'])).total_seconds()
@@ -535,11 +550,10 @@ class DsvSimulationSession(SimulationSession):
                         # Rebuild a proved suffix for observation only. Entry
                         # and existing exits still require fresh market facts.
                         self._extend_late_path(code,late);late=[]
-                    if live:
-                        self._try_resume_entries(event)
                     strategy_start = time.monotonic_ns()
                     account,instrument=self.feed.facts(event,k)
-                    try:future=self.driver.on_market(event,account,instrument,_allow_entry=live)
+                    entry_recovery = self._try_resume_entries(event, account) if live else None
+                    try:future=self.driver.on_market(event,account,instrument,_allow_entry=live,_entry_recovery=entry_recovery)
                     except ExpiredMarketQuote:
                         late.append(event)
                         continue
@@ -549,7 +563,6 @@ class DsvSimulationSession(SimulationSession):
                     if self.monitor.diagnostic:
                         try:self.monitor.processed(event, strategy_start, strategy_end, self.port.clock)
                         except (TraderError, ValueError, TypeError, KeyError):k._dsv_monitor_error = 'E_MARKET_DIAGNOSTIC'
-                    self._operation_log('market', event, self.last_decisions[code])
                     self._comparison('market',event,account,instrument,self.last_decisions[code])
                 if late:self._extend_late_path(code,late)
             self.driver.poll();k.wait_idle();self.owner.tick();k.wait_idle()
@@ -604,7 +617,7 @@ class DsvSimulationSession(SimulationSession):
                 self.status('DSV_BLOCKED_' + error_code, error_code=error_code, contract_id=code, decision_id=decision_id,
                             exception={key: val for key, val in self._runtime_error.items() if key != 'count'},
                             repeat_count=repeat)
-                self._operation_log('write', [{
+                self._operation_log('auxiliary', [{
                     'observed_at_utc': utc(datetime.now(timezone.utc)), 'kind': 'DSV_RUNTIME_ERROR', 'tag': '警告',
                     'message': f"{error_code} · {self._runtime_error['exception_id']} · 累计 {repeat} 次",
                     'contract_id': code, 'decision_id': decision_id,
@@ -724,7 +737,8 @@ def _claim_run_output(output, grant):
                'auto-offsets-completed.json', 'market-latency.jsonl*', 'workbench-latency-*', 'final-relogin.json',
                'final-money-report.json')
     try:
-        if any(next(output.glob(pattern), None) is not None for pattern in records):
+        recovery = output.with_name(output.name + '.operation-log-recovery.json')
+        if recovery.exists() or any(next(output.glob(pattern), None) is not None for pattern in records):
             raise TraderError('E_RUN_OUTPUT', 'Choose a new DSV output directory for each run')
         publish_new_bytes(canonical_bytes({'account_key': grant.account_key, 'scope_hash': grant.content_hash}),
                           output / 'dsv-run-claim.json')
@@ -769,10 +783,10 @@ def verify_closed_snapshot(kernel,snapshot):
                 raise TraderError('E_FACT_BARRIER','Final native order identity or terminal quantities differ')
             evidence={f['trade_key']:f for f in kernel.simulation._observed_orders.get(order['child_order_id'],{}).get('fills',[])}
             facts=kernel.ledger.query('SELECT trade_key,quantity,price FROM fill_facts WHERE broker_order_key=?',(order['child_order_id'],))
-            expected={f['trade_key'][3:]:{'quantity':f['quantity'],'price':f['price'],
+            expected={f['trade_key']:{'quantity':f['quantity'],'price':f['price'],
                 'source_time_ns':evidence.get(f['trade_key'],{}).get('source_time_ns')} for f in facts}
             trades=trades_by_order.get(item['order_id'], ())
-            actual={t['trade_id']:{key:t[key] for key in ('quantity','price','source_time_ns')} for t in trades}
+            actual={kernel.port.trade_key(t['trade_id']):{key:t[key] for key in ('quantity','price','source_time_ns')} for t in trades}
             if (expected!=actual or sum(t['quantity'] for t in trades)!=order['filled_qty']
                     or any(t['contract_id']!=item['contract_id'] or t['direction']!=direction or t['offset']!=item['offset'] for t in trades)):
                 raise TraderError('E_FACT_BARRIER','Final native trade identities and economics differ from original owned fills')

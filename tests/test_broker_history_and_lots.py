@@ -104,7 +104,7 @@ class LocalArchiveTests(unittest.TestCase):
             'position_cycle_id':None,'query_order_archive':True})
 
     def test_query_uses_a_durable_terminal_observation_saved_before_interruption(self):
-        self.missing(2)
+        self.missing(2,trade_id='SHFE|archive-fill')
         self.assertEqual(self.query_archive()['evidence_ids'],[])
         self.assertTrue(self.kernel.recovery_required)
         native=self.original_native_order;native.status='FINISHED'
@@ -121,4 +121,6 @@ class LocalArchiveTests(unittest.TestCase):
         self.assertTrue(order['terminal_confirmed'])
         self.assertEqual(order['filled_qty'],2)
         self.assertEqual(self.x.api.inserted[-1]['offset'],'CLOSE')
-        self.assertEqual(owner.historical_orders.records[self.oid]['source_kind'],'DURABLE_NATIVE_ORDER_OBSERVATION')
+        history = owner.historical_orders.records[self.oid]
+        self.assertEqual(history['source_kind'],'DURABLE_NATIVE_ORDER_OBSERVATION')
+        self.assertEqual(history['trades'][0]['trade_id'],'SHFE|archive-fill')

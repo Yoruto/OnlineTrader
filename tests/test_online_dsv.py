@@ -115,7 +115,10 @@ class OnlineDsvTests(unittest.TestCase):
         record['contracts'][0]['sessions'].insert(0,{'session_id':'night','trading_day':'2026-11-10',
             'open_utc':'2026-11-09T13:00:00Z','close_utc':'2026-11-09T15:00:00Z',
             'is_opening_session':True,'force_close_at_end':True})
-        self.start(trade={'continuation_ignore_no_open':True},calendar=TradingCalendar.from_record(record),
+        self.start(trade={'continuation_ignore_no_open':True, 'max_daily_orders': 1},
+            calendar=TradingCalendar.from_record(record),
+            grant_changes={'schema_version': 'KQ_DSV_DESKTOP/1', 'trading_days': ['2026-11-10'],
+                           'resume_entries_on_day_change': False, 'daily_targets_per_contract': 1},
             overnight={'at':'2026-11-09T14:59:59Z','last':1050,'high':1080,'low':990})
         self.assertEqual(self.api.inserted,[])
         self.quote(1048,high=1080,low=1000)
@@ -123,6 +126,8 @@ class OnlineDsvTests(unittest.TestCase):
         candidate=result['candidates'][0]
         self.assertEqual((candidate['entry_kind'],candidate['theoretical_price']),('CONTINUATION','1048'))
         self.assertEqual([(order['direction'],order['limit_price']) for order in self.api.inserted],[('BUY',1049.0)])
+        from online_trader.kernel.statistics import strategy_open_counts
+        self.assertEqual(strategy_open_counts(self.kernel._committed.values(), '2026-11-10'), {self.code: 1})
         self.api.terminal(self.api.inserted[0]['order_id'])
         self.quote(1048,high=1080,low=1000)
         self.assertEqual(len(self.api.inserted),1)
@@ -253,6 +258,93 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertTrue(self.kernel._armed)
         self.assertEqual(len(self.api.inserted), 1)
 
+    def test_reconnect_uses_ordinary_configured_age_without_consuming_the_minute(self):
+        from datetime import datetime, timedelta
+
+        cases = [(0, 6000, True)]
+        for limit in (1, 5, 10):
+            cases.extend((limit, limit * 1000 + delta, delta <= 0) for delta in (-1, 0, 1))
+        for limit, age, allowed in cases:
+            with self.subTest(limit=limit, age=age):
+                x = OnlineDsvTests()
+                x.setUp()
+                try:
+                    x.start(trade={'max_quote_age_seconds': limit}, max_quote_age_ms=5000)
+                    x.api._data['notify']['disconnect'] = {'code': 2019112910}
+                    x.session.step()
+                    x.api._data['notify']['reconnect'] = {'code': 2019112902}
+                    x.session.step()
+                    x.quote(1040)
+                    source = datetime.fromisoformat('2026-11-10T01:06:02.700Z')
+                    target = source.replace(microsecond=0) + timedelta(milliseconds=age)
+                    move = (target - x.clock.now()) // timedelta(milliseconds=1)
+                    x.quote(1055, milliseconds=move, at=source.isoformat())
+                    self.assertEqual(x.kernel._armed, allowed)
+                    self.assertEqual(len(x.api.inserted), int(allowed))
+                    if not allowed:
+                        report = x.session.last_decisions[x.code]
+                        self.assertIn('ENTRY_RESUME_QUOTE_AGE_POLICY', report['reasons'])
+                        self.assertEqual(report['entry_recovery']['limit_seconds'], str(limit))
+                        self.assertIsNone(report['opportunity']['last_signal_bar_after'])
+                        x.quote(1055, milliseconds=100)
+                        self.assertTrue(x.kernel._armed)
+                        self.assertEqual(len(x.api.inserted), 1)
+                finally:
+                    x.tearDown()
+
+    def test_pending_reconnect_observes_touch_until_native_quote_matches(self):
+        self.start(trade={'max_quote_age_seconds': 0}, max_quote_age_ms=5000)
+        self.api._data['notify']['disconnect'] = {'code': 2019112910}
+        self.session.step()
+        self.api._data['notify']['reconnect'] = {'code': 2019112902}
+        self.session.step()
+        self.quote(1040)
+        self.clock.advance(1000)
+        self.api.tick(self.code, last=1055)
+        self.api.quotes[self.code].last_price = 1054.
+        self.session.step()
+        report = self.session.last_decisions[self.code]
+        self.assertIn('ENTRY_RESUME_NATIVE_QUOTE', report['reasons'])
+        self.assertIsNone(report['opportunity']['last_signal_bar_after'])
+        self.assertFalse(self.kernel._armed)
+        self.assertEqual(self.api.inserted, [])
+
+        self.quote()
+        self.assertTrue(self.kernel._armed)
+        self.assertEqual(len(self.api.inserted), 1)
+
+    def test_reconnect_keeps_continuation_age_independent_of_ordinary_age(self):
+        from online_trader.kernel.statistics import strategy_open_counts
+
+        for limit, age, expected_count in ((1, 2000, 1), (0, 6000, 0)):
+            with self.subTest(limit=limit, age=age):
+                x = OnlineDsvTests()
+                x.setUp()
+                try:
+                    x.clock = FactClock('2026-11-10T01:00:10Z')
+                    record = day_calendar().to_record()
+                    record['coverage_from_utc'] = '2026-11-09T12:00:00Z'
+                    record['contracts'][0]['sessions'].insert(0, {
+                        'session_id': 'night', 'trading_day': '2026-11-10', 'open_utc': '2026-11-09T13:00:00Z',
+                        'close_utc': '2026-11-09T15:00:00Z', 'is_opening_session': True, 'force_close_at_end': True})
+                    x.start(trade={'max_quote_age_seconds': limit, 'continuation_ignore_no_open': True,
+                                   'max_daily_orders': 1}, calendar=TradingCalendar.from_record(record),
+                            max_quote_age_ms=5000,
+                            overnight={'at': '2026-11-09T14:59:59Z', 'last': 1050, 'high': 1080, 'low': 990})
+                    x.api._data['notify']['disconnect'] = {'code': 2019112910}
+                    x.session.step()
+                    x.api._data['notify']['reconnect'] = {'code': 2019112902}
+                    x.session.step()
+                    x.quote(1040, high=1080)
+                    x.quote(1048, high=1080, at='2026-11-10T01:00:12Z', milliseconds=age + 1000)
+                    counts = strategy_open_counts(x.kernel._committed.values(), '2026-11-10')
+                    self.assertEqual((len(x.api.inserted), counts.get(x.code, 0)), (expected_count, expected_count))
+                    x.quote(1048, high=1080)
+                    self.assertEqual(len(x.api.inserted), 1)
+                    self.assertEqual(x.cycle()['strategy_metadata']['candidate']['entry_kind'], 'CONTINUATION')
+                finally:
+                    x.tearDown()
+
     def test_clock_jump_still_accepts_owned_fill_and_reconciles_disarmed(self):
         from datetime import timedelta
         from types import SimpleNamespace
@@ -294,6 +386,83 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertEqual(len(self.api.inserted), 2)
         from online_trader.kernel.statistics import strategy_open_counts
         self.assertEqual(strategy_open_counts(self.kernel._committed.values(), '2026-11-10'), {self.code: 1})
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(), 2)
+
+    def test_desktop_target_quota_counts_only_durable_acceptance_and_survives_new_f5(self):
+        from online_trader.kernel.workbench import workbench_view
+
+        for limit in (1, 2):
+            with self.subTest(limit=limit):
+                x = OnlineDsvTests()
+                x.setUp()
+                try:
+                    x.start(trade={'max_daily_orders': limit, 'half_close_enabled': False},
+                            grant_changes={'schema_version': 'KQ_DSV_DESKTOP/1', 'trading_days': ['2026-11-10'],
+                                           'resume_entries_on_day_change': False, 'daily_targets_per_contract': limit})
+                    x.api.funds.available = 0.
+                    x.quote()
+                    self.assertIn('INSUFFICIENT_QUANTITY', x.session.last_decisions[x.code]['reasons'])
+                    self.assertEqual(workbench_view(x.kernel)['account_metrics']['opening_orders'], 0)
+                    self.assertEqual(x.kernel.simulation.opening_attempt_count(), 0)
+                    self.assertEqual(x.api.inserted, [])
+
+                    x.api.funds.available = 1000000.
+                    with patch.object(x.port, 'validate_send', side_effect=TraderError('E_GATEWAY_SCOPE')):
+                        x.quote(milliseconds=60_000)
+                    self.assertEqual(x.cycle()['orders'][0]['send_state'], 'DEFINITELY_NOT_SENT')
+                    self.assertEqual(workbench_view(x.kernel)['account_metrics']['opening_orders'], 1)
+                    attempts = x.kernel.simulation.opening_attempt_count()
+                    self.assertGreaterEqual(attempts, 1)
+                    self.assertEqual({order['send_state'] for order in x.cycle()['orders']},
+                                     {'DEFINITELY_NOT_SENT'})
+                    self.assertEqual(x.api.inserted, [])
+
+                    x.quote(1055, milliseconds=60_000)
+                    self.assertEqual(len(x.api.inserted), 1)
+                    native_id = x.api.inserted[0]['order_id']
+                    x.api.orders[native_id].is_error = True
+                    x.api.terminal(native_id)
+                    x.session.step()
+                    self.assertEqual(list(x.kernel._committed.values())[-1]['orders'][-1]['broker_state'], 'REJECTED')
+                    self.assertEqual(workbench_view(x.kernel)['account_metrics']['opening_orders'], limit)
+                    self.assertEqual(x.kernel.simulation.opening_attempt_count(), attempts + 1)
+                    x.restart(new_scope=True)
+                    x.session.request_initial_arm()
+                    x.quote(1040, milliseconds=60_000)
+                    x.quote()
+                    self.assertEqual(x.api.inserted, [])
+                    self.assertIn('DAILY_ORDER_LIMIT', x.session.last_decisions[x.code]['reasons'])
+                    self.assertEqual(workbench_view(x.kernel)['account_metrics']['opening_orders'], limit)
+                finally:
+                    x.tearDown()
+
+    def test_desktop_target_quota_retains_partial_order_during_unknown_cancel(self):
+        from online_trader.kernel.workbench import workbench_view
+
+        self.start(trade={'max_daily_orders': 1, 'half_close_enabled': False}, grant_changes={
+            'schema_version': 'KQ_DSV_DESKTOP/1', 'trading_days': ['2026-11-10'],
+            'resume_entries_on_day_change': False, 'daily_targets_per_contract': 1})
+        self.quote()
+        original = self.api.inserted[0]['order_id']
+        with patch.object(self.api, 'cancel_order', side_effect=OSError('synthetic unknown cancel')) as cancel:
+            self.quote(1056)
+        self.assertEqual(cancel.call_count, 1)
+        native = self.api.orders[original]
+        self.api.fill(original, 2, 1055)
+        self.quote(1056)
+        self.session.step()
+        child = self.cycle()['orders'][0]
+        self.assertEqual((child['cancel_status'], OrderState.from_dict(child).potential_remaining), ('UNKNOWN', 3))
+        self.assertEqual(len(self.api.inserted), 1)
+        self.assertEqual(workbench_view(self.kernel)['account_metrics']['opening_orders'], 1)
+
+        self.api.terminal(original)
+        self.quote(1056)
+        self.assertEqual(native.status, 'FINISHED')
+        self.assertEqual([(order['offset'], order['volume']) for order in self.api.inserted],
+                         [('OPEN', 5), ('OPEN', 3)])
+        self.assertEqual(self.cycle()['orders'][-1]['intent_id'], child['intent_id'])
+        self.assertEqual(workbench_view(self.kernel)['account_metrics']['opening_orders'], 1)
         self.assertEqual(self.kernel.simulation.opening_attempt_count(), 2)
 
     def test_missing_margin_is_zero_only_for_proved_flat_contract(self):

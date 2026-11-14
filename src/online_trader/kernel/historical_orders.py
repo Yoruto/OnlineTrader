@@ -43,7 +43,7 @@ class HistoricalOrders:
                         'quantity':order['original_qty'],'remaining':item['remaining'],'status':'FINISHED',
                         'limit_price':order['limit_price'],'source_time_ns':proof['source_time_ns'],
                         'trades':[{key:f[key] for key in ('quantity','price','source_time_ns')}|
-                            {'trade_id':f['trade_key'].removeprefix(port.trade_prefix)} for f in item['fills']]}]}
+                            {'trade_id':port.native_trade_id(f)} for f in item['fills']]}]}
                 verified=self.prepare(packet,source_kind='DURABLE_NATIVE_ORDER_OBSERVATION')
                 for record in verified:
                     ids={t['trade_id'] for t in record['trades']}
@@ -99,10 +99,11 @@ class HistoricalOrders:
             for item in row['trades']:
                 if type(item) is not dict or item.keys()!={'trade_id','quantity','price','source_time_ns'}:
                     raise TraderError('E_SCHEMA','Historical trade details require their original identity and timestamp')
-                tid=identifier(item['trade_id']);trade_key=identifier(port.trade_prefix+tid)
+                tid=item['trade_id']
+                identity=port.trade_identity(tid)
                 quantity(item['quantity'],positive=True);decimal_value(item['price'],positive=True)
                 proof=native_day(port.calendar,row['contract_id'],item['source_time_ns'])
-                fill={key:item[key] for key in ('quantity','price','source_time_ns')}|{'trade_key':trade_key,
+                fill=identity|{key:item[key] for key in ('quantity','price','source_time_ns')}|{
                     'trading_day':proof['trading_day'],'native_day_evidence':proof}
                 owner.fill_day(observation,fill)
                 trade=item|{key:row[key] for key in ('order_id','contract_id','direction','offset')}

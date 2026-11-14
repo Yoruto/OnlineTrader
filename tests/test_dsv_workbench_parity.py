@@ -278,6 +278,48 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             self.assertEqual(dashboard.visible_log_lines, [])
             self.assertIsNone(dashboard.latest_run())
 
+    def test_operation_log_recovery_and_rebuilt_rows_are_bound_to_current_owner(self):
+        from online_trader.runtime.strategy_log import publish_log_recovery
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            run = parent / 'run'
+            run.mkdir()
+            local = QSettings(str(parent/'ui.ini'), QSettings.IniFormat)
+            with patch('online_trader.desktop.workbench_layout.QSettings', return_value=local):
+                window = WorkbenchWindow(None)
+            window.timer.stop()
+            self.addCleanup(dispose_widget, window)
+            view = test_workbench.view()
+            identity = {key: view[key] for key in ('account_key', 'kernel_boot_id')}
+            comparison_fixture(run, view)
+            recovery = {'schema_version': 'DSV_OPERATION_LOG_RECOVERY/1', **identity,
+                        'run_directory': str(run), 'status': 'DEGRADED',
+                        'observed_at_utc': '2026-11-12T05:30:00Z',
+                        'first_event_seq': '12', 'through_event_seq': '16'}
+            path = parent / 'run.operation-log-recovery.json'
+            publish_log_recovery(path, recovery)
+            view['configuration']['run_directory'] = str(run)
+            window.view = view
+            dashboard = window.dashboard
+            dashboard.show_details(dashboard.log_tab)
+            dashboard.log_filter.setCurrentText('执行器')
+            self.assertIn('操作日志降级', dashboard.log_text.toPlainText())
+
+            publish_log_recovery(path, recovery | {'status': 'RECOVERED'})
+            record = identity | {'observed_at_utc': '2026-11-12T05:30:00Z', 'tag': '执行', 'message': '已补回报单'}
+            other = record | {'account_key': 'other-owner', 'message': '其他账户的报单'}
+            (run/'strategy-log.jsonl').write_bytes(canonical_bytes(record)+b'\n'+canonical_bytes(other)+b'\n')
+            dashboard.update_logs()
+            self.assertIn('已从账本补回操作日志', dashboard.log_text.toPlainText())
+            self.assertIn('已补回报单', dashboard.log_text.toPlainText())
+            self.assertNotIn('其他账户的报单', dashboard.log_text.toPlainText())
+
+            publish_log_recovery(path, recovery | {'kernel_boot_id': 'foreign-boot'})
+            dashboard.update_logs()
+            self.assertNotIn('操作日志降级', dashboard.log_text.toPlainText())
+            self.assertNotIn('已从账本补回操作日志', dashboard.log_text.toPlainText())
+
     def test_suggested_lots_is_display_only_with_unknown_inputs(self):
         window = WorkbenchWindow(None)
         self.addCleanup(dispose_widget, window)

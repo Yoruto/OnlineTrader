@@ -499,7 +499,11 @@ class WorkbenchWindow(StatusWindow):
             diagnostic_notice += ' · DSV 对照不可用或参数不一致'
         if diagnostics.get('ntp') in {'NTP_UNAVAILABLE', 'NTP_SKEW'}:
             diagnostic_notice += ' · 请核对本机时钟'
-        if any(diagnostics.get(key) for key in ('operation_log', 'status', 'run_identity')):
+        operation_log = diagnostics.get('operation_log')
+        if isinstance(operation_log, dict):
+            from online_trader.desktop.runtime_logs import operation_log_message
+            diagnostic_notice += ' · ' + operation_log_message(operation_log)
+        if any(diagnostics.get(key) for key in ('status', 'run_identity')) or isinstance(operation_log, str):
             diagnostic_notice += ' · 诊断日志写入失败'
         self.connection_detail.setText(f"账户连接：{'已连接' if c['broker_connected'] else '未连接'} · 事实同步：{'完整' if c['synchronized'] else '不完整'} · 通道：{'故障' if c['fault'] else '无已知故障'} · 持仓核对：{'待处理' if c['recovery_required'] else '无未决屏障'} · 时钟：{'故障' if c['clock_fault'] else '无已知故障'} · {authority_label}：{v['entry_authority']}" + diagnostic_notice)
         for name,table in self.tables.items():

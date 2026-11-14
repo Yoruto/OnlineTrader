@@ -31,7 +31,7 @@ def reconcile_equal_lots(owner, snapshot, row, packet):
     identifier(packet['statement_reference'])
     originals,used=original_lots(owner,code,day)
     originals_input=_rows(packet['original_lots'],'lot_key')
-    replacements=_rows(packet['replacement_lots'],'trade_id')
+    replacements=_rows(packet['replacement_lots'],'trade_id',validate=port.trade_key)
     if originals_input.keys()!=originals.keys() or not replacements:
         raise TraderError('E_FACT_BARRIER','Evidence must identify every original lot and each surviving replacement')
     reductions=[];removed={}
@@ -39,7 +39,7 @@ def reconcile_equal_lots(owner, snapshot, row, packet):
         original=originals[key];qty=original['quantity']-remain
         if qty<0:raise TraderError('E_FACT_BARRIER','An original lot cannot grow through a position review')
         if qty:
-            if not key.startswith(port.trade_prefix):
+            if not port.is_native_trade_key(key):
                 raise TraderError('E_OWNERSHIP','The removed original batch needs its own native opening trade identity')
             bucket=(original['direction'],original['bucket']);removed[bucket]=removed.get(bucket,0)+qty
             reductions.append({name:original[name] for name in ('position_cycle_id','direction','bucket')}|
@@ -66,7 +66,7 @@ def reconcile_equal_lots(owner, snapshot, row, packet):
             raise TraderError('E_FACT_BARRIER','Replacement evidence requires complete terminal foreign trade details')
     additions={};added={}
     for tid,qty in replacements.items():
-        trade=foreign.get(tid);key=identifier(port.trade_prefix+tid)
+        trade=foreign.get(tid);key=port.trade_key(tid)
         if trade is None or key in used or trade['offset']!='OPEN' or not 0<qty<=trade['quantity']:
             raise TraderError('E_OWNERSHIP','Replacement must be a new surviving native opening batch')
         side='LONG' if trade['direction']=='BUY' else 'SHORT'
@@ -95,14 +95,15 @@ def reconcile_equal_lots(owner, snapshot, row, packet):
     return reductions,result
 
 
-def _rows(rows,key):
+def _rows(rows,key,*,validate=identifier):
     if type(rows) is not list or not 1<=len(rows)<=512:
         raise TraderError('E_SCHEMA','Expected bounded explicit lot rows')
     result={}
     for row in rows:
         if type(row) is not dict or row.keys()!={key,'remaining_quantity'}:
             raise TraderError('E_SCHEMA','Expected a batch identity and its reviewed surviving quantity')
-        identity=identifier(row[key])
+        identity=row[key]
+        validate(identity)
         if identity in result:raise TraderError('E_DUPLICATE_CONFLICT','Lot identity is repeated')
         result[identity]=quantity(row['remaining_quantity'])
     return result

@@ -112,10 +112,10 @@ class HistoricalOrderRecoveryTests(unittest.TestCase):
         return self.run_command('REQUEST_RECONCILIATION',{'requested_scope':'FULL_ACCOUNT',
             'position_cycle_id':None,'historical_orders':packet})
 
-    def missing(self,filled):
+    def missing(self,filled,*,trade_id=None):
         x=self.start();self.kernel=x.kernel;self.account=x.grant.account_key
         sent=x.api.orders[self.oid];self.original_native_order=sent
-        if filled:x.api.fill(self.oid,filled,1079)
+        if filled:x.api.fill(self.oid,filled,1079,trade_id=trade_id)
         native=x.port.snapshot()
         order=next(r for r in native['orders'] if r['order_id']==self.oid)
         trades=[{key:t[key] for key in ('trade_id','quantity','price','source_time_ns')} for t in native['trades']]

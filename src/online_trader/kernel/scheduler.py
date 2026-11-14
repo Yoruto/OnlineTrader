@@ -128,7 +128,7 @@ class ScheduledRuntime:
             'force_close_at_end':session['force_close_at_end'],'entry_close_utc':at['next_forced_close_utc']}
         return event
 
-    def on_market(self,event,account,instrument,*,_allow_entry=True):
+    def on_market(self,event,account,instrument,*,_allow_entry=True,_entry_recovery=None):
         self.kernel._writable();self.preflight()
         if not self._enabled or self._fault:raise TraderError('E_CLOCK_FAULT','Activate and resolve the scheduler clock before accepting market facts')
         event=self._event(event);sample=self._sample
@@ -153,7 +153,7 @@ class ScheduledRuntime:
             self._register(received,sample,max(0,age))
         self._busy=True
         try:
-            future=self.strategy.on_market(event,account,instrument,_allow_entry=_allow_entry)
+            future=self.strategy.on_market(event,account,instrument,_allow_entry=_allow_entry,_entry_recovery=_entry_recovery)
             latest=self.strategy._latest.get((event['contract_id'],event['trading_day']))
             if fresh and latest:self._register(latest['received_ns'],sample,max(0,age))
             for cycle in self.kernel._staged.values():

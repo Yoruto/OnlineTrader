@@ -1,12 +1,19 @@
 """Operator messages from accepted DSV decisions and committed execution facts."""
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from concurrent.futures import Future
 from pathlib import Path
+import os
+import sqlite3
+from threading import Thread
+import tempfile
 import time
 
 from online_trader.domain.orders import OrderState
 
 from online_trader.contracts.codec import canonical_bytes, strict_loads
+from online_trader.errors import TraderError, exception_record
+from online_trader.gateway.dsv_facts import utc
 
 
 BEIJING = timezone(timedelta(hours=8))
@@ -15,6 +22,10 @@ WAIT_REASONS = {'OBSERVATION_ONLY_BACKLOG', 'TRIGGER_NOT_REACHED', 'DUPLICATE_MA
                 'OUT_OF_ORDER_MARKET_EVENT', 'OUT_OF_ORDER_SOURCE_TIME'}
 BLOCK_MESSAGES = {
     'ENTRY_AUTHORITY_DISARMED': '尚未启用策略开仓',
+    'ENTRY_RESUME_MARKET_PATH': '重连后等待连续实时行情及日内区间',
+    'ENTRY_RESUME_NATIVE_QUOTE': '重连后等待当前盘次的有效原生报价',
+    'ENTRY_RESUME_QUOTE_AGE_POLICY': '重连报价年龄超过开仓配置值',
+    'ENTRY_RESUME_ACCOUNT_SYNC': '重连后等待柜台状态核清及原权限恢复',
     'RECONCILIATION_REQUIRED': '等待柜台委托和持仓核对',
     'CONTROL_BARRIER': '操作或维护限制新增',
     'STRATEGY_EPOCH_REVOKED': '策略运行身份失效',
@@ -88,14 +99,50 @@ COMMITTED_EVENT_TYPES = frozenset(SESSION_EVENTS) | {
     'CONTROL_CANCEL_RESULT', 'CONTROL_CANCEL_ERRORS', 'SCHEDULER_FACT_BARRIER', 'CLOCK_RESET_REQUIRES_FRESH_FACTS',
     'EXECUTION_OBSERVATION', 'PROTECTION_OBSERVATION', 'SCHEDULED_DATA_GAP',
 }
+OPERATION_EVENT_TYPES = tuple(sorted(COMMITTED_EVENT_TYPES | {'DSV_STRATEGY_OBSERVED'}))
+
+
+def publish_log_recovery(path, record):
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix='operation-log-', suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(canonical_bytes(record))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 class DsvEntryLog:
-    def __init__(self, kernel, output, profile):
+    def __init__(self, kernel, output, profile, *, boot_id=None, from_seq=None):
         self.kernel = kernel
         self.path = Path(output) / 'strategy-log.jsonl'
-        self.path.touch(exist_ok=False)
+        self.boot_id = boot_id or kernel.boot_id
+        self.start_seq = kernel._durable_seq if from_seq is None else from_seq
+        self.source = kernel.ledger
+        self.last_event_seq = self.start_seq
+        self.recovery_path = Path(output).with_name(Path(output).name + '.operation-log-recovery.json')
+        self.registry = self.source.path.with_name(self.source.path.name + '.operation-log-recovery')
+        self.registry_path = self.registry / (self.boot_id + '.json')
+        self.recovery = None
+        self.next_recovery = 0
+        self._rebuilding = None
+        self._prior_runs = []
+        self._prior_rebuild = None
+        self._next_prior_recovery = 0
+        self._target = self.path
+        self._file_state = None
+        self._event = None
+        self._pending = None
         settings = profile.to_record()['settings']
+        self.profile = profile
+        self._identity = {'account_key': kernel.account_key, 'kernel_boot_id': self.boot_id,
+                          'profile_hash': profile.content_hash}
+        self._run_record = self._identity | {'run_directory': str(Path(output).resolve()),
+                                            'from_event_seq': str(self.start_seq)}
         self.trade = settings['trade']
         self.symbols = {row['code']: row for row in settings['symbols']}
         self.geometry_days = set()
@@ -105,23 +152,297 @@ class DsvEntryLog:
         self.cycle_markers = {}
         self.order_markers = {}
         self.last_slow_loop_ns = None
-        self.last_event_seq = getattr(kernel, '_durable_seq', 0)
+
+    def start(self):
+        self.path.touch(exist_ok=False)
+        self._verify_file(opening=True)
+        self.registry.mkdir(exist_ok=True)
+        publish_log_recovery(self.registry_path, self._run_record |
+                             {'schema_version': 'DSV_OPERATION_LOG_RECOVERY/1', 'status': 'TRACKING'})
+
+    def find_prior_failures(self):
+        for path in self.registry.glob('boot-*.json'):
+            try:
+                with path.open('rb') as stream:
+                    raw = stream.read(65_537)
+                record = strict_loads(raw) if len(raw) <= 65_536 else None
+                if (not isinstance(record, dict) or record.get('schema_version') != 'DSV_OPERATION_LOG_RECOVERY/1'
+                        or record.get('account_key') != self.kernel.account_key
+                        or record.get('status') not in {'DEGRADED', 'REBUILDING', 'RECOVERED', 'TRACKING'}
+                        or record.get('kernel_boot_id') == self.boot_id
+                        or path.stem != record.get('kernel_boot_id')):
+                    continue
+                if 'observed_at_utc' in record:
+                    record['observed_at_utc'] = utc(datetime.fromisoformat(record['observed_at_utc']).astimezone(timezone.utc))
+                directory = Path(record['run_directory']).resolve()
+                if not directory.is_dir() or directory == self.path.parent.resolve():
+                    continue
+                boot_id = record['kernel_boot_id']
+                proof = self.source.query(
+                    'SELECT account_key FROM kernel_boots WHERE kernel_boot_id=?', (boot_id,))
+                if proof != [{'account_key': self.kernel.account_key}]:
+                    continue
+                identity_path = directory / 'run-identity.json'
+                if identity_path.is_file():
+                    with identity_path.open('rb') as stream:
+                        identity = strict_loads(stream.read(65_536))
+                    if (not isinstance(identity, dict) or
+                            (identity.get('account_key'), identity.get('kernel_boot_id'), identity.get('run_directory'))
+                            != (self.kernel.account_key, boot_id, str(directory))):
+                        continue
+                from_seq = int(record['from_event_seq'])
+                if not 0 <= from_seq <= self.kernel._durable_seq:
+                    continue
+                profile = self.profile
+                if record['profile_hash'] != profile.content_hash:
+                    from online_trader.configuration.dsv import DsvProfile
+                    rows = self.source.query(
+                        "SELECT payload_json FROM config_revisions WHERE created_event_seq<=? "
+                        "AND json_extract(payload_json,'$.profile_hash')=? ORDER BY config_revision DESC LIMIT 1",
+                        (from_seq, record['profile_hash']))
+                    if not rows:
+                        continue
+                    profile = DsvProfile.from_record(strict_loads(rows[0]['payload_json'])['profile'])
+                old = DsvEntryLog(self.kernel, directory, profile, boot_id=boot_id, from_seq=from_seq)
+                self._prior_runs.append((old, record))
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+
+    def _recover_prior_run(self):
+        old, record = self._prior_runs[0]
+        try:
+            if self._prior_rebuild is None:
+                through = self.source.query('SELECT MAX(event_seq) AS seq FROM event_journal WHERE kernel_boot_id=?',
+                                            (old.boot_id,))[0]['seq']
+                if record['status'] == 'TRACKING':
+                    if not self.source.query(
+                            'SELECT 1 FROM event_journal WHERE kernel_boot_id=? AND event_seq>? LIMIT 1',
+                            (old.boot_id, old.start_seq)):
+                        old.registry_path.unlink(missing_ok=True)
+                        self._prior_runs.pop(0)
+                        return
+                    record = record | {'status': 'REBUILDING', 'first_event_seq': str(old.start_seq + 1),
+                                       'observed_at_utc': utc(datetime.now(timezone.utc)),
+                                       'auxiliary_rows_unavailable': True}
+                elif record['status'] == 'RECOVERED':
+                    previous = int(record['recovered_through_event_seq'])
+                    record = record | {
+                        'first_event_seq': str(previous + 1 if previous < through else old.start_seq + 1),
+                        'observed_at_utc': utc(datetime.now(timezone.utc)),
+                        'first_decision_id': None, 'operation': 'recover_interrupted_run',
+                    }
+                record = record | {'status': 'REBUILDING', 'through_event_seq': str(through)}
+                self._prior_runs[0] = (old, record)
+                old.recovery = record
+                old._persist_recovery()
+                self._prior_rebuild = self._start_rebuild(old, through)
+            elif self._prior_rebuild.done():
+                replacement = self._prior_rebuild.result()
+                old.recovery = record | {'status': 'RECOVERED', 'recovered_through_event_seq': str(replacement.last_event_seq)}
+                old._finish_recovery(archive=True)
+                self._prior_runs.pop(0)
+                self._prior_rebuild = None
+        except (OSError, sqlite3.Error, TraderError, ValueError, KeyError, TypeError):
+            # Retry this archive later without preventing the current run's log.
+            self._prior_runs.append(self._prior_runs.pop(0))
+            self._prior_rebuild = None
+            self._next_prior_recovery = time.monotonic() + 30
+
+    @staticmethod
+    def _signature(stream):
+        stat = os.fstat(stream.fileno())
+        stream.seek(max(0, stat.st_size - 128))
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stream.read(128)
+
+    def _verify_file(self, *, opening=False):
+        with self.path.open('rb') as stream:
+            signature = self._signature(stream)
+        if not opening and self._file_state != signature:
+            raise TraderError('E_OPERATION_LOG_CHANGED', 'Operation log was truncated, replaced or changed')
+        self._file_state = signature
+
+    def _events(self, through, *, query=None):
+        select = query or self.source.query
+        placeholders = ','.join('?' for _ in OPERATION_EVENT_TYPES)
+        return select(
+            'SELECT event_seq,event_type,observed_at_utc,payload_json FROM event_journal '
+            f'WHERE kernel_boot_id=? AND event_seq>? AND event_seq<=? AND event_type IN ({placeholders}) '
+            'ORDER BY event_seq LIMIT 256',
+            (self.boot_id, self.last_event_seq, through, *OPERATION_EVENT_TYPES))
+
+    def _consume(self, row):
+        kind = row['event_type']
+        data = strict_loads(row['payload_json'])
+        data = data.get('data', data)
+        report = data.get('report', {})
+        strategy = (data.get('cycle') or {}).get('strategy_metadata') or {}
+        self._event = row['event_seq'], report.get('decision_id') or strategy.get('decision_id')
+        if (market := report.get('market_log')) is not None:
+            self.market(market, report)
+        if kind in COMMITTED_EVENT_TYPES:
+            self.committed(kind, row['event_seq'], row['observed_at_utc'], data)
+        self._event = None
+        self._pending = None
 
     def poll(self):
-        rows = self.kernel.ledger.query(
-            'SELECT event_seq,event_type,observed_at_utc,payload_json FROM event_journal '
-            'WHERE kernel_boot_id=? AND event_seq>? AND event_seq<=? ORDER BY event_seq LIMIT 1000',
-            (self.kernel.boot_id, self.last_event_seq, self.kernel._durable_seq))
+        if self.recovery is not None:
+            if time.monotonic() < self.next_recovery:
+                return
+            self._recover()
+            return
+        self._verify_file()
+        through = self.kernel._durable_seq
+        rows = self._events(through)
         for row in rows:
-            if row['event_type'] in COMMITTED_EVENT_TYPES:
-                data = strict_loads(row['payload_json'])
-                self.committed(row['event_type'], row['event_seq'], row['observed_at_utc'], data.get('data', data))
+            self._consume(row)
             self.last_event_seq = row['event_seq']
+        if len(rows) < 256:
+            self.last_event_seq = through
+        if self._prior_runs and time.monotonic() >= self._next_prior_recovery:
+            self._recover_prior_run()
+
+    def _persist_recovery(self):
+        try:
+            self.registry.mkdir(exist_ok=True)
+            publish_log_recovery(self.registry_path, self.recovery)
+        except OSError:
+            publish_log_recovery(self.recovery_path, self.recovery)
+        else:
+            try:
+                publish_log_recovery(self.recovery_path, self.recovery)
+            except OSError:
+                pass
+
+    def _finish_recovery(self, *, archive):
+        # Keep the original run registered until its normal close persists
+        # the tail. A recovered file may still receive new committed events.
+        if not archive:
+            self._persist_recovery()
+        publish_log_recovery(self.recovery_path, self.recovery)
+        if archive:
+            self.registry_path.unlink(missing_ok=True)
+
+    def failed(self, operation, error, emit):
+        details = error.code if isinstance(error, TraderError) else None
+        record = exception_record(error)
+        through = self.kernel._durable_seq
+        event_seq, decision_id = self._event or (None, None)
+        self._event = None
+        self._pending = None
+        stage = 'DEGRADED' if self.recovery is None else 'REBUILDING'
+        if self.recovery is None:
+            self.recovery = {'schema_version': 'DSV_OPERATION_LOG_RECOVERY/1', **self._run_record,
+                             'status': stage, 'operation': operation, 'file': self.path.name,
+                             'first_event_seq': str(event_seq or (self.last_event_seq + 1)),
+                             'through_event_seq': str(through), 'first_decision_id': decision_id,
+                             'exception': record, 'error_code': details,
+                             'observed_at_utc': utc(datetime.now(timezone.utc)),
+                             'auxiliary_rows_unavailable': True,
+                             'repeat_count': 1}
+        else:
+            self.recovery.update(status=stage, through_event_seq=str(through),
+                                 repeat_count=self.recovery['repeat_count'] + 1,
+                                 last_error_code=details, last_error_type=type(error).__name__)
+        self.kernel._dsv_diagnostics['operation_log'] = self.recovery.copy()
+        delay = min(30, 2 ** min(self.recovery['repeat_count'] - 1, 5))
+        self.next_recovery = time.monotonic() + delay
+        try:
+            self._persist_recovery()
+        except OSError:
+            if self.recovery['repeat_count'] == 1:
+                try:
+                    emit({key: value for key, value in self.recovery.items() if key != 'run_directory'} |
+                         {'phase': 'DSV_OPERATION_LOG_DEGRADED', 'error_code': 'E_OPERATION_LOG'})
+                except (OSError, ValueError):
+                    pass
+
+    def _recover(self):
+        if self._rebuilding is None:
+            through = self.kernel._durable_seq
+            self.recovery.update(status='REBUILDING', through_event_seq=str(through))
+            self.kernel._dsv_diagnostics['operation_log'] = self.recovery.copy()
+            self._persist_recovery()
+            self._rebuilding = self._start_rebuild(self, through)
+            return
+        if not self._rebuilding.done():
+            return
+        done, self._rebuilding = self._rebuilding, None
+        replacement = done.result()
+        self._verify_file(opening=True)
+        self.last_event_seq = replacement.last_event_seq
+        for name in ('geometry_days', 'last_time', 'last_hint', 'active_blocks', 'cycle_markers', 'order_markers'):
+            setattr(self, name, getattr(replacement, name))
+        self.recovery.update(status='RECOVERED', recovered_through_event_seq=str(self.last_event_seq))
+        self._finish_recovery(archive=False)
+        self.kernel._dsv_diagnostics['operation_log'] = self.recovery.copy()
+        self.recovery = None
+
+    def close(self):
+        if self.recovery is None and self.last_event_seq >= self.kernel._durable_seq:
+            self._verify_file()
+            with self.path.open('r+b') as stream:
+                os.fsync(stream.fileno())
+            self.registry_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _start_rebuild(log, through):
+        result = Future()
+
+        def rebuild():
+            try:
+                result.set_result(log.rebuild(through))
+            except Exception as error:
+                result.set_exception(error)
+
+        Thread(target=rebuild, name='OnlineTrader-operation-log-rebuild', daemon=True).start()
+        return result
+
+    def rebuild(self, through):
+        """Recreate the workbench log from this boot's committed journal rows."""
+        replacement = DsvEntryLog(self.kernel, self.path.parent, self.profile,
+                                  boot_id=self.boot_id, from_seq=self.start_seq)
+        with tempfile.TemporaryDirectory(dir=self.path.parent, prefix='.strategy-log-') as location:
+            replacement._target = Path(location) / self.path.name
+            replacement._target.touch(exist_ok=False)
+            connection = sqlite3.connect(self.source.path.as_uri() + '?mode=ro', uri=True, timeout=1)
+            try:
+                connection.row_factory = sqlite3.Row
+                while rows := replacement._events(through, query=lambda sql, params: connection.execute(sql, params).fetchall()):
+                    for row in rows:
+                        replacement._consume(row)
+                        replacement.last_event_seq = row['event_seq']
+                replacement.last_event_seq = through
+            finally:
+                connection.close()
+            with replacement._target.open('r+b') as stream:
+                os.fsync(stream.fileno())
+            os.replace(replacement._target, self.path)
+        return replacement
 
     def write(self, rows):
-        if rows:
-            with self.path.open('ab') as stream:
-                stream.write(b''.join(canonical_bytes(row) + b'\n' for row in rows))
+        if not rows:
+            return
+        rows = [row | self._identity for row in rows]
+        if self._event is not None:
+            seq, _ = self._event
+            first = self._pending or 0
+            rows = [row | {'journal_event_seq': str(seq), 'journal_row': first + index}
+                    for index, row in enumerate(rows)]
+            self._pending = first + len(rows)
+        raw = b''.join(canonical_bytes(row) + b'\n' for row in rows)
+        with self._target.open('r+b') as stream:
+            if self._target == self.path and self._signature(stream) != self._file_state:
+                raise TraderError('E_OPERATION_LOG_CHANGED', 'Operation log was truncated, replaced or changed')
+            stream.seek(0, os.SEEK_END)
+            if stream.write(raw) != len(raw):
+                raise OSError('Incomplete operation log append')
+            stream.flush()
+            if self._target == self.path:
+                self._file_state = self._signature(stream)
+
+    def auxiliary(self, rows):
+        if self.recovery is None:
+            self.write(rows)
 
     def due(self, key, now, seconds):
         previous = self.last_time.get(key)
@@ -135,7 +456,7 @@ class DsvEntryLog:
         reasons = dict.fromkeys(decision.get('reasons', ()))
         code, day = event['contract_id'], event['trading_day']
         symbol = self.symbols[code]
-        now = self.kernel.port.strategy_wall_time()
+        now = datetime.fromisoformat(event['decision_time_utc'])
         prefix = f"{symbol['name']}({code})"
         rows = []
         observation = decision.get('event_mode') == 'OBSERVATION' or 'OBSERVATION_ONLY_BACKLOG' in reasons
@@ -156,7 +477,7 @@ class DsvEntryLog:
             if kind in WAIT_REASONS or kind == 'GEOMETRY_BLOCK' or kind.endswith('NO_CHASE_AFTER_ACT'):
                 continue
             if kind == 'NET_LOSS_LIMIT':
-                stop = (decision.get('stops') or self.kernel.statistics.snapshot(code, day) or {}).get('state')
+                stop = (decision.get('stops') or {}).get('state')
                 message = (f'当前净亏 {Decimal(stop["net_loss_points"]):.0f} 点，达到停开阈值'
                            if stop else '达到净亏停开阈值')
             else:
@@ -265,8 +586,9 @@ class DsvEntryLog:
             started = datetime.fromisoformat(event['session_open_utc'])
             elapsed = (now - started).total_seconds()
             window = float(self.trade['chase_window_minutes']) * 60
-            opening_session = event.get('session_is_opening', started.astimezone(BEIJING).strftime('%H:%M') in
-                                        {'09:00', '09:30', '21:00'})
+            opening_session = event.get('is_opening_session')
+            if opening_session is None:
+                opening_session = started.astimezone(BEIJING).strftime('%H:%M') in {'09:00', '09:30', '21:00'}
             ratio = self.trade['chase_slip_ratio' if opening_session and 0 <= elapsed <= window else 'entry_slip_ratio']
             cap = max(1, round(opening * Decimal(ratio)))
             over = max(opponent, last) - trigger - cap if is_long else trigger - min(opponent, last) - cap
@@ -277,6 +599,8 @@ class DsvEntryLog:
             append(reason, '等待', f'开仓条件受阻 · {reason}')
 
     def monitor(self, monitor, loop_start, timings):
+        if self.recovery is not None:
+            return
         now_ns = time.monotonic_ns()
         summary = monitor.summary(now_ns)
         now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
@@ -388,6 +712,7 @@ class DsvEntryLog:
             report('柜台成交', f'{side}{target} {partial} {fill["quantity"]} 手 @ {fill["price"]}',
                    origin='柜台', category='manual' if manual else 'open' if opening else 'close',
                    child_order_id=fill['child_order_id'], trade_key=fill['trade_key'],
+                   native_trade_id=fill.get('native_trade_id'),
                    native_time_utc=native_time)
         if current[3] == 'CLOSED' and previous[3] != 'CLOSED':
             exit_reason = (cycle.get('nominal_exit') or {}).get('exit_reason')

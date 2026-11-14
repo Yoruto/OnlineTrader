@@ -225,7 +225,7 @@ def workbench_view(kernel):
     market_by_code={item['contract_id']:item for item in markets}
     broker_orders=port.api.get_order(account=port.account) if day is not None else {}
     broker_positions=port.api.get_position(account=port.account) if day is not None else {}
-    broker_trades={port.trade_prefix+item['trade_id']:item for item in native['trades']} if day is not None else {}
+    broker_trades={item['trade_id']:item for item in native['trades']} if day is not None else {}
     position_owners={}
     for cycle in snapshot['cycles']:
         plan=cycle['plan']
@@ -235,9 +235,12 @@ def workbench_view(kernel):
     trades=[];position_fees={}
     for fill in kernel.money.book.fills.values():
         fee=kernel.money.book.fees.get(fill['trade_key']) or fill.get('original_fee') or {}
-        broker_trade=broker_trades.get(fill['trade_key'],{})
+        original = kernel._money_fact_meta.get(fill['trade_key'], fill)
+        native_trade_id = original.get('native_trade_id')
+        raw_id = port.native_trade_id(original) if day is not None and port.is_native_trade_key(fill['trade_key']) else None
+        broker_trade = broker_trades.get(raw_id, {})
         confirmed_fee=fee.get('amount') if fee.get('quality')=='CONFIRMED' else None
-        trades.append(copy.deepcopy(fill)|{'commission':confirmed_fee,'native_trade_id':broker_trade.get('trade_id'),
+        trades.append(copy.deepcopy(fill)|{'commission':confirmed_fee,'native_trade_id':broker_trade.get('trade_id', native_trade_id),
             'source_time_ns':broker_trade.get('source_time_ns')})
         position_fees.setdefault(fill['position_cycle_id'],[]).append(confirmed_fee)
     cycles=[];orders=[];exit_blocks=[]

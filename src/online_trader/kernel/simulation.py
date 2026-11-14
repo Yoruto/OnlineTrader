@@ -25,6 +25,11 @@ class OnlineSimulation:
         self._observed_orders={}
         for row in kernel.ledger.query("SELECT payload_json FROM event_journal WHERE event_type='ONLINE_ORDER_OBSERVATIONS' ORDER BY event_seq"):
             data=strict_loads(row['payload_json'])['data']
+            # Older boots could commit observation evidence before rejecting its
+            # fill key. Normalize that evidence before unioning it with live facts.
+            for observation in data['orders']:
+                for fill in observation['fills']:
+                    fill.update(self.port.trade_identity(self.port.native_trade_id(fill)))
             self._observed_orders=self._merge_observations(data['orders'])
 
     def accepts_cycle(self, cycle):
@@ -245,7 +250,8 @@ class OnlineSimulation:
                         first_confirmation = {'quantity': total, 'value': decimal_text(value)}
                 for fill, day in proved_fills:
                     changed=k.record_fill(child,fill['trade_key'],fill['quantity'],fill['price'],trading_day=day,
-                        native_day_evidence=fill.get('native_day_evidence'),_initial_entry_confirmation=first_confirmation,
+                        native_day_evidence=fill.get('native_day_evidence'),native_trade_id=fill.get('native_trade_id'),
+                        _initial_entry_confirmation=first_confirmation,
                         _defer_entry_slippage=defer_entry_slippage,_adapter_token=self.port.callback_token)
                     k.wait_idle()
                     if changed:
@@ -394,9 +400,9 @@ class OnlineSimulation:
             trades=[t for t in snapshot['trades'] if t.get('order_id')==item['order_id']]
             facts=k.ledger.query('SELECT trade_key,quantity,price FROM fill_facts WHERE broker_order_key=?',(order['child_order_id'],))
             evidence={f['trade_key']:f for f in self._observed_orders.get(order['child_order_id'],{}).get('fills',[])}
-            expected={f['trade_key'][3:]:{'quantity':f['quantity'],'price':f['price'],
+            expected={f['trade_key']:{'quantity':f['quantity'],'price':f['price'],
                 'source_time_ns':evidence.get(f['trade_key'],{}).get('source_time_ns')} for f in facts}
-            actual={t['trade_id']:{key:t.get(key) for key in ('quantity','price','source_time_ns')} for t in trades}
+            actual={self.port.trade_key(t['trade_id']):{key:t.get(key) for key in ('quantity','price','source_time_ns')} for t in trades}
             if (actual!=expected or sum(f['quantity'] for f in facts)!=order['filled_qty']
                     or any(t.get('contract_id')!=code or t.get('direction')!=direction or t.get('offset')!=offset for t in trades)
                     or any(f['source_time_ns'] is None for f in expected.values())):

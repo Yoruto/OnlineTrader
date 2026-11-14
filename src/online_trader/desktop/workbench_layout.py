@@ -25,7 +25,10 @@ from online_trader.configuration.rollover import expiry_date, expiry_warning, fu
 from online_trader.configuration.symbol_csv import ALIASES, PRODUCT_NAMES
 from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.reports import EquityChart
-from online_trader.desktop.runtime_logs import JsonLogTail, comparison_file, executor_log_path, matches_run_identity, resolve_run
+from online_trader.desktop.runtime_logs import (
+    JsonLogTail, comparison_file, executor_log_path, matches_operation_log_recovery, matches_run_identity,
+    operation_log_message, resolve_run,
+)
 from online_trader.errors import TraderError
 from online_trader.runtime.comparison import dsv_log_category
 
@@ -1837,6 +1840,7 @@ class WorkbenchLayout:
         paths = [executor_log_path(run), run/'startup-failure.json', *sorted(run.glob('phase-*.json'))]
         comparison = self.log_comparison
         paths.append(run / 'strategy-log.jsonl')
+        paths.append(run.with_name(run.name + '.operation-log-recovery.json'))
         if comparison is not None:
             paths.append(comparison)
         return paths
@@ -1854,6 +1858,8 @@ class WorkbenchLayout:
         if run is not None:
             path = run/'strategy-log.jsonl'
             for record in self.log_tail(path).read(path):
+                if not self.strategy_log_row_matches(record):
+                    continue
                 kind = record.get('kind')
                 code, day = record.get('contract_id'), record.get('trading_day')
                 if all(isinstance(value, str) for value in (kind, code, day)) and record.get('message'):
@@ -1863,14 +1869,24 @@ class WorkbenchLayout:
                 return {}
         return result
 
+    def strategy_log_row_matches(self, row):
+        if not any(key in row for key in ('account_key', 'kernel_boot_id')):
+            return True
+        return (row.get('account_key'), row.get('kernel_boot_id')) == self.log_binding[0]
+
     def executor_log(self, run):
         phases = []
+        identity = self.log_binding[0]
         for path in (executor_log_path(run), *sorted(run.glob('phase-*.json'))):
             for record in self.log_tail(path).read(path):
                 phase = record.get('phase')
                 if not isinstance(phase, str):
                     continue
                 at, stamp = log_time(record.get('observed_at_utc'))
+                if phase == 'DSV_OPERATION_LOG_DEGRADED':
+                    if (record.get('account_key'), record.get('kernel_boot_id')) == identity:
+                        phases.append(WorkbenchLogLine(f'[{at}] [日志] {operation_log_message(record)}', 'error', stamp))
+                    continue
                 message = record.get('message') or LOG_PHASES.get(phase, '策略状态已更新')
                 if not isinstance(message, str):
                     message = LOG_PHASES.get(phase, '策略状态已更新')
@@ -1886,8 +1902,16 @@ class WorkbenchLayout:
             identity = (record.get('exception') or {}).get('exception_id')
             suffix = f' · {identity}' if identity else ''
             phases.append(WorkbenchLogLine(f"[执行器] {record.get('message','启动失败')} · {record.get('error_code','—')}{suffix}", 'error'))
+        recovery_path = run.with_name(run.name + '.operation-log-recovery.json')
+        for recovery in self.log_tail(recovery_path).read(recovery_path):
+            if matches_operation_log_recovery(recovery, run, identity):
+                at, stamp = log_time(recovery.get('observed_at_utc'))
+                phases.append(WorkbenchLogLine(f'[{at}] [日志] {operation_log_message(recovery)}',
+                                               None if recovery.get('status') == 'RECOVERED' else 'error', stamp))
         path = run/'strategy-log.jsonl'
         for record in self.log_tail(path).read(path):
+            if not self.strategy_log_row_matches(record):
+                continue
             stamp = record.get('native_time_utc') or record.get('observed_at_utc')
             tag, message = record.get('tag'), record.get('message')
             if not all(isinstance(value,str) and value for value in (stamp,tag,message)):
@@ -1907,7 +1931,7 @@ class WorkbenchLayout:
             return product, dsv
         strategy_path = run/'strategy-log.jsonl'
         recorded = {row['event_seq'] for row in self.log_tail(strategy_path).read(strategy_path)
-                    if isinstance(row.get('event_seq'), str)}
+                    if isinstance(row.get('event_seq'), str) and self.strategy_log_row_matches(row)}
         expected_boot = self.log_binding[0][1]
         for record in self.log_tail(path).read(path):
             event = record.get('data',{})

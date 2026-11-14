@@ -42,7 +42,6 @@ def credentials(path):
 
 class TqKqPort(OnlineSimulationPort):
     provider='TQKQ'
-    trade_prefix='kq-'
     @classmethod
     def connect(cls,path,grant,clock,*,read_only=False):
         if getattr(grant,'provider','TQKQ')!='TQKQ':
@@ -211,7 +210,7 @@ class TqKqPort(OnlineSimulationPort):
                         or number(t.price) is None or Decimal(number(t.price))<=0
                         or type(t.trade_date_time) is not int or t.trade_date_time<=0):
                     raise TraderError('E_FACT_BARRIER','Native fill identity, quantity, price or time is invalid')
-                fills.append({'trade_key':self.trade_prefix+tid,'quantity':t.volume,'price':number(t.price),'source_time_ns':str(t.trade_date_time)})
+                fills.append(self.trade_identity(tid)|{'quantity':t.volume,'price':number(t.price),'source_time_ns':str(t.trade_date_time)})
             if sum(f['quantity'] for f in fills)>o.volume_orign-o.volume_left:
                 raise TraderError('E_FACT_BARRIER','Native detailed fills exceed the reported execution quantity')
             result.append({'child_order_id':child,'order_id':oid,'contract_id':binding['contract_id'],'status':o.status,

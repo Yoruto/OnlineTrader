@@ -80,6 +80,31 @@ def executor_log_path(directory):
     return inside if inside.is_file() else directory.with_name(directory.name + '.executor.log')
 
 
+def matches_operation_log_recovery(record, directory, identity):
+    if (identity is not None and record.get('schema_version') == 'DSV_OPERATION_LOG_RECOVERY/1'
+            and (record.get('account_key'), record.get('kernel_boot_id')) == identity):
+        try:
+            return Path(record['run_directory']).resolve() == directory.resolve()
+        except (KeyError, TypeError, ValueError, OSError):
+            pass
+    return False
+
+
+def operation_log_message(record):
+    state = record.get('status')
+    first, last = record.get('first_event_seq'), record.get('through_event_seq')
+    interval = (f' · 账本事件 {first}–{last}'
+                if all(isinstance(n, str) and n.isdecimal() and len(n) <= 19 for n in (first, last))
+                and int(first) <= int(last) else '')
+    labels = {'DEGRADED': '操作日志降级，等待从账本补回',
+              'REBUILDING': '正在从账本补回操作日志',
+              'RECOVERED': '已从账本补回操作日志'}
+    label = labels.get(state, '操作日志写入失败')
+    if state == 'RECOVERED' and record.get('auxiliary_rows_unavailable'):
+        label += '，部分临时诊断可能缺失'
+    return label + interval
+
+
 class JsonLogTail:
     """Retain the operator's view across appends, including incomplete writes."""
     def __init__(self, limit, *, document=False):

@@ -1,10 +1,12 @@
 """Targeted native-fact checks; never imports the real SDK or connects."""
 import copy
 from datetime import datetime,timedelta,timezone
+import errno
 import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -36,10 +38,197 @@ class SimNowComparisonTests(unittest.TestCase):
         with patch.object(fixture,'scope_for',simnow_scope),patch.object(fixture,'TqKqDsvPort',SimNowDsvPort):
             self.x.start(**options)
 
+    def test_composite_native_trade_ids_survive_restart_and_stop_to_flat(self):
+        from online_trader.kernel.workbench import workbench_view
+        from online_trader.runtime.dsv_simulation import verify_closed_snapshot
+
+        self.start(code='SHFE.bu2701', trade={'half_close_enabled': False})
+        x = self.x
+        x.quote(1079)
+        opening = x.api.inserted[0]['order_id']
+        x.api.fill(opening, 2, 1079, trade_id='SHFE|opening-1')
+        x.session.step()
+        self.assertEqual(x.cycle()['protection']['owned_qty'], 2)
+        x.quote(1066)
+        self.assertEqual(x.api.cancelled, [opening])
+        self.assertEqual([(o['offset'], o['volume']) for o in x.api.inserted],
+                         [('OPEN', 5), ('CLOSETODAY', 2)])
+        closing = x.api.inserted[-1]['order_id']
+        x.api.fill(opening, 1, 1078, trade_id='SHFE|opening-2')
+        x.api.terminal(opening)
+        x.api.fill(closing, 2, 1066, trade_id='SHFE|closing-1')
+        # Prevent another protective send until the restarted owner has
+        # reconciled the original fills and received a fresh quote.
+        x.clock.advance(6000)
+        x.session.step()
+        self.assertEqual(x.cycle()['protection']['owned_qty'], 1)
+        self.assertEqual(len(x.api.inserted), 2)
+        x.session.step()
+
+        with patch.object(fixture, 'TqKqDsvPort', SimNowDsvPort):
+            x.restart()
+        self.assertFalse(x.kernel._armed)
+        self.assertEqual(x.api.inserted, [])
+        self.assertEqual(x.cycle()['protection']['owned_qty'], 1)
+        self.assertEqual(len(x.kernel.ledger.query('SELECT * FROM fill_facts')), 3)
+        self.assertEqual({row['native_trade_id'] for row in workbench_view(x.kernel)['trades']},
+                         {'SHFE|opening-1', 'SHFE|opening-2', 'SHFE|closing-1'})
+
+        x.quote(1066)
+        self.assertEqual([(o['offset'], o['volume']) for o in x.api.inserted], [('CLOSETODAY', 1)])
+        x.api.fill(x.api.inserted[0]['order_id'], 1, 1066, trade_id='SHFE|closing-2')
+        x.session.step()
+        x.session.step()
+        self.assertEqual(x.cycle()['lifecycle'], 'CLOSED')
+        self.assertEqual(len(x.kernel.ledger.query('SELECT * FROM fill_facts')), 4)
+        self.assertTrue(verify_closed_snapshot(x.kernel, x.port.snapshot())['test_owned_flat'])
+
+    def test_restart_reads_composite_fill_observation_from_old_ledger(self):
+        self.start(quantity=1, trade={'half_close_enabled': False})
+        x = self.x
+        x.quote()
+        x.api.fill(x.api.inserted[0]['order_id'], 1, 1055, trade_id='DCE|original-fill')
+        observations = x.port.observations()
+        fill = observations[0]['fills'][0]
+        native_id = fill.pop('native_trade_id')
+        fill['trade_key'] = x.port.trade_prefix + native_id
+        x.kernel.simulation.capture('ONLINE_ORDER_OBSERVATIONS', {
+            'gateway_identity': x.port.gateway_identity,
+            'source_epoch': x.port.source_epoch,
+            'orders': observations,
+        })
+        self.assertEqual(x.kernel.ledger.query('SELECT * FROM fill_facts'), [])
+
+        with patch.object(fixture, 'TqKqDsvPort', SimNowDsvPort):
+            x.restart()
+        self.assertEqual(x.cycle()['protection']['owned_qty'], 1)
+        self.assertEqual(len(x.kernel.ledger.query('SELECT * FROM fill_facts')), 1)
+        x.quote(1038)
+        self.assertEqual([(order['offset'], order['volume']) for order in x.api.inserted], [('CLOSE', 1)])
+
     def read_strategy_log(self, *, market_only=True):
         path = self.x.session.comparison.directory.parent / 'strategy-log.jsonl'
         rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
         return [row for row in rows if not market_only or 'event_seq' not in row]
+
+    def wait_for_log_rebuild(self, log, path=None, *, after=None):
+        sidecar = path or log.recovery_path
+        deadline = time.monotonic() + 5
+        log.next_recovery = 0
+        while time.monotonic() < deadline:
+            self.x.session._operation_log('poll')
+            if sidecar.is_file():
+                state = strict_loads(sidecar.read_bytes())
+                if state['status'] == 'RECOVERED' and (
+                        after is None or int(state['recovered_through_event_seq']) > int(after)):
+                    return state
+            time.sleep(.01)
+        self.fail(f'Operation log recovery did not complete at {sidecar}')
+
+    def test_operation_log_rebuilds_partial_send_result_from_journal(self):
+        from online_trader.contracts.codec import content_hash
+        from online_trader.contracts.validation import validate_message
+        from online_trader.kernel.server import ControlServer
+        from online_trader.kernel.workbench import workbench_view
+
+        self.start()
+        x = self.x
+        log = x.session.entry_log
+        original = log.write
+        injected = []
+
+        def validate_workbench_snapshot():
+            view = workbench_view(x.kernel)
+            sender = SimpleNamespace(kernel=x.kernel)
+            peer = SimpleNamespace(connection_id='offline-workbench')
+            validate_message(ControlServer._reply(sender, peer, None, 'WorkbenchSnapshot',
+                                                 {'payload': view, 'content_hash': content_hash(view)}))
+
+        def write(rows):
+            if not injected and any(row['kind'] == 'SEND_RESULT' for row in rows):
+                injected.append(rows[0]['event_seq'])
+                with log.path.open('ab') as stream:
+                    stream.write(b'{"incomplete":')
+                raise OSError(errno.ENOSPC, 'private-test-token')
+            original(rows)
+
+        with patch.object(log, 'write', side_effect=write):
+            x.quote()
+        self.assertTrue(x.kernel._armed)
+        self.assertEqual(len(x.api.inserted), 1)
+        self.assertEqual(len(injected), 1)
+        failure = strict_loads(log.recovery_path.read_bytes())
+        self.assertEqual(failure['status'], 'DEGRADED')
+        self.assertEqual(failure['first_event_seq'], injected[0])
+        self.assertEqual(failure['first_decision_id'], x.session.last_decisions[x.code]['decision_id'])
+        self.assertNotIn('private-test-token', log.recovery_path.read_text(encoding='utf-8'))
+        validate_workbench_snapshot()
+
+        recovered = self.wait_for_log_rebuild(log)
+        self.assertEqual(recovered['first_event_seq'], injected[0])
+        self.assertTrue(log.registry_path.is_file())
+        validate_workbench_snapshot()
+        rows = self.read_strategy_log(market_only=False)
+        keys = [(row['journal_event_seq'], row['journal_row']) for row in rows]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertTrue(any(row.get('event_seq') == injected[0] for row in rows))
+        self.assertTrue(any(row.get('kind') == 'TRIGGER_HINT' for row in rows))
+        x.session._operation_log('poll')
+        self.assertEqual(rows, self.read_strategy_log(market_only=False))
+
+    def test_operation_log_keeps_a_recovered_run_registered_until_clean_close(self):
+        self.start()
+        x = self.x
+        log = x.session.entry_log
+        with patch.object(log, 'write', side_effect=PermissionError('synthetic log fault')):
+            x.quote(1040)
+        recovered = self.wait_for_log_rebuild(log)
+        earlier_size = log.path.stat().st_size
+
+        x.quote()
+        trade_id = 'DCE|filled-after-first-recovery'
+        x.api.fill(x.api.inserted[0]['order_id'], 5, 1055, trade_id=trade_id)
+        x.session.step()
+        x.session._operation_log('poll')
+        self.assertIn(trade_id.encode(), log.path.read_bytes())
+        with log.path.open('r+b') as stream:
+            stream.truncate(earlier_size)
+        self.assertNotIn(trade_id.encode(), log.path.read_bytes())
+        # No final verification/poll before losing the owner.
+        with (patch.object(log, 'close'), patch.object(log, 'poll'),
+              patch.object(fixture, 'TqKqDsvPort', SimNowDsvPort)):
+            x.restart()
+        repaired = self.wait_for_log_rebuild(x.session.entry_log, log.recovery_path,
+                                             after=recovered['recovered_through_event_seq'])
+        self.assertGreater(int(repaired['first_event_seq']), int(recovered['recovered_through_event_seq']))
+        self.assertEqual(log.path.read_bytes().count(trade_id.encode()), 1)
+        self.assertFalse(log.registry_path.exists())
+        self.assertEqual(x.cycle()['protection']['owned_qty'], 5)
+        self.assertEqual(x.api.inserted, [])
+
+    def test_pending_log_failure_is_rebuilt_after_owner_restart(self):
+        self.start(trade={'half_close_enabled': False})
+        x = self.x
+        old = x.session.entry_log
+        with patch.object(old, 'write', side_effect=PermissionError('synthetic read-only log')):
+            x.quote()
+            x.api.fill(x.api.inserted[0]['order_id'], 5, 1055, trade_id='DCE|held')
+            x.session.step()
+            self.assertEqual(x.cycle()['protection']['owned_qty'], 5)
+            old.next_recovery = float('inf')
+            self.assertTrue(old.registry_path.is_file())
+            with patch.object(fixture, 'TqKqDsvPort', SimNowDsvPort):
+                x.restart()
+        state = self.wait_for_log_rebuild(x.session.entry_log, old.recovery_path)
+        self.assertEqual(state['kernel_boot_id'], old.boot_id)
+        self.assertFalse(old.registry_path.exists())
+        rows = [strict_loads(line) for line in old.path.read_bytes().splitlines()]
+        self.assertTrue(all(row['kernel_boot_id'] == old.boot_id and row['account_key'] == x.kernel.account_key
+                            for row in rows))
+        self.assertEqual(sum(row.get('native_trade_id') == 'DCE|held' for row in rows), 1)
+        self.assertFalse(x.kernel._armed)
+        x.quote(1038)
+        self.assertEqual([(order['offset'], order['volume']) for order in x.api.inserted], [('CLOSE', 5)])
 
     def test_strategy_log_throttles_geometry_trigger_and_activation_in_dsv_order(self):
         self.start(trade={'no_chase_after_act': True, 'trailing_activate_ratio': 0.8})

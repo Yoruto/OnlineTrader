@@ -111,6 +111,7 @@ class Kernel:
         self._staged: dict[str, dict] = {}
         self._committed: dict[str, dict] = {}
         self._facts: dict[str, str] = {}
+        self._money_fact_meta: dict[str, dict] = {}
         self._decision_keys: set[str] = set()
         self._dispatched: set[str] = set()
         self._errors: list[str] = []
@@ -130,7 +131,9 @@ class Kernel:
             for cycle in data.get("cycles",[]):
                 self._committed[cycle["position_cycle_id"]]=cycle
             if data.get("fill"):
-                self._facts[data["fill"]["trade_key"]] = data["fill"]["fact_hash"]
+                fill = data["fill"]
+                self._facts[fill["trade_key"]] = fill["fact_hash"]
+                self._money_fact_meta[fill["trade_key"]] = fill
         for row in self.ledger.query("SELECT decision_key FROM order_intents WHERE effect='OPEN'"):
             self._decision_keys.add(row["decision_key"])
         current_orders = {r["child_order_id"]: r for r in self.ledger.query(
@@ -152,7 +155,6 @@ class Kernel:
         self.statistics=StatisticsOwner(self)
         from online_trader.kernel.money import MoneyOwner
         self.money=MoneyOwner(self)
-        self._money_fact_meta=copy.deepcopy(self.money.book.fills)
 
     def _check_owner(self) -> None:
         if threading.get_ident() != self._owner:
@@ -762,7 +764,7 @@ class Kernel:
 
     def record_fill(self, child_id: str, trade_key: str, qty: int, price: str, *, observed_at_utc=None,
                     trading_day=None,commission=None,estimated_commission=None,native_day_evidence=None,
-                    _initial_entry_confirmation=None,_defer_entry_slippage=False,_adapter_token=None):
+                    native_trade_id=None,_initial_entry_confirmation=None,_defer_entry_slippage=False,_adapter_token=None):
         self._writable()
         if not self.development and not (self.simulation and _adapter_token is self.port.callback_token):
             raise TraderError("E_UNSUPPORTED", "No trusted broker callback adapter is installed")
@@ -771,6 +773,8 @@ class Kernel:
         cycle,_ = self._find(child_id)
         order = next(o for o in cycle["orders"] if o["child_order_id"]==child_id)
         identity = {"child_order_id":child_id,"trade_key":identifier(trade_key),"quantity":qty,"price":price,"effect":order["effect"]}
+        if native_trade_id is not None and (not self.simulation or self.port.trade_key(native_trade_id)!=trade_key):
+            raise TraderError('E_FACT_BARRIER','Fill does not match its original native trade identity')
         digest = content_hash(identity)
         if trade_key in self._facts:
             if self._facts[trade_key] != digest:
@@ -782,6 +786,8 @@ class Kernel:
                 raise TraderError('E_DUPLICATE_CONFLICT','Original fill day or observation identity changed')
             if native_day_evidence is not None and previous.get('native_day_evidence') not in (None,native_day_evidence):
                 raise TraderError('E_DUPLICATE_CONFLICT','Original native cabinet-day proof changed')
+            if native_trade_id is not None and previous.get('native_trade_id')!=native_trade_id:
+                raise TraderError('E_DUPLICATE_CONFLICT','Original native trade identity changed')
             if commission is not None or estimated_commission is not None:
                 from online_trader.accounting.book import validate_fee
                 if commission is not None and estimated_commission is not None:
@@ -861,6 +867,7 @@ class Kernel:
         if order.get('native_offset'):fill['offset_kind']={'CLOSETODAY':'CLOSE_TODAY'}.get(order['native_offset'],order['native_offset'])
         fill.update(trading_day=financial_day,observed_at_utc=observed_at_utc or cycle.get('statistics_observed_at_utc') or utc_now())
         if native_day_evidence is not None:fill['native_day_evidence']=copy.deepcopy(native_day_evidence)
+        if native_trade_id is not None:fill['native_trade_id']=native_trade_id
         if fee is not None:fill['money_fee']=fee
         if money_issues:fill['money_issues']=money_issues
         self._money_fact_meta[trade_key]=copy.deepcopy(fill)

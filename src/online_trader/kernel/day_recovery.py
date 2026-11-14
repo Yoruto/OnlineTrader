@@ -72,7 +72,7 @@ class DayRecovery:
                         retained=[]
                         for f in fills:
                             day=native_day(self.owner.port.calendar,cycle['plan']['contract_id'],f['source_time_ns'])['trading_day']
-                            trade={'trade_id':f['trade_key'][3:],'order_id':oid,'contract_id':cycle['plan']['contract_id'],
+                            trade={'trade_id':self.owner.port.native_trade_id(f),'order_id':oid,'contract_id':cycle['plan']['contract_id'],
                                 'direction':direction,'offset':item['offset'],'quantity':f['quantity'],
                                 'price':f['price'],'source_time_ns':f['source_time_ns']}
                             # Missing current-day details are still a missing
