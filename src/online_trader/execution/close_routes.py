@@ -142,12 +142,13 @@ def owned_lot_facts(kernel,contract_id,direction,cycles):
     return fills,mapping
 
 
-def preview_owned_routes(kernel,cycle_id,target_quantity,*,_exclude_child=None,_recovery_review=False):
+def preview_owned_routes(kernel,cycle_id,target_quantity,*,_exclude_child=None,_recovery_review=False,_now=None):
     """Review accepted original ledger lots against the current native buckets."""
     kernel._check_owner();cycle=kernel._committed[cycle_id];plan=cycle['plan'];port=kernel.port
     calendar=getattr(port,'calendar',None)
     if calendar is None:raise TraderError('E_CALENDAR_INCOMPLETE','A current bound calendar is required')
-    window=calendar.query(plan['contract_id'],port.clock.now().isoformat().replace('+00:00','Z'))
+    now=port.clock.now() if _now is None else _now
+    window=calendar.query(plan['contract_id'],now.isoformat().replace('+00:00','Z'))
     if not window['complete'] or not window['is_trading']:raise TraderError('E_CALENDAR_INCOMPLETE','Current native close buckets need a proved active trading day')
     if not port.complete() or (port.fault and not _recovery_review):raise TraderError('E_FACT_BARRIER','Current native position sync is incomplete')
     fills,mapping=owned_lot_facts(kernel,plan['contract_id'],plan['direction'],kernel._committed.values())

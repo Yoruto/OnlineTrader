@@ -180,6 +180,19 @@ class DsvFactFeed:
             'path_complete':path_complete,'is_trading':True,'calendar_complete':True,
             'candle_id':code+':'+moment.strftime('%Y%m%dT%H%M'),'is_opening_session':session['is_opening_session']}
 
+    def current_protection_event(self, code, session):
+        """Read the live serial tail without advancing the strategy's replay cursor."""
+        raw = self.port.latest_tick_record(code)
+        if raw is None:
+            return None
+        index = native_integer(raw.get('id'))
+        stamp = native_integer(raw.get('datetime'), minimum=1)
+        moment = datetime.fromtimestamp(stamp // 1_000_000_000, timezone.utc).replace(
+            microsecond=(stamp % 1_000_000_000) // 1000)
+        if not datetime.fromisoformat(session['open_utc']) <= moment < datetime.fromisoformat(session['close_utc']):
+            return None
+        return self._event(code, session, (index, moment, raw), 1, False)
+
     def _resume_anchor(self,code,session,rows,state,calendar_event):
         if (state['coverage_lost'] or state['session_id']!=session['session_id']
                 or not 0<state['source_epoch']<=self.port.source_epoch or not state['last_source_time_utc']):

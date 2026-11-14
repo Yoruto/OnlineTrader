@@ -7,13 +7,13 @@ def _native_order_identity(order):
     return tuple(order[key] for key in ('contract_id','direction','offset','quantity','limit_price'))
 
 
-def cancel_review(owner):
-    snapshot=owner.port.snapshot()
+def cancel_review(owner, *, snapshot=None, allow_external=True):
+    snapshot=owner.port.snapshot() if snapshot is None else snapshot
     orders=sorted((o for o in snapshot['orders'] if o['status']=='ALIVE'),key=lambda o:o['order_id'])
     outside=sorted({o['contract_id'] for o in orders}-set(owner.grant.value['contracts']))
     evidence={'account_key':owner.kernel.account_key,'kernel_boot_id':owner.kernel.boot_id,
         'trading_day':snapshot['trading_day'],'source_epoch':snapshot['source_epoch'],'orders':orders}
-    eligible=(owner.grant.manual_workbench and snapshot['complete'] and not owner.port.fault and not outside
+    eligible=(allow_external and owner.grant.manual_workbench and snapshot['complete'] and not owner.port.fault and not outside
         and owner.grant.in_window(owner.port.clock.now()) and 0<len(orders)<=512)
     by_contract={}
     for order in orders:
@@ -68,7 +68,7 @@ def prepare_strategy_stop(control,binding):
         return
 
     try:
-        snapshot,active,review=cancel_review(owner)
+        snapshot,active,review=_strategy_stop_cancel_review(owner)
         owner._validate_snapshot(snapshot)
         if owner.port.fault:
             raise TraderError('E_FACT_BARRIER','Native channel is not synchronized')
@@ -117,7 +117,7 @@ def prepare_strategy_stop(control,binding):
     binding['metadata']['stop_message']=message
 
     def recheck():
-        current,current_orders,current_review=cancel_review(owner)
+        current,current_orders,current_review=_strategy_stop_cancel_review(owner)
         owner._validate_snapshot(current)
         if (owner.port.fault or current['trading_day']!=snapshot['trading_day']
                 or current['source_epoch']!=snapshot['source_epoch']):
@@ -129,6 +129,17 @@ def prepare_strategy_stop(control,binding):
             and _native_order_identity(row)==_native_order_identity(approved[row['order_id']])]
 
     _commit_native_cancel(control,binding,snapshot,orders,owned,recheck,'DSV_STRATEGY_STOPPED')
+
+
+def _strategy_stop_cancel_review(owner):
+    scheduler = getattr(owner.kernel, '_scheduled_runtime', None)
+    if scheduler is not None and scheduler._fault:
+        sample = scheduler.clock_protection_sample()
+        snapshot = scheduler.clock_protection_snapshot(sample)
+        if snapshot is None:
+            raise TraderError('E_FACT_BARRIER', 'The current native cancel session cannot be proved')
+        return cancel_review(owner, snapshot=snapshot, allow_external=False)
+    return cancel_review(owner)
 
 
 def _commit_native_cancel(control,binding,snapshot,orders,owned,recheck,event_type):
@@ -169,14 +180,18 @@ def account_cancel_result(owner,metadata,command_id,*,strategy_stop=False):
     kernel=owner.kernel
     unresolved=('NEEDS_RECONCILIATION','E_UNKNOWN_SEND','Original native cancellation is awaiting terminal evidence',[])
     owned={owner.port.order_id(o['child_order_id']):o for c in kernel._committed.values() for o in c['orders']}
-    try:snapshot=owner.port.snapshot()
+    if strategy_stop and all(order['order_id'] in owned and owned[order['order_id']]['terminal_confirmed']
+            and owned[order['order_id']]['reported_fill_qty']==owned[order['order_id']]['filled_qty']
+            for order in metadata['native_cancel_orders']):
+        return ('SUCCEEDED','NONE','All original owned orders have quantity-consistent terminal evidence',[])
+    try:
+        if strategy_stop:
+            snapshot, _, _ = _strategy_stop_cancel_review(owner)
+        else:
+            snapshot=owner.port.snapshot()
     except TraderError:return unresolved
     if not snapshot['complete']:return None
     if snapshot['trading_day']!=metadata['native_cancel_day']:
-        if strategy_stop and all(order['order_id'] in owned and owned[order['order_id']]['terminal_confirmed']
-                and owned[order['order_id']]['reported_fill_qty']==owned[order['order_id']]['filled_qty']
-                for order in metadata['native_cancel_orders']):
-            return ('SUCCEEDED','NONE','All original owned orders have quantity-consistent terminal evidence',[])
         return ('NEEDS_RECONCILIATION','E_FACT_BARRIER','Original native terminal evidence is still required',[])
     native={row['order_id']:row for row in snapshot['orders']}
     attempts=kernel.control.native_cancel_results.get(command_id)
@@ -212,8 +227,28 @@ def record_reconciliation(control,binding,run_id):
         try:
             observations = owner.observe_native_orders()
             k.wait_idle()
-            owner.recover_working(observations)
+            # A wall-clock jump can leave same-session price protection live.
+            # Reset still requires the existing full original-cycle review.
+            owned = [c for c in k._staged.values() if c['lifecycle'] != 'CLOSED' and not owner.archived_cycle(c)]
+            pending = set(k._recovery_pending)
+            owner.recover_working(observations, reconcile_cycles=False)
             k.wait_idle()
+            for code in {cycle['plan']['contract_id'] for cycle in owned}:
+                current = owner.port.calendar.query(code, clock_sample['now_utc'])
+                if (not current['complete'] or (current['is_trading'] and
+                        current['trading_day'] != snapshot['trading_day'])):
+                    raise TraderError('E_FACT_BARRIER', '原持仓所在的柜台交易日待核对。')
+            for cycle in owned:
+                cid = cycle['position_cycle_id']
+                orders = k._staged[cid]['orders']
+                if ('CANCEL_TERMINAL_TIMEOUT' in cycle.get('execution', {}).get('last_reasons', [])
+                        and any(o.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}
+                                and not o['terminal_confirmed'] for o in orders)):
+                    raise TraderError('E_FACT_BARRIER', '仍在等待原撤单的柜台终态。')
+                if cid in pending:
+                    owner.reconcile(cid, allow_working=True, clear_gateway_fault=False)
+                else:
+                    owner.verify_clock_protection(k._staged[cid], snapshot)
         finally:
             k._command_binding = command
         if k._has_unknown() or k.recovery_required or k._recovery_pending or owner.port.fault:

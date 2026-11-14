@@ -331,8 +331,10 @@ class OnlineSimulation:
 
     def can_close(self,cycle):return True
 
-    def reconcile(self,cid,*,close=False,allow_working=False,clear_gateway_fault=True):
-        k=self.kernel;k._writable();snapshot=self.port.snapshot();self._validate_snapshot(snapshot)
+    def reconcile(self,cid,*,close=False,allow_working=False,clear_gateway_fault=True,_snapshot=None,_statistics_at_utc=None):
+        k=self.kernel;k._writable()
+        snapshot=self.port.snapshot() if _snapshot is None else _snapshot
+        self._validate_snapshot(snapshot)
         snapshot=self.reconciliation_snapshot(snapshot)
         cycle=copy.deepcopy(k._staged[cid]);code=cycle['plan']['contract_id']
         if close and cycle.get('statistics_review_required'):
@@ -344,11 +346,7 @@ class OnlineSimulation:
             raise TraderError('E_FACT_BARRIER','Native terminal orders and all owned fills must agree')
         self.verify_foreign_orders(cycle,snapshot)
         self.verify_cycle_orders(cycle,orders,snapshot)
-        position=next((p for p in snapshot['positions'] if p['contract_id']==code),{'long':0,'short':0})
-        expected={direction:sum(c['protection']['owned_qty'] for c in k._staged.values()
-                   if c['plan']['contract_id']==code and c['plan']['direction']==direction.upper()) for direction in ('long','short')}
-        if position['long']!=expected['long'] or position['short']!=expected['short']:
-            raise TraderError('E_OWNERSHIP','Native position differs from the exact owned quantity')
+        self.verify_owned_position(code,snapshot)
         rid='sim-reconcile-'+uuid.uuid4().hex;cycle['entry_reconciliation_id']=rid
         cycle['online_reconciliation']=snapshot
         if close:
@@ -361,12 +359,19 @@ class OnlineSimulation:
         else:
             cycle['protection'].update(reconciliation_required=False,block_new=True)
         cycle['revision']+=1
-        statistics=k.statistics.prepare_close(cycle) if close else None
+        statistics=k.statistics.prepare_close(cycle,at_utc=_statistics_at_utc) if close else None
         def accepted():
             k._recovery_pending.discard(cid);k.recovery_required=bool(k._recovery_pending) or k._has_unknown()
             if clear_gateway_fault and self.port.fault and self.port.fresh(code):self.port.fault=False
             k._progress_exits(cid)
         result=k._stage_cycle(cycle,'TX_RECONCILE','ONLINE_SIMULATION_RECONCILED',after=accepted,money_account=self.money_fact(snapshot),nominal_statistics=statistics);k.wait_idle();return result.result()
+
+    def verify_owned_position(self,code,snapshot):
+        position=next((p for p in snapshot['positions'] if p['contract_id']==code),{'long':0,'short':0})
+        expected={direction:sum(c['protection']['owned_qty'] for c in self.kernel._staged.values()
+                   if c['plan']['contract_id']==code and c['plan']['direction']==direction.upper()) for direction in ('long','short')}
+        if position['long']!=expected['long'] or position['short']!=expected['short']:
+            raise TraderError('E_OWNERSHIP','Native position differs from the exact owned quantity')
 
     def verify_foreign_orders(self,cycle,snapshot):
         code=cycle['plan']['contract_id'];k=self.kernel

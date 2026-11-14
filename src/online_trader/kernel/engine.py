@@ -668,6 +668,11 @@ class Kernel:
         if scheduler is not None and checks['ORIGINAL_BOOT']:
             expected_day = order.get('native_trading_day', cycle['plan']['trading_day'])
             checks['CURRENT_SESSION'] = scheduler.scope_current(cycle['plan']['contract_id'], expected_day)
+            if scheduler._fault and order['effect'] == 'REDUCE':
+                now = scheduler.clock_protection_time(cycle)
+                if now is not None:
+                    window = scheduler.clock_protection_session(cycle['plan']['contract_id'], now)
+                    checks['CURRENT_SESSION'] = window['trading_day'] == expected_day
             if not checks['CURRENT_SESSION']:
                 review_details['CURRENT_SESSION'] = {'expected_trading_day': expected_day,
                                                       'clock_fault': scheduler._fault}

@@ -28,7 +28,7 @@ class ExecutionCoordinator:
     def side(cycle,effect):
         return 'BUY' if (cycle['plan']['direction']=='LONG')==(effect=='OPEN') else 'SELL'
 
-    def tick(self,cid,event,*,_observe_quote=True,_market_received_ns=None):
+    def tick(self,cid,event,*,_observe_quote=True,_market_received_ns=None,_price_only=False):
         k=self.kernel;k._writable()
         if (not k.development and not getattr(k.simulation,'strategy_enabled',False)) or isinstance(k.port,UnavailablePort):
             raise TraderError('E_UNSUPPORTED','Execution facts require an isolated development port')
@@ -46,8 +46,16 @@ class ExecutionCoordinator:
                 if previous.get('quote_hash')!=identity.get('quote_hash'):
                     raise TraderError('E_DUPLICATE_CONFLICT','An original native protection quote changed content')
                 _observe_quote=False
-            elif previous and int(identity['native_time_ns'])<int(previous['native_time_ns']):
-                raise TraderError('E_FACT_BARRIER','Protection cannot consume an older native source quote')
+            elif previous:
+                keys = ('native_time_ns', 'native_tick_id')
+                proof = (cycle.get('execution') or {}).get('clock_protection')
+                if (not _price_only and proof and event.get('market_source') == proof['market_source'] and
+                        tuple(int(identity[key]) for key in keys) < tuple(int(previous[key]) for key in keys)):
+                    # Catch up strategy observation after an exit advanced on
+                    # the live tick during a wall-clock fault.
+                    f=Future();f.set_result({'status':'ALREADY_PROTECTED_MARKET_PATH'});return f
+                if int(identity['native_time_ns'])<int(previous['native_time_ns']):
+                    raise TraderError('E_FACT_BARRIER','Protection cannot consume an older native source quote')
             if _observe_quote:cycle['last_protection_market_identity']=copy.deepcopy(identity)
         if cycle['plan']['schema_version'] not in ('1.2','1.3'):raise TraderError('E_UNSUPPORTED','Original plans retain their original execution policy')
         if (event.get('trading_day')!=cycle['plan']['trading_day'] and not
@@ -80,6 +88,10 @@ class ExecutionCoordinator:
         ex.update(event_id=event['event_id'],source_epoch=event['source_epoch'],sequence=event['sequence'],
                   event_hash=digest,elapsed_ms=event['elapsed_ms'],market=copy.deepcopy(event['market']))
         ex['ordinary_entry_fresh'] = event.get('ordinary_entry_fresh')
+        if _price_only:
+            ex['clock_protection'] = event['clock_protection']
+        else:
+            ex.pop('clock_protection', None)
         ex['context_id']=event.get('context_id');ex['peer_id']=event.get('peer_id','qa')
         cycle['execution']=ex
         # Validate quote grammar before freezing a clock-driven exit reference.
@@ -120,13 +132,14 @@ class ExecutionCoordinator:
                     'observed_at_utc':event.get('observed_at_utc') or cycle.get('statistics_observed_at_utc') or utc_now(),
                     'trading_day':event['trading_day'],'received_ns':str(received)}
         else:cycle['last_quote']=None
-        self._contexts(cycle)
+        self._contexts(cycle, price_only=_price_only)
         cycle['revision']+=1
-        return k._stage_cycle(cycle,'TX_PROTECT','EXECUTION_OBSERVATION',after=lambda:self.progress(cid,allow_open=True,allow_retry=True))
+        return k._stage_cycle(cycle,'TX_PROTECT','EXECUTION_OBSERVATION',
+            after=lambda:self.progress(cid,allow_open=not _price_only,allow_retry=True))
 
-    def _contexts(self,cycle):
+    def _contexts(self,cycle,*,price_only=False):
         ex=cycle['execution'];p=cycle['plan']['execution_policy'];elapsed=ex['elapsed_ms']
-        for effect in ('OPEN','REDUCE'):
+        for effect in (('REDUCE',) if price_only else ('OPEN','REDUCE')):
             side=self.side(cycle,effect);mode=None;row={}
             if effect=='OPEN':
                 market=ex['market'];since=market.get('since_open_ms')
@@ -271,13 +284,20 @@ class ExecutionCoordinator:
         cycle=copy.deepcopy(k._staged[cid])
         if not self.active(cycle) or cid in k._recovery_pending or cycle.get('management_state')=='TAKEN_OVER':return
         ex=cycle['execution'];state=cycle['protection'];target=state.get('target_remaining_qty')
+        price_only = False
         if getattr(k.simulation,'strategy_enabled',False):
-            snapshot=k.port.snapshot()
+            scheduler = getattr(k, '_scheduled_runtime', None)
+            price_only = bool(scheduler is not None and scheduler._fault)
+            now = scheduler.clock_protection_time(cycle) if price_only else None
+            if price_only and now is None:
+                return
+            snapshot=k.port.snapshot(now=now) if price_only else k.port.snapshot()
             if k.port.fault or not snapshot['complete'] or not k.simulation.exit_day_ready(cycle,snapshot['trading_day']):return
         if set(state.get('exit_reasons',[]))&{'ADVERSE_SLIPPAGE','DATA_GAP_EXIT'} and ex['force_start_ms'] is None:
-            ex['force_start_ms']=ex['elapsed_ms'];ex['context_ms'].pop('REDUCE',None);self._contexts(cycle)
+            ex['force_start_ms']=ex['elapsed_ms'];ex['context_ms'].pop('REDUCE',None);self._contexts(cycle,price_only=price_only)
         manual=self.manual_reduction(cycle)
-        if manual and manual.get('price_wait') and not manual.get('price_failure') and self._resolve_manual_price(cycle,manual):
+        if (not price_only and manual and manual.get('price_wait') and not manual.get('price_failure')
+                and self._resolve_manual_price(cycle,manual)):
             cycle['revision'] += 1
             k._stage_cycle(cycle,'TX_PROTECT','MANUAL_REDUCTION_PRICE_RESOLVED',
                            after=lambda:self.progress(cid,allow_open=allow_open,allow_retry=allow_retry))
@@ -288,7 +308,9 @@ class ExecutionCoordinator:
             if not orders:continue
             desired=max(0,cycle['plan']['initial_open_quantity']-state['entry_filled_qty']) if effect=='OPEN' else (max(0,state['owned_qty']-target) if target is not None else 0)
             stop_open=bool(effect=='OPEN' and (ex['entry_stopped'] or cycle.get('cancel_entries') or target is not None))
-            timeout=bool(effect=='OPEN' and not cycle.get('manual_limit_order') and state['entry_filled_qty']==0
+            if price_only and effect=='OPEN' and not stop_open:
+                continue
+            timeout=bool(not price_only and effect=='OPEN' and not cycle.get('manual_limit_order') and state['entry_filled_qty']==0
                          and ex['elapsed_ms']>cycle['plan']['execution_policy']['entry_confirm_timeout_ms'])
             hold_open = (effect=='OPEN' and not stop_open
                          and k.control.preserve_open_orders_revision==k._authority_revision)

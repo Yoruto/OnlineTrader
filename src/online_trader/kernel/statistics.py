@@ -123,6 +123,9 @@ class StatisticsOwner:
         scheduler=getattr(self.kernel,'_scheduled_runtime',None)
         if scheduler is not None and scheduler._sample is not None:
             sample=scheduler._sample
+            protection=scheduler._clock_exit
+            if cycle is not None and protection is not None and protection['cycle_id']==cycle['position_cycle_id']:
+                sample=protection['sample']
             return {'now_utc':sample.now_utc,'monotonic_ns':sample.monotonic_ns,'kernel_boot_id':self.kernel.boot_id,
                     'clock_basis':'SCHEDULED_MONOTONIC'}
         observed=(cycle or {}).get('statistics_observed_at_utc')

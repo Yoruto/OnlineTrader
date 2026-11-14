@@ -230,6 +230,69 @@ class SimNowComparisonTests(unittest.TestCase):
         x.quote(1038)
         self.assertEqual([(order['offset'], order['volume']) for order in x.api.inserted], [('CLOSE', 5)])
 
+    def test_first_registration_failure_is_discovered_from_original_ledger_after_restart(self):
+        from online_trader.runtime import strategy_log
+
+        publish = strategy_log.publish_log_recovery
+        def write_only_fallback(path, record):
+            if path.parent.name == 'ledger.db.operation-log-recovery':
+                raise PermissionError('synthetic index write failure')
+            return publish(path, record)
+
+        with patch.object(strategy_log, 'publish_log_recovery', side_effect=write_only_fallback):
+            self.start(trade={'half_close_enabled': False})
+            x = self.x
+            old = x.session.entry_log
+            old.next_recovery = float('inf')
+            x.quote()
+            x.api.fill(x.api.inserted[0]['order_id'], 5, 1055, trade_id='DCE|fallback-only')
+            x.session.step()
+            self.assertFalse(old.registry_path.exists())
+            self.assertEqual(strict_loads(old.recovery_path.read_bytes())['status'], 'DEGRADED')
+
+        # Only the original ledger can locate the receipt after the separate
+        # run identity file is lost.
+        (old.path.parent / 'run-identity.json').unlink()
+        with patch.object(fixture, 'TqKqDsvPort', SimNowDsvPort):
+            x.restart()
+        state = self.wait_for_log_rebuild(x.session.entry_log, old.recovery_path)
+        self.assertEqual(state['kernel_boot_id'], old.boot_id)
+        self.assertTrue(state['finalized'])
+        self.assertEqual(old.path.read_bytes().count(b'DCE|fallback-only'), 1)
+        self.assertEqual(x.api.inserted, [])
+        self.assertEqual(x.cycle()['protection']['owned_qty'], 5)
+
+    def test_operation_log_fallback_for_previous_version_checks_original_run_identity(self):
+        from online_trader.runtime.dsv_simulation import DsvSimulationSession
+
+        with patch.object(DsvSimulationSession, '_register_operation_log', autospec=True):
+            self.start()
+        x = self.x
+        old = x.session.entry_log
+        with patch.object(old, 'write', side_effect=PermissionError('synthetic temporal log failure')):
+            x.quote()
+        old.next_recovery = float('inf')
+        old.registry_path.unlink()
+        old.registry.rmdir()
+        receipt = strict_loads(old.recovery_path.read_bytes())
+        self.assertEqual(receipt['status'], 'DEGRADED')
+        from online_trader.runtime.strategy_log import publish_log_recovery
+        publish_log_recovery(old.recovery_path, receipt | {'account_key': 'other-account'})
+        with patch.object(fixture, 'TqKqDsvPort', SimNowDsvPort):
+            x.restart()
+        self.assertEqual(x.session.entry_log._prior_runs, [])
+        empty = old.path.read_bytes()
+        self.assertNotIn(b'ENTRY_PREPARED', empty)
+        publish_log_recovery(old.recovery_path, receipt | {'run_directory': str(x.session.output)})
+        x.session.entry_log.find_prior_failures()
+        self.assertEqual(x.session.entry_log._prior_runs, [])
+        publish_log_recovery(old.recovery_path, receipt)
+        x.session.entry_log.find_prior_failures()
+        self.assertEqual(len(x.session.entry_log._prior_runs), 1)
+        self.wait_for_log_rebuild(x.session.entry_log, old.recovery_path)
+        self.assertNotEqual(old.path.read_bytes(), empty)
+        self.assertEqual(x.api.inserted, [])
+
     def test_strategy_log_throttles_geometry_trigger_and_activation_in_dsv_order(self):
         self.start(trade={'no_chase_after_act': True, 'trailing_activate_ratio': 0.8})
         x = self.x

@@ -10,6 +10,7 @@ from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import strict_loads,canonical_bytes,content_hash
 from online_trader.configuration.files import publish_new_bytes
 from online_trader.errors import TraderError, exception_record
+from online_trader.execution.close_routes import preview_owned_routes
 from online_trader.gateway.dsv_facts import DsvFactFeed,utc
 from online_trader.gateway.tqkq_dsv import TqKqDsvPort
 from online_trader.gateway.simnow import strategy_port
@@ -84,6 +85,7 @@ class DsvSimulationSession(SimulationSession):
         self._arm_request_revision=None
         self._entry_resume = None
         self._calendar_anchor=utc(self.port.clock.now())
+        self._clock_reset_seen = None
         self._day_barriers=set()
         self._last_day_observations=None
         original_days=[c['plan']['trading_day'] for c in kernel._staged.values() if c['lifecycle']!='CLOSED']
@@ -99,18 +101,27 @@ class DsvSimulationSession(SimulationSession):
         self._next_clock_check = 0
         self._clock_worker = None
         self.entry_log = DsvEntryLog(kernel, output, profile)
+        self._register_operation_log()
         self.comparison = None
         self.comparison_error = None
         try:
             self.entry_log.start()
-            self.entry_log.find_prior_failures()
         except Exception as error:
             self.entry_log.failed('start', error, self.emit)
+        try:
+            self.entry_log.find_prior_failures()
+        except Exception as error:
+            self.entry_log.failed('discover', error, self.emit)
         try:
             self.comparison = ComparisonRecorder(kernel, output, profile, calendar,
                                                  dsv_config=dsv_config, dsv_log_dir=dsv_log_dir)
         except Exception as error:
             self._comparison_failed(error)
+
+    def _register_operation_log(self):
+        # This binding uses the original writer to locate the diagnostics
+        # even when their separate file index cannot be written.
+        self.owner.capture('DSV_OPERATION_LOG_STARTED', self.entry_log.registration())
 
     def _comparison_failed(self, error):
         self.comparison_error = getattr(error, 'code', 'E_COMPARISON_WRITE')
@@ -250,6 +261,8 @@ class DsvSimulationSession(SimulationSession):
         return False
 
     def request_initial_arm(self):
+        if self.driver._fault:
+            return  # A latched boot requires complete reconciliation and explicit F5.
         if any(not self.owner.archived_cycle(cycle) for cycle in self.kernel._staged.values()):
             raise TraderError('E_NOT_READY','A restored scope manages original exits only')
         self._arm_request_revision=self.kernel._authority_revision
@@ -262,6 +275,10 @@ class DsvSimulationSession(SimulationSession):
     def prime(self,*,manage_owned=False):
         """Rebuild available history with zero signal execution and no arming."""
         self.kernel.pause();self.kernel.wait_idle()
+        if self.driver._fault:
+            self.driver.clock_rebuild_pending = True
+            self._primed = True
+            return  # Startup still exposes the original callbacks and reconciliation entry.
         rebuilt={}
         for code,events in self._market_batches():
             if events and all(e['path_complete'] for e in events):
@@ -280,6 +297,11 @@ class DsvSimulationSession(SimulationSession):
             self.port.poll_updates(.2)
             if isinstance(self.port.clock, LocalWallClock):
                 self.port.clock.begin_turn()
+            self.driver.preflight()
+            if self.driver._fault:
+                self.driver.clock_rebuild_pending = True
+                self._primed = True
+                return
             pending=dict(self.feed.batches())
             for code,event in tuple(rebuilt.items()):
                 suffix=pending.get(code,[])
@@ -307,6 +329,7 @@ class DsvSimulationSession(SimulationSession):
                             _market_received_ns=self.driver.received_for(code))
                         self.kernel.wait_idle();future.result()
         self._primed=True
+        self.driver.clock_rebuild_pending = False
         self._comparison('poll')
         self.status('DSV_PRIMED_DISARMED',strategy=self.driver.strategy.status())
 
@@ -428,9 +451,9 @@ class DsvSimulationSession(SimulationSession):
             if ticks:
                 self._latency_written_ns = int(ticks[-1]['strategy_end_monotonic_ns'])
 
-    def _finish_strategy_stop(self):
+    def _finish_strategy_stop(self, *, _snapshot=None):
         k = self.kernel
-        snapshot = self.port.snapshot()
+        snapshot = self.port.snapshot() if _snapshot is None else _snapshot
         if self.port.fault or not snapshot['complete']:
             reason = '等待柜台恢复同步'
         elif snapshot['positions']:
@@ -468,6 +491,79 @@ class DsvSimulationSession(SimulationSession):
         k._dsv_stop_wait = reason
         self.status('DSV_STOPPING', armed=False, reason=reason)
 
+    def _clock_protection(self, sample, received_ns):
+        k = self.kernel
+        blocked = {}
+        active = []
+        for cycle in tuple(k._staged.values()):
+            cid, code = cycle['position_cycle_id'], cycle['plan']['contract_id']
+            if (cycle['lifecycle'] == 'CLOSED' or self.owner.archived_cycle(cycle)
+                    or cycle.get('management_state') == 'TAKEN_OVER'):
+                continue
+            owned = cycle['protection']['owned_qty']
+            try:
+                if sample is None:
+                    raise TraderError('CLOCK_PROTECTION_MONOTONIC_UNPROVED', 'No same-process monotonic clock proof')
+                if self.port.fault or not self.port.complete() or self.port.source_epoch != self._source_epoch:
+                    raise TraderError('CLOCK_PROTECTION_CONNECTION_UNPROVED', 'The original synchronized native source changed')
+                at = self.driver.clock_protection_session(code, sample.utc)
+                if at is None or not self.owner.exit_day_ready(cycle, at['trading_day']):
+                    raise TraderError('CLOCK_PROTECTION_SESSION_UNPROVED', 'The last verified active trading session is no longer current')
+                if cid in k._recovery_pending or cycle['protection']['reconciliation_required']:
+                    raise TraderError('RECONCILIATION_REQUIRED', 'The original cycle still needs full reconciliation')
+                snapshot = self.port.snapshot(now=sample.utc)
+                if snapshot['trading_day'] != at['trading_day']:
+                    raise TraderError('CLOCK_PROTECTION_SESSION_UNPROVED', 'The account and the quote do not prove the same cabinet day')
+                self.owner.verify_clock_protection(cycle, snapshot)
+                orders_terminal = all(o['terminal_confirmed'] for o in cycle['orders'])
+                if not owned:
+                    if orders_terminal and self.owner.can_close(cycle):
+                        self.owner.reconcile(cid, close=True, _snapshot=snapshot, _statistics_at_utc=sample.now_utc)
+                        self.owner._closed.add(cid)
+                    continue
+                binding = cycle.get('schedule_binding')
+                if (not binding or binding != self.driver.binding_for(cycle['plan'], entry_time_utc=binding['entry_time_utc'])):
+                    raise TraderError('CLOCK_PROTECTION_SESSION_UNPROVED', 'The original cycle calendar binding changed')
+                reduction = preview_owned_routes(k, cid, owned, _now=sample.utc)
+                if sum(reduction['cycle_owned'].values()) != owned:
+                    raise TraderError('E_OWNERSHIP', 'Native close buckets differ from the owned cycle')
+                if (not cycle['protection']['entry_terminal_reconciled']
+                        and all(o['terminal_confirmed'] for o in cycle['orders'] if o['effect'] == 'OPEN')):
+                    self.owner.reconcile(cid, _snapshot=snapshot)
+                    self.owner._entry_reconciled.add(cid)
+                    cycle = k._staged[cid]
+                event = self.feed.current_protection_event(code, at['session'])
+                if event is None or not self.port.current_protection_quote(event, sample.utc):
+                    raise TraderError('E_NATIVE_QUOTE_NOT_CURRENT', 'A fresh matching native book and tick are required')
+                prior = cycle.get('last_protection_market_identity')
+                if prior and (int(event['native_time_ns']) < int(prior['native_time_ns'])
+                              or int(event['native_tick_id']) < int(prior['native_tick_id'])
+                              or (event['native_tick_id'] == prior['native_tick_id']
+                                  and event['native_time_ns'] != prior['native_time_ns'])):
+                    raise TraderError('E_NATIVE_QUOTE_NOT_CURRENT', 'The live native source moved backwards')
+                instrument = self.port.market(code)
+                if not self.driver.on_clock_protection(cycle, event, instrument, sample, at, received_ns):
+                    raise TraderError('E_NATIVE_QUOTE_NOT_CURRENT', 'The original session or native quote changed before evaluation')
+                current = k._staged[cid]
+                if any(o['send_state'] == 'UNKNOWN' or (o['cancel_status'] == 'UNKNOWN' and not o['terminal_confirmed'])
+                       for o in current['orders']):
+                    raise TraderError('E_UNKNOWN_SEND', 'The original order or cancellation still needs native evidence')
+                if cid in k._recovery_pending:
+                    raise TraderError('RECONCILIATION_REQUIRED', 'The original cycle still needs full reconciliation')
+                if current.get('last_dispatch_abort') != cycle.get('last_dispatch_abort'):
+                    reasons = current['last_dispatch_abort']['reasons']
+                    blocked[cid] = next(iter(reasons), 'E_FACT_BARRIER')
+                    continue
+                active.append(cid)
+            except (TraderError, ValueError, OverflowError) as error:
+                if k._failed:
+                    raise
+                if owned:
+                    blocked[cid] = getattr(error, 'code', 'E_NATIVE_QUOTE_NOT_CURRENT')
+        result = {'active_cycles': active, 'blocked_cycles': blocked}
+        k._dsv_diagnostics['clock_protection'] = result
+        return result
+
     def step(self):
         k=self.kernel
         clock = self.port.clock
@@ -479,6 +575,7 @@ class DsvSimulationSession(SimulationSession):
             received = self.port.poll_updates(.05)
             if isinstance(clock, LocalWallClock):
                 clock.begin_turn()
+            clock_received_ns = time.monotonic_ns()
             wall, sdk_return = received or (datetime.now(timezone.utc), time.monotonic_ns())
             timings['SDK 更新'] = sdk_return - update_start
             try:
@@ -491,14 +588,31 @@ class DsvSimulationSession(SimulationSession):
                 self._suspend_for_recovery()
             self.driver.preflight()
             if self.driver._fault:
+                protection_sample = self.driver.clock_protection_sample()
                 self.owner.observe_native_orders()
                 k.wait_idle()
                 self._entry_resume = None
                 self._arm_request_revision = None
+                self._day_resume_revision = None
                 self.driver.poll()
                 k.wait_idle()
-                self.status('DSV_CLOCK_FAULT', armed=False, reasons=list(self.driver._fault))
+                protection = self._clock_protection(protection_sample, clock_received_ns)
+                if k.control.strategy_stop_requested():
+                    stop_snapshot = self.driver.clock_protection_snapshot(protection_sample)
+                    if stop_snapshot is not None and stop_snapshot['trading_day'] == self._managed_day:
+                        self._finish_strategy_stop(_snapshot=stop_snapshot)
+                        if self.result is not None:
+                            return
+                    else:
+                        k._dsv_stop_wait = '等待原盘次及柜台终态核对'
+                self.status('DSV_CLOCK_PROTECTION_BLOCKED' if protection['blocked_cycles'] else 'DSV_CLOCK_FAULT',
+                            armed=False, reasons=list(self.driver._fault), clock_protection=protection)
                 return
+            k._dsv_diagnostics.pop('clock_protection', None)
+            reset = self.driver.last_clock_reset
+            if reset is not self._clock_reset_seen:
+                self._calendar_anchor = reset.now_utc
+                self._clock_reset_seen = reset
             if self.check_day_transition():
                 self.owner.observe_native_orders()
                 k.wait_idle()
@@ -522,6 +636,9 @@ class DsvSimulationSession(SimulationSession):
                 self.prime()
                 self._source_epoch = self.port.source_epoch
             self.owner.tick();k.wait_idle()
+            if self.driver.clock_rebuild_pending:
+                self.prime(manage_owned=True)
+                return
             path_start = time.monotonic_ns()
             batches=self._market_batches()
             rebuilt=self._rebuild_session_paths(batches)

@@ -133,6 +133,7 @@ class DsvEntryLog:
         self._prior_runs = []
         self._prior_rebuild = None
         self._next_prior_recovery = 0
+        self._recovered_receipt = None
         self._target = self.path
         self._file_state = None
         self._event = None
@@ -160,38 +161,88 @@ class DsvEntryLog:
         publish_log_recovery(self.registry_path, self._run_record |
                              {'schema_version': 'DSV_OPERATION_LOG_RECOVERY/1', 'status': 'TRACKING'})
 
+    def registration(self):
+        return self._run_record.copy()
+
     def find_prior_failures(self):
-        for path in self.registry.glob('boot-*.json'):
+        candidates = {path.stem: (path, None) for path in self.registry.glob('boot-*.json')}
+        directory = self.path.parent.resolve()
+        root = directory.parent
+        # Older builds did not register the directory in SQLite. Only look
+        # for run identity files in the same CLI or desktop launch layout.
+        if directory.name == 'run' and root.parent.name == 'desktop-starts':
+            root = root.parent
+            identities = root.glob('*/run/run-identity.json')
+        else:
+            identities = root.glob('*/run-identity.json')
+        for path in identities:
+            identity = self._read_recovery_record(path)
+            if (identity is None or identity.get('schema_version') != 'DSV_RUN_IDENTITY/1'
+                    or identity.get('account_key') != self.kernel.account_key):
+                continue
+            boot_id = identity.get('kernel_boot_id')
+            if not isinstance(boot_id, str) or not boot_id.startswith('boot-') or boot_id == self.boot_id:
+                continue
             try:
-                with path.open('rb') as stream:
-                    raw = stream.read(65_537)
-                record = strict_loads(raw) if len(raw) <= 65_536 else None
-                if (not isinstance(record, dict) or record.get('schema_version') != 'DSV_OPERATION_LOG_RECOVERY/1'
-                        or record.get('account_key') != self.kernel.account_key
-                        or record.get('status') not in {'DEGRADED', 'REBUILDING', 'RECOVERED', 'TRACKING'}
-                        or record.get('kernel_boot_id') == self.boot_id
-                        or path.stem != record.get('kernel_boot_id')):
+                run = path.parent.resolve(strict=True)
+                if not run.is_relative_to(root):
+                    continue
+                if identity.get('run_directory') != str(run):
+                    continue
+            except (OSError, ValueError, RuntimeError):
+                continue
+            registered = candidates.get(boot_id, (None, None))[0]
+            candidates[boot_id] = (registered, {'run_directory': str(run)})
+        for row in self.source.query(
+                "SELECT kernel_boot_id,payload_json FROM event_journal WHERE event_type='DSV_OPERATION_LOG_STARTED'"):
+            boot_id = row['kernel_boot_id']
+            try:
+                data = strict_loads(row['payload_json'])['data']
+                if ((data['account_key'], data['kernel_boot_id']) != (self.kernel.account_key, boot_id)
+                        or boot_id == self.boot_id):
+                    continue
+                registered = candidates.get(boot_id, (None, None))[0]
+                candidates[boot_id] = (registered, data)
+            except (ValueError, KeyError, TypeError):
+                continue
+        for boot_id, (registered, registration) in candidates.items():
+            if boot_id == self.boot_id or self.source.query(
+                    'SELECT account_key FROM kernel_boots WHERE kernel_boot_id=?', (boot_id,)) != [
+                        {'account_key': self.kernel.account_key}]:
+                continue
+            try:
+                record = self._read_recovery_record(registered) if registered is not None else None
+                if not self._matches_recovery(record, boot_id, registration):
+                    record = None
+                if registration is not None:
+                    run = Path(registration['run_directory']).resolve(strict=True)
+                    # A run path comes from the original ledger or launch
+                    # layout, before the fallback receipt is opened.
+                    receipt = self._read_recovery_record(run.with_name(run.name + '.operation-log-recovery.json'))
+                    if (receipt is not None and receipt.get('finalized') is True
+                            and self._matches_recovery(receipt, boot_id, registration)):
+                        continue
+                    if (self._matches_recovery(receipt, boot_id, registration)
+                            and (record is None or record.get('status') == 'TRACKING')
+                            and (receipt.get('status') != 'RECOVERED' or receipt.get('finalized') is False)):
+                        record = receipt
+                if record is None or record.get('finalized') is True:
                     continue
                 if 'observed_at_utc' in record:
                     record['observed_at_utc'] = utc(datetime.fromisoformat(record['observed_at_utc']).astimezone(timezone.utc))
-                directory = Path(record['run_directory']).resolve()
-                if not directory.is_dir() or directory == self.path.parent.resolve():
+                run = Path(record['run_directory']).resolve(strict=True)
+                if not run.is_dir() or run == directory or str(run) != record['run_directory']:
                     continue
-                boot_id = record['kernel_boot_id']
-                proof = self.source.query(
-                    'SELECT account_key FROM kernel_boots WHERE kernel_boot_id=?', (boot_id,))
-                if proof != [{'account_key': self.kernel.account_key}]:
-                    continue
-                identity_path = directory / 'run-identity.json'
+                identity_path = run / 'run-identity.json'
                 if identity_path.is_file():
-                    with identity_path.open('rb') as stream:
-                        identity = strict_loads(stream.read(65_536))
-                    if (not isinstance(identity, dict) or
-                            (identity.get('account_key'), identity.get('kernel_boot_id'), identity.get('run_directory'))
-                            != (self.kernel.account_key, boot_id, str(directory))):
+                    identity = self._read_recovery_record(identity_path)
+                    if (identity is None or identity.get('schema_version') != 'DSV_RUN_IDENTITY/1'
+                            or (identity.get('account_key'), identity.get('kernel_boot_id'), identity.get('run_directory'))
+                                != (self.kernel.account_key, boot_id, str(run))):
                         continue
                 from_seq = int(record['from_event_seq'])
-                if not 0 <= from_seq <= self.kernel._durable_seq:
+                if not self.source.query('SELECT 1 FROM event_journal WHERE kernel_boot_id=? AND event_seq=?',
+                                         (boot_id, from_seq)):
                     continue
                 profile = self.profile
                 if record['profile_hash'] != profile.content_hash:
@@ -203,10 +254,26 @@ class DsvEntryLog:
                     if not rows:
                         continue
                     profile = DsvProfile.from_record(strict_loads(rows[0]['payload_json'])['profile'])
-                old = DsvEntryLog(self.kernel, directory, profile, boot_id=boot_id, from_seq=from_seq)
+                old = DsvEntryLog(self.kernel, run, profile, boot_id=boot_id, from_seq=from_seq)
                 self._prior_runs.append((old, record))
-            except (OSError, ValueError, KeyError, TypeError):
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 continue
+
+    def _matches_recovery(self, record, boot_id, registration):
+        return (record is not None and record.get('schema_version') == 'DSV_OPERATION_LOG_RECOVERY/1'
+                and (record.get('account_key'), record.get('kernel_boot_id')) == (self.kernel.account_key, boot_id)
+                and record.get('status') in ('DEGRADED', 'REBUILDING', 'RECOVERED', 'TRACKING')
+                and all(record.get(key) == value for key, value in (registration or {}).items()))
+
+    @staticmethod
+    def _read_recovery_record(path):
+        try:
+            with path.open('rb') as stream:
+                raw = stream.read(65_537)
+            data = strict_loads(raw) if len(raw) <= 65_536 else None
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError, TypeError):
+            return None
 
     def _recover_prior_run(self):
         old, record = self._prior_runs[0]
@@ -316,6 +383,7 @@ class DsvEntryLog:
     def _finish_recovery(self, *, archive):
         # Keep the original run registered until its normal close persists
         # the tail. A recovered file may still receive new committed events.
+        self.recovery['finalized'] = archive
         if not archive:
             self._persist_recovery()
         publish_log_recovery(self.recovery_path, self.recovery)
@@ -374,6 +442,7 @@ class DsvEntryLog:
             setattr(self, name, getattr(replacement, name))
         self.recovery.update(status='RECOVERED', recovered_through_event_seq=str(self.last_event_seq))
         self._finish_recovery(archive=False)
+        self._recovered_receipt = self.recovery.copy()
         self.kernel._dsv_diagnostics['operation_log'] = self.recovery.copy()
         self.recovery = None
 
@@ -382,6 +451,8 @@ class DsvEntryLog:
             self._verify_file()
             with self.path.open('r+b') as stream:
                 os.fsync(stream.fileno())
+            if self._recovered_receipt is not None:
+                publish_log_recovery(self.recovery_path, self._recovered_receipt | {'finalized': True})
             self.registry_path.unlink(missing_ok=True)
 
     @staticmethod

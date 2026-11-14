@@ -305,6 +305,17 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             dashboard.show_details(dashboard.log_tab)
             dashboard.log_filter.setCurrentText('执行器')
             self.assertIn('操作日志降级', dashboard.log_text.toPlainText())
+            failure = run / 'startup-failure.json'
+            for exception in ({'exception_id': 'start-example-id'}, None):
+                with self.subTest(exception=exception):
+                    failure.write_bytes(canonical_bytes(identity | {'message': '启动回执中的异常',
+                        'error_code': 'E_STARTUP_TEST', 'exception': exception}))
+                    dashboard.update_logs()
+                    displayed = dashboard.log_text.toPlainText()
+                    self.assertIn('启动回执中的异常', displayed)
+                    self.assertIn('操作日志降级', displayed)
+                    if exception:
+                        self.assertIn(exception['exception_id'], displayed)
 
             publish_log_recovery(path, recovery | {'status': 'RECOVERED'})
             record = identity | {'observed_at_utc': '2026-11-12T05:30:00Z', 'tag': '执行', 'message': '已补回报单'}
@@ -316,9 +327,11 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             self.assertNotIn('其他账户的报单', dashboard.log_text.toPlainText())
 
             publish_log_recovery(path, recovery | {'kernel_boot_id': 'foreign-boot'})
+            failure.write_bytes(canonical_bytes(identity | {'account_key': 'foreign-owner', 'message': '其他账户启动失败'}))
             dashboard.update_logs()
             self.assertNotIn('操作日志降级', dashboard.log_text.toPlainText())
             self.assertNotIn('已从账本补回操作日志', dashboard.log_text.toPlainText())
+            self.assertNotIn('其他账户启动失败', dashboard.log_text.toPlainText())
 
     def test_suggested_lots_is_display_only_with_unknown_inputs(self):
         window = WorkbenchWindow(None)
@@ -357,6 +370,30 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         self.assertIn('执行器已绑定 · 柜台交易日 2026-11-10',dashboard.calendar_status.text())
         self.assertEqual(dashboard.session_grid.rowCount(),1)
         self.assertEqual(dashboard.session_grid.item(0,2).text(),'09:00–15:00')
+
+    def test_home_displays_clock_price_protection_and_the_exact_block_cause(self):
+        from datetime import timedelta
+
+        case = test_online_dsv.OnlineDsvTests()
+        case.setUp()
+        self.addCleanup(case.tearDown)
+        case.entered(trade={'half_close_enabled': False}, max_quote_age_ms=5000)
+        case.clock.value -= timedelta(seconds=4)
+        case.session.step()
+        window = WorkbenchWindow(None)
+        self.addCleanup(dispose_widget, window)
+        window.timer.stop()
+        window._stale = False
+        window.view = workbench_view(case.kernel)
+        window.render_view()
+        dashboard = window.dashboard
+        self.assertEqual(dashboard.home_positions.item(0, 4).text(), '价格保护中')
+        case.clock.advance(6000)
+        case.session.step()
+        window.view = workbench_view(case.kernel)
+        window.render_view()
+        self.assertEqual(dashboard.home_positions.item(0, 4).text(), '本地自动保护待恢复')
+        self.assertIn('等待同盘次有效的原生报价', dashboard.home_pending.toolTip())
 
     def test_unsolicited_terminal_close_only_alerts_when_unreserved(self):
         case = test_online_dsv.OnlineDsvTests()

@@ -1,6 +1,7 @@
 """Actual product DSV simulation chain with externally injected native facts."""
 from pathlib import Path
 import copy
+from datetime import timedelta
 import json
 import tempfile
 import unittest
@@ -346,7 +347,6 @@ class OnlineDsvTests(unittest.TestCase):
                     x.tearDown()
 
     def test_clock_jump_still_accepts_owned_fill_and_reconciles_disarmed(self):
-        from datetime import timedelta
         from types import SimpleNamespace
         from tests.test_control import ControlTests
 
@@ -372,6 +372,260 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertFalse(self.kernel._armed)
         self.quote(1030)
         self.assertEqual(self.api.inserted[-1]['offset'], 'CLOSE')
+
+    def test_wall_clock_jump_keeps_same_session_stop_loss_and_take_profit_live(self):
+        for jump in (-4, 4):
+            for reason in ('STOP_LOSS', 'TAKE_PROFIT'):
+                with self.subTest(jump=jump, reason=reason):
+                    case = OnlineDsvTests()
+                    case.setUp()
+                    try:
+                        case.entered(trade={'half_close_enabled': False, 'protect_80_enabled': False})
+                        state = case.cycle()['protection']
+                        bar = case.session.driver.strategy._states[(case.code, '2026-11-10')]['last_signal_bar']
+                        source = FactClock(case.clock.now().isoformat())
+                        case.api.clock = source
+                        case.clock.value += timedelta(seconds=jump)
+                        for _ in range(7):
+                            case.clock.advance(1000)
+                            source.advance(1000)
+                            case.api.tick(case.code, last=1055)
+                            case.session.step()
+                        self.assertEqual(len(case.api.inserted), 1)
+                        self.assertIsNone(case.cycle()['protection']['target_remaining_qty'])
+                        self.assertEqual(case.kernel._dsv_diagnostics['clock_protection']['active_cycles'],
+                                         [case.cycle()['position_cycle_id']])
+                        with self.assertRaises(TraderError):
+                            case.kernel.simulation.arm()
+                        case.clock.advance(1000)
+                        source.advance(1000)
+                        plan = case.cycle()['plan']
+                        if reason == 'STOP_LOSS':
+                            price = int(plan['theoretical_entry_price']) - int(plan['fixed_stop_loss']['distance_points']) - 1
+                        else:
+                            price = int(plan['theoretical_entry_price']) + int(plan['fixed_take_profit']['distance_points']) + 1
+                        case.api.tick(case.code, last=price)
+                        case.session.step()
+                        self.assertEqual(case.session.phase, 'DSV_CLOCK_FAULT', case.kernel._dsv_diagnostics)
+                        self.assertEqual(case.cycle()['protection']['target_remaining_qty'], 0)
+                        self.assertIn(reason, case.cycle()['protection']['exit_reasons'])
+                        trigger = case.cycle()['nominal_exit']['trigger_clock']
+                        self.assertEqual(trigger['now_utc'], source.sample()['now_utc'])
+                        self.assertEqual(trigger['monotonic_ns'], str(case.clock.monotonic_ns))
+                        self.assertEqual(state['owned_qty'], 5)
+                        self.assertEqual([(o['offset'], o['volume'], o['limit_price']) for o in case.api.inserted],
+                                         [('OPEN', 5, 1056), ('CLOSE', 5, price - 1)])
+                        order = case.api.inserted[-1]
+                        case.api.fill(order['order_id'], 2, price)
+                        case.session.step()
+                        self.assertEqual(case.cycle()['protection']['owned_qty'], 3)
+                        self.assertEqual(len(case.api.inserted), 2)
+                        case.api.fill(order['order_id'], 3, price)
+                        case.session.step()
+                        self.assertFalse(case.kernel.snapshot()['armed'])
+                        self.assertEqual(case.cycle()['lifecycle'], 'CLOSED')
+                        self.assertEqual(len(case.kernel.ledger.query('SELECT trade_key FROM fill_facts')), 3)
+                        self.assertEqual(case.session.driver.strategy._states[(case.code, '2026-11-10')]['last_signal_bar'], bar)
+                    finally:
+                        case.tearDown()
+
+    def test_jump_with_stale_changed_quote_and_wrong_position_waits_for_proof(self):
+        self.entered(trade={'half_close_enabled': False}, max_quote_age_ms=5000)
+        source = FactClock(self.clock.now().isoformat())
+        self.api.clock = source
+        self.clock.value -= timedelta(seconds=5)
+        self.session.step()
+        self.clock.advance(6000)
+        self.session.step()
+        cid = self.cycle()['position_cycle_id']
+        blockers = lambda: self.kernel._dsv_diagnostics['clock_protection']['blocked_cycles']
+        self.assertEqual(blockers()[cid], 'E_NATIVE_QUOTE_NOT_CURRENT')
+        source.advance(6000)
+        self.api.tick(self.code, last=1030)
+        self.api.quotes[self.code].bid_price1 -= 1
+        self.session.step()
+        self.assertEqual(blockers()[cid], 'E_NATIVE_QUOTE_NOT_CURRENT')
+        self.clock.advance(1000)
+        source.advance(1000)
+        self.api.tick(self.code, last=1030)
+        position = self.api.positions[self.code]
+        position.pos_long_today = 4
+        self.session.step()
+        self.assertEqual(blockers()[cid], 'E_OWNERSHIP')
+        self.assertIsNone(self.cycle()['protection']['target_remaining_qty'])
+        self.assertEqual(len(self.api.inserted), 1)
+        position.pos_long_today = 5
+        self.session.step()
+        self.assertEqual(blockers(), {})
+        self.assertEqual([(o['offset'], o['volume']) for o in self.api.inserted], [('OPEN', 5), ('CLOSE', 5)])
+
+    def test_jump_does_not_run_close_time_or_reenter_after_original_session_ends(self):
+        self.clock = FactClock('2026-11-10T06:59:30Z')
+        self.entered(trade={'half_close_enabled': False, 'close_before_seconds': 20,
+                            'no_open_before_close_minutes': 0})
+        source = FactClock(self.clock.now().isoformat())
+        self.api.clock = source
+        self.clock.value += timedelta(seconds=40)
+        self.clock.advance(11000)
+        source.advance(11000)
+        self.api.tick(self.code, last=1055)
+        self.session.step()
+        cid = self.cycle()['position_cycle_id']
+        self.assertIn(cid, self.kernel._dsv_diagnostics['clock_protection']['active_cycles'])
+        self.assertIsNone(self.cycle()['execution']['close_start_ms'])
+        self.assertIsNone(self.cycle()['protection']['target_remaining_qty'])
+        self.clock.advance(19_000)
+        source.advance(19_000)
+        self.api.tick(self.code, last=1030)
+        self.session.step()
+        self.assertEqual(self.kernel._dsv_diagnostics['clock_protection']['blocked_cycles'][cid],
+                         'CLOCK_PROTECTION_SESSION_UNPROVED')
+        self.assertEqual(len(self.api.inserted), 1)
+
+    def test_jump_with_unknown_close_retains_reservation_and_original_target(self):
+        self.entered(trade={'half_close_enabled': False})
+        source = FactClock(self.clock.now().isoformat())
+        self.api.clock = source
+        self.clock.value += timedelta(seconds=4)
+        self.clock.advance(1000)
+        source.advance(1000)
+        self.api.tick(self.code, last=1030)
+        with patch.object(self.api, 'insert_order', side_effect=OSError('missing native send result')) as send:
+            self.session.step()
+            send.assert_called_once()
+        cid = self.cycle()['position_cycle_id']
+        self.assertEqual(self.cycle()['orders'][-1]['send_state'], 'UNKNOWN')
+        self.assertEqual(self.cycle()['protection']['target_remaining_qty'], 0)
+        self.assertEqual(self.kernel._dsv_diagnostics['clock_protection']['blocked_cycles'][cid], 'E_UNKNOWN_SEND')
+        self.clock.advance(1000)
+        source.advance(1000)
+        self.api.tick(self.code, last=1029)
+        self.session.step()
+        self.assertEqual(len(self.api.inserted), 1)
+        self.assertEqual(OrderState.from_dict(self.cycle()['orders'][-1]).potential_remaining, 5)
+        self.assertEqual(self.cycle()['protection']['target_remaining_qty'], 0)
+
+    def test_jump_keeps_partial_entry_stop_and_late_cancel_fill_in_the_original_cycle(self):
+        self.start(trade={'half_close_enabled': False})
+        self.quote()
+        opening = self.api.inserted[0]['order_id']
+        self.api.fill(opening, 2, 1055, finish=False)
+        self.session.step()
+        source = FactClock(self.clock.now().isoformat())
+        self.api.clock = source
+        self.clock.value -= timedelta(seconds=4)
+        self.clock.advance(1000)
+        source.advance(1000)
+        self.api.tick(self.code, last=1030)
+        self.session.step()
+        self.assertEqual(self.api.cancelled, [opening])
+        self.assertEqual([(o['offset'], o['volume']) for o in self.api.inserted], [('OPEN', 5), ('CLOSE', 2)])
+        self.api.fill(opening, 1, 1055, finish=True)
+        self.api.fill(self.api.inserted[-1]['order_id'], 2, 1029)
+        self.clock.advance(1000)
+        source.advance(1000)
+        self.api.tick(self.code, last=1030)
+        self.session.step()
+        self.assertEqual(self.cycle()['protection']['owned_qty'], 1)
+        self.assertEqual(self.cycle()['protection']['target_remaining_qty'], 0)
+        self.assertEqual([(o['offset'], o['volume']) for o in self.api.inserted],
+                         [('OPEN', 5), ('CLOSE', 2), ('CLOSE', 1)])
+        self.api.fill(self.api.inserted[-1]['order_id'], 1, 1029)
+        self.session.step()
+        self.assertEqual(self.cycle()['lifecycle'], 'CLOSED')
+        self.assertTrue(self.session.driver._fault)
+
+    def test_jump_with_loss_of_monotonic_progress_or_source_epoch_stays_disarmed(self):
+        for failure in ('monotonic', 'source_epoch'):
+            with self.subTest(failure=failure):
+                case = OnlineDsvTests()
+                case.setUp()
+                try:
+                    case.entered(trade={'half_close_enabled': False})
+                    source = FactClock(case.clock.now().isoformat())
+                    case.api.clock = source
+                    case.clock.value += timedelta(seconds=4)
+                    case.session.step()
+                    if failure == 'monotonic':
+                        case.clock.monotonic_ns -= 1
+                        rule = 'CLOCK_PROTECTION_MONOTONIC_UNPROVED'
+                    else:
+                        case.port.source_epoch += 1
+                        rule = 'CLOCK_PROTECTION_CONNECTION_UNPROVED'
+                    case.session.step()
+                    case.clock.advance(1000)
+                    source.advance(1000)
+                    case.api.tick(case.code, last=1030)
+                    case.session.step()
+                    self.assertEqual(case.kernel._dsv_diagnostics['clock_protection']['blocked_cycles'],
+                                     {case.cycle()['position_cycle_id']: rule})
+                    self.assertEqual(len(case.api.inserted), 1)
+                    self.assertFalse(case.kernel.snapshot()['armed'])
+                finally:
+                    case.tearDown()
+
+    def test_clock_reset_followed_immediately_by_f5_only_trades_on_a_later_native_tick(self):
+        from types import SimpleNamespace
+        from tests.test_control import ControlTests
+
+        self.start()
+        source = FactClock(self.clock.now().isoformat())
+        self.api.clock = source
+        self.clock.value += timedelta(seconds=4)
+        self.clock.advance(1000)
+        source.advance(1000)
+        self.api.tick(self.code, last=1055)
+        self.session.step()
+        self.clock.value = source.now()
+        client = SimpleNamespace(kernel=self.kernel, account=self.kernel.account_key)
+        reconciliation = ControlTests.message(client, 'REQUEST_RECONCILIATION',
+            {'requested_scope': 'FULL_ACCOUNT', 'position_cycle_id': None})
+        result = self.kernel.execute_command(reconciliation, 'desktop')
+        self.kernel.wait_idle()
+        self.assertEqual(result.result()['status'], 'SUCCEEDED')
+        arm = ControlTests.message(client, 'ARM_ENTRIES', {
+            'rule_set_id': self.kernel._configuration['rule_set_id'],
+            'config_revision': str(self.kernel._config_revision),
+            'authority_policy_id': self.kernel.ledger.query(
+                "SELECT policy_id FROM policy_revisions WHERE policy_kind='AUTHORITY'")[0]['policy_id'],
+        })
+        result = self.kernel.execute_command(arm, 'desktop')
+        self.kernel.wait_idle()
+        self.assertTrue(self.kernel.snapshot()['armed'], result.result())
+        self.session.step()
+        self.assertEqual(self.api.inserted, [])
+        self.clock.advance(1000)
+        source.advance(1000)
+        self.api.tick(self.code, last=1055)
+        self.session.step()
+        self.assertEqual([(o['offset'], o['volume']) for o in self.api.inserted], [('OPEN', 5)])
+
+    def test_restarted_clock_fault_with_fast_wall_can_reconcile_and_accept_original_exit_fill(self):
+        from types import SimpleNamespace
+        from tests.test_control import ControlTests
+
+        self.entered(trade={'half_close_enabled': False})
+        self.quote(1038)
+        close_id = self.api.inserted[-1]['order_id']
+        source = FactClock(self.clock.now().isoformat())
+        self.clock.value += timedelta(seconds=10)
+        self.session.step()
+        self.restart()
+        self.assertTrue(self.session.driver._fault)
+        self.clock.value = source.now()
+        self.api.clock = source
+        client = SimpleNamespace(kernel=self.kernel, account=self.kernel.account_key)
+        reconciliation = ControlTests.message(client, 'REQUEST_RECONCILIATION',
+            {'requested_scope': 'FULL_ACCOUNT', 'position_cycle_id': None})
+        result = self.kernel.execute_command(reconciliation, 'desktop')
+        self.kernel.wait_idle()
+        self.assertEqual(result.result()['status'], 'SUCCEEDED')
+        self.api.fill(close_id, 5, 1037)
+        self.session.step()
+        self.assertEqual(self.cycle()['lifecycle'], 'CLOSED')
+        self.assertEqual(self.api.inserted, [])
+        self.assertIsNone(self.session.driver._fault)
+        self.assertFalse(self.kernel.snapshot()['armed'])
 
     def test_desktop_target_count_allows_replacement_at_daily_cap(self):
         self.start(trade={'max_daily_orders': 1}, grant_changes={

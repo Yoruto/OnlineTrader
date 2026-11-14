@@ -74,10 +74,22 @@ LOG_PHASES = {
     'DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION': '柜台换日，等待核对原委托及持仓',
     'DSV_STOPPING': '已停止开仓，继续保护并等待核对',
     'DSV_STOPPED': '策略已停止',
-    'DSV_CLOCK_FAULT': 'Windows 时间或交易时段待核对，保留原持仓退出目标',
+    'DSV_CLOCK_FAULT': 'Windows 时间待核对，暂停开仓和定时调度',
+    'DSV_CLOCK_PROTECTION_BLOCKED': '本地自动保护待恢复，保留原持仓退出目标',
     'DSV_ENTRY_RECOVERY_PENDING': '等待柜台核对和实时行情，开仓权限暂挂',
     'CLOCK_REFRESH_RETRY_PROTECTION_ACTIVE': '参考时钟暂不可用，继续保护已有持仓',
     'DSV_CONTROLLER_INTERRUPTED_ORIGINAL_PROTECTION_CONTINUES': '控制连接中断，继续管理原持仓',
+}
+
+CLOCK_PROTECTION_REASONS = {
+    'CLOCK_PROTECTION_MONOTONIC_UNPROVED': '连续的单调时间证据缺失',
+    'CLOCK_PROTECTION_CONNECTION_UNPROVED': '原行情或柜台连接待核对',
+    'CLOCK_PROTECTION_SESSION_UNPROVED': '原盘次或柜台交易日待确认',
+    'RECONCILIATION_REQUIRED': '持仓及原委托待核对',
+    'E_UNKNOWN_SEND': '报单或撤单结果待确认',
+    'E_NATIVE_QUOTE_NOT_CURRENT': '等待同盘次有效的原生报价',
+    'E_OWNERSHIP': '柜台持仓、委托或今昨仓待核对',
+    'E_FACT_BARRIER': '柜台委托及逐笔成交待核对',
 }
 
 
@@ -834,6 +846,9 @@ class WorkbenchLayout:
         by_cycle = {}
         failed_exits = {block.get('position_cycle_id') for block in view['blocks']
                         if block.get('active') and block['reason_code'] == 'EXIT_REDUCTION_TERMINAL_UNFILLED'}
+        protection = view['configuration'].get('strategy_diagnostics', {}).get('clock_protection', {})
+        protection_blocked = protection.get('blocked_cycles', {}) if connection.get('clock_fault') else {}
+        protection_active = protection.get('active_cycles', ()) if connection.get('clock_fault') else ()
         if available:
             if connection.get('recovery_required'):
                 pending.append('柜台持仓待核对')
@@ -866,7 +881,18 @@ class WorkbenchLayout:
         for cycle in cycles:
             cid, code = cycle['position_cycle_id'], cycle['contract_id']
             floating = cycle.get('floating_profit') if available else None
-            if not available:
+            current = not self.window._stale and not view['truncated']
+            if current and cid in protection_blocked:
+                status = '本地自动保护待恢复'
+                reason = protection_blocked[cid]
+                pending.append(f'{code} {status} · {CLOCK_PROTECTION_REASONS.get(reason, reason)}')
+            elif current and cid in protection_active:
+                if cid in failed_exits:
+                    status = '平仓待核对'
+                    pending.append(f'{code} 平仓剩余目标待核对')
+                else:
+                    status = '平仓待确认' if cycle.get('exit_pending') else '价格保护中'
+            elif not available:
                 status = '待核对'
             elif cycle.get('management_state') in {'TAKEN_OVER', 'TAKEOVER_PENDING'}:
                 status = '已交接' if cycle['management_state'] == 'TAKEN_OVER' else '交接待确认'
@@ -889,7 +915,8 @@ class WorkbenchLayout:
             grouped.setdefault((code, cycle['direction']), []).append((cycle['remaining_quantity'], floating, status))
 
         names = self.names | {item['code']: item['name'] for item in view['configuration'].get('strategy_symbols', [])}
-        status_order = ('待核对', '平仓待核对', '平仓待确认', '交接待确认', '保护待核对', '平仓待成交', '已交接', '保护中')
+        status_order = ('本地自动保护待恢复', '待核对', '平仓待核对', '平仓待确认', '交接待确认', '保护待核对',
+                        '平仓待成交', '已交接', '价格保护中', '保护中')
         rows = []
         for (code, direction), items in grouped.items():
             name = names.get(code)
@@ -1876,7 +1903,7 @@ class WorkbenchLayout:
 
     def executor_log(self, run):
         phases = []
-        identity = self.log_binding[0]
+        run_identity = self.log_binding[0]
         for path in (executor_log_path(run), *sorted(run.glob('phase-*.json'))):
             for record in self.log_tail(path).read(path):
                 phase = record.get('phase')
@@ -1884,12 +1911,19 @@ class WorkbenchLayout:
                     continue
                 at, stamp = log_time(record.get('observed_at_utc'))
                 if phase == 'DSV_OPERATION_LOG_DEGRADED':
-                    if (record.get('account_key'), record.get('kernel_boot_id')) == identity:
+                    if (record.get('account_key'), record.get('kernel_boot_id')) == run_identity:
                         phases.append(WorkbenchLogLine(f'[{at}] [日志] {operation_log_message(record)}', 'error', stamp))
                     continue
                 message = record.get('message') or LOG_PHASES.get(phase, '策略状态已更新')
                 if not isinstance(message, str):
                     message = LOG_PHASES.get(phase, '策略状态已更新')
+                if phase == 'DSV_CLOCK_PROTECTION_BLOCKED':
+                    protection = record.get('clock_protection')
+                    blocked = protection.get('blocked_cycles') if isinstance(protection, dict) else None
+                    if isinstance(blocked, dict):
+                        reasons = {CLOCK_PROTECTION_REASONS.get(code, code) for code in blocked.values() if isinstance(code, str)}
+                        if reasons:
+                            message += ' · ' + '、'.join(sorted(reasons))
                 error = record.get('error_code')
                 if isinstance(error, str):
                     message += ' · ' + error
@@ -1899,12 +1933,16 @@ class WorkbenchLayout:
                 phases.append(WorkbenchLogLine(f'[{at}] [执行器] {message}', 'error' if error else None, stamp))
         failure = run/'startup-failure.json'
         for record in self.log_tail(failure).read(failure):
-            identity = (record.get('exception') or {}).get('exception_id')
-            suffix = f' · {identity}' if identity else ''
+            if run_identity is not None and any(record.get(key) not in (None, expected)
+                for key, expected in zip(('account_key', 'kernel_boot_id'), run_identity)):
+                continue
+            exception = record.get('exception')
+            exception_id = exception.get('exception_id') if isinstance(exception, dict) else None
+            suffix = f' · {exception_id}' if isinstance(exception_id, str) and exception_id else ''
             phases.append(WorkbenchLogLine(f"[执行器] {record.get('message','启动失败')} · {record.get('error_code','—')}{suffix}", 'error'))
         recovery_path = run.with_name(run.name + '.operation-log-recovery.json')
         for recovery in self.log_tail(recovery_path).read(recovery_path):
-            if matches_operation_log_recovery(recovery, run, identity):
+            if matches_operation_log_recovery(recovery, run, run_identity):
                 at, stamp = log_time(recovery.get('observed_at_utc'))
                 phases.append(WorkbenchLogLine(f'[{at}] [日志] {operation_log_message(recovery)}',
                                                None if recovery.get('status') == 'RECOVERED' else 'error', stamp))

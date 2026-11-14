@@ -140,7 +140,7 @@ class OnlineDsvSimulation(OnlineSimulation):
         k=self.kernel;scheduler=getattr(k,'_scheduled_runtime',None)
         if not self.port.entry_clock_ready():
             raise TraderError('E_CLOCK','A valid Windows wall clock is required to enable new entries')
-        if (scheduler is None or not scheduler._enabled or scheduler._fault
+        if (scheduler is None or not scheduler._enabled or scheduler._fault or scheduler.clock_rebuild_pending
                 or scheduler.calendar.content_hash!=self.grant.value['calendar_hash']
                 or scheduler.strategy.epoch!=k.active_epoch or not k.control.can_increase()
                 or any(c.get('statistics_review_required') for c in k._staged.values())):
@@ -179,6 +179,8 @@ class OnlineDsvSimulation(OnlineSimulation):
         if not self.grant.manual_workbench or facts is None or not self.days.ready(candidate['trading_day']) or not self.port.fresh(code):
             raise TraderError('E_NOT_READY','A current manual workbench scope and native quote are required')
         event=facts['event']
+        if not k._scheduled_runtime.entry_quote_after_clock_reset(event):
+            raise TraderError('E_NOT_READY', '完整核对后需等待下一笔实时行情。')
         if (event['source_epoch']!=self.port.source_epoch or
                 k._quote_age_ns(facts['received_ns'])>k.max_quote_age_ms*1_000_000 or
                 runtime._blocked(event,exclude_decision=exclude_decision) or
@@ -294,7 +296,13 @@ class OnlineDsvSimulation(OnlineSimulation):
             from online_trader.execution.close_routes import preview_owned_routes
             state=cycle['protection'];target=state.get('target_remaining_qty')
             if target is None:raise TraderError('E_FACT_BARRIER','An original common exit target is required')
-            try:review=preview_owned_routes(self.kernel,cycle['position_cycle_id'],max(0,state['owned_qty']-target))
+            scheduler = getattr(self.kernel, '_scheduled_runtime', None)
+            now = None
+            if scheduler is not None and scheduler._fault:
+                now = scheduler.clock_protection_time(cycle)
+                if now is None:
+                    return False
+            try:review=preview_owned_routes(self.kernel,cycle['position_cycle_id'],max(0,state['owned_qty']-target),_now=now)
             except TraderError as error:
                 if error.code not in {'E_FACT_BARRIER','E_OWNERSHIP','E_CALENDAR_INCOMPLETE'}:raise
                 return False
@@ -308,6 +316,27 @@ class OnlineDsvSimulation(OnlineSimulation):
                 'position_cycle_id':cycle['position_cycle_id'],'trading_day':review['current_day'],
                 'native_offset':order.native_offset,'quantity':order.original_qty}
         return True
+
+    def verify_clock_protection(self, cycle, snapshot, *, exclude_child=None):
+        """Check current account facts before acting on a native quote during a wall-clock fault."""
+        self._validate_snapshot(snapshot)
+        code = cycle['plan']['contract_id']
+        self.verify_owned_position(code, snapshot)
+        self.verify_foreign_orders(cycle, snapshot)
+        managed = [c for c in self.kernel._staged.values() if c['plan']['contract_id'] == code
+                   and c['lifecycle'] != 'CLOSED']
+        owned = {self.port.order_id(o['child_order_id']) for c in managed for o in c['orders']}
+        if any(o['order_id'] not in owned for o in snapshot['orders']
+               if o['contract_id'] == code and o['status'] == 'ALIVE'):
+            raise TraderError('E_OWNERSHIP', 'An active foreign order prevents proof of owned price protection')
+        snapshot = self.reconciliation_snapshot(snapshot)
+        for current in managed:
+            orders = [o for o in current['orders'] if o['child_order_id'] != exclude_child]
+            if any(o['send_state'] in {'SEND_POSSIBLE', 'UNKNOWN'}
+                   or o['cancel_status'] == 'UNKNOWN' and not o['terminal_confirmed']
+                   or o['reported_fill_qty'] not in (None, o['filled_qty']) for o in orders):
+                raise TraderError('E_UNKNOWN_SEND', 'The original order or cancellation still needs native evidence')
+            self.verify_cycle_orders(current, orders, snapshot)
 
     def can_close(self,cycle):
         ex=cycle.get('execution',{});state=cycle['protection'];k=self.kernel

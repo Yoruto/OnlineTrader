@@ -46,6 +46,25 @@ class TqKqDsvPort(TqKqPort):
         except (TraderError, KeyError, AttributeError, TypeError, ValueError):
             return False
 
+    def current_protection_quote(self, event, now):
+        """Match an executable native book to the price observation used for an exit."""
+        code = event['contract_id']
+        try:
+            q = self.quotes[code]
+            source = datetime.fromisoformat(event['source_time_utc'])
+            if (not 0 <= (now - source).total_seconds() * 1000 <= self.kernel.max_quote_age_ms
+                    or not self.fresh(code, now=now) or not self._matches_strategy_quote(q, event)
+                    or (number(q.bid_price1), number(q.ask_price1), number(q.price_tick)) != (
+                        event['bid1'], event['ask1'], event['tick_size'])
+                    or not all(math.isfinite(size) for size in (q.bid_volume1, q.ask_volume1))
+                    or not q.lower_limit <= q.last_price <= q.upper_limit):
+                return False
+            for price in ('last', 'bid1', 'ask1'):
+                order_price(event[price], event['tick_size'])
+            return True
+        except (TraderError, KeyError, AttributeError, TypeError, ValueError):
+            return False
+
     def fresh_strategy_entry(self, code, side, event):
         """Use the strategy age rule and verify the exact legal native quote."""
         if event is None:
@@ -229,10 +248,10 @@ class TqKqDsvPort(TqKqPort):
             raise TraderError('E_ONLINE_SCOPE','The native adapter calendar differs from the strategy grant')
         self.calendar=calendar
 
-    def snapshot(self):
+    def snapshot(self, *, now=None):
         value=super().snapshot()
         if self.calendar is None:raise TraderError('E_CALENDAR','Explicit strategy calendar is required')
-        now=self.clock.now().isoformat().replace('+00:00','Z')
+        now=(self.clock.now() if now is None else now).isoformat().replace('+00:00','Z')
         windows=[self.calendar.query(code,now) for code in self.grant.value['contracts']]
         days=set()
         for item in windows:
@@ -301,15 +320,22 @@ class TqKqDsvPort(TqKqPort):
                 or request.get('effect') not in {'OPEN','REDUCE'} or type(request.get('original_qty')) is not int
                 or not 1<=request['original_qty']<=value['max_order_quantity']):
             raise TraderError('E_GATEWAY_SCOPE','A fresh, complete and exactly owned DSV simulated order is required')
-        snapshot=self.snapshot()
-        if not snapshot['complete'] or snapshot['trading_day']!=request['trading_day']:
-            raise TraderError('E_FACT_BARRIER','Current trading day is outside the explicit native scope')
         cycle,_=kernel._find(request['child_order_id'])
         order=next(o for o in cycle['orders'] if o['child_order_id']==request['child_order_id'])
         if (cycle['position_cycle_id']!=request.get('position_cycle_id') or cycle.get('management_state')=='TAKEN_OVER'
                 or kernel.simulation.archived_cycle(cycle)
                 or any(order[key]!=request[key] for key in ('effect','original_qty','limit_price','native_offset'))):
             raise TraderError('E_OWNERSHIP','Native order is not the exact committed original child')
+        scheduler = getattr(kernel, '_scheduled_runtime', None)
+        protection_now = None
+        if scheduler is not None and scheduler._fault:
+            if order['effect'] == 'REDUCE':
+                protection_now = scheduler.clock_protection_time(cycle)
+            if protection_now is None:
+                raise TraderError('E_CLOCK_FAULT', '本地自动保护需要重新确认原盘次与实时行情。')
+        snapshot=self.snapshot(now=protection_now)
+        if not snapshot['complete'] or snapshot['trading_day']!=request['trading_day']:
+            raise TraderError('E_FACT_BARRIER','Current trading day is outside the explicit native scope')
         manual = kernel.execution.manual_reduction(cycle) if order['effect']=='REDUCE' else None
         direct = (manual and manual.get('price')==request['limit_price']
                   and cycle['execution'].get('manual_reduction_children',{}).get(order['child_order_id'])==manual['request_id'])
@@ -318,7 +344,12 @@ class TqKqDsvPort(TqKqPort):
         candidate = metadata.get('candidate') or {}
         runtime = getattr(kernel, '_dsv_runtime', None)
         facts = runtime._latest.get((code, request['trading_day'])) if runtime is not None else None
-        if request['effect']=='OPEN' and candidate.get('entry_kind')=='NORMAL' and cycle['entry_origin']=='STRATEGY':
+        if protection_now is not None:
+            # The scheduler matched the native book immediately above. Check
+            # original orders again, excluding just this unsent durable child.
+            kernel.simulation.verify_clock_protection(cycle, snapshot, exclude_child=request['child_order_id'])
+            fresh = True
+        elif request['effect']=='OPEN' and candidate.get('entry_kind')=='NORMAL' and cycle['entry_origin']=='STRATEGY':
             fresh = self.fresh_strategy_entry(code, request['direction'], facts['event'] if facts is not None else None)
         else:
             fresh = self.fresh(code) or (direct and self.fresh_manual_reduction(code))
@@ -364,7 +395,7 @@ class TqKqDsvPort(TqKqPort):
             state=cycle['protection'];target=state.get('target_remaining_qty')
             if target is None:raise TraderError('E_FACT_BARRIER','Native reduction lacks its common remaining target')
             review=preview_owned_routes(kernel,cycle['position_cycle_id'],max(0,state['owned_qty']-target),
-                _exclude_child=request['child_order_id'])
+                _exclude_child=request['child_order_id'], _now=protection_now)
             route=next((r for r in review['routes'] if r['native_offset']==request['native_offset']),None)
             saved=order.get('close_route')
             if (route is None or request['original_qty']>route['quantity'] or order.get('native_trading_day')!=review['current_day']
@@ -394,6 +425,11 @@ class TqKqDsvPort(TqKqPort):
         if not self.api.is_serial_ready(serial):return []
         self.subscription_ready_at.setdefault(code,self.clock.now())
         return serial.to_dict('records')
+
+    def latest_tick_record(self, code):
+        serial = self.tick_serials[code]
+        if self.api.is_serial_ready(serial):
+            return serial.tail(1).to_dict('records')[0]
 
     def request_tick_backfill(self,code):
         """Refresh a gapped native serial through a new, bounded SDK request."""

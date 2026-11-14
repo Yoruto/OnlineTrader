@@ -1,8 +1,10 @@
 """F6 stop and native terminal evidence using the product simulation owner."""
+from datetime import timedelta
 from types import SimpleNamespace
 import unittest
 
 from online_trader.kernel.workbench import workbench_view
+from qa.dsv_native_facts import FactClock
 import test_control
 import test_online_dsv
 
@@ -141,6 +143,35 @@ class DsvStopCommandTests(unittest.TestCase):
         self.assertEqual(receipt['status'], 'NEEDS_RECONCILIATION', receipt)
         self.assertEqual(self.api.cancelled, [])
         self.assertFalse(self.kernel.snapshot()['armed'])
+
+    def test_stop_after_wall_jump_cancels_owned_native_exit_and_keeps_target(self):
+        cycle = self.entered(trade={'cancel_on_stop': True, 'half_close_enabled': False})
+        self.quote(1038)
+        original_exit = self.api.inserted[-1]
+        self.api.fill(original_exit['order_id'], 2, 1037, finish=False)
+        self.session.step()
+        source = FactClock(self.clock.now().isoformat())
+        self.api.clock = source
+        self.clock.value += timedelta(days=1)
+        self.session.step()
+        receipt = self.stop()
+        self.assertEqual(receipt['status'], 'EXECUTING', receipt)
+        self.assertEqual(self.api.cancelled, [original_exit['order_id']])
+        self.api.terminal(original_exit['order_id'])
+        self.clock.advance(1000)
+        source.advance(1000)
+        self.api.tick(self.code, last=1038)
+        self.session.step()
+        self.assertEqual(self.command_status(receipt)['status'], 'SUCCEEDED')
+        self.assertEqual(self.cycle()['position_cycle_id'], cycle['position_cycle_id'])
+        self.assertEqual(self.cycle()['protection']['target_remaining_qty'], 0)
+        self.assertEqual([(o['offset'], o['volume']) for o in self.api.inserted],
+                         [('OPEN', 5), ('CLOSE', 5), ('CLOSE', 3)])
+        final = self.api.inserted[-1]
+        self.api.fill(final['order_id'], 3, 1037)
+        self.session.step()
+        self.assertTrue(self.session.stop.is_set())
+        self.assertEqual(self.session.result['status'], 'DSV_STOPPED')
 
     def test_stop_reports_existing_position_and_keeps_the_exit_target(self):
         cycle = self.entered()

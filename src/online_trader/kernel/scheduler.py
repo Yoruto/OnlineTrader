@@ -45,6 +45,12 @@ class ScheduledRuntime:
         self.guard=ClockGuard(max_wall_drift_ms=max_wall_drift_ms)
         self.interval_ms=interval_ms;self.max_wall_drift_ms=max_wall_drift_ms
         self._sample=None;self._busy=False;self._enabled=False;self._fault=None;self._fault_written=False
+        self._fault_monotonic = None
+        self._fault_received_ns = None
+        self._clock_exit = None
+        self._fault_source_epoch = None
+        self.last_clock_reset = None
+        self.clock_rebuild_pending = False
         self._quotes={};self._ages={};self._anchors={};self._driven={};self._gaps={};self._scope_faults=set()
         for row in kernel.ledger.query("SELECT event_type,payload_json FROM event_journal WHERE event_type IN ('SCHEDULER_FACT_BARRIER','CLOCK_RESET_REQUIRES_FRESH_FACTS') ORDER BY event_seq"):
             data=strict_loads(row['payload_json']);data=data.get('data',data)
@@ -74,17 +80,110 @@ class ScheduledRuntime:
         if not self._enabled or self._busy or self._fault:
             return
         try:
-            observed=self.guard.observe(self.clock.sample())
-            if observed['valid']:self._sample=ClockSample.from_record({'now_utc':observed['now_utc'],'monotonic_ns':observed['monotonic_ns']})
-            elif self._fault is None:self._fault=list(observed['reasons'])
+            sample = self.clock.sample()
+            observed = self.guard.observe(sample)
+            if observed['valid']:
+                self._sample = ClockSample.from_record(sample)
+            else:
+                self._fault = list(observed['reasons'])
+                if (self.strategy.online and self._sample is not None
+                        and set(self._fault) <= {'CLOCK_WALL_REGRESSION', 'CLOCK_DRIFT_EXCEEDED'}):
+                    self._fault_monotonic = int(observed['monotonic_ns'])
+                    self._fault_received_ns = time.monotonic_ns()
+                    self._fault_source_epoch = self.kernel.port.source_epoch
         except TraderError as error:
             if self._fault is None:self._fault=[error.code]
         except Exception:
             if self._fault is None:self._fault=['CLOCK_SOURCE_FAILED']
         if self._fault:
             k=self.kernel;k._armed=False;k.contexts.revoke_all()
-            k._recovery_pending.update(c['position_cycle_id'] for c in k._staged.values() if c['lifecycle']!='CLOSED')
-            k.recovery_required |= bool(k._recovery_pending)
+            if self._fault_monotonic is None:
+                k._recovery_pending.update(c['position_cycle_id'] for c in k._staged.values() if c['lifecycle']!='CLOSED')
+                k.recovery_required |= bool(k._recovery_pending)
+
+    def clock_protection_sample(self):
+        """Project the last accepted reading using the same boot's monotonic clock."""
+        if self._fault_monotonic is None:
+            return None
+        try:
+            received_ns = time.monotonic_ns()
+            current = ClockSample.from_record(self.clock.sample()).monotonic
+            if (current > self._fault_monotonic or (current == self._fault_monotonic
+                    and received_ns - self._fault_received_ns <= self.max_wall_drift_ms * 1_000_000)):
+                elapsed = current - self._sample.monotonic
+                projected = self._sample.utc + timedelta(microseconds=elapsed // 1000)
+                if current > self._fault_monotonic:
+                    self._fault_received_ns = received_ns
+                self._fault_monotonic = current
+                return ClockSample(projected.isoformat().replace('+00:00', 'Z'), str(current))
+        except (TraderError, OverflowError, OSError):
+            pass
+        # A failed or regressive monotonic observation breaks the proof for
+        # the rest of this fault. Explicit reconciliation may reset it.
+        self._fault_monotonic = None
+        return None
+
+    def clock_protection_snapshot(self, sample):
+        port = self.kernel.port
+        if (sample is None or port.fault or not port.complete()
+                or port.source_epoch != self._fault_source_epoch):
+            return None
+        snapshot = port.snapshot(now=sample.utc)
+        day = snapshot['trading_day']
+        if (snapshot['complete'] and self.kernel.simulation.days.ready(day)
+                and any(self.clock_protection_session(code, sample.utc) for code in port.grant.value['contracts'])):
+            return snapshot
+
+    def clock_protection_session(self, code, now):
+        initial = self.calendar.query(code, self._sample.now_utc)
+        current = self.calendar.query(code, now.isoformat().replace('+00:00', 'Z'))
+        if (initial['complete'] and current['complete'] and initial['is_trading'] and current['is_trading']
+                and initial['session'] == current['session']):
+            return current
+
+    def clock_protection_time(self, cycle):
+        scope = self._clock_exit
+        if scope is None or scope['cycle_id'] != cycle['position_cycle_id']:
+            return None
+        event = scope['event']
+        port = self.kernel.port
+        elapsed = time.monotonic_ns() - scope['clock_received_ns']
+        now = scope['sample'].utc + timedelta(microseconds=elapsed // 1000)
+        if (not port.fault and port.source_epoch == event['source_epoch']
+                and self.clock_protection_session(event['contract_id'], now)
+                and port.current_protection_quote(event, now)):
+            return now
+
+    def on_clock_protection(self, cycle, event, instrument, sample, at, clock_received_ns):
+        """Advance only this cycle's price rules and retain dispatch proof through CommitAck."""
+        k = self.kernel
+        received = time.monotonic_ns()
+        age = max(0, _ms(sample.utc - datetime.fromisoformat(event['source_time_utc']))
+                  + (received - clock_received_ns) // 1_000_000)
+        self._register(received, sample, age)
+        self._clock_exit = {'cycle_id': cycle['position_cycle_id'], 'event': event,
+                            'sample': sample, 'clock_received_ns': clock_received_ns}
+        try:
+            if self.clock_protection_time(cycle) is None:
+                return False
+            previous = cycle.get('last_protection_market_identity')
+            quote = cycle.get('last_quote')
+            if (previous == self._native_identity(event) and quote and quote['kernel_boot_id'] == k.boot_id
+                    and self.quote_age_ns(quote['received_ns']) <= k.max_quote_age_ms * 1_000_000):
+                # Try an existing reduction after native callbacks, without
+                # evaluating this protection price a second time.
+                k.execution.progress(cycle['position_cycle_id'])
+                k.wait_idle()
+                return self.clock_protection_time(cycle) is not None
+            cached = {'event': event, 'instrument': instrument, 'received_ns': received}
+            elapsed = cycle.get('execution', {}).get('elapsed_ms', 0)
+            tick = self._execution(cycle, cached, at, elapsed, sample=sample, price_only=True)
+            future = k.execution.tick(cycle['position_cycle_id'], tick, _market_received_ns=received, _price_only=True)
+            k.wait_idle()
+            future.result()
+            return self.clock_protection_time(cycle) is not None
+        finally:
+            self._clock_exit = None
 
     def quote_age_ns(self,received):
         real=max(0,time.monotonic_ns()-int(received));anchor=self._ages.get(str(received))
@@ -135,6 +234,9 @@ class ScheduledRuntime:
         if not self.scope_current(event['contract_id'],event['trading_day'],event['session_id']):
             raise TraderError('E_SCOPE','The quote no longer belongs to the current proved trading session')
         source=datetime.fromisoformat(event['source_time_utc'])
+        if not self.entry_quote_after_clock_reset(event):
+            _allow_entry = False
+            _entry_recovery = None
         age=_ms(sample.utc-source)
         if age < -self.max_wall_drift_ms:
             raise TraderError('E_FACT_BARRIER','Quote source time is not fresh against the clock evidence')
@@ -212,11 +314,18 @@ class ScheduledRuntime:
         at=self.calendar.query(event['contract_id'],sample.to_record()['now_utc'])
         return self._execution(cycle,cached,at,elapsed)
 
-    def _execution(self,cycle,cached,at,elapsed):
-        epoch,seq=self._sequence(cycle);event=cached['event'];sample=self._sample
+    @staticmethod
+    def _native_identity(event):
+        return {'contract_id':event['contract_id'], 'native_time_ns':event['native_time_ns'],
+                'native_tick_id':event['native_tick_id'], 'quote_hash':content_hash({key:event[key] for key in
+                    ('last','bid1','ask1','day_high','day_low','native_time_ns','native_tick_id')})}
+
+    def _execution(self,cycle,cached,at,elapsed,*,sample=None,price_only=False):
+        epoch,seq=self._sequence(cycle);event=cached['event'];sample=self._sample if sample is None else sample
         current=at['session'];since=at['since_open_ms'] if current else 0
         policy=cycle['plan']['execution_policy'];deadline=cycle['schedule_binding']['forced_close_utc']
-        close_due=deadline is not None and _ms(datetime.fromisoformat(deadline)-sample.utc)<=cycle['plan']['close_session']['advance_seconds']*1000
+        close_due=(not price_only and deadline is not None
+                   and _ms(datetime.fromisoformat(deadline)-sample.utc)<=cycle['plan']['close_session']['advance_seconds']*1000)
         fresh=self.quote_age_ns(cached['received_ns'])<=self.kernel.max_quote_age_ms*1000000
         # Missing entry history blocks new signals, not fresh-price management
         # of an already proved owned position.
@@ -229,13 +338,15 @@ class ScheduledRuntime:
             'source_epoch':epoch,'sequence':seq,'elapsed_ms':quantity(elapsed),'trading_day':at['trading_day'] or cycle['plan']['trading_day'],
             'close_due':close_due,'market':market,'calendar_hash':self.calendar.content_hash,
             'observed_at_utc':sample.to_record()['now_utc']}
-        if (self.strategy.online and cycle.get('entry_origin') == 'STRATEGY'
+        if (not price_only and self.strategy.online and cycle.get('entry_origin') == 'STRATEGY'
                 and ((cycle.get('strategy_metadata') or {}).get('candidate') or {}).get('entry_kind') == 'NORMAL'):
             result['ordinary_entry_fresh'] = not self.strategy.ordinary_quote_stale(event, now=sample.utc)
         if 'native_time_ns' in event:
-            result['market_identity']={'contract_id':event['contract_id'],'native_time_ns':event['native_time_ns'],
-                'native_tick_id':event['native_tick_id'],'quote_hash':content_hash({key:event[key] for key in
-                    ('last','bid1','ask1','day_high','day_low','native_time_ns','native_tick_id')})}
+            result['market_identity'] = self._native_identity(event)
+            result['market_source'] = {'session_id': event['session_id'], 'source_epoch': event['source_epoch']}
+        if price_only:
+            result['clock_protection'] = {'market_source': result['market_source'],
+                                          'last_accepted_clock': self._sample.to_record()}
         if close_due:
             due=datetime.fromisoformat(deadline)-timedelta(seconds=cycle['plan']['close_session']['advance_seconds'])
             result['close_start_elapsed_ms']=max(0,elapsed-max(0,_ms(sample.utc-due)))
@@ -243,11 +354,12 @@ class ScheduledRuntime:
 
     def received_for(self,contract):return self._quotes[contract]['received_ns']
 
-    def _block(self,reason,cid=None):
+    def _block(self,reason,cid=None,*,require_cycle_reconciliation=True):
         k=self.kernel;k._armed=False;k.contexts.revoke_all()
         ids=[cid] if cid else [c['position_cycle_id'] for c in k._staged.values() if c['lifecycle']!='CLOSED']
-        k._recovery_pending.update(ids)
-        k.recovery_required |= bool(k._recovery_pending)
+        if require_cycle_reconciliation:
+            k._recovery_pending.update(ids)
+            k.recovery_required |= bool(k._recovery_pending)
         k._state_revision+=1;k._authority_revision+=1;authority=k._authority()
         return k._submit('TX_RECONCILE','SCHEDULER_FACT_BARRIER',{'reasons':[reason],'cycles_affected':ids,
             'clock':None if self._sample is None else self._sample.to_record(),'authority':authority},
@@ -259,7 +371,7 @@ class ScheduledRuntime:
         self.preflight()
         if self._fault:
             if not k._pending and not self._fault_written:
-                self._fault_written=True;self._block(self._fault[0])
+                self._fault_written=True;self._block(self._fault[0], require_cycle_reconciliation=self._fault_monotonic is None)
             return {'status':'CLOCK_FAULT','reasons':list(self._fault)}
         if k._pending:return {'status':'DEFERRED'}
         sample=self._sample
@@ -332,11 +444,20 @@ class ScheduledRuntime:
         def accepted():
             self.guard.reset(sample)
             self._sample = ClockSample.from_record(sample)
+            self.last_clock_reset = self._sample
             self._fault = None
+            self._fault_monotonic = None
+            self._fault_received_ns = None
+            self._fault_source_epoch = None
             self._fault_written = False
 
         return k._submit('TX_RECONCILE', 'CLOCK_RESET_REQUIRES_FRESH_FACTS', {'authority': authority},
                          lambda conn, seq: k._write_authority(conn, seq, authority), after=accepted)
+
+    def entry_quote_after_clock_reset(self, event):
+        return (not self.strategy.online or self.last_clock_reset is None or (not self.clock_rebuild_pending
+                and 'native_tick_id' in event
+                and datetime.fromisoformat(event['source_time_utc']) > self.last_clock_reset.utc))
 
     def status(self):
         return {'enabled':self._enabled,'clock_fault':copy.deepcopy(self._fault),'calendar_hash':self.calendar.content_hash,

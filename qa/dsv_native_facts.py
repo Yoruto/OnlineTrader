@@ -17,6 +17,10 @@ class FactClock:
 class NativeRows:
     def __init__(self):self.rows=[]
     def to_dict(self,mode):assert mode=='records';return copy.deepcopy(self.rows)
+    def tail(self, count):
+        selection = NativeRows()
+        selection.rows = self.rows[-count:]
+        return selection
 
 
 class NativeFactApi:
