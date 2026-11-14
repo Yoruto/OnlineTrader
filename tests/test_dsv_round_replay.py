@@ -79,6 +79,28 @@ class DsvRoundReplayTests(unittest.TestCase):
         self.assertEqual(orders[replacement["child_order_id"]]["parent_child_order_id"], child)
         self.assertEqual(orders[replacement["child_order_id"]]["intent_id"], orders[child]["intent_id"])
 
+    def test_disconnect_exit_waits_for_fresh_exchange_quote(self):
+        opening, = self.session.apply_round(round_frame(1, [1060]))["effects"]
+        child = opening["child_order_id"]
+        self.session.apply_round(round_frame(2, [1060], owned=5, facts=[
+            order_fact(child, "FILLED", 5), trade_fact(child, "entry-fill", 5, 1060),
+        ]))
+        for sequence, wall, mono, expected in (
+            (3, "2026-11-13T01:13:02Z", 182000, "POSITION_OR_ENTRY_PENDING"),
+            (4, "2026-11-13T01:13:02.001Z", 182001, "DATA_GAP_EXIT"),
+        ):
+            frame = round_frame(sequence, [1060], owned=5)
+            frame.update(wall_time=wall, monotonic_ms=mono)
+            frame["market"][0]["ticks"][0]["native_time"] = "2026-11-13T01:10:02Z"
+            result = self.session.apply_round(frame)
+            self.assertEqual(result["decisions"][0]["reason"], expected)
+            self.assertEqual(result["effects"], [])
+        fresh = round_frame(5, [1060], owned=5)
+        fresh.update(wall_time="2026-11-13T01:13:03Z", monotonic_ms=183000)
+        fresh["market"][0]["ticks"][0]["native_time"] = fresh["wall_time"]
+        closing, = self.session.apply_round(fresh)["effects"]
+        self.assertEqual((closing["native_offset"], closing["quantity"]), ("CLOSE", 5))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -117,9 +117,13 @@ class OfflineWorkbench(QMainWindow):
         return item.data(Qt.UserRole) if item is not None else None
 
     def _reduce_selected(self):
-        contract = self._selected(self.positions, 0)
-        if contract is not None:
-            self._submit('REDUCE', contract_id=contract, quantity=self.quantity.value())
+        selection = self._selected(self.positions, 0)
+        if isinstance(selection, tuple):
+            contract, position = selection
+            self._submit('REDUCE_DETACHED', contract_id=contract, position_id=position,
+                         quantity=self.quantity.value())
+        elif selection is not None:
+            self._submit('REDUCE', contract_id=selection, quantity=self.quantity.value())
 
     def _cancel_selected(self):
         child = self._selected(self.orders, 0)
@@ -154,6 +158,7 @@ class OfflineWorkbench(QMainWindow):
         else:
             reason = result['decisions'][0]['reason']
             messages = {'START': '已请求启动', 'STOP': '已停止新增', 'USER_REDUCE': '已登记减仓目标',
+                        'USER_REDUCE_DETACHED': '已登记原周期减仓目标',
                         'USER_CANCEL': '已请求撤单', 'CANCEL_UNAVAILABLE': '该委托当前不可撤'}
             self.receipt.setText(f'{messages.get(reason, reason)} · {result["input_id"]}')
             self.pending = None
@@ -172,18 +177,30 @@ class OfflineWorkbench(QMainWindow):
         self._state = state
         if not state['synchronized']:
             status = '等待行情与订单核对'
+        elif any(row.get('native_conflicts') for row in state['symbols'].values()):
+            status = '迟到平仓成交待核对原周期'
         elif any(row.get('detached_positions') for row in state['symbols'].values()):
             status = '迟到成交待核对归属'
+        elif any((row.get('position') or {}).get('gap_exit') for row in state['symbols'].values()):
+            status = '断流退出待行情或成交'
         else:
             status = '策略运行中' if state['running'] else '已停止新增'
         self.status.setText(status)
         self.account.setText(f"{state['scope']['account_key']} · {state['trading_day']} · 离线回放")
         positions = [(contract, data['position']) for contract, data in state['symbols'].items()
                      if data['position'] and data['position']['owned']]
-        self._populate(self.positions, [(contract, (contract, '多' if position['direction'] == 'LONG' else '空',
+        entries = [(contract, (contract, '多' if position['direction'] == 'LONG' else '空',
                          position['owned'], position.get('today', '—'), position.get('historical', '—'),
                          '—' if position['exit_target'] is None else position['exit_target']))
-                       for contract, position in positions])
+                   for contract, position in positions]
+        for contract, data in state['symbols'].items():
+            for position in data.get('detached_cycles', []):
+                identity = position['position_id']
+                target = position['reviewed_exit_target']
+                entries.append(((contract, identity), (f'{contract} · {identity}', '多' if position['direction'] == 'LONG' else '空',
+                                position['owned'], position['today'], position['historical'],
+                                '待核对' if target is None else target)))
+        self._populate(self.positions, entries)
         self._populate(self.orders, [(key, (order['contract_id'], order['direction'], order['native_offset'],
                          order['original_qty'], order['filled_qty'], order['cancel_status'] or
                          (order['broker_state'] if order['native_id'] else order['send_state']),
@@ -205,7 +222,12 @@ class OfflineWorkbench(QMainWindow):
         state = self._state or {}
         self.start.setEnabled(idle and connected and not state.get('running'))
         self.stop.setEnabled(idle and connected and state.get('running', False))
-        self.reduce.setEnabled(idle and connected and self._selected(self.positions, 0) is not None)
+        selection = self._selected(self.positions, 0)
+        contract = selection[0] if isinstance(selection, tuple) else selection
+        row_state = state.get('symbols', {}).get(contract, {})
+        can_reduce = not row_state.get('native_conflicts') and (
+            state.get('synchronized') if isinstance(selection, tuple) else not row_state.get('detached_positions'))
+        self.reduce.setEnabled(idle and connected and selection is not None and bool(can_reduce))
         self.cancel.setEnabled(idle and connected and state.get('synchronized', False) and
                                self._selected(self.orders, 0) is not None)
         self.retry.setEnabled(self.request is None and self.pending is not None)

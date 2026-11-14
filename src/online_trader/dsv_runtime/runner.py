@@ -10,17 +10,19 @@ from uuid import uuid4
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import content_hash
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
-from online_trader.dsv_core.transition import ordinary_entry, protect
+from online_trader.dsv_core.business_statistics import reduce_stops
+from online_trader.dsv_core.transition import continuation_entry, ordinary_entry, price_value, protect
 from online_trader.dsv_core.price_rules import scheduled_close_mode
 from online_trader.dsv_runtime.controller import ExplicitOrderController, terminal, tighten_target
 from online_trader.dsv_storage.journal import Journal
 from online_trader.errors import TraderError
 from online_trader.gateway.ports import OnlineSimulationPort
 from online_trader.runtime.instance import AccountLock
+from online_trader.strategy.entry import is_night_session
 
 
 _CLOCK_READS = {'session', 'opening', 'entry_close', 'quote_age', 'cooldown', 'chase', 'submit',
-                'close', 'pending', 'protection', 'pending_start', 'price_context'}
+                'close', 'pending', 'protection', 'pending_start', 'price_context', 'stale'}
 _PRICE_FIELDS = ('last', 'day_high', 'day_low', 'bid1', 'ask1', 'tick_size', 'lower_limit', 'upper_limit')
 _FUNDS_FIELDS = ('available', 'margin_per_lot', 'multiplier', 'equity', 'risk_ratio', 'margin',
                  'frozen_margin', 'pending_margin', 'symbol_margin')
@@ -50,7 +52,15 @@ def _utc(value):
 
 def _initial_symbol():
     return {'position': None, 'last_signal_bar': None, 'last_order_ms': None, 'target_count': 0,
-            'net_loss': '0', 'day_stop': False, 'last_stop': None, 'tick': None, 'tick_session': None}
+            'net_loss': '0', 'day_stop': False, 'last_stop': None, 'tick': None, 'tick_session': None,
+            'night_reference': None, 'continuation_attempted': False, 'continuation_stopped': False,
+            'stop_streak': 0, 'month_stop': None, 'stop_days': []}
+
+
+def initial_state(trading_day, contracts):
+    return {'running': False, 'sequence': 0, 'monotonic_ms': None, 'session_id': None,
+            'trading_day': trading_day, 'synchronized': True,
+            'symbols': {key: _initial_symbol() for key in contracts}, 'orders': {}, 'retired_positions': {}}
 
 
 class DsvSession:
@@ -73,9 +83,7 @@ class DsvSession:
         settings = profile.to_record()['settings']
         self._trade = settings['trade']
         self._symbols = {item['code']: item for item in settings['symbols']}
-        initial = {'running': False, 'sequence': 0, 'monotonic_ms': None, 'session_id': None,
-                   'trading_day': trading_day, 'synchronized': True, 'symbols': {key: _initial_symbol() for key in self._symbols},
-                   'orders': {}, 'retired_positions': {}}
+        initial = initial_state(trading_day, self._symbols)
         try:
             self._journal = Journal(database, self._scope, initial)
             self._state = self._journal.load()
@@ -126,6 +134,13 @@ class DsvSession:
                 position.update(self._controller.position_buckets(state, position, contract))
             if detached := row.get('detached_positions'):
                 row['detached_owned'] = sum(state['retired_positions'][key]['owned'] for key in detached)
+                row['detached_cycles'] = []
+                for key in detached:
+                    cycle = state['retired_positions'][key]
+                    row['detached_cycles'].append({
+                        'position_id': key, 'direction': cycle['direction'], 'owned': cycle['owned'],
+                        'reviewed_exit_target': cycle.get('reviewed_exit_target'),
+                        **self._controller.position_buckets(state, cycle, contract)})
         state.pop('retired_positions', None)
         return state
 
@@ -165,18 +180,24 @@ class DsvSession:
         state['synchronized'] = False
         for row in state['symbols'].values():
             row.update(tick=None, tick_session=None)
+            row.pop('quote_clock', None)
 
     def prepare_shutdown(self):
         """Report unresolved child identities and owned lots without issuing commands."""
         self._check_owner()
         orders = [order['child_order_id'] for order in self._state['orders'].values() if not terminal(order)]
+        conflicts = [code for code, row in self._state['symbols'].items() if row.get('native_conflicts')]
         positions = {key: row['position']['owned'] for key, row in self._state['symbols'].items()
                      if row['position'] is not None and row['position']['owned']}
         for contract, row in self._state['symbols'].items():
             if detached := row.get('detached_positions'):
                 positions[contract] = positions.get(contract, 0) + sum(
                     self._state['retired_positions'][key]['owned'] for key in detached)
-        return {'ready': not orders and not positions, 'unresolved_children': orders, 'owned_lots': positions}
+        result = {'ready': not orders and not positions and not conflicts, 'unresolved_children': orders,
+                  'owned_lots': positions}
+        if conflicts:
+            result['allocation_conflicts'] = conflicts
+        return result
 
     def apply_round(self, frame):
         self._check_owner()
@@ -238,6 +259,11 @@ class DsvSession:
         _utc(frame['wall_time'])
         if 'trading_day' in frame:
             _day(frame['trading_day'])
+        if 'trading_days' in frame:
+            days = frame['trading_days']
+            if (type(days) is not list or len(days) > 512 or
+                    any(_day(day) != day for day in days) or sorted(set(days)) != days):
+                raise TraderError('E_DSV_SCOPE', 'Expected an ordered complete trading-day calendar')
         if 'synchronized' in frame and type(frame['synchronized']) is not bool:
             raise TraderError('E_DSV_ROUND', 'Synchronization status must be explicit')
         if 'sync_orders' in frame and (type(frame['sync_orders']) is not list or
@@ -271,6 +297,8 @@ class DsvSession:
                     _utc(market[key])
             if type(market['opening_session']) is not bool or type(market['ticks']) is not list:
                 raise TraderError('E_DSV_ROUND', 'Describe the opening session and ordered quote rows explicitly')
+            if market.get('night_boundary') is not None:
+                _utc(market['night_boundary'])
             for name, reading in market.get('wall_reads', {}).items():
                 if name not in _CLOCK_READS:
                     raise TraderError('E_DSV_ROUND', 'Unrecognized rule-specific wall-clock reading')
@@ -308,6 +336,8 @@ class DsvSession:
     def _evaluate(self, state, frame):
         mono = str(frame['monotonic_ms'])
         day = frame.get('trading_day', state['trading_day'])
+        if 'trading_days' in frame and day not in frame['trading_days']:
+            raise TraderError('E_DSV_SCOPE', 'Trading-day calendar must include the observed cabinet day')
         if frame['sequence'] != state['sequence'] + 1:
             raise TraderError('E_DSV_ROUND_SEQUENCE', 'Expected the next wait_update round')
         if (day == state['trading_day'] and state['session_id'] == frame['session_id'] and state['monotonic_ms'] is not None
@@ -333,15 +363,15 @@ class DsvSession:
         for contract, spec in self._symbols.items():
             row = state['symbols'][contract]
             market = market_rows[contract]
-            if market['ticks'] and state['synchronized']:
-                row.update(tick=copy.deepcopy(market['ticks'][-1]), tick_session=frame['session_id'])
             if not state['synchronized']:
                 decisions.append({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:0",
                                   'reason': 'AWAITING_NATIVE_SYNC', 'rule_ids': ['I01', 'I02']})
                 continue
+            self._observe_market(row, market, frame)
             tick = row['tick'] if row['tick_session'] == frame['session_id'] else None
             observed = market | {'tick': tick}
             values = self._evaluate_symbol(state, row, observed, frame, spec)
+            self._update_stops(row, contract, day, spec, frame.get('trading_days', []))
             decisions.extend({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:{i}",
                               **value} for i, value in enumerate(values))
             if self._in_session(frame, observed):
@@ -349,21 +379,93 @@ class DsvSession:
                 if tick is None:
                     self._controller.settle(state, row)
                 else:
+                    gap = row['position'] and row['position'].get('gap_exit')
+                    if gap and not self._fresh_after_gap(observed, gap):
+                        observed = observed | {'allow_new_order': False}
                     effects.extend(self._controller.plan(state, row, observed, now))
             else:
                 self._controller.settle(state, row)
         return decisions, effects
+
+    def _update_stops(self, row, contract, day, spec, calendar):
+        result = reduce_stops(
+            contract, day, loss=Decimal(row['net_loss']), stop_streak=row.get('stop_streak', 0),
+            continuation_stopped=row.get('continuation_stopped', False), day_stopped=row['day_stop'],
+            day_stopped_reason=row.get('day_stop_reason'), history=row.get('stop_days', []),
+            month_stop=row.get('month_stop'), calendar=calendar, stop_offset=spec['stop_offset'], trade=self._trade)
+        stops = result['state']
+        row.update(day_stop=stops['day_stopped'], day_stop_reason=stops['day_stopped_reason'],
+                   stop_days=stops['stop_days'], month_stop=stops['month_stop'])
+
+    @staticmethod
+    def _fresh_after_gap(market, gap):
+        native = _utc(market['tick']['native_time'])
+        previous = gap['last_native_time']
+        return (_utc(market['session_open']) <= native < _utc(market['session_close'])
+                and (previous is None or native > _utc(previous)))
 
     def _roll_day(self, state, day):
         self._mark_unsynchronized(state)
         state['trading_day'] = day
         for row in state['symbols'].values():
             position, last_stop = row['position'], row['last_stop']
-            row.update(_initial_symbol(), position=position, last_stop=last_stop)
+            history = row.get('stop_days', [])
+            month = row.get('month_stop') if row.get('month_stop') == day[:7] else None
+            reviews = {key: row[key] for key in ('detached_positions', 'native_conflicts') if row.get(key)}
+            row.clear()
+            row.update(_initial_symbol(), position=position, last_stop=last_stop, month_stop=month, stop_days=history, **reviews)
             if position is not None:
                 position.update(entry_stopped=True, preserve_open_on_stop=False)
                 for key in ('close_started', 'close_refresh', 'close_mode'):
                     position.pop(key, None)
+
+    def _observe_market(self, row, market, frame):
+        session, opening = frame['session_id'], market['session_open']
+        wall = _utc(market.get('wall_reads', {}).get('stale', frame['wall_time']))
+        sample = {'wall': wall.isoformat(), 'mono': str(frame['monotonic_ms'])}
+        clock = row.get('quote_clock')
+        if clock is None or (clock['session'], clock['opening']) != (session, opening):
+            clock = {'session': session, 'opening': opening, 'native_time': None, 'anchor': sample}
+        previous = clock.get('previous')
+        if previous is not None:
+            wall_gap = (wall - datetime.fromisoformat(previous['wall'])).total_seconds()
+            mono_gap = (int(sample['mono']) - int(previous['mono'])) / 1000
+            if wall_gap < 0 or wall_gap > 300 and 0 < mono_gap < wall_gap * 0.5:
+                clock['anchor'] = sample
+        clock['previous'] = sample
+        row['quote_clock'] = clock
+        for tick in market['ticks']:
+            if tick['native_time'] != clock['native_time']:
+                clock.update(native_time=tick['native_time'], anchor=sample)
+            if is_night_session(_utc(opening)):
+                self._observe_night(row, market, tick)
+        if market['ticks']:
+            row.update(tick=copy.deepcopy(market['ticks'][-1]), tick_session=session)
+        if boundary := market.get('night_boundary'):
+            night = row.get('night_reference')
+            if (night is None or night['native_time'] != boundary or not _utc(boundary) < _utc(opening)
+                    or is_night_session(_utc(opening))):
+                raise TraderError('E_DSV_NIGHT_BOUNDARY', 'Night boundary must match the observed same-day tail')
+            night['complete'] = True
+
+    @staticmethod
+    def _observe_night(row, market, tick):
+        time = tick['native_time']
+        if not _utc(market['session_open']) <= _utc(time) < _utc(market['session_close']):
+            return
+        last, high, low = (tick.get(key) for key in ('last', 'day_high', 'day_low'))
+        if any(price_value(value) is None for value in (last, high, low)):
+            return
+        if not Decimal(low) <= Decimal(last) <= Decimal(high):
+            return
+        night = row.get('night_reference')
+        if night is None:
+            row['night_reference'] = {'native_time': time, 'high': high, 'low': low, 'last': last, 'complete': False}
+        elif not night['complete']:
+            if _utc(time) >= _utc(night['native_time']):
+                night.update(native_time=time, last=last)
+            night['high'] = decimal_text(max(Decimal(high), Decimal(night['high'])))
+            night['low'] = decimal_text(min(Decimal(low), Decimal(night['low'])))
 
     def _synchronize(self, state, frame, pending):
         seen = {fact['child_order_id'] for fact in frame['native'] if fact['kind'] == 'ORDER'}
@@ -375,7 +477,7 @@ class DsvSession:
         for market in frame['market']:
             row = state['symbols'][market['contract_id']]
             position = row['position']
-            if row.get('detached_positions'):
+            if row.get('detached_positions') or row.get('native_conflicts'):
                 continue
             if position is not None and not self._controller.proves_position(state, position, market):
                 return
@@ -388,7 +490,7 @@ class DsvSession:
 
     def _evaluate_symbol(self, state, row, market, frame, spec):
         position, tick = row['position'], market['tick']
-        if row.get('detached_positions'):
+        if row.get('detached_positions') or row.get('native_conflicts'):
             return [{'reason': 'LATE_FILL_OWNERSHIP_REVIEW', 'rule_ids': ['I01', 'I02']}]
         if position is not None:
             return self._maintain_position(row, position, market, frame, spec)
@@ -400,11 +502,20 @@ class DsvSession:
             return [{'reason': 'QUOTE_UNAVAILABLE', 'rule_ids': ['D01']}]
         if market['long_qty'] or market['short_qty'] or market.get('external_orders'):
             return [{'reason': 'UNOWNED_POSITION', 'rule_ids': ['I01', 'I02']}]
+        if row.get('month_stop') == state['trading_day'][:7]:
+            return [{'reason': 'MONTH_STOP', 'rule_ids': ['D10']}]
         rows = tuple(state['symbols'].values())
         active = sum(not candidate['day_stop'] for candidate in rows)
         # Source counts established strategy directions, independent of requested quantity.
         opened = sum(bool(candidate['position'] and candidate['position']['owned']) for candidate in rows)
-        decision = ordinary_entry(row, frame, market, spec, self._trade, active_symbols=max(1, active), open_symbols=opened)
+        sizes = {'active_symbols': max(1, active), 'open_symbols': opened}
+        decision = continuation_entry(row, frame, market, spec, self._trade, **sizes)
+        if decision is not None:
+            row['continuation_attempted'] = True
+            rules = ['D05', 'D07']
+        else:
+            decision = ordinary_entry(row, frame, market, spec, self._trade, **sizes)
+            rules = ['D01', 'D02', 'D04', 'D05', 'D06']
         if 'consume' in decision:
             row['last_signal_bar'] = decision['consume']
         if decision.get('day_stop'):
@@ -416,14 +527,35 @@ class DsvSession:
             row['position'] = goal | {'id': 'position-' + uuid4().hex, 'owned': 0, 'entry_filled': 0,
                                       'entry_notional': '0', 'children': [], 'entry_stopped': False,
                                       'peak': '0', 'protected': False, 'half_stage': 0, 'exit_target': None,
-                                      'open_day': state['trading_day'], 'fills': []}
-        return [decision | {'rule_ids': ['D01', 'D02', 'D04', 'D05', 'D06']}]
+                                      'open_day': state['trading_day'], 'fills': [],
+                                      'entry_kind': decision['reason']}
+        return [decision | {'rule_ids': rules}]
 
     def _maintain_position(self, row, position, market, frame, spec):
         if market['tick'] is not None and position['owned'] and self._in_session(frame, market):
             close = self._scheduled_close(row, position, market, frame)
             if close is not None:
                 return [close]
+        if position['entry_filled'] and not position.get('entry_slip_checked'):
+            position['entry_slip_checked'] = True
+            if self._trade['entry_slip_abort'] and position['exit_target'] != 0:
+                actual = float(position['entry_notional']) / position['entry_filled']
+                theory = float(position['theory'])
+                slip = actual - theory if position['direction'] == 'LONG' else theory - actual
+                cap = max(2.0, float(position['stop']) * float(self._trade['entry_slip_abort_ratio']))
+                if slip > cap:
+                    tighten_target(position, 0)
+                    row['net_loss'] = decimal_text(Decimal(row['net_loss']) + Decimal(str(slip)))
+                    if self._trade['entry_slip_abort_stop_day']:
+                        row.update(day_stop=True, day_stop_reason='ADVERSE_SLIPPAGE')
+                    return [{'reason': 'ADVERSE_SLIPPAGE', 'remaining': 0, 'slip': str(slip), 'rule_ids': ['D04', 'D08']}]
+        if position.get('gap_exit'):
+            return [{'reason': 'DATA_GAP_EXIT_PENDING', 'remaining': 0, 'rule_ids': ['D10', 'I01']}]
+        if self._stale_position(row, position, market, frame):
+            clock = row['quote_clock']
+            position['gap_exit'] = {'last_native_time': clock['native_time'], 'day_stop': self._trade['stale_close_day_stop']}
+            tighten_target(position, 0)
+            return [{'reason': 'DATA_GAP_EXIT', 'remaining': 0, 'rule_ids': ['D10', 'I01']}]
         now = _utc(market.get('wall_reads', {}).get('pending', frame['wall_time'])).timestamp()
         elapsed = now - float(position['submitted_at'])
         if not position['entry_stopped'] and not position['entry_filled'] and elapsed > self._trade['entry_confirm_timeout']:
@@ -447,16 +579,33 @@ class DsvSession:
             if reason == 'TRAILING_STOP' and self._trade['stop_day_on_trailing']:
                 row['day_stop'] = True
             if reason == 'STOP_LOSS':
+                row['stop_streak'] = row.get('stop_streak', 0) + 1
+                if position.get('entry_kind') == 'CONTINUATION_ENTRY' and self._trade['cont_stop_day_stop']:
+                    row.update(continuation_stopped=True, day_stop=True)
                 cooldown = float(self._trade['stop_cooldown_minutes']) * 60
                 protection_now = _utc(market.get('wall_reads', {}).get('protection', frame['wall_time'])).timestamp()
                 row['last_stop'] = {'direction': position['direction'], 'theory': position['theory'],
                                     'until': str(protection_now + cooldown) if cooldown > 0 else None}
             if result.get('remaining') == 0:
+                if reason in {'TAKE_PROFIT', 'TRAILING_STOP', 'PROTECTED_FLOOR'}:
+                    row['stop_streak'] = 0
                 loss = (Decimal(position['stop']) if reason == 'STOP_LOSS' else
                         -Decimal(position['profit']) if reason == 'TAKE_PROFIT' else -Decimal(result['move']))
                 row['net_loss'] = decimal_text(Decimal(row['net_loss']) + loss)
         return [result | {'rule_ids': ['D08', 'D09', 'D10']} for result in results] or [
             {'reason': 'POSITION_OR_ENTRY_PENDING', 'rule_ids': ['D08', 'D12']}]
+
+    def _stale_position(self, row, position, market, frame):
+        limit = Decimal(self._trade['stale_force_close_seconds'])
+        if not position['owned'] or not limit or not self._in_session(frame, market) or position['exit_target'] == 0:
+            return False
+        clock = row['quote_clock']
+        anchor = clock['anchor']
+        wall = datetime.fromisoformat(clock['previous']['wall'])
+        start = _utc(market['session_open'])
+        quiet = (wall - max(start, datetime.fromisoformat(anchor['wall']))).total_seconds()
+        elapsed = Decimal(int(frame['monotonic_ms']) - int(anchor['mono'])) / 1000
+        return (wall - start).total_seconds() > 60 and quiet > limit and elapsed > limit
 
     def _scheduled_close(self, row, position, market, frame):
         end = market.get('liquidation_at')
@@ -472,6 +621,8 @@ class DsvSession:
         first = 'close_started' not in position
         if first:
             position['close_started'] = str(now)
+            if is_night_session(_utc(market['session_open'])) and row.get('night_reference'):
+                row['night_reference']['fallback'] = position['direction']
         if first or now - float(position['close_refresh']) >= 3:
             remaining_ms = window * 1000 - int((now - float(position['close_started'])) * 1000)
             position.update(close_mode=scheduled_close_mode(remaining_ms), close_refresh=str(now))
@@ -509,11 +660,26 @@ class DsvSession:
             qty = quantity(command['quantity'], positive=True)
             if position is None or qty > position['owned']:
                 raise TraderError('E_DSV_OWNERSHIP', 'Manual reduction exceeds the owned position')
-            if row.get('detached_positions'):
+            if row.get('detached_positions') or row.get('native_conflicts'):
                 raise TraderError('E_DSV_OWNERSHIP', 'Late fill from another cycle requires ownership review')
             target = position['owned'] - qty
             if position['exit_target'] is not None:
                 target = min(target, position['exit_target'])
             tighten_target(position, target, new_request=True)
             return [{'reason': 'USER_REDUCE', 'remaining': target, 'rule_ids': ['I01', 'I02']}], []
+        if action == 'REDUCE_DETACHED':
+            row = state['symbols'].get(command['contract_id'])
+            identity = identifier(command['position_id'])
+            qty = quantity(command['quantity'], positive=True)
+            if (not state['synchronized'] or row is None or row.get('native_conflicts') or
+                    identity not in row.get('detached_positions', [])):
+                raise TraderError('E_DSV_OWNERSHIP', 'A reduction review requires a synchronized, identified detached cycle')
+            position = state['retired_positions'][identity]
+            if qty > position['owned']:
+                raise TraderError('E_DSV_OWNERSHIP', 'Reviewed reduction exceeds the original owned cycle')
+            target = min(position.get('reviewed_exit_target', position['owned']), position['owned'] - qty)
+            position['reviewed_exit_target'] = target
+            tighten_target(position, target, new_request=True)
+            return [{'reason': 'USER_REDUCE_DETACHED', 'position_id': identity, 'remaining': target,
+                     'rule_ids': ['I01', 'I02']}], []
         raise TraderError('E_DSV_COMMAND', 'Unsupported offline command')

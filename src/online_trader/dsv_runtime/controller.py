@@ -129,6 +129,12 @@ class ExplicitOrderController:
             raise TraderError('E_DSV_NATIVE_FACT', 'Trade would exceed original child quantity')
         if position is not None and position['id'] != order['position_id'] and order['effect'] == 'OPEN':
             self._record_detached_late_open(state, row, position, order, qty, fact, fill_day)
+            self._reconcile_pending_reduces(state, row, state['retired_positions'][order['position_id']])
+            return
+        matching = position is not None and position['id'] == order['position_id']
+        if order['effect'] == 'REDUCE' and (
+                not matching or not self._allocate_reduce(state, position, order, fact, fill_day)):
+            self._review_late_reduce(state, row, order, qty, fact, fill_day)
             return
         was_within_terminal = order['terminal_confirmed'] and order['filled_qty'] + qty <= limit
         if position is None or position['id'] != order['position_id'] or order['filled_qty'] + qty > limit:
@@ -136,19 +142,75 @@ class ExplicitOrderController:
             if was_within_terminal:
                 order['terminal_confirmed'] = True
         order['filled_qty'] += qty
-        if order['effect'] == 'REDUCE':
-            if qty > position['owned']:
-                raise TraderError('E_DSV_NATIVE_FACT', 'Closing trade exceeds the owned quantity')
-            position['owned'] -= qty
-        else:
+        if order['effect'] == 'OPEN':
             position['entry_filled'] += qty
             position['owned'] += qty
             position['entry_notional'] = decimal_text(Decimal(position['entry_notional']) + Decimal(fact['price']) * qty)
-        self._position_fill(position, order, fact, fill_day)
-        self.position_buckets(state, position, order['contract_id'])
+            self._position_fill(position, order, fact, fill_day)
+            self.position_buckets(state, position, order['contract_id'])
+            self._reconcile_pending_reduces(state, row, position)
         if order.get('terminal_conflict') and terminal(order):
             order.pop('terminal_conflict')
         self.journal.event('NATIVE_TRADE', fact)
+
+    def _review_late_reduce(self, state, row, order, qty, fact, fill_day):
+        original = state['retired_positions'].get(order['position_id'])
+        detached = row.get('detached_positions', [])
+        if (original is not None and original['id'] in detached and
+                self._allocate_reduce(state, original, order, fact, fill_day)):
+            self._accept_corrected_total(order, qty)
+            if not original['owned']:
+                detached.remove(original['id'])
+            self.journal.event('DETACHED_NATIVE_REDUCE_APPLIED', fact)
+            return
+        self._accept_corrected_total(order, qty)
+        entry = {'position_id': order['position_id'], 'order_day': order['native_trading_day'],
+                 'fill_day': fill_day, 'fact': fact}
+        row.setdefault('native_conflicts', []).append(entry)
+        if row['position'] is not None:
+            row['position'].update(entry_stopped=True, preserve_open_on_stop=False)
+        self.journal.event('NATIVE_REDUCE_ALLOCATION_CONFLICT', entry)
+
+    def _allocate_reduce(self, state, position, order, fact, fill_day):
+        qty = fact['quantity']
+        if qty > position['owned']:
+            return False
+        self._position_fill(position, order, fact, fill_day)
+        try:
+            buckets = self.position_buckets(state, position, order['contract_id'])
+        except TraderError:
+            position['fills'].pop()
+            return False
+        if sum(buckets.values()) != position['owned'] - qty:
+            position['fills'].pop()
+            return False
+        position['owned'] -= qty
+        return True
+
+    def _reconcile_pending_reduces(self, state, row, position):
+        remaining = []
+        for entry in row.get('native_conflicts', []):
+            fact = entry['fact']
+            order = state['orders'][fact['child_order_id']]
+            if entry['position_id'] == position['id'] and self._allocate_reduce(state, position, order, fact, entry['fill_day']):
+                self.journal.event('NATIVE_REDUCE_ALLOCATION_RECONCILED', entry)
+            else:
+                remaining.append(entry)
+        if remaining:
+            row['native_conflicts'] = remaining
+        else:
+            row.pop('native_conflicts', None)
+        detached = row.get('detached_positions', [])
+        if not position['owned'] and position['id'] in detached:
+            detached.remove(position['id'])
+
+    @staticmethod
+    def _accept_corrected_total(order, qty):
+        order['filled_qty'] += qty
+        if order['terminal_confirmed'] and order['filled_qty'] > order['reported_fill_qty']:
+            order.update(terminal_confirmed=False, terminal_conflict=True)
+        if order.get('terminal_conflict') and terminal(order):
+            order.pop('terminal_conflict')
 
     @staticmethod
     def _position_fill(position, order, fact, fill_day):
@@ -276,6 +338,50 @@ class ExplicitOrderController:
             raise
         return result['routes']
 
+    def plan_detached(self, state, row, market, wall_time):
+        positions = [state['retired_positions'][identity] for identity in row.get('detached_positions', [])]
+        if row['position'] is not None:
+            positions.append(row['position'])
+        children = [order for position in positions for order in self.child_orders(state, position) if not terminal(order)]
+        opening = [order for order in children if order['effect'] == 'OPEN']
+        if opening or row.get('native_conflicts'):
+            return [request for order in opening if (request := self.cancel(order, 'TARGET_REDUCED'))]
+        if children or market.get('external_orders') or not market.get('allow_new_order', True):
+            return []
+        contract, day = market['contract_id'], state['trading_day']
+        buckets = {key: 0 for key in ('long_today', 'long_historical', 'short_today', 'short_historical')}
+        for position in positions:
+            for bucket, count in self.position_buckets(state, position, contract).items():
+                buckets[position['direction'].lower() + '_' + bucket] += count
+        if any(market.get(bucket) != quantity for bucket, quantity in buckets.items()):
+            return []
+        for position in positions:
+            target = position.get('reviewed_exit_target')
+            if target is None or target >= position['owned']:
+                continue
+            old = self.child_orders(state, position, 'REDUCE')
+            if old and old[-1]['filled_qty'] < old[-1]['original_qty']:
+                last = old[-1]
+                if last['broker_state'] != 'CANCELLED' or position.get('exit_revision', 0) <= last.get('exit_revision', 0):
+                    continue
+            side = position['direction'].lower()
+            fills = [fill | {'position_cycle_id': candidate['id'], 'event_seq': index}
+                     for index, (candidate, fill) in enumerate(
+                         (candidate, fill) for candidate in positions if candidate['direction'] == position['direction']
+                         for fill in self._position_fills(candidate, contract))]
+            native = {bucket: buckets[f'{side}_{bucket}'] for bucket in ('today', 'historical')}
+            native['total'] = native['today'] + native['historical']
+            result = close_routes(contract_id=contract, direction=position['direction'], current_day=day, fills=fills,
+                                  native=native, orders=[], target_quantity=position['owned'] - target,
+                                  position_cycle_id=position['id'])
+            desired = self._desired(position, market, 'REDUCE', wall_time)
+            if result['routes'] and desired is not None:
+                route = result['routes'][0]
+                return [self.new_order(state, position, market, 'REDUCE',
+                                       min(route['quantity'], market.get('max_order_qty', 2_147_483_647)),
+                                       desired, route['native_offset'])]
+        return []
+
     @staticmethod
     def _desired(position, market, effect, wall_time):
         tick = market['tick']
@@ -307,13 +413,22 @@ class ExplicitOrderController:
     def plan(self, state, row, market, wall_time):
         position = row['position']
         tick = market.get('tick')
-        if position is None or tick is None:
+        if tick is None:
+            return []
+        prior = [
+            order for order in state['orders'].values()
+            if order['contract_id'] == market['contract_id'] and not terminal(order)
+            and (position is None or order['position_id'] != position['id'])]
+        if prior:
+            current = [] if position is None else self.child_orders(state, position)
+            return [request for order in prior + current if order['effect'] == 'OPEN' and not order.get('terminal_conflict')
+                    and (request := self.cancel(order, 'TARGET_REDUCED'))]
+        if row.get('detached_positions') or row.get('native_conflicts'):
+            return self.plan_detached(state, row, market, wall_time)
+        if position is None:
             return []
         proven_position = self.proves_position(state, position, market)
         children = self.child_orders(state, position)
-        if row.get('detached_positions'):
-            return [request for order in children if order['effect'] == 'OPEN'
-                    and (request := self.cancel(order, 'TARGET_REDUCED'))]
         if any(order['native_trading_day'] != state['trading_day'] and not terminal(order) for order in children):
             return []
         if any(order.get('terminal_conflict') and not terminal(order) for order in children):
@@ -330,7 +445,7 @@ class ExplicitOrderController:
                     continue
             else:
                 needed = 0 if position['exit_target'] is None else position['owned'] - position['exit_target']
-            desired = self._desired(position, market, effect, wall_time) if needed > 0 else None
+            desired = self._desired(position, market, effect, wall_time) if needed > 0 and market.get('allow_new_order', True) else None
             for order in outstanding:
                 pending = order['original_qty'] - order['filled_qty']
                 reason = 'TARGET_REDUCED' if pending > max(0, needed) else None
@@ -370,7 +485,7 @@ class ExplicitOrderController:
 
     def settle(self, state, row):
         position = row['position']
-        if position is None:
+        if position is None or row.get('native_conflicts'):
             return
         if position['owned'] == 0 and position['entry_stopped'] and not position['children']:
             row['position'] = None
@@ -380,6 +495,8 @@ class ExplicitOrderController:
             opens = self.child_orders(state, position, 'OPEN')
             if (position['entry_filled'] or position['entry_stopped'] or
                     opens[-1]['cancel_reason'] != 'REPRICE' or opens[-1]['broker_state'] != 'CANCELLED'):
+                if position.get('gap_exit', {}).get('day_stop'):
+                    row['day_stop'] = True
                 state['retired_positions'][position['id']] = position
                 row['position'] = None
 

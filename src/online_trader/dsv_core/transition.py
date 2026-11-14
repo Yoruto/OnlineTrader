@@ -1,7 +1,7 @@
 """Ordinary-session decisions for the DSV round contract."""
 
 from datetime import datetime, timedelta, timezone
-from online_trader.dsv_core.entry_rules import geometry_limit, trigger_prices
+from online_trader.dsv_core.entry_rules import continuation_direction, geometry_limit, trigger_prices
 from online_trader.dsv_core.protection_rules import half_close_target, trailing_floor
 from online_trader.dsv_core.sizing_rules import auto_lots, margin_lots
 
@@ -68,6 +68,45 @@ def _clock(frame, market, name):
 
 def _profit_activation(settings):
     return float(settings['protect_80_ratio']) or 0.8
+
+
+def continuation_entry(state, frame, market, spec, settings, *, active_symbols, open_symbols):
+    tick, night = market['tick'], state.get('night_reference')
+    if (not settings['continuation_entry'] or state.get('continuation_attempted') or
+            state.get('stop_streak', 0) >= 2 or state.get('continuation_stopped') and settings['cont_stop_day_stop']
+            or not night or not night['complete'] or state['day_stop']):
+        return None
+    last, high, low = (price_value(tick.get(key)) for key in ('last', 'day_high', 'day_low'))
+    if None in (last, high, low):
+        return None
+    start = datetime.fromisoformat(market['session_open'])
+    elapsed = (_clock(frame, market, 'chase') - start).total_seconds()
+    civil = datetime.fromisoformat(tick['native_time']).astimezone(_BEIJING)
+    if (start.astimezone(_BEIJING).strftime('%H:%M') != '09:00' or civil.hour != 9 or
+            not 0 <= elapsed <= float(settings['chase_window_minutes']) * 60):
+        return None
+    opening, stop, profit = (float(spec[key]) for key in ('open_offset', 'stop_offset', 'profit_offset'))
+    if (min(opening, stop, profit) <= 0 or state['target_count'] >= settings['max_daily_orders'] or
+            settings['max_net_loss_stops'] > 0 and float(state['net_loss']) >= stop * settings['max_net_loss_stops']):
+        return None
+    maximum = geometry_limit(opening, stop)
+    wait = (_clock(frame, market, 'opening') - start).total_seconds()
+    if (maximum > 0 and high - low > maximum or settings['no_open_after_open'] and
+            not settings['continuation_ignore_no_open'] and 0 <= wait < float(settings['no_open_after_open_minutes']) * 60):
+        night.pop('fallback', None)
+        return None
+    direction = continuation_direction(last, float(night['last']), float(night['high']), float(night['low']),
+                                       opening, night.get('fallback'))
+    if direction is None or settings['max_symbols_enabled'] and open_symbols >= settings['max_symbols_on']:
+        return None
+    lots = _lots(market, settings, spec, active_symbols)
+    if not lots or not market.get('min_order_qty', 1) <= lots <= market.get('max_order_qty', 2_147_483_647):
+        return None
+    return {'reason': 'CONTINUATION_ENTRY', 'target': {
+        'direction': direction, 'quantity': lots, 'theory': str(last), 'stop': str(stop), 'profit': str(profit),
+        'mode': 'ACTIVE', 'cap': str(last), 'order_ms': str(int(_clock(frame, market, 'submit').timestamp() * 1000)),
+        'submitted_at': str(_clock(frame, market, 'pending_start').timestamp()),
+        'context_at': str(_clock(frame, market, 'price_context').timestamp())}}
 
 
 def ordinary_entry(state, frame, market, spec, settings, *, active_symbols, open_symbols):

@@ -111,8 +111,18 @@ def serve(pipe_name, database, header, *, ready_file=None):
 
 def cli(args):
     try:
+        if args.offline_action == 'rollback-review':
+            from online_trader.dsv_runtime.migration import rollback_review
+            result = rollback_review(args.source, args.db)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result['eligible'] else 2
         value = strict_loads(Path(args.input).read_bytes())
-        if args.offline_action == 'serve':
+        if args.offline_action == 'migrate':
+            from online_trader.dsv_runtime.migration import migrate
+            result = migrate(args.source, value, args.target)
+            print(json.dumps(result, ensure_ascii=False))
+            return 2 if result['blockers'] else 0
+        elif args.offline_action == 'serve':
             try:
                 serve(args.pipe, args.db, value, ready_file=args.ready_file)
             except KeyboardInterrupt:

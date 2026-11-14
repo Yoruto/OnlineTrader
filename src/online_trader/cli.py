@@ -35,6 +35,13 @@ def main(argv=None):
         if name=='serve':
             mode.add_argument('--db',type=Path,required=True)
             mode.add_argument('--ready-file',type=Path)
+    migrate=offline_actions.add_parser('migrate',help='只读预检旧账本，可显式导入全新离线事实库')
+    migrate.add_argument('--source',type=Path,required=True)
+    migrate.add_argument('--input',type=Path,required=True)
+    migrate.add_argument('--target',type=Path)
+    rollback=offline_actions.add_parser('rollback-review',help='只读核对离线迁移是否允许恢复原状态')
+    rollback.add_argument('--source',type=Path,required=True)
+    rollback.add_argument('--db',type=Path,required=True)
     desktop_start=commands.add_parser('desktop-start',help='执行桌面确认的本次模拟策略启动')
     desktop_start.add_argument('--request',type=Path,required=True)
     desktop_start.add_argument('--output',type=Path,required=True)
