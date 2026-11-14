@@ -10,8 +10,8 @@ from uuid import uuid4
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.rollover import expiry_date
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
-from online_trader.dsv_runtime.controller import legal_price, terminal
-from online_trader.errors import TraderError
+from online_trader.dsv_runtime.controller import SendNotAttempted, legal_price, terminal
+from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.dsv_facts import native_integer, utc
 from online_trader.gateway.native_days import native_day
 from online_trader.gateway.tqkq import number
@@ -370,7 +370,11 @@ class DsvSdkAdapter:
         result['pending_margin'] = pending
         expiry = expiry_date(getattr(quote, 'expire_datetime', None))
         if expiry is not None:
-            result['days_to_expiry'] = str((expiry - now.astimezone(_BEIJING).date()).days)
+            # DSV subtracts the full local wall time from expiry-day midnight,
+            # then floors through timedelta.days; a date-only subtraction is one
+            # day too large after midnight. Keep the decision independent of host TZ.
+            midnight = datetime.combine(expiry, datetime.min.time(), tzinfo=_BEIJING)
+            result['days_to_expiry'] = str((midnight - now.astimezone(_BEIJING)).days)
         for field, native in (('min_order_qty', 'min_limit_order_volume'), ('max_order_qty', 'max_limit_order_volume')):
             value = getattr(quote, native, None)
             if value is not None and window['is_trading']:
@@ -440,21 +444,30 @@ class DsvSdkAdapter:
 
     def send(self, effect):
         native = self._authorized(effect, 'SEND')
-        market = self.dispatch_market[effect['contract_id']]
-        tick = market['ticks'][-1] if market['ticks'] else None
-        if (tick is None or market['external_orders'] or
-                legal_price(tick, Decimal(effect['limit_price'])) != effect['limit_price']):
-            raise TraderError('E_DSV_SDK_SCOPE', 'A native dispatch requires a legal price and current scoped quote')
-        if self.grant is not None:
-            now, _ = self.clock()
-            if (effect['contract_id'] not in self.grant.value['contracts'] or
-                    not self.grant.permits_day(effect['trading_day']) or
-                    effect['native_offset'] == 'OPEN' and not self.grant.in_window(now)):
-                raise TraderError('E_DSV_SDK_SCOPE', 'The SDK request exceeded its explicit account scope')
+        # _authorized remains outside the proof boundary: a reused/ambiguous
+        # effect must never be downgraded to definitely unsent.
+        try:
+            market = self.dispatch_market[effect['contract_id']]
+            tick = market['ticks'][-1] if market['ticks'] else None
+            if (tick is None or market['external_orders'] or
+                    legal_price(tick, Decimal(effect['limit_price'])) != effect['limit_price']):
+                raise TraderError('E_DSV_SDK_SCOPE', 'A native dispatch requires a legal price and current scoped quote')
+            if self.grant is not None:
+                now, _ = self.clock()
+                if (effect['contract_id'] not in self.grant.value['contracts'] or
+                        not self.grant.permits_day(effect['trading_day']) or
+                        effect['native_offset'] == 'OPEN' and not self.grant.in_window(now)):
+                    raise TraderError('E_DSV_SDK_SCOPE', 'The SDK request exceeded its explicit account scope')
+            request = dict(symbol=effect['contract_id'], direction=effect['direction'],
+                           offset=effect['native_offset'], volume=quantity(effect['quantity'], positive=True),
+                           limit_price=float(Decimal(effect['limit_price'])), order_id=native, account=self.account)
+        except Exception as error:
+            return SendNotAttempted(effect['id'], getattr(error, 'code', 'E_DSV_PRE_SEND'), exception_record(error))
         self._seen_effects.add(effect['id'])
-        return self.api.insert_order(symbol=effect['contract_id'], direction=effect['direction'],
-                                     offset=effect['native_offset'], volume=quantity(effect['quantity'], positive=True),
-                                     limit_price=float(Decimal(effect['limit_price'])), order_id=native, account=self.account)
+        # Never turn an exception from inside insert_order into unsent proof,
+        # even if it has the same error code as a local validation failure.
+        self.api.insert_order(**request)
+        return None
 
     def cancel(self, effect):
         native = self._authorized(effect, 'CANCEL')
