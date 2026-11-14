@@ -117,7 +117,10 @@ def cli(args):
             print(json.dumps(result, ensure_ascii=False))
             return 0 if result['eligible'] else 2
         value = strict_loads(Path(args.input).read_bytes())
-        if args.offline_action == 'migrate':
+        if args.offline_action == 'archive-log':
+            from online_trader.dsv_runtime.log_archive import archive_log
+            print(json.dumps(archive_log(args.source, args.runs_root, args.boot_id, value, args.target), ensure_ascii=False))
+        elif args.offline_action == 'migrate':
             from online_trader.dsv_runtime.migration import migrate
             result = migrate(args.source, value, args.target)
             print(json.dumps(result, ensure_ascii=False))

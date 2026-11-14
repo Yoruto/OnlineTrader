@@ -25,4 +25,15 @@ python -m online_trader offline-dsv rollback-review --source legacy.sqlite --db 
 
 ## 发布依赖
 
-本阶段使用离线快照与原版静态取证。向运营交付前需完成新控制器真实 SDK 接入、同场对跑、授权模拟、历史日志迁移、Windows 制品及自动校时维护窗口验收。实际旧账本归档、真实柜台状态复核和生产控制者交接依照 M0–M9 执行。发生新业务后回旧版的反向转换和合法重置窗口须另行验证。
+本阶段使用离线快照与原版静态取证。向运营交付前需完成新控制器真实 SDK 接入、同场对跑、授权模拟、Windows 制品及自动校时维护窗口验收。实际旧账本归档、真实柜台状态复核和生产控制者交接依照 M0–M9 执行。发生新业务后回旧版的反向转换和合法重置窗口须另行验证。
+
+## 旧操作日志归档和逐轮对照
+
+```powershell
+python -m online_trader offline-dsv archive-log --source legacy.sqlite --runs-root legacy-runs --boot-id boot-... --input profile.json --target recovered-run
+python -m qa.dsv_parity.compare_trace --input rounds.jsonl --expected expected.jsonl --candidate replay.jsonl --candidate-release COMMIT
+```
+
+归档从指定旧启动的身份文件、账本登记及可用恢复回执核对来源，在新的目录创建 `operation-log.jsonl` 和 `archive-receipt.json`。缺失 `finalized` 的旧回执按可恢复水位处理。输出只包含可从已提交事件重建的内容，收据标注不可恢复的辅助诊断。
+
+对照器针对固定输入、预期和固定候选轨迹。预期首行 `type=DSV_TRACE_EXPECTATION/1` 含 `reference_release` 和 `input_sha256`。后续每行用 `type`、`input_id` 和 `evidence` 定位预期，提供有序 `decisions` 和 `effects`。末尾 `SNAPSHOT` 使用 `input_id=snapshot` 和 `state`。未知预期写 `pending` 和理由。对象按列出的字段对照，数组按顺序及数量对照，随机生成的身份以 `{"$id":"name"}` 在各轮一一绑定。输出给出首处分歧、对应字段路径和未定项。
