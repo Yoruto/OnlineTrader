@@ -302,7 +302,10 @@ def protect(position, tick, settings, spec):
         if second <= first:
             second = first * 1.5
         if settings['half_close_enabled'] and 0 < first_ratio < 1 and virtual >= 2 and (
-                stage == 0 and move >= first or stage == 1 and settings['half_stage2'] and move >= second):
+                stage == 0 and move >= first or stage == 1 and settings['half_stage2'] and (
+                    move >= second or settings.get('half_pullback_close', False) and move <= first)):
+            # Frozen gui.decide_half_close 1871-1877: pullback is a second-stage
+            # trigger, not an independent exit. Retain one remaining target.
             target = half_close_target(virtual)
             updated.update(half_stage=stage + 1, exit_target=target)
             events.append({'reason': f'PARTIAL_STAGE_{stage + 1}', 'remaining': target})
