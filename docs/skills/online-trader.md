@@ -19,6 +19,15 @@ Use the frozen archive and hashes in `qa/dsv_parity/fixtures/baseline-manifest.j
 - Follow user-approved differences in `00-evidence-and-decisions.md`. The slow partial-fill regression uses `--verify-slow-partial` on the scheduled fixture. Round 7 keeps the five-lot target with three proved fills and only prepares the two-lot remainder. Round 9 retains five proved lots without an extra close. The guard checks the original divergence and exact round order. Keep unrelated mismatches visible.
 - For a changed behavior, supply the version and actual entry point to the independent testing agent. Cover the failing input, its corrected behavior, adjacent execution and restart paths. Use the Qt interface when accepting a displayed result. An offline outbound queue proves local scheduling for those inputs. Network timing, live cabinet response and shipped binaries require their own evidence.
 
+### Exit recovery and workbench acceptance
+
+Use `docs/refactor/dsv-parity-20261114/16-exit-recovery-and-evidence-acceptance.md` for the fixtures, commands and expected observations.
+
+- For a rejected reduction, first replay invalid then restored quotes through frozen DSV. In the candidate, inject a proved unsent reduction and separately an ambiguous SDK-call failure. Check that opening the same ledger and receiving a fresh, valid quote resumes the original exit revision with a new child after position and route checks. A repeated quote or a limit-band fallback alone cannot trigger recovery. An unresolved `UNKNOWN` keeps its original reservation and awaits facts.
+- For history reads, measure the first snapshot and the first snapshot after reopen with a populated ledger. While the history loader still runs, act in the real Qt workbench and verify an owner command or round and its receipt can advance. Inspect the read-only worker boundary. Local results are observations, not fixed performance thresholds.
+- For event display, drive actual Qt through the pipe. Check representative no-trade reasons and a cancellation-call exception. Verify visible time, contract/child identity, error code and sanitized exception type. Confirm the original order remains reserved, and reopen an older ledger to check the retained fills and missing historical fields.
+- For comparison changes, mutate a valid trace to remove the final zero from `[0, 5, 0]`, and add, remove, duplicate or reorder rounds. Each must fail. Adjacent repeated zero targets remain valid. Run the comparator tests and all fixed scheduled samples, including the approved difference in slow partial-fill rounds 7 and 9.
+
 ## Startup and online evidence
 
 - Historical replay restores observation state with entry disabled. The original tick can age while replay runs. After committing the path, wait briefly for continuous incremental ticks and register a fresh quote through the existing gate. Extend only from the accepted sequence in the same session and source epoch. Preserve the original observation start and leave unproved gaps blocked.

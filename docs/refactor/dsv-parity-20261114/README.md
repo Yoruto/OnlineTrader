@@ -1,8 +1,8 @@
 # OnlineTrader：以 DSV 为唯一业务基准的减法重构计划
 
-编制于 2026-11-14，当前源码状态更新于 2026-11-15。原设计代码基线为 `af8b53b`，本轮验收源码为 `f6a2bdd`。
+编制于 2026-11-14，当前源码状态更新于 2026-11-15。原设计代码基线为 `af8b53b`，调度固定回归基线为 `f6a2bdd`，平仓恢复、历史隔离、事件和比较器的验收提交为 `6468b00`。
 
-**当前入口**：[策略和 SDK 串联调度及固定回归](15-strategy-sdk-schedule.md) · [用户批准的行为差异](00-evidence-and-decisions.md#用户批准的行为差异) · [当前状态及独立验收](../../功能实现与待办清单_20261110.md#当前替代链状态)
+**当前入口**：[平仓恢复、历史隔离、事件和比较器验收](16-exit-recovery-and-evidence-acceptance.md) · [策略和 SDK 串联调度及固定回归](15-strategy-sdk-schedule.md) · [用户批准的行为差异](00-evidence-and-decisions.md#用户批准的行为差异) · [当前状态及独立验收](../../功能实现与待办清单_20261110.md#当前替代链状态)
 
 **阶段记录**：[执行选型](05-offline-implementation.md) · [显式执行](06-round-replay-and-controller.md) · [离线工作台](07-offline-workbench-and-recovery.md) · [迁移与恢复](08-offline-migration-and-business-recovery.md) · [SDK 适配](09-sdk-opening-and-rollback-rehearsal.md) · [候选启动与回滚](10-sdk-startup-and-same-day-rollback.md) · [SimNow 只读核验](11-simnow-readonly-acceptance.md) · [F01–F03](12-review-fixes-f01-f03.md) · [原策略循环](13-original-loop-replay.md) · [SDK 子单及结清](14-sdk-round-and-close-sync.md)
 

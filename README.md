@@ -4,7 +4,7 @@
 
 ## DSV 替代链开发与验收
 
-截至 2026-11-15，`refactor/dsv-parity` 的源码基线为 `f6a2bdd`。离线对照直接运行固定版 DSV 策略循环及 TqSdk 3.10.2 目标任务，对比同一批输入下的策略决定、委托回报和 `wait_update` 出站轮次。第 7、9 轮慢部分成交按用户确认保留 OnlineTrader 逐笔核对行为，固定回归要求补足原目标后保持 5 手。[当前状态与证据](docs/功能实现与待办清单_20261110.md#当前替代链状态) · [调度回放与复现命令](docs/refactor/dsv-parity-20261114/15-strategy-sdk-schedule.md)
+截至 2026-11-15，`main` 的已验收提交为 `6468b00`。离线对照直接运行固定版 DSV 策略循环及 TqSdk 3.10.2 目标任务，对比同一批输入下的策略决定、委托回报和 `wait_update` 出站轮次。第 7、9 轮慢部分成交按用户确认保留 OnlineTrader 逐笔核对行为，固定回归要求补足原目标后保持 5 手。[当前状态与证据](docs/功能实现与待办清单_20261110.md#当前替代链状态) · [调度回放与复现命令](docs/refactor/dsv-parity-20261114/15-strategy-sdk-schedule.md) · [平仓恢复、历史隔离、事件和比较器验收](docs/refactor/dsv-parity-20261114/16-exit-recovery-and-evidence-acceptance.md)
 
 [逐轮回放与显式执行](docs/refactor/dsv-parity-20261114/06-round-replay-and-controller.md)记录冻结原版的轮次顺序、替代控制器、独立事实库及离线运行入口。
 
