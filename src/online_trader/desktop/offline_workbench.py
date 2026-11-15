@@ -4,11 +4,18 @@ from uuid import uuid4
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QSpinBox, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QHeaderView, QLabel, QMainWindow, QSpinBox, QTabWidget, QVBoxLayout, QWidget
 
 from online_trader.desktop.workbench_layout import button, populate, row, table
 from online_trader.dsv_runtime.offline_endpoint import OfflineClient, _TIMEOUT
 from online_trader.errors import TraderError
+
+
+_REJECTION_REASONS = {
+    'QUOTE_OR_PRICE_SCOPE': '缺少有效报价、存在外部委托或限价不合规',
+    'ACCOUNT_SCOPE_OR_WINDOW': '合约、交易日或开仓时段超出账户授权',
+    'PRE_SEND_VALIDATION': '发送前校验失败',
+}
 
 
 class _Request(QThread):
@@ -37,7 +44,7 @@ class OfflineWorkbench(QMainWindow):
         self._transport_ok = False
         self._confirmed_absent = False
         self.setWindowTitle('OnlineTrader · DSV 离线工作台')
-        self.resize(1060, 620)
+        self.resize(1120, 760)
 
         panel = QWidget()
         self.setCentralWidget(panel)
@@ -68,6 +75,21 @@ class OfflineWorkbench(QMainWindow):
         layout.addWidget(QLabel('未核齐委托'))
         layout.addWidget(self.orders, 3)
         layout.addLayout(row(self.cancel))
+
+        self.activity = table(('时间', '合约', '事件', '原因或计价依据', '委托身份'))
+        self.activity.setObjectName('offlineActivity')
+        activity_header = self.activity.horizontalHeader()
+        activity_header.setSectionResizeMode(QHeaderView.Interactive)
+        activity_header.resizeSection(0, 210)
+        activity_header.resizeSection(2, 130)
+        activity_header.resizeSection(4, 180)
+        activity_header.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.fills = table(('成交日', '合约', '买卖', '开平', '成交量', '成交价', '成交编号', '原生委托号'))
+        self.fills.setObjectName('offlineFills')
+        evidence = QTabWidget(objectName='offlineEvidence')
+        evidence.addTab(self.activity, '策略事件')
+        evidence.addTab(self.fills, '逐笔成交')
+        layout.addWidget(evidence, 3)
         self.receipt = QLabel('—', objectName='offlineReceipt')
         self.receipt.setWordWrap(True)
         layout.addWidget(self.receipt)
@@ -95,7 +117,7 @@ class OfflineWorkbench(QMainWindow):
         if self.pending:
             self._job('receipt', {'id': self.pending['id'], 'expected_scope': self.pending['expected_scope']})
         else:
-            self._job('snapshot')
+            self._job('snapshot', {'workbench_evidence': True})
 
     def _query_receipt(self):
         if self.pending:
@@ -207,6 +229,34 @@ class OfflineWorkbench(QMainWindow):
                          order['original_qty'], order['filled_qty'], order['cancel_status'] or
                          (order['broker_state'] if order['native_id'] else order['send_state']),
                          order['native_id'] or key)) for key, order in state['orders'].items()])
+        populate(self.activity, [self._activity_row(event) for event in state.get('activity', ())])
+        populate(self.fills, [
+            (fill['fill_day'], fill.get('contract_id', '—'), fill.get('direction', '—'),
+             fill.get('native_offset', '—'), fill['quantity'], fill['price'], fill['native_trade_id'],
+             fill['native_order_id']) for fill in state.get('fills', ())])
+
+    @staticmethod
+    def _activity_row(event):
+        reason = event['reason']
+        if reason == 'EXPIRY_ENTRY_BLOCK':
+            name = '到期阻断开仓'
+            detail = (f"剩余 {event['days_to_expiry']} 天，达到或低于阈值 {event['min_days_to_expiry']} 天"
+                      if event.get('days_to_expiry') is not None else '达到或低于到期开仓阈值')
+        elif reason == 'PROTECTED_FLOOR':
+            name = '保护线退出'
+            detail = (f"理论保护价 {event['nominal_reference_price']}，名义点数 {event['nominal_move']}"
+                      if event.get('nominal_move') is not None else '原记录缺少保护线名义点数')
+        else:
+            if reason == 'DEFINITELY_NOT_SENT':
+                name = '本地拒发'
+                detail = _REJECTION_REASONS.get(event.get('rejection_reason'), '发送前校验失败')
+            else:
+                name = '发送结果未知'
+                detail = '等待原生委托与成交核对'
+            if code := event.get('error_code'):
+                detail = f'{detail} · {code}'
+        return (event.get('at') or '—', event.get('contract_id', '—'), name, detail,
+                event.get('child_order_id', '—'))
 
     def _populate(self, grid, entries):
         selected = self._selected(grid, 0)

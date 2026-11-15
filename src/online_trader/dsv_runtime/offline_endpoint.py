@@ -65,6 +65,8 @@ def _handle(session, request, *, sdk=None):
     body, op = request['body'], request['op']
     if op == 'snapshot':
         result = _snapshot(session, detail=body.get('detail') is True)
+        if body.get('workbench_evidence') is True:
+            result.update(session.workbench_evidence())
         if sdk is not None:
             result['sdk_connection'] = True
         return result

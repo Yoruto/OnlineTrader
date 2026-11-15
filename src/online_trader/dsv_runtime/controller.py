@@ -22,6 +22,7 @@ class SendNotAttempted(NamedTuple):
     effect_id: str
     error_code: str
     exception: dict
+    rejection_reason: str | None = None
 
 
 def terminal(order):
@@ -545,6 +546,8 @@ class ExplicitOrderController:
                     result = 'DEFINITELY_NOT_SENT'
                     details.update(stage='PRE_SEND_VALIDATION', error_code=outcome.error_code,
                                    exception=outcome.exception)
+                    if outcome.rejection_reason is not None:
+                        details['rejection_reason'] = outcome.rejection_reason
                 else:
                     result = 'CALL_RETURNED'
             except Exception as error:

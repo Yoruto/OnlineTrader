@@ -164,6 +164,18 @@ class DsvSession:
         state.pop('retired_positions', None)
         return state
 
+    def workbench_evidence(self):
+        self._check_owner()
+        activity, fills = self._journal.recent_workbench_evidence()
+        for row in activity + fills:
+            if order := self._state['orders'].get(row.get('child_order_id')):
+                row['contract_id'] = order['contract_id']
+                row['direction'] = order['direction']
+                row['native_offset'] = order['native_offset']
+            if row.get('reason') == 'EXPIRY_ENTRY_BLOCK':
+                row['min_days_to_expiry'] = self._trade['min_days_to_expiry']
+        return {'activity': activity, 'fills': fills}
+
     def command_receipt(self, command_id):
         self._check_owner()
         return self._journal.command_receipt(identifier(command_id))

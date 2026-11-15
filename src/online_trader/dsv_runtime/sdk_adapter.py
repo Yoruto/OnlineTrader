@@ -444,6 +444,7 @@ class DsvSdkAdapter:
 
     def send(self, effect):
         native = self._authorized(effect, 'SEND')
+        rejection_reason = 'PRE_SEND_VALIDATION'
         # _authorized remains outside the proof boundary: a reused/ambiguous
         # effect must never be downgraded to definitely unsent.
         try:
@@ -451,18 +452,21 @@ class DsvSdkAdapter:
             tick = market['ticks'][-1] if market['ticks'] else None
             if (tick is None or market['external_orders'] or
                     legal_price(tick, Decimal(effect['limit_price'])) != effect['limit_price']):
+                rejection_reason = 'QUOTE_OR_PRICE_SCOPE'
                 raise TraderError('E_DSV_SDK_SCOPE', 'A native dispatch requires a legal price and current scoped quote')
             if self.grant is not None:
                 now, _ = self.clock()
                 if (effect['contract_id'] not in self.grant.value['contracts'] or
                         not self.grant.permits_day(effect['trading_day']) or
                         effect['native_offset'] == 'OPEN' and not self.grant.in_window(now)):
+                    rejection_reason = 'ACCOUNT_SCOPE_OR_WINDOW'
                     raise TraderError('E_DSV_SDK_SCOPE', 'The SDK request exceeded its explicit account scope')
             request = dict(symbol=effect['contract_id'], direction=effect['direction'],
                            offset=effect['native_offset'], volume=quantity(effect['quantity'], positive=True),
                            limit_price=float(Decimal(effect['limit_price'])), order_id=native, account=self.account)
         except Exception as error:
-            return SendNotAttempted(effect['id'], getattr(error, 'code', 'E_DSV_PRE_SEND'), exception_record(error))
+            return SendNotAttempted(effect['id'], getattr(error, 'code', 'E_DSV_PRE_SEND'),
+                                    exception_record(error), rejection_reason)
         self._seen_effects.add(effect['id'])
         # Never turn an exception from inside insert_order into unsent proof,
         # even if it has the same error code as a local validation failure.
