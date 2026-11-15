@@ -14,6 +14,7 @@ from online_trader.dsv_runtime.migration import _COLD_CHECKS, _readonly, _source
 from online_trader.dsv_runtime.controller import terminal
 from online_trader.dsv_runtime.offline_endpoint import _handle, serve_request, validate_offline_message
 from online_trader.dsv_runtime.runner import DsvSession
+from online_trader.dsv_runtime.runtime_diagnostics import RuntimeDiagnostics
 from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
 from online_trader.errors import TraderError
 from online_trader.gateway.dsv_facts import utc
@@ -138,6 +139,7 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
             raise TraderError('E_ONLINE_SCOPE', 'The replacement scope has expired without pending responsibilities')
         _claim_run_output(output, grant)
         status_path = output / 'status.json'
+        diagnostics = RuntimeDiagnostics(output / 'runtime-diagnostics.jsonl')
         _status(status_path, {'phase': 'STARTING', 'entry_authority': 'DISARMED', 'account_key': grant.account_key})
         try:
             with ExitStack() as owner:
@@ -165,11 +167,13 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
 
                 def complete():
                     return connection.broker_connected and connection.complete()
-                return _serve(session, adapter, listener, date_resolver, status_path, complete)
+                return _serve(session, adapter, listener, date_resolver, status_path, complete, diagnostics=diagnostics)
         except Exception as error:
+            diagnostics.report(error, stage='STARTUP_OR_CLEANUP')
             try:
                 _status(status_path, {'phase': 'NEEDS_REVIEW', 'entry_authority': 'DISARMED',
-                                      'account_key': grant.account_key, 'error_code': getattr(error, 'code', 'E_DSV_SDK_RUNTIME')})
+                                      'account_key': grant.account_key, 'error_code': getattr(error, 'code', 'E_DSV_SDK_RUNTIME'),
+                                      'diagnostics': diagnostics.status()})
             except OSError:
                 pass
             if isinstance(error, TraderError):
@@ -177,7 +181,9 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
             raise TraderError('E_DSV_SDK_RUNTIME', 'Replacement startup or cleanup failed') from None
 
 
-def _serve(session, adapter, listener, day, status_path, complete):
+def _serve(session, adapter, listener, day, status_path, complete, *, diagnostics=None):
+    if diagnostics is None:
+        diagnostics = RuntimeDiagnostics(Path(status_path).with_name('runtime-diagnostics.jsonl'))
     previous = None
     stopping = False
 
@@ -201,14 +207,18 @@ def _serve(session, adapter, listener, day, status_path, complete):
             adapter.command(session, {'id': 'sdk-console-stop', 'action': 'STOP'})
             continue
         except (TraderError, OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+            diagnostics.report(error, stage='SDK_ROUND')
             if session._failed:
                 raise
             error_code = getattr(error, 'code', 'E_DSV_SDK_RUNTIME')
             time.sleep(0.1)
         state = session.snapshot()
+        if error_code is None and state['synchronized']:
+            diagnostics.recovered()
         payload = {'phase': 'READY' if state['synchronized'] else 'WAITING_FOR_NATIVE_SYNC',
                    'account_key': state['scope']['account_key'], 'trading_day': state['trading_day'],
-                   'entry_authority': 'RUNNING' if state['running'] else 'DISARMED', 'error_code': error_code}
+                   'entry_authority': 'RUNNING' if state['running'] else 'DISARMED', 'error_code': error_code,
+                   'diagnostics': diagnostics.status()}
         if payload != previous:
             try:
                 _status(status_path, payload)
