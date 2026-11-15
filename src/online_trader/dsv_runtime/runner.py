@@ -11,6 +11,7 @@ from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import content_hash
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
 from online_trader.dsv_core.business_statistics import reduce_stops
+from online_trader.dsv_core.month_stop import observe_month_stop
 from online_trader.dsv_core.transition import continuation_entry, ordinary_entry, price_value, protect
 from online_trader.dsv_core.price_rules import scheduled_close_mode
 from online_trader.dsv_runtime.controller import ExplicitOrderController, terminal, tighten_target
@@ -408,9 +409,20 @@ class DsvSession:
         old_day = state['trading_day']
         if day < old_day:
             raise TraderError('E_DSV_SCOPE', 'Observed cabinet day cannot move backward')
+        if day != old_day and frame.get('synchronized') is not True:
+            raise TraderError('E_DSV_SCOPE', 'Day rollover requires an explicit cabinet-day snapshot')
+        # Source monthly observation precedes per-symbol trading-day reset.
+        # Evaluate saved loss/day first, so the last round's loss is not lost.
+        for contract, spec in self._symbols.items():
+            row = state['symbols'][contract]
+            stops = observe_month_stop(
+                old_day, loss=row['net_loss'], stop_offset=spec['stop_offset'], trade=self._trade,
+                history=row.get('stop_days', []), month_stop=row.get('month_stop'),
+                day_stopped=row['day_stop'], day_stopped_reason=row.get('day_stop_reason'),
+                calendar=frame.get('trading_days', []))
+            row.update(stop_days=stops['stop_days'], month_stop=stops['month_stop'],
+                       day_stop=stops['day_stopped'], day_stop_reason=stops['day_stopped_reason'])
         if day != old_day:
-            if frame.get('synchronized') is not True:
-                raise TraderError('E_DSV_SCOPE', 'Day rollover requires an explicit cabinet-day snapshot')
             self._roll_day(state, day)
             if self._sdk_port is not None:
                 state['running'] = False
@@ -470,7 +482,13 @@ class DsvSession:
             contract, day, loss=Decimal(row['net_loss']), stop_streak=row.get('stop_streak', 0),
             continuation_stopped=row.get('continuation_stopped', False), day_stopped=row['day_stop'],
             day_stopped_reason=row.get('day_stop_reason'), history=row.get('stop_days', []),
-            month_stop=row.get('month_stop'), calendar=calendar, stop_offset=spec['stop_offset'], trade=self._trade)
+            month_stop=row.get('month_stop'), calendar=calendar, stop_offset=spec['stop_offset'],
+            trade=self._trade | {'month_stop_days': 0})
+        # Monthly tracking already ran at the source's earlier phase. The
+        # legacy reducer remains unchanged for the not-yet-retired Kernel.
+        # Do not overwrite a stop cause that was established before this phase.
+        if row['day_stop']:
+            result['state']['day_stopped_reason'] = row.get('day_stop_reason')
         stops = result['state']
         row.update(day_stop=stops['day_stopped'], day_stop_reason=stops['day_stopped_reason'],
                    stop_days=stops['stop_days'], month_stop=stops['month_stop'])
@@ -488,7 +506,7 @@ class DsvSession:
         for row in state['symbols'].values():
             position, last_stop = row['position'], row['last_stop']
             history = row.get('stop_days', [])
-            month = row.get('month_stop') if row.get('month_stop') == day[:7] else None
+            month = row.get('month_stop')
             reviews = {key: row[key] for key in ('detached_positions', 'native_conflicts') if row.get(key)}
             if 'expiry_days_checked' in row:
                 reviews['expiry_days_checked'] = row['expiry_days_checked']
@@ -589,8 +607,6 @@ class DsvSession:
             return [{'reason': 'QUOTE_UNAVAILABLE', 'rule_ids': ['D01']}]
         if market['long_qty'] or market['short_qty'] or market.get('external_orders'):
             return [{'reason': 'UNOWNED_POSITION', 'rule_ids': ['I01', 'I02']}]
-        if row.get('month_stop') == state['trading_day'][:7]:
-            return [{'reason': 'MONTH_STOP', 'rule_ids': ['D10']}]
         if self._sdk_port is not None:
             reason = self._sdk_port.opening_limit(state, market, spec, _utc(frame['wall_time']))
             if reason:
