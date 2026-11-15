@@ -1,6 +1,6 @@
 # Independent OnlineTrader
 
-Work in `E:\online-trader`. Its `README.md` points to the current 96-item list and dated evidence. Use `AGENTS.md` and the relevant product contract for constraints. The parent V7 documentation keeps the historical design and skill source. Keep the V7, WT9, OnlineTrader and original DSV runtimes separate.
+Work in `E:\online-trader`. Read `AGENTS.md` and `README.md` for current scope. For DSV parity, use `docs/refactor/dsv-parity-20261114/README.md` and its current replay notes. Keep the V7, WT9, OnlineTrader and reference DSV runtimes separate.
 
 - For OnlineTrader source commits, confirm the fetch and push targets are `https://github.com/Yoruto/OnlineTrader.git`. Fetch the branch refs before deciding what needs merging. Include relevant source, tests, documentation and release scripts. Runtime logs, accounts, ledgers, credentials and generated packages stay in local evidence or their authorized delivery location.
 
@@ -10,6 +10,15 @@ Work in `E:\online-trader`. Its `README.md` points to the current 96-item list a
 - Check the Beijing session, cabinet trading day, exact contract identities, profile, calendar and clock for a new observation. A prior readiness package or successful login is historical after its window ends. Apply the current request's connection and order permissions.
 - A calculator preview, DSV saved parameters, DSV UI readback and the product's actual bound startup profile are separate facts. Compare the correct pair. Preserve the real daily rows, day cutoff and intraday range to reproduce an offset calculation. Re-read the saved configuration before comparing runs, including startup switches.
 
+## Frozen DSV parity
+
+Use the frozen archive and hashes in `qa/dsv_parity/fixtures/baseline-manifest.json`. Run the verified original strategy code and relevant SDK methods in isolated QA. Use the Python version required by the archive for bytecode and the project's environment for OnlineTrader. Supply the same business settings, ordered update batches, wall time, native positions and fills. Keep the original SDK network boundary local.
+
+- Start with `docs/refactor/dsv-parity-20261114/15-strategy-sdk-schedule.md` for the commands. `compare_original_loop` covers strategy decisions and state. `sdk_round_replay` covers the order tasks. `scheduled_sdk_replay` connects both and traces `wait_update`, strategy targets, API calls and outbound packets. Locate the first differing round before changing the candidate. Per-round API invocation and packet emission can occur in different rounds.
+- Confirm which native facts are proved. A current-session SDK local order can support cancellation by its bound identity after the original call returns. It does not establish acceptance, fill, terminal state or reconnect reconciliation. Preserve original quantity reservations and per-child commit-before-send evidence. Compare native flat and strategy close synchronization separately.
+- Follow user-approved differences in `00-evidence-and-decisions.md`. The slow partial-fill regression uses `--verify-slow-partial` on the scheduled fixture. Round 7 keeps the five-lot target with three proved fills and only prepares the two-lot remainder. Round 9 retains five proved lots without an extra close. The guard checks the original divergence and exact round order. Keep unrelated mismatches visible.
+- For a changed behavior, supply the version and actual entry point to the independent testing agent. Cover the failing input, its corrected behavior, adjacent execution and restart paths. Use the Qt interface when accepting a displayed result. An offline outbound queue proves local scheduling for those inputs. Network timing, live cabinet response and shipped binaries require their own evidence.
+
 ## Startup and online evidence
 
 - Historical replay restores observation state with entry disabled. The original tick can age while replay runs. After committing the path, wait briefly for continuous incremental ticks and register a fresh quote through the existing gate. Extend only from the accepted sequence in the same session and source epoch. Preserve the original observation start and leave unproved gaps blocked.
@@ -18,10 +27,9 @@ Work in `E:\online-trader`. Its `README.md` points to the current 96-item list a
 
 ## Checks and documentation
 
-Use targeted `unittest` files in the independent core environment and `scripts/check.ps1` for full source-only validation. Its result records source and validation-input hashes, which can establish whether an earlier run still applies to a documentation-only change. Keep SDK-backed runs in their separate environment. For the mid-session startup path, use `test_online_dsv*.py` and `test_auto_offsets_runtime.py`.
+Use targeted `unittest` files in the project environment. For a Windows full source run use the `-X utf8` invocation in `AGENTS.md`. `scripts/check.ps1` records source and validation-input hashes. For the mid-session startup path, use `test_online_dsv*.py` and `test_auto_offsets_runtime.py`.
 
-- For DSV parity work, verify the original behavior in the installed reference archive or existing evidence and trace the OnlineTrader feature from its normal entry point. Replay the same market and account facts when available. Check entry, risk, order/cancel, post-fill protection and recovery separately. Check whether a DSV control has a functional handler before treating the control as a missing feature.
 - For workbench parity, estimate suggested lots from known inputs and keep it separate from execution sizing. Display intervals from the bound calendar for the accepted cabinet day. Report a proved terminal close shortfall against the original target and outstanding reservations without creating a new order.
 - For explicit Windows portable delivery, use `scripts/build-portable.ps1` and verify the extracted directory as delivered. Keep the main and CLI executables with their shared `_internal` and adjacent scripts. For tray acceptance, verify close hides the window, a real tray double-click restores the same window and process, and the tray menu exits that process. Record the archive SHA-256 and distinguish extracted-build acceptance from later source checks. The watchdog is optional and only opens the workbench. Its activation, broker access and packaging follow the current request.
 
-Update current state in `docs/功能实现与待办清单_20261110.md` and link the dated run from `README.md`. Distinguish offline injected facts, live observation, real order/fill evidence and installed-build acceptance. Retain older reports and expired scopes as evidence. When changing this reference, sync the installed skill and the OnlineTrader repository copy at `docs/skills/online-trader.md`.
+Update the current section of `docs/功能实现与待办清单_20261110.md` and route readers from the README and refactor index. Preserve dated evidence and expired scopes as historical records. Maintain this reference in the OnlineTrader repo at `docs/skills/online-trader.md`, the parent V7 skill snapshot and the installed skill under `references/online-trader.md`.

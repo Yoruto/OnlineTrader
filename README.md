@@ -2,17 +2,21 @@
 
 [DSV 行为基准、源码落点与验收交接](docs/dsv-behavior-baseline-20261113.md) · [F01–F17 修复与验收摘要](docs/dsv-audit-repair-20261114.md)
 
-DSV 架构重构的首阶段已开始。[实现记录](docs/refactor/dsv-parity-20261114/05-offline-implementation.md)记录纯业务规则拆分、执行选型及切换前的剩余验证。
+## DSV 替代链开发与验收
+
+截至 2026-11-15，`refactor/dsv-parity` 的源码基线为 `f6a2bdd`。离线对照直接运行固定版 DSV 策略循环及 TqSdk 3.10.2 目标任务，对比同一批输入下的策略决定、委托回报和 `wait_update` 出站轮次。第 7、9 轮慢部分成交按用户确认保留 OnlineTrader 逐笔核对行为，固定回归要求补足原目标后保持 5 手。[当前状态与证据](docs/功能实现与待办清单_20261110.md#当前替代链状态) · [调度回放与复现命令](docs/refactor/dsv-parity-20261114/15-strategy-sdk-schedule.md)
 
 [逐轮回放与显式执行](docs/refactor/dsv-parity-20261114/06-round-replay-and-controller.md)记录冻结原版的轮次顺序、替代控制器、独立事实库及离线运行入口。
 
-[离线工作台](docs/refactor/dsv-parity-20261114/07-offline-workbench-and-recovery.md)可附着离线执行器做启停、减仓、撤单与跨日恢复核验。
+[离线工作台](docs/refactor/dsv-parity-20261114/07-offline-workbench-and-recovery.md)可附着离线执行器做启停、减仓、撤单与跨日恢复核验。「策略事件」查看本地拒发、到期阻断和保护线名义点数，「逐笔成交」查看事实库记录的成交价。[独立 Qt 验收](output/validation/20261115-offline-evidence-independent/test-report.md)
+
+## 历史验收与桌面交付
 
 11 月 13 日完成 DSV 与 OnlineTrader 的定向离线联合验证。两边用同一份旧格式配置载入的五合约字段及归档偏移重算结果一致。国债尾盘、首分钟零比例及缺资金字段的处理仍有差异，原 DSV EXE 的完整启动和两边在线交易待验。[联合验证报告](output/validation/20261113-dsv-onlinetrader-joint/test-report.md)
 
 11 月 13 日源码继续对齐 DSV 的普通入场缺价回退、整手边界、账户选用、权益累计、日报和日志归档筛选。剩余差异及 Qt 单进程诊断均有独立复测证据。本轮保持离线，未打包。[剩余 20 项复测](output/validation/20261113-dsv-remaining-fixes/test-report.md) · [首轮优先修复复测](output/validation/20261113-dsv-priority-fixes/test-report.md) · [原 96 项验收](output/validation/20261113-dsv-item-acceptance/test-report.md)
 
-当前桌面交付为 **0.1.0.dev28 · DSV 参数同步版（2026-11-13）**。在桌面 `OnlineTrader` 文件夹双击 `OnlineTrader.exe`。独立验收从资源管理器双击桌面 EXE，并用工作台导出的业务参数对照本机 DSV，117 项逐字段一致。验收期间工作台未连接模拟盘。[便携 ZIP](dist/OnlineTrader-0.1.0.dev28-Windows-x64-Portable-20261113-DSV-Parameters.zip) · [独立测试报告](output/portable-acceptance/20261113-dsv-parameters/qa/test-report.md)
+**0.1.0.dev28 · DSV 参数同步版（2026-11-13）**有独立桌面验收记录。在桌面 `OnlineTrader` 文件夹双击 `OnlineTrader.exe`。原验收从资源管理器双击对应 EXE，并对照工作台和本机 DSV 的 117 项业务参数。11 月 15 日的替代链对照是源码验收，未出制品。[便携 ZIP](dist/OnlineTrader-0.1.0.dev28-Windows-x64-Portable-20261113-DSV-Parameters.zip) · [独立测试报告](output/portable-acceptance/20261113-dsv-parameters/qa/test-report.md)
 
 工程状态见[功能实现与待办清单](docs/功能实现与待办清单_20261110.md)。旧版桌面交付见[历史记录](docs/history/releases/README.md)。`output/` 和 `dist/` 的链接指向本机生成的验收证据和制品。
 

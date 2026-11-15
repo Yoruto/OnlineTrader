@@ -1,10 +1,10 @@
 # OnlineTrader：以 DSV 为唯一业务基准的减法重构计划
 
-版本：1.0｜编制日期：2026-11-14｜[首阶段实现与执行选型](05-offline-implementation.md) · [逐轮回放与显式执行](06-round-replay-and-controller.md) · [离线工作台、恢复和今昨仓](07-offline-workbench-and-recovery.md) · [离线业务恢复与旧账本迁移](08-offline-migration-and-business-recovery.md) · [SDK 适配、首分钟和成交后回滚](09-sdk-opening-and-rollback-rehearsal.md) · [候选 SDK 启动与同日回滚](10-sdk-startup-and-same-day-rollback.md)
+编制于 2026-11-14，当前源码状态更新于 2026-11-15。原设计代码基线为 `af8b53b`，本轮验收源码为 `f6a2bdd`。
 
-代码基线：`af8b53b16592bfbd5b09185e1eee48120b3ead34`。当前实施与验收范围见阶段记录。账户连接、交易、软件安装和系统校时使用当次授权。
+**当前入口**：[策略和 SDK 串联调度及固定回归](15-strategy-sdk-schedule.md) · [用户批准的行为差异](00-evidence-and-decisions.md#用户批准的行为差异) · [当前状态及独立验收](../../功能实现与待办清单_20261110.md#当前替代链状态)
 
-[SimNow 只读核验与对跑状态](11-simnow-readonly-acceptance.md)
+**阶段记录**：[执行选型](05-offline-implementation.md) · [显式执行](06-round-replay-and-controller.md) · [离线工作台](07-offline-workbench-and-recovery.md) · [迁移与恢复](08-offline-migration-and-business-recovery.md) · [SDK 适配](09-sdk-opening-and-rollback-rehearsal.md) · [候选启动与回滚](10-sdk-startup-and-same-day-rollback.md) · [SimNow 只读核验](11-simnow-readonly-acceptance.md) · [F01–F03](12-review-fixes-f01-f03.md) · [原策略循环](13-original-loop-replay.md) · [SDK 子单及结清](14-sdk-round-and-close-sync.md)
 
 ## 1. 最终要交付什么
 
@@ -19,7 +19,7 @@
 | 重构范围 | 保留外围，替换交易核心；不继续在旧通用内核内永久堆叠兼容分支 |
 | 规则来源 | DSV 已证行为、用户明确需求、最小执行事实约束、未证增强四类分别管理 |
 | 自发增加的交易规则 | 默认进入删除候选，不以“现有测试要求如此”为保留依据 |
-| SDK 执行 | 优先验证复用原版 TargetPosTask；它是待通过可行性闸门的候选，不是已完成选型 |
+| SDK 执行 | QA 直接运行原版 TargetPosTask 和子单任务。候选采用保留逐单提交证据的显式执行控制器 |
 | 最小正确性 | 保留单执行者、成交去重、未知结果不重放、未终态数量不释放、用户停止不被自动撤销 |
 | 日志与比较 | 不参与策略决策；可读日志和对照报告从交易控制中分离 |
 | 校时 | DSV 兼容行为与用户新增的自动校时需求分开；不借校时引入新的策略门禁 |

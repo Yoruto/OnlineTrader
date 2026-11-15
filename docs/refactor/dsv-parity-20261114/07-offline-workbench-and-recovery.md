@@ -15,6 +15,8 @@ F5/F6 登记启动和停止意图。F6 只停止新增，仓位及原保护继�
 
 本地注入命令使用 `python -m online_trader offline-dsv request --pipe OnlineTrader.OfflineDSV --input request.json`。文件是 `{"op":"snapshot","body":{}}`、`{"op":"receipt","body":{"id":"..."}}`、`{"op":"disconnect","body":{}}`、`{"op":"command","body":{...}}` 或 `{"op":"round","body":{...}}`。`round` 复用上阶段回放格式，去掉外层 `type`。`snapshot` 可传 `detail:true` 查看包含已终态子单和成交依据的完整投影。记录端口的发送与撤单都只落入离线库，原生回报需显式注入。
 
+「策略事件」显示本地拒发原因与错误码、发送结果未知、到期阻断的剩余天数和阈值，以及保护线理论价和名义点数。「逐笔成交」显示已记录的成交价和数量，结清后仍可查。旧账本缺少细分拒发理由时显示「发送前校验失败」，仍保留错误码。发送结果账本无时间字段，界面显示 `—`。[实际 Qt 界面独立验收](../../../output/validation/20261115-offline-evidence-independent/test-report.md)
+
 ## 同步与换日
 
 执行器启动或收到断线后，清理旧报价缓存并等待同步。收原单事实和记录启停意图仍可进行。恢复时传 `synchronized:true`，每个当前未核齐子单需在该轮有 `ORDER` 事实且列入 `sync_orders`，已由本轮逐笔事实证明核齐的子单也可对账通过。还需匹配现有自有仓。缺证据时保持待核对，可以随后补报。恢复不会重放准备动作或撤销先前的 F6。底层单机回放可以继续使用原 `DsvSession` API；要模拟断线须显式调用 `disconnect()`，工作台执行器每次启动自动执行此步骤。
