@@ -43,7 +43,9 @@ stale_force_close_seconds stop_cooldown_minutes total_margin_cap trailing_activa
 trailing_pullback_ratio""".split())
 _TRADE_KEYS = _BOOLEANS | _INTEGERS | _DECIMALS | {"night_session_close", "close_price_mode", "holidays"}
 _OPTIONAL_DURATIONS = {"passive_wait_seconds", "resume_gap_seconds"}
-_OPTIONAL_SWITCHES = {"half_pullback_close"}
+# Preserve missing optional fields in canonical records and their historical hashes.
+# The replacement runner applies the source default for stop_day_on_profit at use.
+_OPTIONAL_SWITCHES = {"half_pullback_close", "stop_day_on_profit"}
 _RATIOS = frozenset(key for key in _DECIMALS if key.endswith("_ratio")) | {"total_margin_cap"}
 _SYMBOL_REQUIRED = frozenset({"name", "code", "open_offset", "stop_offset", "profit_offset", "order_volume", "half_close_ratio", "hysteresis_points"})
 _SYMBOL_DECIMALS = ("open_offset", "stop_offset", "profit_offset", "half_close_ratio", "hysteresis_points")
