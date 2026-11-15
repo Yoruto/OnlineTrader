@@ -12,7 +12,9 @@ from online_trader.configuration.files import publish_new_bytes
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.dsv_runtime.migration import _COLD_CHECKS, _readonly, _source_digest, _source_schema, read_migration_receipt
 from online_trader.dsv_runtime.controller import terminal
-from online_trader.dsv_runtime.offline_endpoint import _handle, serve_request, validate_offline_message
+from online_trader.dsv_runtime.control_endpoint import (
+    handle_control as _handle, serve_control_request as serve_request, validate_control_message,
+)
 from online_trader.dsv_runtime.runner import DsvSession
 from online_trader.dsv_runtime.runtime_diagnostics import RuntimeDiagnostics
 from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
@@ -163,7 +165,7 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
                     provider=grant.provider, trading_day=grant.value['trading_day']))
                 session.disconnect('SDK_OWNER_STARTED')
                 session.disable_entries_on_restart()
-                listener = owner.enter_context(PipeListener(pipe, validator=validate_offline_message))
+                listener = owner.enter_context(PipeListener(pipe, validator=validate_control_message))
 
                 def complete():
                     return connection.broker_connected and connection.complete()
