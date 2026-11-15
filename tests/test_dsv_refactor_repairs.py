@@ -254,14 +254,15 @@ class DispatchBoundaryTests(unittest.TestCase):
         self.assertEqual(self.result_event()['kind'], 'CANCEL')
         self.adapter.api.cancel_order.assert_called_once_with(native, account=self.adapter.account)
 
-    def test_local_reduction_refusal_retains_target_and_needs_new_review(self):
+    def test_local_reduction_refusal_resumes_on_fresh_quote_under_original_target(self):
         row = self.state['symbols'][CODE]
         pos = row['position']
         self.order().update(send_state='NATIVE_SEEN', native_id='open-native', broker_state='FILLED',
                             terminal_confirmed=True, reported_fill_qty=2, filled_qty=2)
         pos.update(owned=2, entry_filled=2, entry_stopped=True, exit_target=0, exit_revision=1)
         with self.journal.transaction():
-            effect = self.controller.new_order(self.state, pos, {'contract_id': CODE}, 'REDUCE', 2, '100', 'CLOSE')
+            effect = self.controller.new_order(self.state, pos, {'contract_id': CODE, 'tick': tick()},
+                                               'REDUCE', 2, '100', 'CLOSE')
             self.journal.save(self.state)
         self.adapter.dispatch_market[CODE]['ticks'] = []
         self.controller.dispatch(self.state, [effect])
@@ -273,11 +274,16 @@ class DispatchBoundaryTests(unittest.TestCase):
                 self.controller, '_reduction_routes', return_value=[{'quantity': 2, 'native_offset': 'CLOSE'}]):
             with self.journal.transaction():
                 self.assertEqual(self.controller.plan(self.state, row, market, 0), [])
-                tighten_target(pos, 0, new_request=True)
-                requests = self.controller.plan(self.state, row, market, 0)
+                market['tick'].update(native_time=DAY + 'T01:10:01Z', bid1='NaN', last='NaN')
+                self.assertEqual(self.controller.plan(self.state, row, market, 1), [])
+                market['tick'] = tick() | {'native_time': DAY + 'T01:10:02Z'}
+                requests = self.controller.plan(self.state, row, market, 2)
             self.assertEqual(len(requests), 1)
             self.assertEqual(requests[0]['quantity'], 2)
             self.assertNotEqual(requests[0]['child_order_id'], effect['child_order_id'])
+            self.assertEqual(pos['exit_revision'], 1)
+            self.assertEqual(self.state['orders'][requests[0]['child_order_id']]['parent_child_order_id'],
+                             effect['child_order_id'])
         self.adapter.api.insert_order.assert_not_called()
 
 

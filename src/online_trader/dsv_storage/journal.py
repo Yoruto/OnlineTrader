@@ -1,6 +1,5 @@
 """One SQLite writer; round, checkpoint, facts and prepared effects commit together."""
 
-from collections import deque
 from contextlib import contextmanager
 import sqlite3
 
@@ -22,11 +21,6 @@ _SCHEMA = (
 
 class Journal:
     def __init__(self, path, scope, initial):
-        self._activity_seq = 0
-        self._activity = {
-            reason: deque(maxlen=50)
-            for reason in ('DEFINITELY_NOT_SENT', 'UNKNOWN', 'EXPIRY_ENTRY_BLOCK', 'PROTECTED_FLOOR')
-        }
         self._db = sqlite3.connect(path, isolation_level=None, timeout=2)
         try:
             with self.transaction():
@@ -97,38 +91,6 @@ class Journal:
 
     def command_receipt(self, identity):
         return self._read("SELECT payload FROM receipts WHERE kind='COMMAND' AND id=?", (identity,))
-
-    def recent_workbench_evidence(self):
-        for seq, kind, payload in self._db.execute(
-                "SELECT seq,kind,payload FROM events WHERE seq>? AND kind IN ('ROUND','EFFECT_RESULT') ORDER BY seq",
-                (self._activity_seq,)):
-            event = strict_loads(payload)
-            if kind == 'EFFECT_RESULT':
-                result = event['result']
-                if result in ('DEFINITELY_NOT_SENT', 'UNKNOWN') and event.get('kind') == 'SEND':
-                    self._activity[result].append((seq, {
-                        'reason': result, 'child_order_id': event['child_order_id'],
-                        'error_code': event.get('error_code'), 'rejection_reason': event.get('rejection_reason'),
-                    }))
-            else:
-                receipt = event['receipt']
-                expiry_days = {row['contract_id']: row.get('days_to_expiry') for row in event['input']['market']}
-                for decision in receipt['decisions']:
-                    reason = decision['reason']
-                    if reason in ('EXPIRY_ENTRY_BLOCK', 'PROTECTED_FLOOR'):
-                        contract = decision['contract_id']
-                        self._activity[reason].append((seq, {
-                            'reason': reason, 'contract_id': contract, 'at': receipt.get('evaluated_at'),
-                            'days_to_expiry': decision.get('days_to_expiry', expiry_days.get(contract)),
-                            'nominal_reference_price': decision.get('nominal_reference_price'),
-                            'nominal_move': decision.get('nominal_move'),
-                        }))
-            self._activity_seq = seq
-        activity = sorted((entry for rows in self._activity.values() for entry in rows),
-                          key=lambda entry: entry[0], reverse=True)
-        fills = self._db.execute('SELECT trading_day,payload FROM native_trades ORDER BY rowid DESC LIMIT 100')
-        return [dict(row) for _, row in activity], [
-            {'fill_day': day, **strict_loads(payload)} for day, payload in fills]
 
     def record_order(self, child, native_id, fact):
         try:

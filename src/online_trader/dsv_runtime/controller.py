@@ -1,5 +1,6 @@
 """Plan explicit child orders and reconcile only bound native facts."""
 
+from datetime import datetime, timezone
 from decimal import Decimal, localcontext
 import sqlite3
 from uuid import uuid4
@@ -307,6 +308,9 @@ class ExplicitOrderController:
         order.update(contract_id=contract, direction=side, position_id=position['id'], native_id=None, cancel_reason=None)
         if not opening:
             order['exit_revision'] = position.get('exit_revision', 0)
+            tick = market.get('tick')
+            if tick is not None and tick.get('native_time') is not None:
+                order['quote_at'] = tick['native_time']
         state['orders'][child_id] = order
         position['children'].append(child_id)
         return self._prepare(order, 'SEND', quantity=qty, limit_price=price, native_offset=offset, direction=side)
@@ -404,8 +408,9 @@ class ExplicitOrderController:
             old = self.child_orders(state, position, 'REDUCE')
             if old and old[-1]['filled_qty'] < old[-1]['original_qty']:
                 last = old[-1]
-                if (last['broker_state'] != 'CANCELLED' and last['send_state'] != 'DEFINITELY_NOT_SENT'
-                        or position.get('exit_revision', 0) <= last.get('exit_revision', 0)):
+                newer_target = position.get('exit_revision', 0) > last.get('exit_revision', 0)
+                if not self._retry_unsent_exit(last, market, newer_target) and (
+                        last['broker_state'] != 'CANCELLED' or not newer_target):
                     continue
             side = position['direction'].lower()
             fills = [fill | {'position_cycle_id': candidate['id'], 'event_seq': index}
@@ -424,6 +429,23 @@ class ExplicitOrderController:
                                        min(route['quantity'], market.get('max_order_qty', 2_147_483_647)),
                                        desired, route['native_offset'])]
         return []
+
+    @staticmethod
+    def _retry_unsent_exit(order, market, newer_target):
+        if order['effect'] != 'REDUCE' or order['send_state'] != 'DEFINITELY_NOT_SENT' or not terminal(order):
+            return False
+        if newer_target:
+            return True
+        # Each automatic successor needs a new received quote and a fresh
+        # route/price check. A limit-band fallback alone does not prove recovery.
+        tick = market['tick']
+        opponent = 'ask1' if order['direction'] == 'BUY' else 'bid1'
+        if price_value(tick.get(opponent)) is None and price_value(tick.get('last')) is None:
+            return False
+        quote_at = tick.get('native_time')
+        previous = order.get('quote_at')
+        return quote_at is not None and (
+            previous is None or datetime.fromisoformat(quote_at) > datetime.fromisoformat(previous))
 
     @staticmethod
     def _desired(position, market, effect, wall_time):
@@ -512,7 +534,7 @@ class ExplicitOrderController:
                 allowed_retry = old['cancel_reason'] in {'REPRICE', 'TARGET_REDUCED'}
                 rolled_exit = not opening and old['native_trading_day'] != state['trading_day']
                 newer_target = not opening and position.get('exit_revision', 0) > old.get('exit_revision', 0)
-                local_retry = old['send_state'] == 'DEFINITELY_NOT_SENT' and newer_target
+                local_retry = self._retry_unsent_exit(old, market, newer_target)
                 if not local_retry and (old['broker_state'] != 'CANCELLED' or not (
                         allowed_retry or newer_target or rolled_exit and old['cancel_reason'] != 'USER_CANCEL')):
                     continue
@@ -549,6 +571,7 @@ class ExplicitOrderController:
             order = state['orders'][effect['child_order_id']]
             sender = self.port.send if effect['kind'] == 'SEND' else self.port.cancel
             details = {'id': effect['id'], 'child_order_id': effect['child_order_id'],
+                       'contract_id': effect['contract_id'],
                        'kind': effect['kind'], 'stage': 'PORT_CALL'}
             try:
                 outcome = sender(dict(effect))
@@ -584,7 +607,8 @@ class ExplicitOrderController:
             try:
                 with self.journal.transaction():
                     self.journal.resolve(effect, result)
-                    self.journal.event('EFFECT_RESULT', details | {'result': result})
+                    self.journal.event('EFFECT_RESULT', details | {
+                        'result': result, 'at': datetime.now(timezone.utc).isoformat()})
                     self.journal.save(state)
             except sqlite3.Error as error:
                 raise TraderError('E_DSV_STORE', 'Dispatch outcome could not be committed; prepared effect requires reconciliation') from error

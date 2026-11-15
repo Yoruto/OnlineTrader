@@ -23,6 +23,8 @@
 
 ## 复现
 
+调度比较器先核对轮次 ID、顺序与唯一性，再检查每轮有序目标和有效报撤。只有连续相同的原版目标可以折叠。多余、缺失、重复和乱序轮次，或将 `[0, 5, 0]` 缩成 `[0, 5]`，均由 `tests.test_dsv_schedule_comparator` 覆盖。
+
 ```powershell
 $env:PYTHONPATH = 'src'
 $archive = Join-Path ([Environment]::GetFolderPath('Desktop')) 'DSV实盘1.0.zip'

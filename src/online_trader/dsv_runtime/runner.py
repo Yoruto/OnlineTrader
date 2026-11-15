@@ -15,6 +15,7 @@ from online_trader.dsv_core.transition import continuation_entry, ordinary_entry
 from online_trader.dsv_core.price_rules import scheduled_close_mode
 from online_trader.dsv_runtime.controller import ExplicitOrderController, terminal, tighten_target
 from online_trader.dsv_storage.journal import Journal
+from online_trader.dsv_storage.workbench_evidence import WorkbenchEvidence
 from online_trader.errors import TraderError
 from online_trader.gateway.ports import OnlineSimulationPort
 from online_trader.runtime.instance import AccountLock
@@ -82,6 +83,8 @@ class DsvSession:
         self._closed = False
         self._failed = False
         self._busy = False
+        self._database = database
+        self._workbench_reader = None
         self._lock = _execution_lock if _execution_lock is not None else AccountLock(account_key)
         self._owns_lock = _execution_lock is None
         self._sdk_port = port if not offline else None
@@ -139,6 +142,8 @@ class DsvSession:
         if self._owner != get_ident() or self._busy:
             raise TraderError('E_DSV_OWNER', 'The session must close on its owning thread')
         try:
+            if self._workbench_reader is not None:
+                self._workbench_reader.close()
             self._journal.close()
         finally:
             if self._owns_lock:
@@ -167,7 +172,11 @@ class DsvSession:
 
     def workbench_evidence(self):
         self._check_owner()
-        activity, fills = self._journal.recent_workbench_evidence()
+        if self._workbench_reader is None:
+            self._workbench_reader = WorkbenchEvidence(self._database)
+        result = self._workbench_reader.request()
+        activity = [dict(row) for row in result['activity']]
+        fills = [dict(row) for row in result['fills']]
         for row in activity + fills:
             if order := self._state['orders'].get(row.get('child_order_id')):
                 row['contract_id'] = order['contract_id']
@@ -175,7 +184,7 @@ class DsvSession:
                 row['native_offset'] = order['native_offset']
             if row.get('reason') == 'EXPIRY_ENTRY_BLOCK':
                 row['min_days_to_expiry'] = self._trade['min_days_to_expiry']
-        return {'activity': activity, 'fills': fills}
+        return {'history_status': result['history_status'], 'activity': activity, 'fills': fills}
 
     def command_receipt(self, command_id):
         self._check_owner()

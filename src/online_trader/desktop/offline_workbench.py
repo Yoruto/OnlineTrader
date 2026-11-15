@@ -17,6 +17,63 @@ _REJECTION_REASONS = {
     'PRE_SEND_VALIDATION': '发送前校验失败',
 }
 
+_STRATEGY_REASONS = {
+    'NORMAL_ENTRY': '普通开仓信号成立',
+    'CONTINUATION_ENTRY': '延续开仓信号成立',
+    'AWAITING_NATIVE_SYNC': '等待柜台委托、成交及仓位核对',
+    'LATE_FILL_OWNERSHIP_REVIEW': '迟到成交待核对归属',
+    'UNRESOLVED_PRIOR_CHILD': '原委托或成交尚未核齐',
+    'USER_STOPPED': '用户已停止新增开仓',
+    'UNOWNED_POSITION': '存在外部持仓或委托',
+    'QUOTE_UNAVAILABLE': '缺少有效行情',
+    'MINUTE_BAR_UNAVAILABLE': '缺少分钟 K 线',
+    'POSITION_OR_ENTRY_PENDING': '已有策略持仓或开仓委托待确认',
+    'POSITION_WAITING_FOR_MARKET': '已有持仓等待有效行情或交易时段',
+    'DAY_STOP': '当日停开',
+    'MONTH_STOP': '当月停开',
+    'DAILY_TARGET_LIMIT': '达到当日开仓目标次数上限',
+    'AUCTION_DISABLED': '配置禁止集合竞价开仓',
+    'OUTSIDE_SESSION': '当前不在交易时段',
+    'OPENING_WAIT': '仍在开盘等待窗口',
+    'CLOSE_ENTRY_WINDOW': '临近收盘，停止新增开仓',
+    'QUOTE_AGE': '行情已超过开仓时效',
+    'OFFSETS_UNAVAILABLE': '开仓、止损或止盈偏移无效',
+    'GEOMETRY_BLOCK': '当前日内振幅不满足开仓条件',
+    'BAR_CONSUMED': '当前分钟的开仓机会已使用',
+    'NO_CHASE_AFTER_ACT': '达到激活幅度后禁止追价',
+    'HYSTERESIS_NOT_READY': '价格尚未满足触发前的回撤条件',
+    'TRIGGER_NOT_REACHED': '行情尚未达到开仓触发价',
+    'ACTIVE_SYMBOL_LIMIT': '达到同时持仓品种数上限',
+    'STOP_COOLDOWN': '仍在止损冷却期',
+    'STOP_TRIGGER_UNCHANGED': '止损后开仓触发价尚未变化',
+    'CHASE_CAP_EXCEEDED': '报单价超出追价上限',
+    'TAKE_PROFIT_OUTSIDE_LIMIT': '理论止盈价超出涨跌停范围',
+    'QUOTE_NEAR_LIMIT': '报价接近涨跌停',
+    'ENTRY_THROTTLED': '同向开仓触发间隔过短',
+    'FUNDS_UNAVAILABLE': '资金或保证金字段不足，无法计算手数',
+    'INSUFFICIENT_MARGIN': '可用保证金不足',
+    'ORDER_QUANTITY_UNSUPPORTED': '手数不符合合约委托要求',
+    'SCOPE_OPENING_WINDOW_CLOSED': '超出账户开仓授权时段',
+    'SCOPE_TARGET_LIMIT': '达到授权开仓目标次数上限',
+    'SCOPE_RISK_UNPROVED': '缺少授权风控所需数据',
+    'SCOPE_QUANTITY_LIMIT': '授权剩余手数低于合约最小手数',
+    'ADVERSE_SLIPPAGE': '开仓滑点过大，触发保护退出',
+    'DATA_GAP_EXIT': '行情断流，触发保护退出',
+    'DATA_GAP_EXIT_PENDING': '断流保护等待行情或成交',
+    'ENTRY_CONFIRM_TIMEOUT': '开仓确认超时',
+    'STOP_LOSS': '触发止损',
+    'TAKE_PROFIT': '触发止盈',
+    'TRAILING_STOP': '触发移动止盈',
+    'PROTECTION_ACTIVATED': '保护线已激活',
+    'PARTIAL_STAGE_1': '触发第一档减仓',
+    'PARTIAL_STAGE_2': '触发第二档减仓',
+    'SCHEDULED_CLOSE': '到达收盘平仓窗口',
+    'SCHEDULED_CLOSE_PENDING': '收盘平仓待完成',
+    'PROTECTION_EXIT_AWAITING_SYNC': '保护退出等待策略同步',
+    'PROTECTION_EXIT_SYNCHRONIZED': '保护退出已完成策略同步',
+    'FIRST_MINUTE_JUMP_DAY_STOP': '首分钟跳空触发当日停开',
+}
+
 
 class _Request(QThread):
     completed = Signal(object, object)
@@ -90,6 +147,9 @@ class OfflineWorkbench(QMainWindow):
         evidence.addTab(self.activity, '策略事件')
         evidence.addTab(self.fills, '逐笔成交')
         layout.addWidget(evidence, 3)
+        self.history_status = QLabel(objectName='offlineHistoryStatus')
+        self.history_status.hide()
+        layout.addWidget(self.history_status)
         self.receipt = QLabel('—', objectName='offlineReceipt')
         self.receipt.setWordWrap(True)
         layout.addWidget(self.receipt)
@@ -234,6 +294,10 @@ class OfflineWorkbench(QMainWindow):
             (fill['fill_day'], fill.get('contract_id', '—'), fill.get('direction', '—'),
              fill.get('native_offset', '—'), fill['quantity'], fill['price'], fill['native_trade_id'],
              fill['native_order_id']) for fill in state.get('fills', ())])
+        message = {'LOADING': '正在读取策略事件与逐笔成交…',
+                   'UNAVAILABLE': '历史记录暂不可用，稍后自动重试'}.get(state.get('history_status'), '')
+        self.history_status.setText(message)
+        self.history_status.setVisible(bool(message))
 
     @staticmethod
     def _activity_row(event):
@@ -246,15 +310,23 @@ class OfflineWorkbench(QMainWindow):
             name = '保护线退出'
             detail = (f"理论保护价 {event['nominal_reference_price']}，名义点数 {event['nominal_move']}"
                       if event.get('nominal_move') is not None else '原记录缺少保护线名义点数')
-        else:
+        elif reason in ('DEFINITELY_NOT_SENT', 'UNKNOWN'):
             if reason == 'DEFINITELY_NOT_SENT':
                 name = '本地拒发'
                 detail = _REJECTION_REASONS.get(event.get('rejection_reason'), '发送前校验失败')
             else:
-                name = '发送结果未知'
-                detail = '等待原生委托与成交核对'
+                cancelling = event.get('effect_kind') == 'CANCEL'
+                name = '撤单结果未知' if cancelling else '发送结果未知'
+                detail = '撤单调用异常，原委托继续占用，等待柜台核对' if cancelling else '等待原生委托与成交核对'
+                if cancelling and (error_type := event.get('exception_type')):
+                    detail += f' · {error_type}'
             if code := event.get('error_code'):
                 detail = f'{detail} · {code}'
+        else:
+            name = '策略决定'
+            detail = _STRATEGY_REASONS.get(reason, reason)
+            if stop := event.get('day_stop_reason'):
+                detail = f'{detail} · {_STRATEGY_REASONS.get(stop, stop)}'
         return (event.get('at') or '—', event.get('contract_id', '—'), name, detail,
                 event.get('child_order_id', '—'))
 

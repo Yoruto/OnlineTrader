@@ -3,7 +3,9 @@
 import argparse
 import ast
 import asyncio
+from collections import Counter
 from datetime import datetime
+from itertools import groupby, zip_longest
 import json
 from pathlib import Path
 import subprocess
@@ -260,12 +262,18 @@ def original(packet, archive, loop):
 
 def compare(reference, current):
     rows = []
-    actual = {row['id']: row for row in current['rounds']}
+    original_counts = Counter(row['id'] for row in reference['rounds'])
+    candidate_counts = Counter(row['id'] for row in current['rounds'])
     original_ids = {identity: alias for alias, identity in reference['identities'].items()}
     candidate_ids = {identity: alias for alias, identity in current['identities'].items()}
     dead = set()
-    for expected in reference['rounds']:
-        observed = actual.get(expected['id'])
+    for expected, observed in zip_longest(reference['rounds'], current['rounds']):
+        round_id = (expected or observed)['id']
+        if (expected is None or observed is None or observed['id'] != round_id
+                or original_counts[round_id] != 1 or candidate_counts[round_id] != 1):
+            rows.append({'id': round_id, 'original': expected, 'candidate': observed,
+                         'match': False, 'round_identity_mismatch': True})
+            continue
         old = [packet | {'order_id': original_ids[packet['order_id']]} for packet in expected['outbound']]
         new = [] if observed is None else [
             packet | {'order_id': candidate_ids[packet['order_id']]} for packet in observed['outbound']]
@@ -273,8 +281,7 @@ def compare(reference, current):
         effective = [packet for packet in old if packet not in terminal_cancels]
         waits_match = (observed is not None and expected['wait_update'] == observed['wait_update']
                        and expected.get('wait_returned') == observed.get('wait_returned'))
-        targets_match = (observed is not None
-                         and list(dict.fromkeys(expected['targets'])) == observed['targets'])
+        targets_match = [volume for volume, _ in groupby(expected['targets'])] == observed['targets']
         rows.append({'id': expected['id'], 'original': expected, 'candidate': observed, 'original_outbound': old,
                      'candidate_outbound': new, 'terminal_cancels': terminal_cancels,
                      'waits_match': waits_match, 'targets_match': targets_match,
@@ -285,7 +292,8 @@ def compare(reference, current):
 
 def verify_slow_partial(rows):
     """Check the one approved strategy deviation without accepting new ones."""
-    if [row['id'] for row in rows] != [f'round-{i}' for i in range(1, 10)]:
+    if ([row['id'] for row in rows] != [f'round-{i}' for i in range(1, 10)]
+            or any(row.get('round_identity_mismatch') for row in rows)):
         return ['Expected the nine ordered rounds of the slow partial-fill fixture']
     by_id = {row['id']: row for row in rows}
     errors = []
