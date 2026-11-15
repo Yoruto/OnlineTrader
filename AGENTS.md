@@ -11,11 +11,25 @@ Trace the first differing round through `wait_update`, strategy target, SDK API 
 Keep `online_trader.dsv_core` free of the legacy owner, SDK, UI, I/O and system clock.
 Keep the explicit controller's per-child pre-send durability and the existing cutover gates.
 
+## Select the execution path before changing it
+
+| Path | Entry points and owner | Applicable contract |
+| --- | --- | --- |
+| Legacy, not yet retired | `simulation run`, `dsv run`, `simnow run`, and the ordinary workbench's existing launch route | Preserve the original Kernel owner and that route's recovery contract until approved cutover. |
+| Replacement candidate | `dsv replacement-run`, `simnow replacement-run` | `DsvSession` + `ExplicitOrderController` + `Journal` + `DsvSdkAdapter`; share the compatible account lock, not the legacy Kernel sender. See [candidate startup](docs/refactor/dsv-parity-20261114/10-sdk-startup-and-same-day-rollback.md). |
+| Isolated QA | `offline-dsv` and `qa/dsv_parity/` replay tools | DEV/OFFLINE fixtures or locally bounded SDK replay; no real account connection or order authority. |
+
+A shared helper or lock does not authorize two senders. Do not import legacy full-Tick-path gates,
+epoch-switching or clock-fault exceptions into the replacement merely because the legacy route
+uses them. Conversely, do not remove legacy checks while maintaining that route. Every changed
+trading condition needs DSV evidence, a scoped user-approved difference, or a stated minimum
+fact/ownership requirement. QA input injection must never become an online input port.
+
 For slow partial fills, honor the approved behavior in
 [the decision register](docs/refactor/dsv-parity-20261114/00-evidence-and-decisions.md#用户批准的行为差异).
 In the fixed sample, keep the 5-lot opening target when 3 lots are proved, then hold the
 5 proved lots after the remaining 2 fill. Include the fixed round 7 and 9 replay when changing
-affected behavior.
+affected behavior. This approval does not approve unrelated month-stop or restart deviations.
 
 Current implementation and evidence are indexed in [README](README.md) and the
 [96-item checklist](docs/功能实现与待办清单_20261110.md). The product has separate
@@ -41,6 +55,9 @@ Tests and QA are outside the production wheel. For a full source regression on W
 Use `.venv\Scripts\python.exe -X utf8 -m compileall -q src tests qa` for source compilation.
 Follow the global independent-testing instructions for delivery acceptance and use the actual
 entry point with isolated fixtures. Report offline, connected and packaged evidence by scope.
+An acceptance statement must name the full candidate SHA, scenario/fixture, environment and
+PASS/FAIL/SKIP/NOT_RUN counts. Unread local reports remain reported results, not independently
+verified evidence. A documentation-only commit does not fix an open source defect.
 
 Offline parameter work also includes the DSV 33-field trade-form templates and whole-batch symbol
 CSV preview/import/export. Template application and CSV import return preview values only; they
@@ -53,8 +70,10 @@ calculated/exported result. Calculations and applications bind the data and prev
 
 Historical execution grants and evidence are archived in [the November 10–11 development record](docs/history/development-authorizations-20261110-11.md).
 
-When modifying startup, commit historical path replay separately from the quote
+When modifying the legacy startup replay, commit historical path replay separately from the quote
 used for execution. Preserve the durable observation start and validate native
 sequence, session and source epoch before extending the path. Delayed incremental
-updates use the bounded startup catch-up and the original freshness limit. Reuse
-the existing evidence when the task only maintains documentation.
+updates use the bounded startup catch-up and the original freshness limit. These are legacy
+maintenance instructions, not a new replacement entry gate. For replacement startup, follow its
+bound SDK facts and documented synchronization contract. Reuse existing evidence when the task
+only maintains documentation, and do not relabel old results as newly executed.
