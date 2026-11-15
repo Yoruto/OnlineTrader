@@ -1,0 +1,138 @@
+{
+  "schema": "OT_ACCEPTANCE_INDEX/1",
+  "recorded_on": "2026-11-15",
+  "document_base_commit": "ddad472235b9fa0749646d7e3fded831040ca6c3",
+  "entries": [
+    {
+      "id": "reported-6468b00-independent",
+      "candidate_commit": "6468b003394315ee2fd1fa919ea6b1117db4cac9",
+      "scope": [
+        "A01",
+        "A02",
+        "A03",
+        "B01"
+      ],
+      "reported_result": "PASS",
+      "evidence_status": "NOT_INSPECTED",
+      "source_document": "docs/refactor/dsv-parity-20261114/16-exit-recovery-and-evidence-acceptance.md",
+      "source_document_commit": "ddad472235b9fa0749646d7e3fded831040ca6c3",
+      "counts": {
+        "reported_pass": 89,
+        "fail": null,
+        "error": null,
+        "skip": null,
+        "not_run": null
+      },
+      "actual_command": null,
+      "environment": null,
+      "artifacts": [
+        {
+          "location": "output/validation/20261115-review-fixes-independent/test-report.md",
+          "availability": "AUTHOR_LOCAL_NOT_IN_GIT",
+          "sha256": null
+        }
+      ],
+      "open_issues": [
+        "C01 compact UNKNOWN format not covered by unspecified old-ledger wording",
+        "Full deployed-artifact and broker acceptance are separate"
+      ]
+    },
+    {
+      "id": "reported-6468b00-full-source",
+      "candidate_commit": "6468b003394315ee2fd1fa919ea6b1117db4cac9",
+      "scope": [
+        "developer source suite"
+      ],
+      "reported_result": "PASS",
+      "evidence_status": "NOT_INSPECTED",
+      "counts": {
+        "reported_pass": 1564,
+        "fail": null,
+        "error": null,
+        "skip": null,
+        "not_run": null
+      },
+      "actual_command": null,
+      "environment": null,
+      "artifacts": [
+        {
+          "location": "output/validation/20261115-review-fixes/developer-full.log",
+          "availability": "AUTHOR_LOCAL_NOT_IN_GIT",
+          "sha256": null
+        }
+      ],
+      "source_document_commit": "ddad472235b9fa0749646d7e3fded831040ca6c3",
+      "open_issues": [
+        "Do not reuse as execution evidence for another candidate commit"
+      ]
+    },
+    {
+      "id": "c01-pr2-targeted",
+      "candidate_commit": "018ce03cbe792a2cd4d88b8a723da58eca6f2e9b",
+      "source_base_commit": "ddad472235b9fa0749646d7e3fded831040ca6c3",
+      "scope": [
+        "C01 read-only legacy projection",
+        "real SQLite and worker thread",
+        "no SDK/account lock"
+      ],
+      "entry_point": "unittest discover; normal imports of complete selected dependency modules",
+      "reported_result": "PASS_WITH_SKIPS",
+      "evidence_status": "EXECUTED_IN_THIS_FIX_SESSION",
+      "environment": {
+        "os": "Linux",
+        "python": "CPython 3.13.5",
+        "checkout": "Selected complete dependency modules, not full project checkout",
+        "Qt_IPC_broker": "NOT_RUN"
+      },
+      "actual_command": "PYTHONPATH=src python -m unittest discover -s tests -p 'test_dsv_workbench_history*.py' -v",
+      "counts": {
+        "total": 17,
+        "pass": 15,
+        "fail": 0,
+        "error": 0,
+        "skip": 2
+      },
+      "baseline_counterexample": "Same compact UNKNOWN test fails on ddad472: UNAVAILABLE and cursor 0",
+      "fixtures": "Synthetic fixtures embedded in test_dsv_workbench_history_compat.py; no user ledger",
+      "files": [
+        {
+          "path": "src/online_trader/dsv_storage/workbench_evidence.py",
+          "sha256": "6f7c8c65ac85cabda0f548906b97bd550f292ef902554450ca8bf85d139a50f7",
+          "git_blob_sha": "b75255f655edd9f0a3824c28553a77fc32890077"
+        },
+        {
+          "path": "src/online_trader/desktop/offline_workbench.py",
+          "sha256": "39084feffb3b5af5a25209e23fbca86d8e4bdca8ca1c08b942860043e9045998",
+          "git_blob_sha": "fd6d2f6a3c09a386183542bbce9142cfc6df1e70"
+        },
+        {
+          "path": "tests/test_dsv_workbench_history_compat.py",
+          "sha256": "95c2973e289cfa65ef5b7cd02d6f5ed020f7fbdf525dd02ebe878f96618cbcd0",
+          "git_blob_sha": "29192d65758e1c99cb6b7d4af9e9a1a9b4dbe2ef"
+        },
+        {
+          "path": "tests/test_dsv_workbench_history_qt.py",
+          "sha256": "8f052e36e2a6e1fa3d505992fce6ea9e82696e5266090eae0c1f3cf27a1a32e9",
+          "git_blob_sha": "fd943f17da8a286c0a3185215bec9125e01f08d3"
+        },
+        {
+          "path": "docs/refactor/dsv-parity-20261114/17-c01-history-compatibility.md",
+          "sha256": "17396c9fcf55e11c2c8638bc416b0c62d7902c1da9b9c9f571198d8f07ef1edc",
+          "git_blob_sha": "e97ff612ab9359ea3cb00bc75f35a3b3fe12f173"
+        }
+      ],
+      "artifacts": [
+        {
+          "location": "docs/validation/c01-history-20261115/unittest.txt",
+          "availability": "TRACKED_SANITIZED_SYNTHETIC_TEST_OUTPUT",
+          "sha256": "fdc2848ef48d8d5d4712df17ec18ee18c09945ca450deeb3771b4f6f3f20cddc"
+        }
+      ],
+      "open_issues": [
+        "Windows Qt tests skipped",
+        "Full checkout regression, named-pipe end-to-end, DSV replay and real broker not executed",
+        "PR merge and deployed SHA require separate confirmation"
+      ]
+    }
+  ]
+}
