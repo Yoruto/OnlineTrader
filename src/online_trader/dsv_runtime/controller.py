@@ -52,7 +52,8 @@ def _bind_native(order, value):
     native = _native_id(value)
     if order['send_state'] == 'DEFINITELY_NOT_SENT':
         raise TraderError('E_DSV_NATIVE_FACT', 'Native evidence contradicts a locally proved unsent child')
-    if order['native_id'] is not None and order['native_id'] != native:
+    known = order['native_id'] or order.get('local_order_id')
+    if known is not None and known != native:
         raise TraderError('E_DSV_NATIVE_ID', 'A child cannot change its native order identity')
     order['native_id'] = native
     order['send_state'] = 'NATIVE_SEEN'
@@ -89,7 +90,15 @@ class ExplicitOrderController:
                 raise TraderError('E_DSV_SCOPE', 'Native update must identify its original order day')
             if any(key in fact and fact[key] != order[key] for key in ('contract_id', 'direction', 'native_offset')):
                 raise TraderError('E_DSV_NATIVE_FACT', 'Native contract, side or offset differs from the child')
+            if fact['kind'] == 'LOCAL_ORDER':
+                local = _native_id(fact['native_order_id'])
+                if (order['send_state'] != 'CALL_RETURNED' or order['native_id'] is not None
+                        or order.get('local_order_id', local) != local):
+                    raise TraderError('E_DSV_NATIVE_FACT', 'Local SDK order must match the original returned send')
+                order['local_order_id'] = local
+                continue
             native_id = _bind_native(order, fact['native_order_id'])
+            order.pop('local_order_id', None)
             if fact['kind'] == 'ORDER':
                 if stamp := fact.get('source_time_ns'):
                     if order.get('native_order_time_ns', stamp) != stamp:
@@ -303,10 +312,15 @@ class ExplicitOrderController:
         return self._prepare(order, 'SEND', quantity=qty, limit_price=price, native_offset=offset, direction=side)
 
     def cancel(self, order, reason):
-        if order['terminal_confirmed'] or order['cancel_status'] or order['send_state'] != 'NATIVE_SEEN':
+        identity = None
+        if order['send_state'] == 'NATIVE_SEEN':
+            identity = order['native_id']
+        elif order['send_state'] == 'CALL_RETURNED':
+            identity = order.get('local_order_id')
+        if order['terminal_confirmed'] or order['cancel_status'] or identity is None:
             return None
         order.update(cancel_status='SEND_POSSIBLE', cancel_reason=reason)
-        return self._prepare(order, 'CANCEL', native_order_id=order['native_id'], reason=reason)
+        return self._prepare(order, 'CANCEL', native_order_id=identity, reason=reason)
 
     def _prepare(self, order, kind, **parameters):
         effect = {'id': order['child_order_id'] + '-' + kind.lower(), 'kind': kind,
@@ -515,7 +529,7 @@ class ExplicitOrderController:
 
     def settle(self, state, row):
         position = row['position']
-        if position is None or row.get('native_conflicts'):
+        if position is None or row.get('native_conflicts') or 'close_request_at' in position:
             return
         if position['owned'] == 0 and position['entry_stopped'] and not position['children']:
             row['position'] = None

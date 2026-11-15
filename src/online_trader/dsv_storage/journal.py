@@ -119,7 +119,7 @@ class Journal:
                         contract = decision['contract_id']
                         self._activity[reason].append((seq, {
                             'reason': reason, 'contract_id': contract, 'at': receipt.get('evaluated_at'),
-                            'days_to_expiry': expiry_days.get(contract),
+                            'days_to_expiry': decision.get('days_to_expiry', expiry_days.get(contract)),
                             'nominal_reference_price': decision.get('nominal_reference_price'),
                             'nominal_move': decision.get('nominal_move'),
                         }))

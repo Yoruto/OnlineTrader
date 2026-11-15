@@ -176,9 +176,24 @@ def ordinary_entry(state, frame, market, spec, settings, *, active_symbols, open
     native_time = datetime.fromisoformat(tick['native_time']).replace(microsecond=0)
     if age_limit > 0 and (_clock(frame, market, 'quote_age') - native_time).total_seconds() > age_limit:
         return {'reason': 'QUOTE_AGE'}
-    expiry = market.get('days_to_expiry')
-    if settings['rollover_stop_enabled'] and expiry is not None and int(expiry) <= settings['min_days_to_expiry']:
-        return {'reason': 'EXPIRY_ENTRY_BLOCK'}
+    # The frozen loop checks expiry once per configured contract (7933–7953).
+    expiry = state.get('expiry_days_checked')
+    expiry_observation = {}
+    if expiry is None and market.get('days_to_expiry') is not None:
+        expiry = int(market['days_to_expiry'])
+        expiry_observation['expiry_days_checked'] = expiry
+    if expiry is not None and expiry <= settings['min_days_to_expiry']:
+        return expiry_observation | {'reason': 'EXPIRY_ENTRY_BLOCK', 'days_to_expiry': expiry}
+    return expiry_observation | _ordinary_signal(
+        state, frame, market, spec, settings, active_symbols, open_symbols,
+        local_start, (last, high, low), (opening, stop, profit))
+
+
+def _ordinary_signal(state, frame, market, spec, settings, active_symbols, open_symbols,
+                     local_start, prices, offsets):
+    last, high, low = prices
+    opening, stop, profit = offsets
+    tick = market['tick']
     if market.get('liquidation_at') is not None:
         end = datetime.fromisoformat(market['liquidation_at'])
         if any(0 < (end - moment).total_seconds() <= settings['close_before_seconds']

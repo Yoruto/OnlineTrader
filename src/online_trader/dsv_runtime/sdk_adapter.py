@@ -82,6 +82,7 @@ class DsvSdkAdapter:
         self.flat_confirmed = False
         self.dispatch_market = {}
         self._seen_effects = set()
+        self._local_returns = set()
         self._foreign_trades = None
         self._legacy_native_orders = _legacy_native_orders or {}
         self.quotes = {code: api.get_quote(code) for code in self.contracts}
@@ -124,6 +125,7 @@ class DsvSdkAdapter:
         self.synchronized = False
         self.flat_confirmed = False
         self.dispatch_market = {}
+        self._local_returns.clear()
         self.epoch = uuid4().hex
         session.disconnect('SDK_DISCONNECTED')
 
@@ -172,6 +174,7 @@ class DsvSdkAdapter:
             self.synchronized = False
             self.flat_confirmed = False
             self.dispatch_market = {}
+            self._local_returns.clear()
             self.epoch = uuid4().hex
             if not session._failed:
                 session.disconnect('SDK_ROUND_FAILED')
@@ -206,7 +209,8 @@ class DsvSdkAdapter:
                  'wall_time': utc(now), 'monotonic_ms': str(mono), 'trading_day': day,
                  'trading_days': self.trading_days, 'calendar_hash': self.calendar.content_hash,
                  'synchronized': True, 'market': markets,
-                 'sync_orders': [fact['child_order_id'] for fact in native], 'native': native + details}
+                 'sync_orders': [fact['child_order_id'] for fact in native if fact['kind'] == 'ORDER'],
+                 'native': native + details}
         return frame, {row['contract_id']: row for row in markets}
 
     def _order_facts(self, orders, bindings):
@@ -228,12 +232,20 @@ class DsvSdkAdapter:
                 if actual != binding['native_trading_day']:
                     raise TraderError('E_DSV_SDK_FACT', 'SDK order belongs to a different cabinet day')
             elif not rejected:
+                if (order.status == 'ALIVE' and filled == 0 and (stamp is None or type(stamp) is int and stamp == 0)
+                        and getattr(order, '_this_session', False) is True
+                        and not getattr(order, 'exchange_order_id', None)
+                        and binding['send_state'] == 'CALL_RETURNED'
+                        and binding['child_order_id'] in self._local_returns):
+                    result.append(self._fact('LOCAL_ORDER', binding, native_id))
+                    continue
                 raise TraderError('E_DSV_SDK_FACT', 'SDK order is missing its native acceptance time')
             if not 0 <= filled <= binding['original_qty'] or order.status not in {'ALIVE', 'FINISHED'} or (
                     rejected and (filled or order.status != 'FINISHED')):
                 raise TraderError('E_DSV_SDK_FACT', 'SDK order cumulative status is contradictory')
             status = ('REJECTED' if rejected else 'FILLED' if filled == binding['original_qty'] else 'CANCELLED'
                       ) if order.status == 'FINISHED' else 'ALIVE'
+            self._local_returns.discard(binding['child_order_id'])
             temporal = {'source_time_ns': str(stamp)} if type(stamp) is int and stamp > 0 else {}
             result.append(self._fact('ORDER', binding, native_id) | {'status': status, 'filled_qty': filled} | temporal)
         return result
@@ -471,6 +483,7 @@ class DsvSdkAdapter:
         # Never turn an exception from inside insert_order into unsent proof,
         # even if it has the same error code as a local validation failure.
         self.api.insert_order(**request)
+        self._local_returns.add(effect['child_order_id'])
         return None
 
     def cancel(self, effect):

@@ -22,7 +22,8 @@ from online_trader.strategy.entry import is_night_session
 
 
 _CLOCK_READS = {'session', 'opening', 'entry_close', 'quote_age', 'cooldown', 'chase', 'submit',
-                'close', 'pending', 'protection', 'pending_start', 'price_context', 'stale', 'opening_observation'}
+                'close', 'pending', 'protection', 'pending_start', 'price_context', 'stale', 'opening_observation',
+                'position_sync'}
 _PRICE_FIELDS = ('last', 'day_high', 'day_low', 'bid1', 'ask1', 'tick_size', 'lower_limit', 'upper_limit')
 _FUNDS_FIELDS = ('available', 'margin_per_lot', 'multiplier', 'equity', 'risk_ratio', 'margin',
                  'frozen_margin', 'pending_margin', 'symbol_margin')
@@ -214,6 +215,8 @@ class DsvSession:
     @staticmethod
     def _mark_unsynchronized(state):
         state['synchronized'] = False
+        for order in state['orders'].values():
+            order.pop('local_order_id', None)
         for row in state['symbols'].values():
             row.update(tick=None, tick_session=None)
             row.pop('quote_clock', None)
@@ -363,8 +366,13 @@ class DsvSession:
                     if tick.get(key) not in (None, 'NaN'):
                         decimal_value(tick[key])
         for fact in frame['native']:
-            if fact['kind'] not in {'ORDER', 'TRADE'}:
+            if fact['kind'] not in {'ORDER', 'TRADE', 'LOCAL_ORDER'}:
                 raise TraderError('E_DSV_ROUND', 'Unsupported native fact kind')
+            if fact['kind'] == 'LOCAL_ORDER':
+                from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
+                port = self._controller.port
+                if type(port) is not DsvSdkAdapter or not port.enabled:
+                    raise TraderError('E_DSV_NATIVE_FACT', 'Local SDK orders require the active SDK owner')
             if fact['kind'] == 'TRADE':
                 decimal_value(fact['price'], positive=True)
             if 'source_time_ns' in fact:
@@ -473,6 +481,8 @@ class DsvSession:
             history = row.get('stop_days', [])
             month = row.get('month_stop') if row.get('month_stop') == day[:7] else None
             reviews = {key: row[key] for key in ('detached_positions', 'native_conflicts') if row.get(key)}
+            if 'expiry_days_checked' in row:
+                reviews['expiry_days_checked'] = row['expiry_days_checked']
             row.clear()
             row.update(_initial_symbol(), position=position, last_stop=last_stop, month_stop=month, stop_days=history, **reviews)
             if position is not None:
@@ -557,6 +567,10 @@ class DsvSession:
         if row.get('detached_positions') or row.get('native_conflicts'):
             return [{'reason': 'LATE_FILL_OWNERSHIP_REVIEW', 'rule_ids': ['I01', 'I02']}]
         if position is not None:
+            if 'close_request_at' in position:
+                wait = self._synchronize_protection_exit(state, position, market, frame, spec)
+                if wait is not None:
+                    return [wait]
             return self._maintain_position(row, position, market, frame, spec)
         if any(order['contract_id'] == market['contract_id'] and not terminal(order) for order in state['orders'].values()):
             return [{'reason': 'UNRESOLVED_PRIOR_CHILD', 'rule_ids': ['I02']}]
@@ -586,6 +600,8 @@ class DsvSession:
                 return [{'reason': 'MINUTE_BAR_UNAVAILABLE', 'rule_ids': ['D03']}]
             decision = ordinary_entry(row, frame, market, spec, self._trade, **sizes)
             rules = ['D01', 'D02', 'D04', 'D05', 'D06']
+        if 'expiry_days_checked' in decision:
+            row['expiry_days_checked'] = decision['expiry_days_checked']
         if 'consume' in decision:
             row['last_signal_bar'] = decision['consume']
         if decision.get('day_stop'):
@@ -610,6 +626,32 @@ class DsvSession:
             if self._sdk_port is not None:
                 row['position']['sdk_multiplier'] = market['multiplier']
         return [decision | {'rule_ids': rules}]
+
+    def _synchronize_protection_exit(self, state, position, market, frame, spec):
+        """Keep the strategy exit pending while preserving the native flat facts."""
+        reads = market.get('wall_reads', {})
+        sync_time = _utc(reads.get('position_sync', frame['wall_time']))
+        elapsed = (sync_time - _utc(position['close_request_at'])).total_seconds()
+        native_flat = not market['long_qty'] and not market['short_qty'] and not market.get('external_orders')
+        children = self._controller.child_orders(state, position)
+        # _run line 6236 guards the account read for five seconds. The
+        # position mismatch (booked side versus native flat) takes the
+        # reconciliation branch regardless of POSITION_ACT_GRACE.
+        if (elapsed >= 5 and native_flat
+                and not position['owned'] and all(terminal(order) for order in children)):
+            position.pop('close_request_at')
+            return {'reason': 'PROTECTION_EXIT_SYNCHRONIZED', 'rule_ids': ['D08', 'I02']}
+        if market['tick'] is not None and self._in_session(frame, market):
+            # The original may renew the same zero target before its account
+            # sync is due. Recheck the trigger for timing without booking or
+            # sending another target.
+            original_position = position | {'owned': position['entry_filled'], 'exit_target': None}
+            _, events = protect(original_position, market['tick'], self._trade, spec)
+            if any(event.get('remaining') == 0 for event in events):
+                position['close_request_at'] = reads.get('protection', frame['wall_time'])
+        if not position['owned']:
+            return {'reason': 'PROTECTION_EXIT_AWAITING_SYNC', 'rule_ids': ['D08', 'I02']}
+        return None
 
     def _maintain_position(self, row, position, market, frame, spec):
         if market['tick'] is not None and position['owned'] and self._in_session(frame, market):
@@ -686,6 +728,7 @@ class DsvSession:
                 position['rollback_exit'] = {'reason': reason,
                                              'at': market.get('wall_reads', {}).get('protection', frame['wall_time']),
                                              'price': reference, 'slip': None}
+                position['close_request_at'] = position['rollback_exit']['at']
                 if reason in {'TAKE_PROFIT', 'TRAILING_STOP', 'PROTECTED_FLOOR'}:
                     row['stop_streak'] = 0
                 loss = (Decimal(position['stop']) if reason == 'STOP_LOSS' else

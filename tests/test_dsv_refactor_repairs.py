@@ -66,6 +66,7 @@ class DispatchBoundaryTests(unittest.TestCase):
         self.adapter.account = object()
         self.adapter.session = SimpleNamespace(_closed=False, _journal=self.journal)
         self.adapter._seen_effects = set()
+        self.adapter._local_returns = set()
         self.adapter.api = SimpleNamespace(insert_order=Mock(), cancel_order=Mock())
         self.adapter.dispatch_market = {CODE: {'ticks': [tick()], 'external_orders': False}}
         self.adapter.clock = lambda: (datetime(2026, 11, 13, 1, 10, tzinfo=UTC), 0)
@@ -152,6 +153,32 @@ class DispatchBoundaryTests(unittest.TestCase):
         self.assertEqual(self.order()['send_state'], 'CALL_RETURNED')
         self.assertEqual(self.order()['filled_qty'], 0)
         self.assertFalse(terminal(self.order()))
+
+    def test_current_sdk_local_order_allows_cancel_without_claiming_native_acceptance(self):
+        self.adapter.grant.in_window = lambda now: True
+        self.dispatch()
+        identity = self.adapter.order_id(self.child)
+        local = SimpleNamespace(order_id=identity, exchange_id='DCE', instrument_id='p2701',
+                                direction='BUY', offset='OPEN', volume_orign=2, volume_left=2,
+                                limit_price=100, status='ALIVE', insert_date_time=0,
+                                exchange_order_id='', _this_session=True)
+        facts = self.adapter._order_facts({identity: local}, {identity: self.order()})
+        self.assertEqual([fact['kind'] for fact in facts], ['LOCAL_ORDER'])
+        with self.journal.transaction():
+            self.controller.accept_native(self.state, facts)
+            request = self.controller.cancel(self.order(), 'REPRICE')
+            self.journal.save(self.state)
+        self.controller.dispatch(self.state, [request])
+        self.adapter.api.cancel_order.assert_called_once_with(identity, account=self.adapter.account)
+        self.assertEqual(self.order()['send_state'], 'CALL_RETURNED')
+        self.assertIsNone(self.order()['native_id'])
+        self.assertFalse(terminal(self.order()))
+        self.assertEqual(self.journal._db.execute('SELECT COUNT(*) FROM native_orders').fetchone()[0], 0)
+        DsvSession._mark_unsynchronized(self.state)
+        self.adapter._local_returns.clear()
+        self.assertNotIn('local_order_id', self.order())
+        with self.assertRaises(TraderError):
+            self.adapter._order_facts({identity: local}, {identity: self.order()})
 
     def test_duplicate_effect_does_not_get_unsent_proof(self):
         self.adapter._seen_effects.add(self.effect['id'])
