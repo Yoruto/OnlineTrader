@@ -18,7 +18,7 @@ Linux / CPython 3.13.5。使用从固定提交读取、Git blob SHA 校验一致
 PYTHONPATH=src python -m unittest discover -s tests -p 'test_dsv_half_pullback_parity.py' -v
 ```
 
-同一组 19 个方法：未修复基线 10 FAIL / 9 PASS，候选 19 PASS / 0 FAIL / 0 SKIP。
+同一组 19 个方法：未修复基线 12 个方法通过、7 个方法含失败；unittest 输出 10 条失败记录（奇数手方法包含 4 个失败子用例）。候选 19 个方法全部通过，0 FAIL / 0 ERROR / 0 SKIP。不能将子用例失败条数直接从方法总数中相减。
 
 覆盖：固定四手反例、阈值等号、上下阈值间隙、第二档上涨、开关关闭/缺省、完成阶段、一手及奇数手、空头、在途减仓共用目标、重复观察、输入不变、保护优先级和同轮止损归零。
 
