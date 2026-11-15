@@ -5,23 +5,25 @@ from pathlib import Path
 import sqlite3
 
 from online_trader.configuration.dsv import DsvProfile
-from online_trader.contracts.codec import encode_frame, strict_loads
-from online_trader.dsv_runtime.controller import terminal
+from online_trader.contracts.codec import strict_loads
+from online_trader.dsv_runtime.control_endpoint import (
+    PROTOCOL as _PROTOCOL, CONTROL_OPS, handle_control, snapshot as _snapshot,
+    serve_validated_request, validate_envelope,
+)
 from online_trader.dsv_runtime.runner import DsvSession
 from online_trader.errors import TraderError
 from online_trader.transport.named_pipe import PipeListener, connect
 
 
-_PROTOCOL = 'DSV_OFFLINE/1'
 _OPS = {'snapshot', 'command', 'round', 'receipt', 'disconnect', 'shutdown'}
-_TIMEOUT = {'E_TIMEOUT', 'E_PIPE', 'E_PIPE_CLOSED', 'E_PIPE_TIMEOUT'}
 
 
 def validate_offline_message(message):
-    if message.get('protocol') != _PROTOCOL or type(message.get('body')) is not dict:
-        raise TraderError('E_DSV_PROTOCOL', 'Expected an offline DSV envelope')
-    if message.keys() != {'protocol', 'op', 'body'} or message['op'] not in _OPS | {'reply', 'error'}:
-        raise TraderError('E_DSV_PROTOCOL', 'Unsupported offline DSV operation')
+    validate_envelope(message, _OPS | {'reply', 'error'})
+
+
+def _validate_offline_request(message):
+    validate_envelope(message, _OPS)
 
 
 class OfflineClient:
@@ -50,37 +52,19 @@ class OfflinePort:
         return None
 
 
-def _snapshot(session, *, detail=False):
-    state = session.snapshot()
-    if not detail:
-        state['orders'] = {key: order for key, order in state['orders'].items() if not terminal(order)}
-        for row in state['symbols'].values():
-            if row['position']:
-                row['position'].pop('fills', None)
-            row.pop('tick', None)
-    return state
-
-
 def _handle(session, request, *, sdk=None):
-    body, op = request['body'], request['op']
-    if op == 'snapshot':
-        result = _snapshot(session, detail=body.get('detail') is True)
-        if body.get('workbench_evidence') is True:
-            result.update(session.workbench_evidence())
-        if sdk is not None:
-            result['sdk_connection'] = True
-        return result
-    if op == 'receipt':
-        session.verify_scope(body.get('expected_scope'))
-        return session.command_receipt(body['id'])
-    if op == 'command':
-        session.verify_scope(body.get('expected_scope'))
-        previous = session.command_receipt(body['id'])
-        if previous is None:
-            session.verify_day(body.get('expected_day'))
-        return session.command(body) if sdk is None else sdk.command(session, body)
+    # The internal legacy helper accepted op/body without a wire envelope.
+    # Network requests still require the complete validated envelope.
+    if type(request) is dict and request.keys() == {'op', 'body'}:
+        request = {'protocol': _PROTOCOL, **request}
+    # Retain the old helper API for existing offline tests/clients. Online
+    # compatibility calls still pass through the strict control dispatcher.
     if sdk is not None:
-        raise TraderError('E_DSV_PROTOCOL', 'Only the SDK owner supplies market and native facts')
+        return handle_control(session, request, sdk=sdk)
+    _validate_offline_request(request)
+    body, op = request['body'], request['op']
+    if op in CONTROL_OPS:
+        return handle_control(session, request)
     if op == 'round':
         return session.apply_round(body)
     if op == 'disconnect':
@@ -89,20 +73,7 @@ def _handle(session, request, *, sdk=None):
 
 
 def serve_request(listener, handle, *, timeout=0.25):
-    try:
-        with listener.accept(timeout=timeout) as pipe:
-            request = pipe.recv(timeout=1.0)
-            try:
-                result = handle(request)
-                reply = {'protocol': _PROTOCOL, 'op': 'reply', 'body': {'value': result}}
-                encode_frame(reply)
-            except (KeyError, TypeError, TraderError) as error:
-                reply = {'protocol': _PROTOCOL, 'op': 'error', 'body': {
-                    'code': getattr(error, 'code', 'E_DSV_PROTOCOL'), 'message': str(error)}}
-            pipe.send(reply, timeout=1.0)
-    except TraderError as error:
-        if error.code not in _TIMEOUT | {'E_AUTH', 'E_DSV_PROTOCOL', 'E_FRAME', 'E_VERSION', 'E_SCHEMA'}:
-            raise
+    return serve_validated_request(listener, handle, request_validator=_validate_offline_request, timeout=timeout)
 
 
 def serve(pipe_name, database, header, *, ready_file=None):
