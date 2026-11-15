@@ -743,6 +743,11 @@ class DsvSession:
                 loss = (Decimal(position['stop']) if reason == 'STOP_LOSS' else
                         -Decimal(position['profit']) if reason == 'TAKE_PROFIT' else -Decimal(nominal_move))
                 row['net_loss'] = decimal_text(Decimal(row['net_loss']) + loss)
+                # Frozen _run 7825-7830: ordinary take-profit, not trailing
+                # or the 80% floor; do not overwrite an existing day-stop cause.
+                if (reason == 'TAKE_PROFIT' and self._trade.get('stop_day_on_profit', True)
+                        and not row['day_stop']):
+                    row.update(day_stop=True, day_stop_reason='止盈触发')
         return [result | {'rule_ids': ['D08', 'D09', 'D10']} for result in results] or [
             {'reason': 'POSITION_OR_ENTRY_PENDING', 'rule_ids': ['D08', 'D12']}]
 
