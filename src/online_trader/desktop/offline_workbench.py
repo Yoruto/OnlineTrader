@@ -154,7 +154,7 @@ class OfflineWorkbench(QMainWindow):
         self.receipt.setWordWrap(True)
         layout.addWidget(self.receipt)
 
-        for shortcut, control in (('F5', self.start), ('F6', self.stop)):
+        for shortcut, control in (('F5', self.start), (('F6', self.stop))):
             QShortcut(QKeySequence(shortcut), self).activated.connect(control.click)
         self.positions.itemSelectionChanged.connect(self._update_controls)
         self.orders.itemSelectionChanged.connect(self._update_controls)
@@ -295,7 +295,8 @@ class OfflineWorkbench(QMainWindow):
              fill.get('native_offset', '—'), fill['quantity'], fill['price'], fill['native_trade_id'],
              fill['native_order_id']) for fill in state.get('fills', ())])
         message = {'LOADING': '正在读取策略事件与逐笔成交…',
-                   'UNAVAILABLE': '历史记录暂不可用，稍后自动重试'}.get(state.get('history_status'), '')
+                   'UNAVAILABLE': '历史记录暂不可用，稍后自动重试',
+                   'DEGRADED': '部分历史记录不完整；已继续读取后续记录，请查看诊断事件'}.get(state.get('history_status'), '')
         self.history_status.setText(message)
         self.history_status.setVisible(bool(message))
 
@@ -310,13 +311,18 @@ class OfflineWorkbench(QMainWindow):
             name = '保护线退出'
             detail = (f"理论保护价 {event['nominal_reference_price']}，名义点数 {event['nominal_move']}"
                       if event.get('nominal_move') is not None else '原记录缺少保护线名义点数')
+        elif reason == 'HISTORY_RECORD_INCOMPLETE':
+            name = '历史记录降级'
+            detail = (f"事件序号 {event.get('event_seq', '—')} · {event.get('error_code', 'E_HISTORY_EVENT_FORMAT')}"
+                      '；仅展示不完整，原始交易事实未修改')
         elif reason in ('DEFINITELY_NOT_SENT', 'UNKNOWN'):
             if reason == 'DEFINITELY_NOT_SENT':
                 name = '本地拒发'
                 detail = _REJECTION_REASONS.get(event.get('rejection_reason'), '发送前校验失败')
             else:
                 cancelling = event.get('effect_kind') == 'CANCEL'
-                name = '撤单结果未知' if cancelling else '发送结果未知'
+                name = {'CANCEL': '撤单结果未知', 'SEND': '发送结果未知'}.get(
+                    event.get('effect_kind'), '报撤结果未知')
                 detail = '撤单调用异常，原委托继续占用，等待柜台核对' if cancelling else '等待原生委托与成交核对'
                 if cancelling and (error_type := event.get('exception_type')):
                     detail += f' · {error_type}'
@@ -327,8 +333,8 @@ class OfflineWorkbench(QMainWindow):
             detail = _STRATEGY_REASONS.get(reason, reason)
             if stop := event.get('day_stop_reason'):
                 detail = f'{detail} · {_STRATEGY_REASONS.get(stop, stop)}'
-        return (event.get('at') or '—', event.get('contract_id', '—'), name, detail,
-                event.get('child_order_id', '—'))
+        return (event.get('at') or '—', event.get('contract_id') or '—', name, detail,
+                event.get('child_order_id') or '—')
 
     def _populate(self, grid, entries):
         selected = self._selected(grid, 0)
