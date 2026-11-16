@@ -140,7 +140,7 @@ def continuation_entry(state, frame, market, spec, settings, *, active_symbols, 
 
 
 def ordinary_entry(state, frame, market, spec, settings, *, active_symbols, open_symbols):
-    """Return a first blocking reason, or a target and the consumed bar."""
+    """Evaluate ordinary entry and report the outcome and any consumed bar."""
     tick = market['tick']
     last, high, low = (price_value(tick.get(key)) for key in ('last', 'day_high', 'day_low'))
     if None in (last, high, low):
@@ -202,17 +202,26 @@ def _ordinary_signal(state, frame, market, spec, settings, active_symbols, open_
     if min(opening, stop, profit) <= 0:
         return {'reason': 'OFFSETS_UNAVAILABLE'}
     lines = trigger_prices(high, low, opening)
-    if high - low > geometry_limit(opening, stop):
-        return {'reason': 'GEOMETRY_BLOCK'}
+    geometry_block = high - low > geometry_limit(opening, stop)
     bar = tick['candle_id']
     if state['last_signal_bar'] == bar:
-        return {'reason': 'BAR_CONSUMED'}
+        return {'reason': 'GEOMETRY_BLOCK' if geometry_block else 'BAR_CONSUMED'}
     activation = profit * (_profit_activation(settings) if settings['protect_80_enabled']
                            else float(settings['trailing_activate_ratio']))
     long_hit, short_hit = last >= lines['LONG'], last <= lines['SHORT']
+    # DSV reports geometry before checking the activation that can consume the bar.
     if settings['no_chase_after_act'] and activation > 0:
-        if long_hit and high >= lines['LONG'] + activation or short_hit and low <= lines['SHORT'] - activation:
-            return {'reason': 'NO_CHASE_AFTER_ACT', 'consume': bar}
+        long_level, short_level = lines['LONG'] + activation, lines['SHORT'] - activation
+        direction = None
+        if long_hit and high >= long_level:
+            direction, level = 'LONG', long_level
+        elif short_hit and low <= short_level:
+            direction, level = 'SHORT', short_level
+        if direction is not None:
+            return {'reason': 'NO_CHASE_AFTER_ACT', 'consume': bar, 'geometry_block': geometry_block,
+                    'direction': direction, 'trigger_price': str(lines[direction]), 'activation_price': str(level)}
+    if geometry_block:
+        return {'reason': 'GEOMETRY_BLOCK'}
     meta, blocked = _opening_observation(state, market, local_start, last, lines, stop, profit, spec, settings)
     if blocked:
         return {'reason': blocked, 'consume': bar, **meta}

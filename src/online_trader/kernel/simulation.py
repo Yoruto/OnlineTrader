@@ -115,13 +115,24 @@ class OnlineSimulation:
 
     def money_fact(self,snapshot):
         from online_trader.accounting.book import ACCOUNT_FIELDS,utc_now,validate_account
-        previous=self.kernel.money.book.account_facts[-1] if self.kernel.money.book.account_facts else None
+        book = self.kernel.money.book
+        fact = {'account_key': self.kernel.account_key, 'trading_day': snapshot['trading_day'],
+                'source_epoch': snapshot['source_epoch'], 'evidence_id': snapshot['snapshot_id'],
+                'currency': 'CNY', 'complete': snapshot['complete']}
+        fact.update({key: snapshot['funds'].get(key) for key in ACCOUNT_FIELDS})
+        recorded = book.account_evidence.get(fact['evidence_id'])
+        if recorded is not None:
+            # Several original cycles can reference the same cabinet snapshot.
+            fact.update(revision=recorded['revision'],
+                        observed_at_utc=snapshot.get('observed_at_utc', recorded['observed_at_utc']))
+            if fact != recorded:
+                raise TraderError('E_DUPLICATE_CONFLICT', 'Account snapshot identity changed content')
+            return fact
+        previous=book.account_facts[-1] if book.account_facts else None
         if previous and previous['source_epoch']==snapshot['source_epoch']:
             self._account_revision=max(self._account_revision,previous['revision'])
         self._account_revision+=1
-        fact={'account_key':self.kernel.account_key,'trading_day':snapshot['trading_day'],'observed_at_utc':utc_now(),
-              'source_epoch':snapshot['source_epoch'],'revision':self._account_revision,'evidence_id':snapshot['snapshot_id'],'currency':'CNY','complete':snapshot['complete']}
-        fact.update({key:snapshot['funds'].get(key) for key in ACCOUNT_FIELDS})
+        fact.update(revision=self._account_revision, observed_at_utc=snapshot.get('observed_at_utc') or utc_now())
         return validate_account(fact,self.kernel.account_key)
 
     def day_permitted(self,day):

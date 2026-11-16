@@ -117,6 +117,10 @@ def cli(args):
             result = migrate(args.source, value, args.target)
             print(json.dumps(result, ensure_ascii=False))
             return 2 if result['blockers'] else 0
+        elif args.offline_action == 'recover-flat':
+            from online_trader.dsv_runtime.legacy_recovery import recover_flat
+            result = recover_flat(args.source, value, args.calendar, args.target, expected_hash=args.expected_hash)
+            print(json.dumps(result, ensure_ascii=False))
         elif args.offline_action == 'serve':
             try:
                 serve(args.pipe, args.db, value, ready_file=args.ready_file)

@@ -163,18 +163,8 @@ def adopt_position(owner,binding):
         cycle['external_review']={'evidence_hash':row['evidence_hash'],'command_id':command_id,
             'snapshot_id':snapshot['snapshot_id'],'source_epoch':snapshot['source_epoch'],'native_trades_hash':row['native_trades_hash']}
         for entry in row['reductions']:
-            if entry['position_cycle_id']!=cid:continue
-            key='external-reduction-'+content_hash({'command_id':command_id,'cycle':cid,'bucket':entry['bucket'],
-                'lot_key':entry.get('lot_key')})
-            decision=reduce_event(cycle['plan'],ProtectionState.from_dict(cycle['protection']),
-                {'type':'EXTERNAL_ALLOCATION_REDUCTION','quantity':entry['quantity'],'event_seq':k._sequence+1,'event_id':key},
-                simulation_permit=owner.permit(cycle['plan']))
-            cycle['protection']=decision.state.to_dict()
-            reduction={'trade_key':key,'trading_day':day,'event_seq':str(k._sequence+1),
-                'bucket':entry['bucket'],'quantity':entry['quantity']}
-            if 'lot_key' in entry:reduction['lot_key']=entry['lot_key']
-            cycle.setdefault('external_reductions',[]).append(reduction)
-            if not decision.state.owned_qty:cycle['lifecycle']='FLAT_PENDING_CONFIRM'
+            if entry['position_cycle_id']==cid:
+                apply_external_reduction(owner, cycle, entry, command_id, day)
         cycles.append(cycle)
     for side,surplus in row['additions'].items():
         cycles.append(_build_cycle(owner,row|surplus|{'direction':side.upper()},snapshot,command_id,profile,scheduler))
@@ -192,6 +182,23 @@ def adopt_position(owner,binding):
         'trades':[t for t in snapshot['trades'] if t['contract_id']==code]}
     if lot_review is not None:proof['lot_review']=lot_review
     k.stage_control_cycles(cycles,'TX_TAKEOVER','ONLINE_EXTERNAL_POSITION_ADOPTED',allocation_review=proof)
+
+
+def apply_external_reduction(owner, cycle, entry, command_id, day):
+    seq = owner.kernel._sequence + 1
+    key = 'external-reduction-' + content_hash({'command_id': command_id, 'cycle': cycle['position_cycle_id'],
+        'bucket': entry['bucket'], 'lot_key': entry.get('lot_key')})
+    decision = reduce_event(cycle['plan'], ProtectionState.from_dict(cycle['protection']),
+        {'type': 'EXTERNAL_ALLOCATION_REDUCTION', 'quantity': entry['quantity'], 'event_seq': seq, 'event_id': key},
+        simulation_permit=owner.permit(cycle['plan']))
+    cycle['protection'] = decision.state.to_dict()
+    reduction = {'trade_key': key, 'trading_day': day, 'event_seq': str(seq),
+                 'bucket': entry['bucket'], 'quantity': entry['quantity']}
+    if 'lot_key' in entry:
+        reduction['lot_key'] = entry['lot_key']
+    cycle.setdefault('external_reductions', []).append(reduction)
+    if not decision.state.owned_qty:
+        cycle['lifecycle'] = 'FLAT_PENDING_CONFIRM'
 
 
 def _build_cycle(owner,row,snapshot,command_id,profile,scheduler):

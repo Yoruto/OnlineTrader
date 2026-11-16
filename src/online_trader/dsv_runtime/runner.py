@@ -650,7 +650,11 @@ class DsvSession:
                                       'multiplier': market.get('multiplier')}
             if self._sdk_port is not None:
                 row['position']['sdk_multiplier'] = market['multiplier']
-        return [decision | {'rule_ids': rules}]
+        decisions = []
+        if decision.pop('geometry_block', False):
+            decisions.append({'reason': 'GEOMETRY_BLOCK', 'rule_ids': ['D05']})
+        decisions.append(decision | {'rule_ids': rules})
+        return decisions
 
     def _synchronize_protection_exit(self, state, position, market, frame, spec):
         """Keep the strategy exit pending while preserving the native flat facts."""

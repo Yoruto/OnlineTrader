@@ -10,24 +10,33 @@ import sqlite3
 from tempfile import TemporaryDirectory
 
 from online_trader.configuration.dsv import DsvProfile
-from online_trader.contracts.codec import content_hash, strict_loads
+from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.domain.values import decimal_value, identifier
 from online_trader.dsv_runtime.runner import _day, _utc, initial_state
 from online_trader.dsv_storage.journal import Journal, _APPLICATION_ID
 from online_trader.errors import TraderError
 from online_trader.kernel.statistics import strategy_open_counts
 from online_trader.ledger.dsv_rollback import EVENT as REVERSE_EVENT
+from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.instance import AccountLock
 from online_trader.strategy.entry import is_night_session
 
 
 _FIELDS = {'type', 'source_account_key', 'source_environment', 'source_broker_identity',
            'source_event_seq', 'source_release', 'native_flat', 'session'}
+RECOVERY_EVENT = 'SIMNOW_ARCHIVED_FLAT_REVIEWED'
 _COLD_CHECKS = {
     'LEGACY_POSITION_OPEN': "SELECT 1 FROM position_cycles WHERE remaining_qty != 0 OR lifecycle != 'CLOSED'",
     'LEGACY_INTENT_PENDING': "SELECT 1 FROM order_intents WHERE status NOT IN ('DONE','ABORTED')",
     'LEGACY_ORDER_UNCONFIRMED': """SELECT 1 FROM child_orders c WHERE
-        broker_state NOT IN ('FILLED','CANCELLED','REJECTED') OR terminal_evidence_json IS NULL OR
+        terminal_evidence_json IS NULL OR
+        json_extract(terminal_evidence_json,'$.confirmed_fill_qty') IS NOT confirmed_fill_qty OR
+        (broker_state NOT IN ('FILLED','CANCELLED','REJECTED') AND NOT (
+            broker_state='NOT_SEEN' AND confirmed_fill_qty=0 AND
+            EXISTS (SELECT 1 FROM send_attempts WHERE child_order_id=c.child_order_id
+                    AND send_state='DEFINITELY_NOT_SENT') AND
+            NOT EXISTS (SELECT 1 FROM send_attempts WHERE child_order_id=c.child_order_id
+                        AND send_state!='DEFINITELY_NOT_SENT'))) OR
         (SELECT COALESCE(SUM(f.quantity),0) FROM fill_facts f LEFT JOIN broker_order_links l USING(broker_order_key)
          WHERE l.child_order_id=c.child_order_id OR
                (f.broker_order_key=c.child_order_id AND json_extract(f.raw_fact_json,'$.child_order_id')=c.child_order_id))
@@ -73,19 +82,29 @@ def _source_digest(db):
 
 
 def _selected_native_history(db, contracts):
-    """Return previous owned native order/trade evidence from legacy projections."""
+    """Return terminal native orders and reviewed external exits from the legacy ledger."""
     orders = {}
-    for (raw,) in db.execute('SELECT payload_json FROM event_journal ORDER BY event_seq'):
+    history = {}
+    for event_type, raw in db.execute('SELECT event_type,payload_json FROM event_journal ORDER BY event_seq'):
         data = strict_loads(raw)['data']
         for cycle in ([data['cycle']] if data.get('cycle') else []) + data.get('cycles', []):
             if cycle['plan']['contract_id'] not in contracts:
                 continue
             for child, native in cycle.get('native_order_keys', {}).items():
                 orders[child] = native
-    history = {}
+        if event_type == RECOVERY_EVENT:
+            review = data['allocation_review']
+            order, trade = review['external_order'], review['external_trade']
+            if order['contract_id'] in contracts:
+                history[order['order_id']] = {key: order[key] for key in (
+                    'contract_id', 'direction', 'limit_price', 'quantity', 'offset')}
+                history[order['order_id']].update(filled=trade['quantity'], fills={
+                    trade['trade_id']: {key: trade[key] for key in ('quantity', 'price')}})
     for order in db.execute('SELECT c.child_order_id,p.contract_id,c.confirmed_fill_qty,c.limit_price,'
                             'c.original_qty,c.offset_kind,p.direction,i.effect FROM child_orders c '
-                            'JOIN order_intents i USING(intent_id) JOIN position_cycles p USING(position_cycle_id)'):
+                            'JOIN order_intents i USING(intent_id) JOIN position_cycles p USING(position_cycle_id) '
+                            "WHERE EXISTS (SELECT 1 FROM send_attempts WHERE child_order_id=c.child_order_id "
+                            "AND send_state='CONFIRMED')"):
         if order['contract_id'] not in contracts or order['child_order_id'] not in orders:
             continue
         side = 'BUY' if (order['direction'] == 'LONG') == (order['effect'] == 'OPEN') else 'SELL'
@@ -136,17 +155,58 @@ def _scope(manifest):
     return scope, profile
 
 
+def _manual_profile(db, data, account, day):
+    descriptor = data.get('online_scope', {})
+    try:
+        grant = DsvSimulationGrant.parse(canonical_bytes(descriptor['grant']))
+    except (KeyError, TypeError, TraderError):
+        return None
+    if not grant.manual_workbench or grant.account_key != account or not grant.permits_day(day):
+        return None
+    approval = db.execute('SELECT manifest_hash FROM approval_manifests WHERE approval_record_id=?',
+                          (grant.value['grant_id'],)).fetchone()
+    if approval is not None and approval[0] == descriptor.get('grant_hash') == grant.content_hash:
+        return grant.value['profile_hash']
+    return None
+
+
+def _manual_observation_only(data, entry, account, manual_profile):
+    report = data.get('report', {})
+    if (manual_profile is None or entry.get('profile_hash') != manual_profile
+            or entry.get('account_key') != account or report.get('profile_hash') != manual_profile
+            or report.get('status') != 'OBSERVED' or report.get('child_order_id') is not None
+            or report.get('candidates') != [] or 'MANUAL_WORKBENCH_SCOPE' not in report.get('reasons', [])):
+        return False
+    for field in ('first_minute_blocks', 'hysteresis_armed', 'last_ordinary_attempt', 'last_signal_bar',
+                  'last_trigger_prices', 'need_hyst', 'night_close_fallback_cleared', 'night_reference',
+                  'open_half_reached', 'unproved_consumed_bar'):
+        value = entry.get(field)
+        has_state = any(value.values()) if type(value) is dict else bool(value)
+        if has_state:
+            return False
+    return True
+
+
 def _material(db, state, scope, manifest, profile, blockers):
     day = state['trading_day']
     keys = set(state['symbols'])
     cycles, entries, stops, statistics, stop_receipts = {}, {}, {}, {}, {}
     closed_statistics = set()
     state_evidence = set()
-    for record in db.execute('SELECT event_type,payload_json,payload_hash FROM event_journal ORDER BY event_seq'):
+    archived = {}
+    manual_profile = None
+    account = manifest['source_account_key']
+    observation_proposals = {row[0] for row in db.execute("""
+        SELECT recorded_event_seq FROM strategy_proposals GROUP BY recorded_event_seq
+        HAVING COUNT(*) = 1 AND MAX(proposal_kind='STATE_UPDATE' AND status='COMMITTED' AND intent_id IS NULL)=1
+    """)}
+    for record in db.execute('SELECT event_seq,event_type,payload_json,payload_hash FROM event_journal ORDER BY event_seq'):
         raw = record['payload_json'].encode('utf-8')
         if sha256(raw).hexdigest() != record['payload_hash']:
             raise TraderError('E_DSV_MIGRATION_SCHEMA', 'Legacy journal payload hash is inconsistent')
         data = strict_loads(raw)['data']
+        if record['event_type'] == 'ONLINE_SIMULATION_SCOPE_COMMITTED':
+            manual_profile = _manual_profile(db, data, account, day)
         if record['event_type'] == REVERSE_EVENT:
             blockers.add('LEGACY_REVERSE_HANDOFF_REQUIRES_REVIEW')
         cycle = data.get('cycle')
@@ -158,6 +218,15 @@ def _material(db, state, scope, manifest, profile, blockers):
             metadata = cycle.get('strategy_metadata') or {}
             entry = metadata.get('strategy_state') or entry
             stop = metadata.get('stop_result') or stop
+        if (entry and entry['contract_id'] in keys and entry['trading_day'] == day
+                and record['event_type'] == 'DSV_STRATEGY_OBSERVED'
+                and record['event_seq'] in observation_proposals
+                and _manual_observation_only(data, entry, account, manual_profile)):
+            code = entry['contract_id']
+            seq = str(record['event_seq'])
+            item = archived.setdefault(code, {'count': 0, 'first_event_seq': seq})
+            item.update(count=item['count'] + 1, last_event_seq=seq)
+            entry = None
         if entry and entry['contract_id'] in keys and entry['trading_day'] == day:
             state_evidence.add((entry['contract_id'], 'ENTRY'))
             if entry['account_key'] != manifest['source_account_key'] or entry['profile_hash'] != scope['configuration_id']:
@@ -259,6 +328,7 @@ def _material(db, state, scope, manifest, profile, blockers):
             state['symbols'][code].update(day_stop=True, day_stop_reason=reason)
         elif code in keys or code == manifest['source_account_key']:
             blockers.add('LEGACY_DAY_BLOCKS_UNMAPPED')
+    return archived
 
 
 def migrate(source, manifest, target=None):
@@ -291,7 +361,7 @@ def migrate(source, manifest, target=None):
             blockers.add('LEGACY_DAY_BLOCKS_UNMAPPED')
         if db.execute('SELECT 1 FROM position_cycles WHERE trading_day > ?', (scope['trading_day'],)).fetchone():
             blockers.add('LEGACY_NEWER_TRADING_DAY')
-        _material(db, state, scope, manifest, profile, blockers)
+        archived = _material(db, state, scope, manifest, profile, blockers)
         receipt = {'type': 'DSV_OFFLINE_MIGRATION/1', 'source_schema': '1', 'target_schema': '2',
                    'source_release': manifest['source_release'], 'source_event_seq': watermark,
                    'source_digest': _source_digest(db), 'source_account_hash': content_hash(manifest['source_account_key']),
@@ -299,6 +369,8 @@ def migrate(source, manifest, target=None):
                    'target_business_digest': content_hash(_business_state(state)), 'native_digest': content_hash(native),
                    'mapped_fields': _MAPPED, 'archive_only': ['fills', 'fees', 'closed_cycles', 'logs', 'execution_authority'],
                    'historical_fills': str(db.execute('SELECT COUNT(*) FROM fill_facts').fetchone()[0])}
+        if archived:
+            receipt['archived_manual_observations'] = archived
         receipt['reset_carry'] = {
             code: {key: row.get(key) for key in ('last_stop', 'month_stop', 'stop_days')}
             for code, row in state['symbols'].items()}

@@ -47,19 +47,30 @@ class _Pending:
 class Kernel:
     def __init__(self, path, account_key: str, *, development: bool = False,
                  port=None, risk_budget: str = "0", tick_size: str = "1",
-                 multiplier: str = "1", max_quote_age_ms: int = 30_000, simulation_grant=None, _execution_lock=None) -> None:
+                 multiplier: str = "1", max_quote_age_ms: int = 30_000, simulation_grant=None, _execution_lock=None,
+                 _archive_source=None) -> None:
         self._owner = threading.get_ident()
         self.account_key = identifier(account_key)
         self.boot_id = _id("boot")
         self.development = development
         self.port = port if port is not None else UnavailablePort()
         self.simulation=None
+        self._owns_lock = True
         if simulation_grant is not None:
             from online_trader.online_scope import SimulationGrant,DsvSimulationGrant
+            scope_path = Path(path).resolve()
+            if _archive_source is not None:
+                from online_trader.dsv_runtime.legacy_recovery import ArchivedSimNowPort
+                source = Path(_archive_source).resolve()
+                if (type(self.port) is not ArchivedSimNowPort or _execution_lock is None
+                        or scope_path.samefile(source)):
+                    raise TraderError('E_ONLINE_SCOPE', 'Historical recovery needs an isolated ledger and a read-only archive port')
+                scope_path = source
+                self._owns_lock = False
             if getattr(simulation_grant,'automatic_offsets',False):
                 raise TraderError('E_AUTO_OFFSETS','An automatic source scope must be calculated before attaching the execution owner')
             if (type(simulation_grant) not in (SimulationGrant,DsvSimulationGrant) or development or not isinstance(self.port,OnlineSimulationPort)
-                    or simulation_grant.account_key!=account_key or Path(path).resolve()!=Path(simulation_grant.value['ledger_path']).resolve()):
+                    or simulation_grant.account_key!=account_key or scope_path!=Path(simulation_grant.value['ledger_path']).resolve()):
                 raise TraderError('E_ONLINE_SCOPE','Online simulation requires its explicit grant, ledger and dedicated adapter')
         elif isinstance(self.port,OnlineSimulationPort):
             raise TraderError('E_ONLINE_SCOPE','An online adapter cannot be attached to a development or default kernel')
@@ -79,7 +90,7 @@ class Kernel:
             if hasattr(self,"ledger"):
                 try:self.ledger.close()
                 except Exception:pass
-            self._lock.close()
+            if self._owns_lock:self._lock.close()
             raise
         try:
             self._restore(ack)
@@ -91,7 +102,8 @@ class Kernel:
                 else:self.simulation=OnlineSimulation(self,simulation_grant)
         except BaseException:
             try:self.ledger.close()
-            finally:self._lock.close()
+            finally:
+                if self._owns_lock:self._lock.close()
             raise
 
     def _restore(self,ack):
@@ -1131,7 +1143,7 @@ class Kernel:
             try:self.wait_idle()
             finally:self.ledger.close()
         finally:
-            self._lock.close()
+            if self._owns_lock:self._lock.close()
             self._closed=True
 
     def __enter__(self): return self

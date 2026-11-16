@@ -10,8 +10,8 @@ from online_trader.errors import TraderError
 
 PROTOCOL = 'DSV_OFFLINE/1'  # Wire compatibility only; not an online replay mode.
 CONTROL_OPS = frozenset({'snapshot', 'command', 'receipt', 'shutdown'})
-_TIMEOUT = frozenset({'E_TIMEOUT', 'E_PIPE', 'E_PIPE_CLOSED', 'E_PIPE_TIMEOUT'})
-_IGNORED = _TIMEOUT | {'E_AUTH', 'E_DSV_PROTOCOL', 'E_FRAME', 'E_VERSION', 'E_SCHEMA'}
+PIPE_CONNECTION_ERRORS = frozenset({'E_TIMEOUT', 'E_PIPE', 'E_PIPE_CLOSED', 'E_PIPE_TIMEOUT'})
+_IGNORED = PIPE_CONNECTION_ERRORS | {'E_AUTH', 'E_DSV_PROTOCOL', 'E_FRAME', 'E_VERSION', 'E_SCHEMA'}
 
 
 def validate_envelope(message, operations):

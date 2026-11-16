@@ -7,7 +7,8 @@ from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QApplication, QHeaderView, QLabel, QMainWindow, QSpinBox, QTabWidget, QVBoxLayout, QWidget
 
 from online_trader.desktop.workbench_layout import button, populate, row, table
-from online_trader.dsv_runtime.offline_endpoint import OfflineClient, _TIMEOUT
+from online_trader.dsv_runtime.control_endpoint import PIPE_CONNECTION_ERRORS
+from online_trader.dsv_runtime.offline_endpoint import OfflineClient
 from online_trader.errors import TraderError
 
 
@@ -216,7 +217,7 @@ class OfflineWorkbench(QMainWindow):
         operation = self.request.operation
         if error is not None:
             code = getattr(error, 'code', 'E_PIPE')
-            if code in _TIMEOUT:
+            if code in PIPE_CONNECTION_ERRORS:
                 self._transport_ok = False
                 self._confirmed_absent = False
                 self.retry.setText('查询原回执')
@@ -307,6 +308,11 @@ class OfflineWorkbench(QMainWindow):
             name = '到期阻断开仓'
             detail = (f"剩余 {event['days_to_expiry']} 天，达到或低于阈值 {event['min_days_to_expiry']} 天"
                       if event.get('days_to_expiry') is not None else '达到或低于到期开仓阈值')
+        elif reason == 'NO_CHASE_AFTER_ACT' and event.get('activation_price') is not None:
+            name = '策略决定'
+            direction = {'LONG': '多头', 'SHORT': '空头'}.get(event.get('direction'), '')
+            detail = (f"当日行情已跑过{direction}激活位（触发 {event['trigger_price']}，"
+                      f"激活 {event['activation_price']}），本次不开仓")
         elif reason == 'PROTECTED_FLOOR':
             name = '保护线退出'
             detail = (f"理论保护价 {event['nominal_reference_price']}，名义点数 {event['nominal_move']}"

@@ -39,6 +39,10 @@ def main(argv=None):
     migrate.add_argument('--source',type=Path,required=True)
     migrate.add_argument('--input',type=Path,required=True)
     migrate.add_argument('--target',type=Path)
+    recovery=offline_actions.add_parser('recover-flat',help='用核实的 SimNow 历史逐笔修复独立账本副本')
+    for field in ('source','input','calendar','target'):
+        recovery.add_argument('--'+field,type=Path,required=True)
+    recovery.add_argument('--expected-hash',required=True,help='已核对证据规范 JSON 的 SHA-256')
     rollback=offline_actions.add_parser('rollback-review',help='只读核对离线迁移是否允许恢复原状态')
     rollback.add_argument('--source',type=Path,required=True)
     rollback.add_argument('--db',type=Path,required=True)

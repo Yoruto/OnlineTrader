@@ -102,5 +102,51 @@ class DsvRoundReplayTests(unittest.TestCase):
         self.assertEqual((closing["native_offset"], closing["quantity"]), ("CLOSE", 5))
 
 
+@unittest.skipUnless(sys.platform == "win32", "Uses the Windows account owner lock")
+class DsvActivationReplayTests(unittest.TestCase):
+    def test_geometry_block_preserves_first_activation_rejection_in_each_minute(self):
+        # The 2026-11-16 DSV opening log and frozen replay show how palm oil uses a minute across both sides.
+        settings = load_confirmed_baseline()[0].to_settings()
+        settings["symbols"] = [settings["symbols"][0] | {
+            "open_offset": 32, "stop_offset": 16, "profit_offset": 73,
+        }]
+        settings["trade"].update(no_chase_after_act=True, protect_80_enabled=True, protect_80_ratio=0.8)
+        profile = DsvProfile.from_settings(settings)
+        port = RecordingPort()
+        day = "2026-11-16"
+        first_minute = day + "T02:55:00Z"
+        next_minute = day + "T02:56:00Z"
+        observations = (
+            ("02:55:09", 0, 9003, first_minute, ("LONG", "8981.0", "9039.4")),
+            ("02:55:25", 16000, 8970, first_minute, None),
+            ("02:56:01", 52000, 8970, next_minute, ("SHORT", "9041.0", "8982.6")),
+        )
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        with DsvSession(Path(directory) / "facts.db", account_key="DEV:activation-regression", provider="OFFLINE",
+                        trading_day=day, profile=profile, port=port) as session:
+            session.command({"id": "start", "action": "START"})
+            for sequence, (time, monotonic_ms, last, minute, expected) in enumerate(observations, 1):
+                with self.subTest(time=time):
+                    wall = f"{day}T{time}Z"
+                    frame = round_frame(sequence, [last])
+                    frame.update(wall_time=wall, monotonic_ms=monotonic_ms)
+                    market, = frame["market"]
+                    market.update(session_open=day + "T02:30:00Z", session_close=day + "T03:30:00Z")
+                    market["ticks"][0].update(native_time=wall, candle_id=minute, day_high="9073", day_low="8949",
+                                              upper_limit="9200", lower_limit="8700")
+                    receipt = session.apply_round(frame)
+                    self.assertEqual(receipt["effects"], [])
+                    decisions = receipt["decisions"]
+                    if expected is None:
+                        self.assertEqual([row["reason"] for row in decisions], ["GEOMETRY_BLOCK"])
+                    else:
+                        self.assertEqual([row["reason"] for row in decisions], ["GEOMETRY_BLOCK", "NO_CHASE_AFTER_ACT"])
+                        rejection = decisions[-1]
+                        self.assertEqual((rejection["direction"], rejection["trigger_price"],
+                                          rejection["activation_price"]), expected)
+                    self.assertEqual(session.snapshot()["symbols"][CONTRACT]["last_signal_bar"], minute)
+            self.assertEqual(port.orders, [])
+
+
 if __name__ == "__main__":
     unittest.main()

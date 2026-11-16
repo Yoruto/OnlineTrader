@@ -143,6 +143,9 @@ class WorkbenchEvidence:
             row = {'reason': reason, 'contract_id': contract}
             if reason == 'EXPIRY_ENTRY_BLOCK':
                 row['days_to_expiry'] = decision.get('days_to_expiry', expiry_days.get(contract))
+            elif reason == 'NO_CHASE_AFTER_ACT':
+                for field in ('direction', 'trigger_price', 'activation_price'):
+                    row[field] = _text(decision.get(field))
             elif reason == 'PROTECTED_FLOOR':
                 row.update(nominal_reference_price=decision.get('nominal_reference_price'),
                            nominal_move=decision.get('nominal_move'))
