@@ -203,8 +203,13 @@ class WorkbenchHistoryCompatibilityTests(unittest.TestCase):
     def test_transient_database_lock_retries_without_skipping_events(self):
         self.prepare()
         self.legacy_unknown()
+        # Explicit old DELETE-mode fixture: WAL intentionally permits readers
+        # during an ordinary writer transaction. Keep testing real lock recovery
+        # for historical files, rather than weakening the UNAVAILABLE assertion.
+        self.journal.close()
         locker = sqlite3.connect(self.path, isolation_level=None)
         self.addCleanup(locker.close)
+        self.assertEqual(locker.execute('PRAGMA journal_mode=DELETE').fetchone()[0], 'delete')
         locker.execute('BEGIN EXCLUSIVE')
         reader = self.reader()
         self.wait(reader, lambda value: value['history_status'] == 'UNAVAILABLE')

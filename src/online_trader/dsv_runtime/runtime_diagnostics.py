@@ -46,6 +46,7 @@ class RuntimeDiagnostics:
         for item in stack[:8]:
             code = item['code']
             bounded.append({
+                **{key: item[key] for key in ('sqlite_errorcode', 'sqlite_errorname', 'storage_context') if key in item},
                 'type': item['type'][:80],
                 'code': code if type(code) is str and _CODE.fullmatch(code) else None,
                 'frames': [{'file': frame['file'].replace('\\', '/').rsplit('/', 1)[-1][:160],

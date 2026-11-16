@@ -19,10 +19,21 @@ _SCHEMA = (
 )
 
 
+def wal_runtime_supported(version):
+    """Official WAL-reset fix: 3.51.3+, or the 3.50.7 / 3.44.6 backports."""
+    return (version >= (3, 51, 3) or
+            version[:2] == (3, 50) and version >= (3, 50, 7) or
+            version[:2] == (3, 44) and version >= (3, 44, 6))
+
+
 class Journal:
     def __init__(self, path, scope, initial):
+        if scope.get('provider') in {'TQKQ', 'TQ_SIMNOW'} and not wal_runtime_supported(sqlite3.sqlite_version_info):
+            raise TraderError('E_DSV_STORE_SQLITE_VERSION', 'Online WAL requires SQLite 3.51.3+, 3.50.7 or 3.44.6 with the WAL-reset fix')
         self._db = sqlite3.connect(path, isolation_level=None, timeout=2)
+        self._journal_mode = 'unknown'
         try:
+            self._journal_mode = self._db.execute('PRAGMA journal_mode').fetchone()[0].lower()
             with self.transaction():
                 application = self._db.execute('PRAGMA application_id').fetchone()[0]
                 version = self._db.execute('PRAGMA user_version').fetchone()[0]
@@ -39,20 +50,47 @@ class Journal:
                     raise TraderError('E_DSV_SCOPE', 'Fact store belongs to a different account, provider, day or profile')
                 if version == 1:
                     self._upgrade_native_facts(scope['trading_day'])
+            # Validate schema/scope before changing an existing database's mode.
+            # Only this owner writes/checkpoints; observers must use mode=ro.
+            # WAL removes ordinary readers from the writer's COMMIT lock path.
+            mode = self._db.execute('PRAGMA journal_mode=WAL').fetchone()[0].lower()
+            memory = not self._db.execute('PRAGMA database_list').fetchone()[2]
+            if mode != 'wal' and not (memory and mode == 'memory'):
+                raise TraderError('E_DSV_STORE_MODE', 'The local fact store requires WAL support')
+            self._journal_mode = mode
             self._db.execute('PRAGMA synchronous=FULL')
+            self._db.execute('PRAGMA wal_autocheckpoint=1000')
         except BaseException:
             self.close()
             raise
 
     @contextmanager
     def transaction(self):
-        self._db.execute('BEGIN IMMEDIATE')
+        stage = 'BEGIN'
+        started = False
         try:
+            self._db.execute('BEGIN IMMEDIATE')
+            started = True
+            stage = 'BODY'
             yield self
+            stage = 'COMMIT'
             self._db.execute('COMMIT')
-        except BaseException:
-            if self._db.in_transaction:
-                self._db.execute('ROLLBACK')
+        except BaseException as error:
+            if isinstance(error, sqlite3.Error):
+                # Numeric/enum facts only; no SQL, paths, parameters or accounts.
+                error.storage_context = {
+                    'transaction_stage': stage, 'journal_mode': self._journal_mode,
+                    'busy_timeout_ms': 2000, 'in_transaction': self._db.in_transaction,
+                }
+            if started and self._db.in_transaction:
+                try:
+                    self._db.execute('ROLLBACK')
+                except sqlite3.Error as rollback_error:
+                    # Preserve the first failure. Never replay an uncertain body
+                    # or allow effects merely because rollback also failed.
+                    if isinstance(error, sqlite3.Error):
+                        error.storage_context['rollback_failed'] = True
+                    raise error from rollback_error
             raise
 
     def _read(self, sql, args=()):
