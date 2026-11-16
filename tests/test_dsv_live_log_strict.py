@@ -46,9 +46,9 @@ class StrictLiveLogTests(unittest.TestCase):
         return compare(self.root, self.start, self.end)
 
     def cli(self, *args):
-        return subprocess.run([sys.executable, '-m', 'qa.dsv_parity.compare_live_logs',
+        return subprocess.run([sys.executable, '-X', 'utf8', '-m', 'qa.dsv_parity.compare_live_logs',
             self.start.isoformat(), self.end.isoformat(), '--run-dir', str(self.root), *args],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, encoding='utf-8', timeout=10)
 
     def test_single_consumption_matches_at_explicitly_limited_precision(self):
         report = self.report(event())

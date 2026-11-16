@@ -24,7 +24,7 @@ from qa.dsv_parity.entry_evidence import SCHEMA, FrozenEntryObserver, SourceEvid
 
 _BEIJING = timezone(timedelta(hours=8))
 _HELPERS = """
-    _is_cffex _next_session_open_old account_mode apply_close_to_net_loss cap_close_points chase_within_cap
+    _atomic_write_json _is_cffex _next_session_open_old account_mode apply_close_to_net_loss cap_close_points chase_within_cap
     current_session current_session_for decide_continuation decide_half_close
     fmt_time get_holidays get_trading_day half_close_lots half_pct_to_ratio half_stage_points
     hysteresis_ready is_before_session_close is_in_auction is_option_symbol is_trading_day
@@ -265,6 +265,9 @@ def replay_original(archive: Path, settings, frames, scheduler=None):
                                 account_info={}, account_lock=Lock(), equity_data=[], equity_lock=Lock(),
                                 _kline_cache={}, _kline_cache_lock=Lock(), log=logs.put,
                                 notify=lambda *_args: None)
+        # Run the frozen daily-state writer against this replay's temporary BASE_DIR.
+        persist = FunctionType(codes['StrategyThread.persist_daily_state'], namespace, argdefs=(None,))
+        owner.persist_daily_state = persist.__get__(owner)
         observer = FrozenEntryObserver(loop, sdk)
         previous_trace = sys.gettrace()
         if previous_trace is not None:
