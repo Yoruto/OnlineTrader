@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.domain.values import decimal_value, identifier
+from online_trader.dsv_runtime.legacy_history import selected_native_history
 from online_trader.dsv_runtime.runner import _day, _utc, initial_state
 from online_trader.dsv_storage.journal import Journal, _APPLICATION_ID
 from online_trader.errors import TraderError
@@ -82,42 +83,7 @@ def _source_digest(db):
 
 
 def _selected_native_history(db, contracts):
-    """Return terminal native orders and reviewed external exits from the legacy ledger."""
-    orders = {}
-    history = {}
-    for event_type, raw in db.execute('SELECT event_type,payload_json FROM event_journal ORDER BY event_seq'):
-        data = strict_loads(raw)['data']
-        for cycle in ([data['cycle']] if data.get('cycle') else []) + data.get('cycles', []):
-            if cycle['plan']['contract_id'] not in contracts:
-                continue
-            for child, native in cycle.get('native_order_keys', {}).items():
-                orders[child] = native
-        if event_type == RECOVERY_EVENT:
-            review = data['allocation_review']
-            order, trade = review['external_order'], review['external_trade']
-            if order['contract_id'] in contracts:
-                history[order['order_id']] = {key: order[key] for key in (
-                    'contract_id', 'direction', 'limit_price', 'quantity', 'offset')}
-                history[order['order_id']].update(filled=trade['quantity'], fills={
-                    trade['trade_id']: {key: trade[key] for key in ('quantity', 'price')}})
-    for order in db.execute('SELECT c.child_order_id,p.contract_id,c.confirmed_fill_qty,c.limit_price,'
-                            'c.original_qty,c.offset_kind,p.direction,i.effect FROM child_orders c '
-                            'JOIN order_intents i USING(intent_id) JOIN position_cycles p USING(position_cycle_id) '
-                            "WHERE EXISTS (SELECT 1 FROM send_attempts WHERE child_order_id=c.child_order_id "
-                            "AND send_state='CONFIRMED')"):
-        if order['contract_id'] not in contracts or order['child_order_id'] not in orders:
-            continue
-        side = 'BUY' if (order['direction'] == 'LONG') == (order['effect'] == 'OPEN') else 'SELL'
-        history[orders[order['child_order_id']]] = {
-            'contract_id': order['contract_id'], 'filled': order['confirmed_fill_qty'], 'direction': side,
-            'limit_price': order['limit_price'], 'quantity': order['original_qty'], 'fills': {}, 'offset': {
-                'CLOSE_TODAY': 'CLOSETODAY', 'CLOSE_YESTERDAY': 'CLOSE'}.get(order['offset_kind'], order['offset_kind'])}
-    for (raw,) in db.execute('SELECT raw_fact_json FROM fill_facts'):
-        fact = strict_loads(raw)
-        native = orders.get(fact['child_order_id'])
-        if native in history and (trade := fact.get('native_trade_id')):
-            history[native]['fills'][trade] = {key: fact[key] for key in ('quantity', 'price')}
-    return history
+    return selected_native_history(db, contracts, recovery_event=RECOVERY_EVENT)
 
 
 def _business_state(state):
