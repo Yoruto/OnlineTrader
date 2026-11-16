@@ -26,10 +26,22 @@ def wal_runtime_supported(version):
             version[:2] == (3, 44) and version >= (3, 44, 6))
 
 
+def validate_sqlite_runtime(provider):
+    """Share the existing online requirement; inspect without opening a database.
+
+    Returned metadata describes this interpreter only. A saved preflight is not
+    authority to skip the check when the owner starts with another interpreter.
+    """
+    version = sqlite3.sqlite_version_info
+    supported = wal_runtime_supported(version)
+    if provider in {'TQKQ', 'TQ_SIMNOW'} and not supported:
+        raise TraderError('E_DSV_STORE_SQLITE_VERSION', 'Online WAL requires SQLite 3.51.3+, 3.50.7 or 3.44.6 with the WAL-reset fix')
+    return {'sqlite_version': '.'.join(map(str, version)), 'wal_runtime_supported': supported}
+
+
 class Journal:
     def __init__(self, path, scope, initial):
-        if scope.get('provider') in {'TQKQ', 'TQ_SIMNOW'} and not wal_runtime_supported(sqlite3.sqlite_version_info):
-            raise TraderError('E_DSV_STORE_SQLITE_VERSION', 'Online WAL requires SQLite 3.51.3+, 3.50.7 or 3.44.6 with the WAL-reset fix')
+        validate_sqlite_runtime(scope.get('provider'))
         self._db = sqlite3.connect(path, isolation_level=None, timeout=2)
         self._journal_mode = 'unknown'
         try:
