@@ -1,0 +1,64 @@
+name: Linux source validation (no trading)
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/linux-validation.yml'
+      - 'qa/linux_validation/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: linux-validation-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: 959098743b29d724db1ff01023541e067b0e0553
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.5'
+      - name: Record source and install exact declared dependencies
+        run: |
+          mkdir -p output/linux-validation
+          git rev-parse HEAD > output/linux-validation/harness-sha.txt
+          git archive --format=tar.gz "$SOURCE_SHA" > output/linux-validation/source-snapshot.tar.gz
+          python -m venv .venv-linux
+          .venv-linux/bin/python -m pip install -r requirements-core.lock 'PySide6==6.8.2.1' 'tqsdk==3.10.4' 2>&1 | tee output/linux-validation/dependency-install.txt
+          .venv-linux/bin/python -m pip freeze > output/linux-validation/pip-freeze.txt
+      - name: Compile unmodified source and tests
+        run: .venv-linux/bin/python -X utf8 -m compileall -q src tests qa 2>&1 | tee output/linux-validation/compileall.txt
+      - name: Run tests with loopback only and no credentials
+        run: |
+          set -o pipefail
+          RUN_USER="$(id -un)"
+          TEST_HOME="$(mktemp -d)"
+          PYTHON_BIN="$PWD/.venv-linux/bin/python"
+          sudo unshare --net -- bash -c '
+            set -e
+            ip link set lo up
+            exec runuser -u "$1" -- env -i \
+              PATH="$2" HOME="$3" QT_QPA_PLATFORM=offscreen PYTHONUNBUFFERED=1 \
+              PYTHONPATH="$4/src:$4" \
+              "$5" -X utf8 "$4/qa/linux_validation/run.py" \
+              --source-sha "$6" --output "$4/output/linux-validation"
+          ' _ "$RUN_USER" "$PATH" "$TEST_HOME" "$PWD" "$PYTHON_BIN" "$SOURCE_SHA" \
+            2>&1 | tee output/linux-validation/driver.txt
+      - name: Preserve evidence even when tests fail
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-validation-${{ github.run_id }}
+          path: output/linux-validation/
+          if-no-files-found: error
+          retention-days: 7
