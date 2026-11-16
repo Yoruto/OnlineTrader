@@ -4,7 +4,7 @@
 
 ## DSV 替代链开发与验收
 
-2026-11-16 的[五合约迁移与模拟盘对照](docs/refactor/dsv-parity-20261114/23-simnow-migration-and-activation-parity.md)已完成原账本副本恢复、同柜台日迁移和首个差异后的启停核对。激活位修复通过独立离线与工作台复测，修复版真实模拟盘复跑仍待验证。
+2026-11-16 的[上午五合约迁移与模拟盘对照](docs/refactor/dsv-parity-20261114/23-simnow-migration-and-activation-parity.md)覆盖原账本副本恢复、同柜台日迁移和激活位修复。[下午四合约真实模拟盘复跑](docs/refactor/dsv-parity-20261114/24-afternoon-four-contract-acceptance.md)完成了几何拒绝、激活位与柜台空仓对照，记录了停开后的 SQLite 提交错误及读库修正。实际发单、成交保护和平仓仍待验证。
 
 截至本次文档核对，源码基线为 `ddad472235b9fa0749646d7e3fded831040ca6c3`；该提交仅更新文档，运行代码沿用 `6468b003394315ee2fd1fa919ea6b1117db4cac9`。**A01、A02、A03、B01 所列场景的记录，不代表整个替代链、全部旧账本格式、真实柜台或正式发布已经验收。**
 

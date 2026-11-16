@@ -4,7 +4,9 @@
 
 ## 2026-11-16 真实模拟盘定向记录
 
-五合约同日迁移、10:55 同秒启动、首个差异与停开、激活位修复及独立复测见[现场与根因报告](../refactor/dsv-parity-20261114/23-simnow-migration-and-activation-parity.md)。[脱敏日志](20261116-simnow-dsv-cutover/events.txt)保留现场关键行、柜台终查摘要、测试输出及原件哈希。修复版源码与离线复测通过，修复版真实模拟盘复跑未执行。
+上午五合约同日迁移、10:55 同秒启动、首个差异与停开、激活位修复及独立复测见[现场与根因报告](../refactor/dsv-parity-20261114/23-simnow-migration-and-activation-parity.md)。[脱敏日志](20261116-simnow-dsv-cutover/events.txt)保留现场关键行、柜台终查摘要、测试输出及原件哈希。
+
+[下午四合约真实模拟盘复跑](../refactor/dsv-parity-20261114/24-afternoon-four-contract-acceptance.md)补录了 29 条激活位匹配、柜台终查、停开后提交错误、读锁隔离复现和 QA 命令。
 
 ## 不把证据来源和执行结果混写
 
