@@ -19,6 +19,7 @@ from types import FunctionType, SimpleNamespace
 from zipfile import ZipFile
 
 from qa.dsv_parity.verify_reference import MANIFEST, archive_objects, code_objects, verify
+from qa.dsv_parity.entry_evidence import SCHEMA, FrozenEntryObserver, SourceEvidenceError
 
 
 _BEIJING = timezone(timedelta(hours=8))
@@ -98,6 +99,7 @@ class _SdkFeed:
         self.clock = datetime.fromisoformat(frames[0]['wall_time'])
         self.rows = []
         self.targets = []
+        self.entry_rejections = []
         self.quotes = {}
         self.positions = {}
         self.bars = {}
@@ -176,9 +178,11 @@ class _SdkFeed:
         if self.frame is not None:
             fields = ('direction', 'volume', 'net_loss_points', 'pending_entry', 'days_to_expiry',
                       'expiry_checked', 'no_new_open', 'no_open_reason', 'day_stopped',
-                      'last_order_time', 'close_booked')
+                      'last_order_time', 'close_booked', 'last_signal_bar')
             state = {symbol: {key: row.get(key) for key in fields} for symbol, row in caller.f_locals['state'].items()}
-            self.rows.append({'id': self.frame['id'], 'targets': self.targets, 'state': deepcopy(state)})
+            self.rows.append({'id': self.frame['id'], 'targets': self.targets, 'state': deepcopy(state),
+                              'entry_trace_schema': SCHEMA, 'entry_rejections': deepcopy(self.entry_rejections)})
+            self.entry_rejections.clear()
             self.targets = []
         self.frame = next(self.frames, None)
         if self.frame is None:
@@ -261,12 +265,20 @@ def replay_original(archive: Path, settings, frames, scheduler=None):
                                 account_info={}, account_lock=Lock(), equity_data=[], equity_lock=Lock(),
                                 _kline_cache={}, _kline_cache_lock=Lock(), log=logs.put,
                                 notify=lambda *_args: None)
+        observer = FrozenEntryObserver(loop, sdk)
+        previous_trace = sys.gettrace()
+        if previous_trace is not None:
+            raise RuntimeError('Run the source trace in a dedicated process without another tracer')
         try:
+            sys.settrace(observer)
             FunctionType(loop, namespace)(owner)
+        except SourceEvidenceError as error:
+            raise RuntimeError('Frozen entry observation failed; parity is not proved') from error
         except _Finished as stop:
             if stop.args:
                 raise RuntimeError(stop.args[0]) from None
         finally:
+            sys.settrace(previous_trace)
             if logger := getattr(owner, '_logger', None):
                 logger.close()
         if len(sdk.rows) != len(frames):

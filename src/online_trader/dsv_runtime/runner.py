@@ -652,7 +652,7 @@ class DsvSession:
                 row['position']['sdk_multiplier'] = market['multiplier']
         decisions = []
         if decision.pop('geometry_block', False):
-            decisions.append({'reason': 'GEOMETRY_BLOCK', 'rule_ids': ['D05']})
+            decisions.append({'reason': 'GEOMETRY_BLOCK', 'rule_ids': ['D02']})
         decisions.append(decision | {'rule_ids': rules})
         return decisions
 

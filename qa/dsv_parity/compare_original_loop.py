@@ -12,6 +12,7 @@ from uuid import uuid4
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.dsv_runtime.runner import DsvSession
 from qa.recording_port import RecordingPort
+from qa.dsv_parity.entry_evidence import compare_entry_evidence
 
 
 class _ReplayPort(RecordingPort):
@@ -82,7 +83,7 @@ def compare(packet, original, candidate):
                                 if row.get('expiry_days_checked', cutoff + 1) <= cutoff)
         reference_loss = {key: Decimal(str(row['net_loss_points'])) for key, row in reference['state'].items()}
         current_loss = {key: Decimal(row['net_loss']) for key, row in current['symbols'].items()}
-        differences = []
+        differences = compare_entry_evidence(reference, current)
         if expected != actual:
             differences.append('targets')
         if source_blocked != actual_blocked:
