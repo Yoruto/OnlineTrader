@@ -18,6 +18,7 @@ from online_trader.dsv_runtime.control_endpoint import (
 from online_trader.dsv_runtime.runner import DsvSession
 from online_trader.dsv_runtime.runtime_diagnostics import RuntimeDiagnostics
 from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
+from online_trader.dsv_storage.journal import validate_sqlite_runtime
 from online_trader.errors import TraderError
 from online_trader.gateway.dsv_facts import utc
 from online_trader.gateway.simnow import strategy_port
@@ -86,11 +87,13 @@ def _validate_source(grant, profile, legacy, database):
 def prepare(scope, profile_path, calendar_path, database, output):
     grant, profile, calendar = load_inputs(scope, profile_path, calendar_path)
     legacy, database = _validate(grant, profile, database)
+    runtime = validate_sqlite_runtime(grant.provider)
     with AccountLock(grant.account_key):
         _validate_source(grant, profile, legacy, database)
     record = {'type': 'DSV_REPLACEMENT_PREPARE/1', 'scope_hash': grant.content_hash,
               'calendar_hash': calendar.content_hash, 'account_key': grant.account_key,
-              'database': str(database), 'broker_connected': False, 'entry_authority': 'DISARMED'}
+              'database': str(database), 'broker_connected': False, 'entry_authority': 'DISARMED',
+              'sqlite_runtime': runtime}
     publish_new_bytes(canonical_bytes(record), Path(output) / 'replacement-preflight.json')
     return record
 
@@ -121,6 +124,9 @@ def _status(path, value):
 def run(scope, credentials, profile_path, calendar_path, database, output, *, pipe):
     grant, profile, calendar = load_inputs(scope, profile_path, calendar_path)
     legacy, database = _validate(grant, profile, database)
+    # Recheck this process before reading facts, claiming output or connecting.
+    # prepare() may have used a different interpreter; its file is not a grant.
+    validate_sqlite_runtime(grant.provider)
     output = Path(output).resolve()
     date_resolver = _date_resolver(grant, calendar)
     wall = LocalWallClock()
