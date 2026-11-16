@@ -60,14 +60,17 @@ class LiveLogReaderTest(unittest.TestCase):
                         'trigger_price': '8981.0', 'activation_price': activation}
             if consume is not None:
                 decision['consume'] = consume
-            event = {'input': {'wall_time': f'{day}T13:{minute}:{second}+08:00', 'market': []},
+            event = {'input': {'wall_time': f'{day}T13:{minute}:{second}+08:00', 'market': [{'contract_id': contract, 'ticks': [
+                        {'candle_id': f'{contract}:20200713T05{minute}'}]}]},
                      'receipt': {'decisions': [decision], 'effects': []}}
             writer.execute("INSERT INTO events (kind, payload) VALUES ('ROUND', ?)", (json.dumps(event),))
         writer.commit()
         (logs / f'trade_{day}.log').write_text('\n'.join(messages), encoding='utf-8')
         result = subprocess.run([sys.executable, '-X', 'utf8', '-m', 'qa.dsv_parity.compare_live_logs',
                                  f'{day}T13:30:05+08:00', f'{day}T13:36:05+08:00', '--run-dir', str(run)],
-                                check=True, capture_output=True, encoding='utf-8')
+                                check=False, capture_output=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 1)
         report = json.loads(result.stdout)
+        self.assertEqual(report['verdict'], 'MISMATCH')
         self.assertEqual(report['candidate_rounds'], len(observations) - 1)
         self.assertEqual([row['status'] for row in report['activation_matches']], [row[-1] for row in observations])
