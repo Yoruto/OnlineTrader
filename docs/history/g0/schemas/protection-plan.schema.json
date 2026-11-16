@@ -1,0 +1,692 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.onlinetrader.invalid/g0/protection-plan.schema.json",
+  "title": "OnlineTrader ProtectionPlan 1.0",
+  "description": "G0 engineering contract. JSON Schema success is necessary but never sufficient for rule approval, ownership, semantic validity or live execution authorization.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "plan_revision",
+    "account_key",
+    "position_cycle_id",
+    "contract_id",
+    "trading_day",
+    "direction",
+    "theoretical_entry_price",
+    "initial_open_quantity",
+    "rule_set_id",
+    "config_revision",
+    "config_hash",
+    "execution_scope",
+    "approval_record_id",
+    "market_quality_policy_id",
+    "price_field",
+    "fixed_stop_loss",
+    "fixed_take_profit",
+    "profit_protection",
+    "trailing_stop",
+    "partial_reduction",
+    "close_session",
+    "slippage_exit",
+    "data_gap_exit",
+    "emergency_exit",
+    "execution_policy"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "plan_id": {
+      "$ref": "#/$defs/id"
+    },
+    "plan_revision": {
+      "$ref": "#/$defs/positive_seq"
+    },
+    "account_key": {
+      "$ref": "#/$defs/id"
+    },
+    "position_cycle_id": {
+      "$ref": "#/$defs/id"
+    },
+    "contract_id": {
+      "$ref": "#/$defs/id"
+    },
+    "trading_day": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+    },
+    "direction": {
+      "enum": [
+        "LONG",
+        "SHORT"
+      ]
+    },
+    "theoretical_entry_price": {
+      "$ref": "#/$defs/decimal"
+    },
+    "initial_open_quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "rule_set_id": {
+      "$ref": "#/$defs/id"
+    },
+    "config_revision": {
+      "$ref": "#/$defs/positive_seq"
+    },
+    "config_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "execution_scope": {
+      "enum": [
+        "DEVELOPMENT",
+        "ONLINE_SIMULATION",
+        "PRODUCTION"
+      ]
+    },
+    "approval_record_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "market_quality_policy_id": {
+      "$ref": "#/$defs/id"
+    },
+    "price_field": {
+      "enum": [
+        "LAST",
+        "LIQUIDATION_SIDE"
+      ]
+    },
+    "fixed_stop_loss": {
+      "$ref": "#/$defs/fixed_distance"
+    },
+    "fixed_take_profit": {
+      "$ref": "#/$defs/fixed_distance"
+    },
+    "profit_protection": {
+      "$ref": "#/$defs/profit_protection"
+    },
+    "trailing_stop": {
+      "$ref": "#/$defs/trailing_stop"
+    },
+    "partial_reduction": {
+      "$ref": "#/$defs/partial_reduction"
+    },
+    "close_session": {
+      "$ref": "#/$defs/close_session"
+    },
+    "slippage_exit": {
+      "$ref": "#/$defs/slippage_exit"
+    },
+    "data_gap_exit": {
+      "$ref": "#/$defs/data_gap_exit"
+    },
+    "emergency_exit": {
+      "$ref": "#/$defs/emergency_exit"
+    },
+    "execution_policy": {
+      "$ref": "#/$defs/execution_policy"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "execution_scope": {
+            "enum": [
+              "ONLINE_SIMULATION",
+              "PRODUCTION"
+            ]
+          }
+        },
+        "required": [
+          "execution_scope"
+        ]
+      },
+      "then": {
+        "properties": {
+          "approval_record_id": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "seq": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,18})$"
+    },
+    "positive_seq": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,18}$"
+    },
+    "decimal": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^-?(0|[1-9][0-9]{0,17})(\\.[0-9]{0,11}[1-9])?$",
+      "not": {
+        "const": "-0"
+      }
+    },
+    "nonnegative_decimal": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^(0|[1-9][0-9]{0,17})(\\.[0-9]{0,11}[1-9])?$"
+    },
+    "positive_decimal": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^(0|[1-9][0-9]{0,17})(\\.[0-9]{0,11}[1-9])?$",
+      "description": "Canonical positive Decimal string, no exponent, leading zeros or trailing fractional zeros.",
+      "not": {
+        "const": "0"
+      }
+    },
+    "ratio": {
+      "type": "string",
+      "pattern": "^(1|0\\.[0-9]{0,11}[1-9])$",
+      "description": "Canonical Decimal ratio, 0<value<=1."
+    },
+    "quantity": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2147483647
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "positive_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+    },
+    "fixed_distance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "distance_points"
+      ],
+      "properties": {
+        "enabled": {
+          "const": true
+        },
+        "distance_points": {
+          "$ref": "#/$defs/positive_decimal"
+        }
+      }
+    },
+    "profit_protection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "activation_ratio",
+            "floor_ratio",
+            "block_new_for_trading_day"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "activation_ratio": {
+              "$ref": "#/$defs/ratio"
+            },
+            "floor_ratio": {
+              "$ref": "#/$defs/ratio"
+            },
+            "block_new_for_trading_day": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    "trailing_stop": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "activation_ratio",
+            "drawdown_mode",
+            "drawdown_value"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "activation_ratio": {
+              "$ref": "#/$defs/ratio"
+            },
+            "drawdown_mode": {
+              "enum": [
+                "POINTS",
+                "PEAK_FAVORABLE_RATIO"
+              ]
+            },
+            "drawdown_value": {
+              "$ref": "#/$defs/positive_decimal"
+            }
+          }
+        }
+      ]
+    },
+    "break_even": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "anchor",
+            "activate_after"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "anchor": {
+              "const": "THEORETICAL_ENTRY"
+            },
+            "activate_after": {
+              "const": "FIRST_STAGE_CONFIRMED_REDUCTION"
+            }
+          }
+        }
+      ]
+    },
+    "second_stage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "trigger_ratio"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "trigger_ratio": {
+              "$ref": "#/$defs/ratio"
+            }
+          }
+        }
+      ]
+    },
+    "partial_reduction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "first_trigger_ratio",
+            "quantity_rule",
+            "q0_freeze_policy",
+            "second_stage",
+            "break_even"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "first_trigger_ratio": {
+              "$ref": "#/$defs/ratio"
+            },
+            "quantity_rule": {
+              "const": "CEIL_Q0_DIV_2_AND_4"
+            },
+            "q0_freeze_policy": {
+              "const": "ENTRY_TERMINAL_AND_RECONCILED"
+            },
+            "second_stage": {
+              "$ref": "#/$defs/second_stage"
+            },
+            "break_even": {
+              "$ref": "#/$defs/break_even"
+            }
+          }
+        }
+      ]
+    },
+    "close_session": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "schedule_policy_id",
+            "calendar_version",
+            "advance_seconds"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "schedule_policy_id": {
+              "$ref": "#/$defs/id"
+            },
+            "calendar_version": {
+              "$ref": "#/$defs/id"
+            },
+            "advance_seconds": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 86400
+            }
+          }
+        }
+      ]
+    },
+    "slippage_exit": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "adverse_threshold_points",
+            "block_new_for_trading_day"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "adverse_threshold_points": {
+              "$ref": "#/$defs/nonnegative_decimal"
+            },
+            "block_new_for_trading_day": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "data_gap_exit": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "data_quality_policy_id",
+            "active_trading_gap_ms",
+            "missing_legal_price_action"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "data_quality_policy_id": {
+              "$ref": "#/$defs/id"
+            },
+            "active_trading_gap_ms": {
+              "$ref": "#/$defs/positive_ms"
+            },
+            "missing_legal_price_action": {
+              "const": "ALERT_AND_TAKEOVER"
+            }
+          }
+        }
+      ]
+    },
+    "emergency_exit": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled"
+          ],
+          "properties": {
+            "enabled": {
+              "const": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "enabled",
+            "approved_policy_id",
+            "scope",
+            "max_reduce_quantity"
+          ],
+          "properties": {
+            "enabled": {
+              "const": true
+            },
+            "approved_policy_id": {
+              "$ref": "#/$defs/id"
+            },
+            "scope": {
+              "const": "OWNED_CYCLE_ONLY"
+            },
+            "max_reduce_quantity": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            }
+          }
+        }
+      ]
+    },
+    "price_step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "after_check_count",
+        "price_mode"
+      ],
+      "properties": {
+        "after_check_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024
+        },
+        "price_mode": {
+          "enum": [
+            "OPPONENT_LIMIT",
+            "OFFSET_TICKS",
+            "EXCHANGE_LIMIT"
+          ]
+        },
+        "offset_ticks": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100000
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "price_mode": {
+                "const": "OFFSET_TICKS"
+              }
+            },
+            "required": [
+              "price_mode"
+            ]
+          },
+          "then": {
+            "required": [
+              "offset_ticks"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "offset_ticks"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "execution_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy_id",
+        "first_price_mode",
+        "cancel_check_interval_ms",
+        "max_child_order_attempts",
+        "price_steps",
+        "close_offset_policy_id"
+      ],
+      "properties": {
+        "policy_id": {
+          "$ref": "#/$defs/id"
+        },
+        "first_price_mode": {
+          "enum": [
+            "OPPONENT_LIMIT",
+            "PASSIVE_LIMIT"
+          ]
+        },
+        "cancel_check_interval_ms": {
+          "$ref": "#/$defs/positive_ms"
+        },
+        "max_child_order_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "price_steps": {
+          "type": "array",
+          "minItems": 0,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/price_step"
+          }
+        },
+        "close_offset_policy_id": {
+          "$ref": "#/$defs/id"
+        }
+      }
+    }
+  }
+}

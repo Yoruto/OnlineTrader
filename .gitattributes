@@ -3,3 +3,7 @@ src/online_trader/resources/*.json text eol=crlf
 src/online_trader/resources/dsv-baseline-20261109.json text eol=lf
 src/online_trader/resources/protection-plan.schema.json text eol=lf
 src/online_trader/resources/schema.sql text eol=lf
+
+# Preserve the original OT-G0-1 resource bytes in the history archive.
+docs/history/g0/schema.sql -text
+docs/history/g0/schemas/*.json -text

@@ -40,6 +40,8 @@ $env:PYTHONPATH = 'src'
 
 ## 历史验收与桌面交付
 
+[早期设计与 G0 规格归档](docs/history/early-design/README.md)收录 2026-11-09 的三份设计稿和 OT-G0-1 规格。
+
 `ddad472` 原 README 已**逐字节保留**为 [README.legacy-ddad472.md](README.legacy-ddad472.md)，Git blob 为 `26beae2901169b8da5e27d86cb7e11e9566c79fa`。归档仍在根目录，原相对链接保持原定位；其内容、历史测试数量与版本说明未被重新认定为当前替代链的完成状态。
 
 原96项编号、全部逐项备注、历史实施及验收记录同样保留在[功能清单原文归档](docs/功能实现与待办清单_20261110_归档_ddad472.md)。当前入口不重算那96项的完成率。
