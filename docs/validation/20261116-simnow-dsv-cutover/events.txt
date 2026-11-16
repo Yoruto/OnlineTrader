@@ -1,0 +1,81 @@
+2026-11-16 DSV / OnlineTrader 模拟盘验收记录
+时间使用北京时间，柜台交易日为 2026-11-16。
+下列 DSV 行来自原日志。OnlineTrader 行汇总对应 SQLite ROUND、控制回执及只读账户快照。
+
+[历史结案]
+2026-11-13 23:42:07  SimNow SHFE.ag2702 开仓成交 1 手，旧内核拒绝逐笔入账 E_ID
+2026-11-13 23:44:50  SimNow SHFE.ag2702 外部应急平今成交 1 手，随后核实空仓
+2026-11-16  recover-flat 成功，原事件水位 3260，修复副本水位 3269，DISARMED
+2026-11-16  migrate IMPORTED，五合约，同一柜台日，归档人工观察 227 条，事件 10–387
+2026-11-16  replacement-prepare 成功，DISARMED，目标账户待同步
+
+[启动指令及首次观察]
+10:55:00.000  OnlineTrader START
+10:55:00.003  DSV F5
+10:55:00.039  OnlineTrader START 回执
+10:55:00.083  DSV F5 调用返回
+
+[10:55:09] [提示] 棕榈油(DCE.p2701) 当日振幅 124 点 > 上限 48 点（2×开仓偏移32 − 止损16）→ 多空触发价交叉，本品种今日不建仓（几何条件，不是故障）
+[10:55:09] [提示] 棕榈油(DCE.p2701) 当日 高9073/低8949（振幅 124，开仓偏移 32）→ 多开触发 8981.0 / 空开触发 9041.0，现价 9003.0（几何条件不满足，暂不建仓）
+[10:55:09] [跳过] 棕榈油(DCE.p2701) 当日行情已跑过多头激活位（触发 8981.0 ∓ 止盈×0.80 = 9039.4），本次不开仓
+[10:55:09] [跳过] 塑料(DCE.l2701) 当日行情已跑过空头激活位（触发 8546.0 ∓ 止盈×0.80 = 8461.2），本次不开仓
+[10:55:09] [跳过] 白银(SHFE.ag2702) 当日行情已跑过空头激活位（触发 11961.0 ∓ 止盈×0.80 = 11849.8），本次不开仓
+[11:05:57] [跳过] 沥青(SHFE.bu2701) 当日行情已跑过空头激活位（触发 4400.0 ∓ 止盈×0.80 = 4341.6），本次不开仓
+
+[OnlineTrader 轮次对照]
+10:55:09  五合约 GEOMETRY_BLOCK，对应三个品种缺 NO_CHASE_AFTER_ACT
+11:05:00  10:55:00–11:05:00 共 4355 轮，READY/RUNNING，新增委托 0，新增逐笔 0
+11:05:57  SHFE.bu2701 GEOMETRY_BLOCK，缺 NO_CHASE_AFTER_ACT
+11:15:00  11:05:00–11:15:00 共 5630 轮，READY/RUNNING，新增委托 0，新增逐笔 0
+11:16:36  11:15:00–11:16:36 共 883 轮，新增委托 0，新增逐笔 0
+11:26:22  取证重扫覆盖启动至 STOP 前 10868 轮。DSV 跳过 10 条，候选相应分钟 MISSING_REASON 10 条。
+
+[停开及柜台终查]
+11:16:36.666  OnlineTrader STOP，11:16:36.724 返回
+11:16:45.589  DSV F6，11:16:46.236 窗口确认策略停开
+11:20:00.338  OnlineTrader shutdown 返回，状态 STOPPED/DISARMED
+11:20:39  DSV 镜像窗口隐藏到托盘，F6 停开状态维持
+11:22:14  SimNow 空仓，活动及非终态委托 0，2 历史委托与 2 历史逐笔逐项相同
+11:23:08  TqKq 空仓，活动及非终态委托 0，3 历史委托与 2 历史逐笔逐项相同
+11:25:00  停开后只读快照，STOPPED/DISARMED
+11:30:00  停开后只读快照，STOPPED/DISARMED，11:25–11:30 新增轮次 0
+
+[独立重放摘要]
+窗口              原版与修复版入场结果                    已用分钟    SEND
+10:55:09          GEOMETRY_BLOCK + 多头激活位拒绝         10:55      0
+10:55:25          同分钟改为空头触线，保留几何阻断       10:55      0
+10:56:01          GEOMETRY_BLOCK + 空头激活位拒绝         10:56      0
+11:06:02          GEOMETRY_BLOCK + 空头激活位拒绝         11:06      0
+旧基线 9590987 执行同一新增回归时，激活位拒绝缺失，已用分钟为空。
+修复后的 7 项独立验收全部通过，含 Windows Qt 实际工作台与命名管道。
+
+[源码验证摘录]
+环境 Windows 11 build 26200，Python 3.13.15，QT_QPA_PLATFORM=offscreen，PYTHONPATH=src;.
+命令 .venv\Scripts\python.exe -X utf8 -m unittest discover -s tests
+Ran 1720 tests in 239.887s
+OK
+
+整理提交时复跑下列测试模块。
+  tests.test_dsv_round_replay
+  tests.test_dsv_month_stop_runtime
+  tests.test_dsv_workbench_history_qt
+  tests.test_dsv_workbench_history_compat
+  tests.test_dsv_control_endpoint
+  tests.test_dsv_control_endpoint_owner
+Ran 68 tests in 1.418s
+OK
+
+[本机原件 SHA-256]
+602502c05f0d9966de67d18de453912c19ba36e830b6c91ca3b1e351b17d4922  DSV trade_2026-11-16.log
+07c76a9402487d2151a39d30971e20b74220c35adbb8ce5783ed3669b6e7124c  review-110500.json
+36e50f7c389dd4c954d4a79deeaa5d24ab99b83034b4326e4704f1c0456cf9de  review-111500.json
+aa1e9177f5653fd7735d32100173f2ac76a34c2a543e51a0aa0982740c526f02  activation-review-until-stop.json
+7aa5274d8827813319211cd31b589f6b3be10ad5364fb8abd15f8b9951151404  stop-counter-reconciliation.json
+2f7a8be0e1cfdad22e901601041f951e2dae09a9bf06fdc73c7ea89815c3eea7  控制工作台独立报告
+8ef71ddea9412512104d4ae08bc0b73ec1314da65ad29af2e2d2bbb6c1a1f1ae  历史账本恢复独立报告
+97a850b86b11cee4d2b99d2db29d9d5c22dce0b17c755f8c6ea38db37cf7f072  recovery-receipt.json
+a29bd7d51c9998599aba4469ce03d2dd8ca8484a1c530d3e861c528b1587feb8  migration-positive-audit.json
+8acd3fbb3a94afd67b7c84181c88496d58b1d1e3a9a193ab56d7a4ac3ec1425b  五合约迁移及现场独立报告
+5ed05caa0ca947b7ae6ed3d5993ed6c4fba8ff423559a22594c751b17df5cd0f  激活位独立报告
+84c46ba93c2376422e54de78df91e8a22832ad80bf33600697eb1e8a743307a4  candidate-final-run.log
+4c1e970d9f8f6699722804061934e3c5e73d29aaf8e64b95db5bf08686befcf3  final-source-tests.log

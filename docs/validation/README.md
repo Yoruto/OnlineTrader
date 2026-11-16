@@ -2,6 +2,10 @@
 
 入口：[机器可读索引](evidence-index-20261115.json) · [当前功能与开放问题](../功能实现与待办清单_20261110.md) · [A01–B01复测方法](../refactor/dsv-parity-20261114/16-exit-recovery-and-evidence-acceptance.md)
 
+## 2026-11-16 真实模拟盘定向记录
+
+五合约同日迁移、10:55 同秒启动、首个差异与停开、激活位修复及独立复测见[现场与根因报告](../refactor/dsv-parity-20261114/23-simnow-migration-and-activation-parity.md)。[脱敏日志](20261116-simnow-dsv-cutover/events.txt)保留现场关键行、柜台终查摘要、测试输出及原件哈希。修复版源码与离线复测通过，修复版真实模拟盘复跑未执行。
+
 ## 不把证据来源和执行结果混写
 
 `reported_result` 记录原作者说测到了什么；`evidence_status` 记录本次审核是否实际取得相应原件。`REPORTED_PASS / NOT_INSPECTED` 不等于失败，也不等于本次独立通过。原件不可取得时，哈希、实际命令、完整环境及未知计数保留 `null`，禁止补造。
