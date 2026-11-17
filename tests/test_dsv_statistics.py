@@ -109,6 +109,23 @@ class DsvStatisticsTests(unittest.TestCase):
         for key in ('trade_count','stop_count','profit_count','stop_streak'):
             self.assertEqual(self.state[key],before[key])
 
+    def test_calendar_exit_without_price_finishes_after_native_flat_without_inventing_points(self):
+        self.cycle(price='975')
+        entry = self.entry()
+        self.apply(entry)
+        closed = self.close(entry, 'SESSION_CLOSE', price=None)
+        with self.assertRaises(TraderError):
+            self.apply(closed)
+        closed['unpriced_calendar_exit_id'] = 'e' * 64
+        proof = self.apply(closed)
+        self.assertEqual(self.state['daily_pnl_points'], '-25')
+        self.assertEqual(self.state['net_loss_points'], '16')
+        self.assertEqual(self.state['trade_count'], 3)
+        self.assertIsNone(proof['receipt']['daily_pnl_delta_points'])
+        self.assertIsNone(proof['receipt']['net_loss_delta_points'])
+        self.assertIn('SESSION_CLOSE_REFERENCE_UNAVAILABLE', proof['source_notes'])
+        self.assertTrue(self.apply(closed)['duplicate'])
+
     def test_slippage_only_changes_net_loss_and_gap_has_zero_delta(self):
         for reason,slip in (('ADVERSE_SLIPPAGE','7.25'),('DATA_GAP_EXIT',None)):
             entry=self.entry();self.apply(entry);before=copy.deepcopy(self.state)

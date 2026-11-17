@@ -104,7 +104,7 @@ def add_close_point_checks(trades, cycles, issues):
         exit_fact = cycle.get('nominal_exit') or {}
         reference = exit_fact.get('nominal_exit_price')
         if (cycle.get('lifecycle') != 'CLOSED' or not cycle.get('statistics_close_id')
-                or cycle.get('statistics_review_required') or reference is None
+                or cycle.get('statistics_review_required')
                 or exit_fact.get('exit_reason') not in
                    {'STOP_LOSS','BREAK_EVEN','TAKE_PROFIT','TRAILING_STOP','PROTECTED_FLOOR','SESSION_CLOSE'}):
             continue
@@ -118,7 +118,8 @@ def add_close_point_checks(trades, cycles, issues):
             manual_reductions = (cycle.get('execution') or {}).get('manual_reduction_children')
             # Older cycles do not bind each reduction to its protection target.
             # A prior partial target cannot be compared to the final exit anchor.
-            if state.get('phase1_target') is None and state.get('phase2_target') is None and not manual_reductions:
+            if (reference is not None and state.get('phase1_target') is None
+                    and state.get('phase2_target') is None and not manual_reductions):
                 row['close_slippage_points'] = _amount(sign * (Decimal(reference) - actual), issues,
                     trade_key=row['trade_key'], field='close_slippage_points')
             opening = cycle.get('initial_open_confirmation') or {}

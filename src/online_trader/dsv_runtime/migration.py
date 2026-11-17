@@ -87,7 +87,8 @@ def _selected_native_history(db, contracts):
 
 
 def _business_state(state):
-    volatile = {'tick', 'tick_session', 'quote_clock'}
+    volatile = {'tick', 'tick_session', 'quote_clock', 'quote_observation', 'calendar_reason',
+                'market_session_active', 'exit_wait_reason', 'timer_recovery_uncertain'}
     return {'day': state['trading_day'], 'orders': state['orders'], 'retired': state['retired_positions'],
             'symbols': {key: {k: v for k, v in row.items() if k not in volatile}
                         for key, row in state['symbols'].items()}}
@@ -365,7 +366,7 @@ def _publish(target, scope, state, receipt):
         temporary = Path(directory) / 'ledger.sqlite'
         with closing(Journal(temporary, scope, state)) as journal, journal.transaction():
             journal.event('LEGACY_MIGRATION', receipt | {'mode': 'IMPORTED'})
-            if receipt['target_schema'] == str(TIME_SCHEMA):
+            if receipt.get('target_schema') == str(TIME_SCHEMA):
                 journal.activate_time_schema({'mode': 'LEGACY_IMPORT', 'migration_id': receipt['migration_id']})
         try:
             os.link(temporary, target)
