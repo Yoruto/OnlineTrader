@@ -218,5 +218,12 @@ def check_and_download(root, current=__version__):
     cache.mkdir(exist_ok=True)
     path = cache / f'{candidate.version}-{candidate.sha256}.zip'
     client.download(candidate, path)
+    try:
+        with tempfile.TemporaryDirectory(dir=cache, prefix='.verify-') as directory:
+            extract_bundle(path, Path(directory))
+    except UpdateError:
+        raise
+    except (zipfile.BadZipFile, RuntimeError) as error:
+        raise UpdateError('下载文件不是有效的更新 ZIP') from error
     atomic_json(cache / 'pending.json', asdict(candidate))
     return candidate.version
