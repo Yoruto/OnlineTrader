@@ -42,15 +42,18 @@ def due_check(timer, sample, target):
 
 def recover_timer(timer, sample, utc_error_ns):
     """Rebase using a conservative UTC elapsed bound after native reconciliation."""
-    if timer["clock_epoch"] == sample.clock_epoch or timer["phase"] != "ACTIVE":
+    if (timer["clock_epoch"] == sample.clock_epoch or timer["start_utc"] is None
+            or timer["phase"] not in {"ACTIVE", "RECOVERY_UNCERTAIN"}):
         return None
     elapsed = delta_ns(sample.utc, datetime.fromisoformat(timer["start_utc"]))
     old_error = timer["utc_error_ns"]
     if old_error is None or utc_error_ns is None or elapsed < 0:
+        if timer["phase"] == "RECOVERY_UNCERTAIN":
+            return None
         timer["phase"] = "RECOVERY_UNCERTAIN"
         return "TIMER_RECOVERY_UNCERTAIN"
     carried = max(0, elapsed - int(old_error) - int(utc_error_ns))
-    timer.update(clock_epoch=sample.clock_epoch, start_mono_ns=sample.monotonic_ns, carried_ns=str(carried))
+    timer.update(clock_epoch=sample.clock_epoch, start_mono_ns=sample.monotonic_ns, carried_ns=str(carried), phase="ACTIVE")
     return "TIMER_REBASED"
 
 
@@ -100,6 +103,17 @@ class RoundTimers:
                 timer["phase"] = "INVALIDATED"
                 self.events.append({"result": "INVALIDATED", "timer_id": timer["timer_id"],
                                     "generation": timer["generation"], "handled_mono_ns": self.sample.monotonic_ns})
+
+    def missing_legacy_start(self, responsibility, kind, target, seconds, *, strict=False):
+        if self.get(responsibility, kind) is not None:
+            return
+        self.arm(responsibility, kind, target, seconds, strict=strict)
+        timer = self.get(responsibility, kind)
+        timer.update(start_event_id=None, start_utc=None, start_mono_ns=None, utc_error_ns=None,
+                     clock_epoch=None, phase="RECOVERY_UNCERTAIN")
+        self.events.append({"result": "TIMER_RECOVERY_UNCERTAIN", "reason": "LEGACY_START_UNPROVED",
+                            "timer_id": timer["timer_id"], "generation": timer["generation"],
+                            "handled_mono_ns": self.sample.monotonic_ns})
 
     def recover(self, responsibility, expected_target):
         for timer in responsibility.get("timers", {}).values():

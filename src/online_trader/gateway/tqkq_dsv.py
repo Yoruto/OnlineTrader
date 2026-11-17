@@ -11,6 +11,7 @@ from online_trader.domain.values import order_price
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import TqKqPort, number
 from online_trader.online_scope import DsvSimulationGrant
+from online_trader.scheduling.clock import NS_PER_SECOND, quote_timestamp, source_age_ns, utc_text
 
 
 def _missing_book_price(value):
@@ -31,8 +32,16 @@ class TqKqDsvPort(TqKqPort):
         return self.clock.now()
 
     def _matches_strategy_quote(self, quote, event):
-        stamp = datetime.fromisoformat(quote.datetime).replace(tzinfo=CHINA_TIME)
+        stamp = quote_timestamp(quote.datetime, CHINA_TIME)
         return stamp == datetime.fromisoformat(event['source_time_utc']) and number(quote.last_price) == event['last']
+
+    def _quote_age_acceptable(self, code, now, source, age, check_age):
+        if self.calendar is None or self.grant.manual_workbench:
+            return super()._quote_age_acceptable(code, now, source, age, check_age)
+        current = self.calendar.query(code, utc_text(now))
+        quoted = self.calendar.query(code, utc_text(source))
+        return bool(current['is_trading'] and current['session'] == quoted['session']
+                    and self.grant.permits_day(current['trading_day']) and (not check_age or age <= 5 * NS_PER_SECOND))
 
     def current_strategy_quote(self, event):
         """Prove the current native last price before restoring entry authority."""
@@ -52,7 +61,7 @@ class TqKqDsvPort(TqKqPort):
         try:
             q = self.quotes[code]
             source = datetime.fromisoformat(event['source_time_utc'])
-            if (not 0 <= (now - source).total_seconds() * 1000 <= self.kernel.max_quote_age_ms
+            if (source_age_ns(now, source, q.datetime) > self.kernel.max_quote_age_ms * 1_000_000
                     or not self.fresh(code, now=now) or not self._matches_strategy_quote(q, event)
                     or (number(q.bid_price1), number(q.ask_price1), number(q.price_tick)) != (
                         event['bid1'], event['ask1'], event['tick_size'])
@@ -370,14 +379,18 @@ class TqKqDsvPort(TqKqPort):
                 raise TraderError('E_GATEWAY_SCOPE','Native opening origin differs from the finite scope')
             if not self.entry_clock_ready():
                 raise TraderError('E_CLOCK','A valid Windows wall clock is required immediately before native opening send')
-            current=datetime.fromisoformat(self.quotes[request['contract_id']].datetime).replace(tzinfo=timezone(timedelta(hours=8)))
+            current=quote_timestamp(self.quotes[request['contract_id']].datetime, CHINA_TIME)
             if facts is None or current!=datetime.fromisoformat(facts['event']['source_time_utc']):
                 raise TraderError('E_GATEWAY_SCOPE','The entry proposal does not reflect the latest native quote')
             if cycle.get('manual_limit_order'):
                 kernel.simulation.manual_entry_facts(cycle['strategy_metadata']['candidate'],request['original_qty'],
                     exclude_decision=cycle['decision_key'])
-            if not self.grant.in_window(self.clock.now()):
+            send_now = self.clock.utc_now() if hasattr(self.clock, 'utc_now') else self.clock.now()
+            if not kernel.simulation.entry_window(send_now):
                 raise TraderError('E_ENTRY_WINDOW_EXPIRED', '当前时刻超出已确认的开仓窗口。')
+            window = self.calendar.query(code, utc_text(send_now))
+            if not window['is_trading'] or window['session']['session_id'] != facts['event']['session_id']:
+                raise TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '报单前已离开原报价盘段。')
             if kernel.recovery_required:
                 raise TraderError('RECONCILIATION_REQUIRED', '原委托和持仓需要核对。')
             if not kernel.simulation.target_quota(code, request['trading_day'], existing=cycle['decision_key']):

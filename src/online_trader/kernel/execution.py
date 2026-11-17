@@ -106,7 +106,11 @@ class ExecutionCoordinator:
             state=cycle['protection'];state['target_remaining_qty']=0;state['block_new']=True
             state['state_revision']=str(int(state['state_revision'])+1)
             cycle['cancel_entries']=True;cycle['reasons']=sorted(set(cycle.get('reasons',[]))|{'SESSION_CLOSE'})
-            k.statistics.freeze_exit(cycle,'SESSION_CLOSE',reference_price=market.get('last'))
+            calendar_event = event.get('calendar_event')
+            if calendar_event is not None:
+                ex['calendar_event'] = copy.deepcopy(calendar_event)
+            reference = market.get('last') if not calendar_event or priced['allowed'] else None
+            k.statistics.freeze_exit(cycle,'SESSION_CLOSE',reference_price=reference)
         if event.get('force_close'):
             if ex['force_start_ms'] is None:
                 ex['force_start_ms']=event['elapsed_ms']

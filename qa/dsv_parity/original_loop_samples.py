@@ -2,7 +2,7 @@
 
 import argparse
 from copy import deepcopy
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
 
@@ -136,8 +136,31 @@ def scheduled_samples():
         row['wall_time'] = f'{_DAY}T01:10:{index:02d}Z'
         row['monotonic_ms'] = index * 1000
         row['market'][0]['ticks'][0]['native_time'] = row['wall_time']
+    final_close = deepcopy(protect)
+    final_close['settings']['trade'].update(close_before_seconds=30, stale_force_close_seconds=0,
+                                            no_open_before_close_minutes=0, no_open_after_open=False)
+    rounds = final_close['rounds'][:3]
+    rounds.extend(_frame(index, 1060, owned=5, second=0) for index in range(4, 81))
+    initial = datetime.fromisoformat(f'{_DAY}T06:59:20Z')
+    for index, round_input in enumerate(rounds):
+        moment = (initial + timedelta(milliseconds=500 * index)).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+        round_input.update(wall_time=moment, monotonic_ms=500 * index)
+        market, = round_input['market']
+        market.update(session_open=f'{_DAY}T05:30:00Z', session_close=f'{_DAY}T07:00:00Z',
+                      opening_session=False, force_close_at_end=True)
+        market['ticks'][0].update(native_time=moment, candle_id=f'{_DAY}T06:59:00Z')
+    rounds[21]['wire_aliases'] = ['first-close']
+    final_close['rounds'] = rounds
+    late_close = deepcopy(final_close)
+    rounds = late_close['rounds']
+    for number in (22, 23, 25, 29, 30, 32, 36, 40, 44, 48, 50, 54, 58, 60, 62, 64, 65, 67, 72, 74, 76, 78, 80):
+        rounds[number - 1]['no_update'] = True
+    rounds[66].pop('no_update')
+    rounds[66]['native'] = [{'kind': 'ORDER', 'child_order_id': 'first-close', 'native_order_id': 'staged-close',
+                             'status': 'CANCELLED', 'filled_qty': 0}]
+    rounds[67]['wire_aliases'] = ['second-close']
     return {'pipeline-chase': chase, 'pipeline-protect': protect, 'pipeline-timeout': timeout,
-            'late-partial-ownership': slow_partial}
+            'late-partial-ownership': slow_partial, 'pipeline-final-close': final_close, 'pipeline-close-late-ack': late_close}
 
 
 def main():

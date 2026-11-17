@@ -9,6 +9,77 @@ import threading
 from online_trader.errors import TraderError
 
 
+CLOCK_GATE = r"Global\OnlineTrader.ClockMaintenance.Gate.v1"
+CLOCK_OWNERS = r"Global\OnlineTrader.ClockMaintenance.Owners.v1"
+
+
+class ClockActivity:
+    """Shared owner participation in the Windows clock maintenance protocol.
+
+    The gate serializes admission with maintenance. Every execution owner keeps
+    one handle to the same event; Windows closes it on a process crash.
+    """
+
+    def __init__(self):
+        if os.name != 'nt':
+            raise TraderError('E_PLATFORM', 'Windows is required for clock maintenance coordination')
+        self.handle = None
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        advapi = ctypes.WinDLL('advapi32', use_last_error=True)
+        handles = wintypes.HANDLE
+        pointer = ctypes.c_void_p
+        descriptors = advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW
+        descriptors.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(pointer), pointer)
+        descriptors.restype = wintypes.BOOL
+        kernel.CreateMutexW.argtypes = (pointer, wintypes.BOOL, wintypes.LPCWSTR)
+        kernel.CreateMutexW.restype = handles
+        kernel.CreateEventW.argtypes = (pointer, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR)
+        kernel.CreateEventW.restype = handles
+        kernel.WaitForSingleObject.argtypes = (handles, wintypes.DWORD)
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        for function in (kernel.ReleaseMutex, kernel.CloseHandle, kernel.LocalFree):
+            function.argtypes = (handles,)
+        kernel.LocalFree.restype = handles
+
+        class SecurityAttributes(ctypes.Structure):
+            _fields_ = [('length', wintypes.DWORD), ('descriptor', pointer), ('inherit', wintypes.BOOL)]
+
+        descriptor = pointer()
+        if not descriptors('D:P(A;;GA;;;AU)(A;;GA;;;SY)', 1, ctypes.byref(descriptor), None):
+            raise TraderError('E_CLOCK_MAINTENANCE', 'Cannot establish the clock coordination ACL')
+        attrs = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+        gate = None
+        locked = False
+        try:
+            gate = kernel.CreateMutexW(ctypes.byref(attrs), False, CLOCK_GATE)
+            if not gate:
+                raise TraderError('E_CLOCK_MAINTENANCE', 'Clock maintenance gate is unavailable')
+            locked = kernel.WaitForSingleObject(gate, 250) in (0, 0x80)
+            if not locked:
+                raise TraderError('E_CLOCK_MAINTENANCE', 'Clock maintenance is active; owner startup deferred')
+            self.handle = kernel.CreateEventW(ctypes.byref(attrs), True, False, CLOCK_OWNERS)
+            if not self.handle:
+                raise TraderError('E_CLOCK_MAINTENANCE', 'Cannot register the execution owner for clock maintenance')
+            self.kernel = kernel
+        finally:
+            if locked:
+                kernel.ReleaseMutex(gate)
+            if gate:
+                kernel.CloseHandle(gate)
+            kernel.LocalFree(descriptor)
+
+    def close(self):
+        if self.handle is not None:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
 class AccountLock:
     def __init__(self, account_key: str) -> None:
         self._handle = None

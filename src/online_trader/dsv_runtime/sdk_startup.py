@@ -18,14 +18,14 @@ from online_trader.dsv_runtime.control_endpoint import (
 from online_trader.dsv_runtime.runner import DsvSession
 from online_trader.dsv_runtime.runtime_diagnostics import RuntimeDiagnostics
 from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
-from online_trader.dsv_storage.journal import validate_sqlite_runtime
+from online_trader.dsv_storage.journal import TIME_SCHEMA, validate_sqlite_runtime
 from online_trader.errors import TraderError
-from online_trader.gateway.dsv_facts import utc
 from online_trader.gateway.simnow import strategy_port
 from online_trader.runtime.dsv_simulation import _claim_run_output, load_inputs
-from online_trader.runtime.instance import AccountLock
+from online_trader.runtime.identity import runtime_identity
+from online_trader.runtime.instance import AccountLock, ClockActivity
 from online_trader.runtime.startup_metadata import SDK_VERSION
-from online_trader.scheduling.reference import LocalWallClock
+from online_trader.scheduling.reference import LocalWallClock, ReferenceMonitor
 from online_trader.transport.named_pipe import PipeListener
 
 
@@ -62,6 +62,8 @@ def _validate_source(grant, profile, legacy, database):
     if existing:
         with _readonly(database) as db:
             imported = read_migration_receipt(db)
+            if db.execute('PRAGMA user_version').fetchone()[0] != TIME_SCHEMA:
+                raise TraderError('E_DSV_TIME_VERSION', 'Prepare a cold clock-schema copy before replacement startup')
             row = db.execute('SELECT payload FROM scope WHERE id=1').fetchone()
             if (imported['target_scope'] != _scope(grant, profile) or row is None or
                     strict_loads(row[0]) != imported['target_scope']):
@@ -130,6 +132,7 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
     date_resolver = _date_resolver(grant, calendar)
     wall = LocalWallClock()
     with ExitStack() as stack:
+        stack.enter_context(ClockActivity())
         lock = stack.enter_context(AccountLock(grant.account_key))
         imported = _validate_source(grant, profile, legacy, database)
         installed = sdk_version()
@@ -141,7 +144,7 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
             recovering = any(row['position'] or row.get('detached_positions') or row.get('native_conflicts')
                              for row in saved['symbols'].values())
             recovering |= any(not terminal(order) for order in saved['orders'].values())
-        if not grant.in_window(now) and not recovering:
+        if (saved.get('scope_expired_at') or not grant.in_window(now)) and not recovering:
             raise TraderError('E_ONLINE_SCOPE', 'The replacement scope has expired without pending responsibilities')
         _claim_run_output(output, grant)
         status_path = output / 'status.json'
@@ -162,11 +165,19 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
                     raise TraderError('E_DSV_SDK_SCOPE', 'Initial SDK snapshot differs from the approved account or day')
                 adapter = DsvSdkAdapter(connection.api, connection.account, account_key=grant.account_key, profile=profile,
                                         calendar=calendar, sdk_version=installed,
-                                        _connection=connection,
+                                        _connection=connection, clock=wall, reference=ReferenceMonitor(wall),
                                         _legacy_native_orders=imported.get('legacy_native_orders'))
                 session = owner.enter_context(DsvSession(
                     database, profile=profile, port=adapter, _execution_lock=lock, account_key=grant.account_key,
                     provider=grant.provider, trading_day=grant.value['trading_day']))
+                command = 'simnow' if grant.provider == 'TQ_SIMNOW' else 'dsv'
+                identity = runtime_identity(command + ' replacement-run', 'DSV_REPLACEMENT', wall.epoch, adapter.epoch,
+                                            adapter.epoch, calendar=calendar, profile=profile, grant=grant)
+                session.runtime_identity = identity
+                try:
+                    publish_new_bytes(canonical_bytes(identity), output / 'runtime-identity.json')
+                except (OSError, TraderError) as error:
+                    diagnostics.report(error, stage='RUNTIME')
                 session.disconnect('SDK_OWNER_STARTED')
                 session.disable_entries_on_restart()
                 listener = owner.enter_context(PipeListener(pipe, validator=validate_control_message))
@@ -191,6 +202,7 @@ def _serve(session, adapter, listener, day, status_path, complete, *, diagnostic
     if diagnostics is None:
         diagnostics = RuntimeDiagnostics(Path(status_path).with_name('runtime-diagnostics.jsonl'))
     previous = None
+    previous_turn = None
     stopping = False
 
     def on_request(request):
@@ -207,8 +219,10 @@ def _serve(session, adapter, listener, day, status_path, complete, *, diagnostic
 
     while not stopping:
         error_code = None
+        receipt = None
+        started = time.monotonic_ns()
         try:
-            adapter.step(session, trading_day=day, complete=complete)
+            receipt = adapter.step(session, trading_day=day, complete=complete)
         except KeyboardInterrupt:
             adapter.command(session, {'id': 'sdk-console-stop', 'action': 'STOP'})
             continue
@@ -221,7 +235,14 @@ def _serve(session, adapter, listener, day, status_path, complete, *, diagnostic
         state = session.snapshot()
         if error_code is None and state['synchronized']:
             diagnostics.recovered()
-        payload = {'phase': 'READY' if state['synchronized'] else 'WAITING_FOR_NATIVE_SYNC',
+        if receipt and receipt.get('type') == 'ROUND':
+            diagnostics.clock_turn(state, adapter.metrics | {
+                'owner_turn_ns': str(time.monotonic_ns() - started),
+                'owner_turn_gap_ns': None if previous_turn is None else str(started - previous_turn)},
+                                   receipt.get('time_events', ()))
+        previous_turn = started
+        phase = ('CLOCK_RECOVERY_REQUIRED' if state.get('clock_recovery_required') else 'READY') if state['synchronized'] else 'WAITING_FOR_NATIVE_SYNC'
+        payload = {'phase': phase, 'runtime_identity': state.get('runtime_identity'),
                    'account_key': state['scope']['account_key'], 'trading_day': state['trading_day'],
                    'entry_authority': 'RUNNING' if state['running'] else 'DISARMED', 'error_code': error_code,
                    'diagnostics': diagnostics.status()}

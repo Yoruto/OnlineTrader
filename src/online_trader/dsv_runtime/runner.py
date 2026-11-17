@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 import sqlite3
 from threading import get_ident
+import time
 from uuid import uuid4
 
 from online_trader.configuration.dsv import DsvProfile
@@ -88,6 +89,8 @@ class DsvSession:
         self._busy = False
         self._database = database
         self._workbench_reader = None
+        self.runtime_identity = None
+        self.round_timing = {}
         self._lock = _execution_lock if _execution_lock is not None else AccountLock(account_key)
         self._owns_lock = _execution_lock is None
         self._sdk_port = port if not offline else None
@@ -157,6 +160,8 @@ class DsvSession:
         self._check_owner()
         state = copy.deepcopy(self._state)
         state['scope'] = dict(self._scope)
+        if identity := getattr(self, 'runtime_identity', None):
+            state['runtime_identity'] = identity | {'feed_epoch': state['session_id']}
         for contract, row in state['symbols'].items():
             position = row['position']
             if position is not None:
@@ -227,11 +232,15 @@ class DsvSession:
     @staticmethod
     def _mark_unsynchronized(state):
         state['synchronized'] = False
+        if 'clock_native_reconciled' in state:
+            state['clock_native_reconciled'] = False
         for order in state['orders'].values():
             order.pop('local_order_id', None)
         for row in state['symbols'].values():
             row.update(tick=None, tick_session=None)
             row.pop('quote_clock', None)
+            if 'quote_observation' in row:
+                row['quote_observation'] = None
 
     def prepare_shutdown(self):
         """Report unresolved child identities and owned lots without issuing commands."""
@@ -264,6 +273,7 @@ class DsvSession:
                 continue
             for kind, timer in position.get('timers', {}).items():
                 if (kind in {'entry_confirm', 'passive_wait', 'price_context'} and position['entry_stopped']
+                        or kind == 'close_refresh' and position.get('close_native_checks', 0)
                         or kind == 'close_span' or timer['phase'] != 'ACTIVE'
                         or timer['clock_epoch'] != last.clock_epoch):
                     continue
@@ -299,6 +309,7 @@ class DsvSession:
         identity = identifier(source['id'])
         digest = content_hash(source)
         state = copy.deepcopy(self._state)
+        started = time.monotonic_ns()
         try:
             with self._journal.transaction():
                 prior = self._journal.receipt(kind, identity, digest)
@@ -330,12 +341,15 @@ class DsvSession:
         except sqlite3.Error as error:
             self._failed = True
             raise TraderError('E_DSV_STORE', 'Required round or command transaction failed before dispatch') from error
+        committed = time.monotonic_ns()
         self._state = state
         try:
             self._controller.dispatch(state, effects)
         except BaseException:
             self._failed = True
             raise
+        self.round_timing = {'transaction_ns': str(committed - started),
+                             'dispatch_ns': str(time.monotonic_ns() - committed)}
         return receipt
 
     def _validate_frame(self, frame):
@@ -481,13 +495,20 @@ class DsvSession:
         if timing:
             self._observe_clock(state, frame, timing)
             if state.get('clock_recovery_required'):
+                timing.utc_error_ns = None
                 state['clock_native_reconciled'] = self._clock_facts_reconciled(state, frame)
-        if (self._sdk_port is not None and not state.get('clock_recovery_required')
-                and not self._sdk_port.opening_window(day, _utc(frame.get('authorization_time', frame['wall_time'])))):
-            state['running'] = False
-            for row in state['symbols'].values():
-                if position := row['position']:
-                    position.update(entry_stopped=True, preserve_open_on_stop=False)
+        if self._sdk_port is not None:
+            authorization_time = _utc(frame.get('authorization_time', frame['wall_time']))
+            if (timing and not state.get('clock_recovery_required') and not state.get('scope_expired_at')
+                    and self._sdk_port.expired(authorization_time)):
+                state['scope_expired_at'] = timing.sample.now_utc
+                timing.events.append({'result': 'OPENING_SCOPE_EXPIRED', 'handled_utc': timing.sample.now_utc})
+            if (state.get('scope_expired_at') or not state.get('clock_recovery_required')
+                    and not self._sdk_port.opening_window(day, authorization_time)):
+                state['running'] = False
+                for row in state['symbols'].values():
+                    if position := row['position']:
+                        position.update(entry_stopped=True, preserve_open_on_stop=False)
         market_rows = {market['contract_id']: market for market in frame['market']}
         decisions, effects = [], []
         for contract, spec in self._symbols.items():
@@ -513,10 +534,13 @@ class DsvSession:
                 tick = None
             observed = market | {'tick': tick}
             if timing:
+                self._identify_legacy_timers(row, contract, timing)
                 timing.recover(row, contract)
                 if position := row['position']:
                     timing.recover(position, position['id'])
                 observed['allow_new_order'] = not state.get('clock_recovery_required') and self._in_session(frame, observed)
+                observed['calendar_clock_unverified'] = state.get('clock_recovery_required') not in (
+                    None, 'OWNER_SCHEDULING_GAP')
             if frame.get('market_clock') and tick is not None:
                 native_time = _utc(tick['native_time'])
                 silence_ms = int(frame['monotonic_ms']) - int(row['quote_clock']['anchor']['mono'])
@@ -599,6 +623,27 @@ class DsvSession:
         row['exit_wait_reason'] = reason
         if reason:
             values.append({'reason': reason, 'rule_ids': ['D06', 'I02']})
+        unresolved = [timer['kind'] for responsibility in (row, row['position']) if responsibility
+                      for timer in responsibility.get('timers', {}).values() if timer['phase'] == 'RECOVERY_UNCERTAIN']
+        row['timer_recovery_uncertain'] = unresolved
+
+    def _identify_legacy_timers(self, row, contract, timing):
+        if (row.get('last_stop') or {}).get('until') is not None:
+            timing.missing_legacy_start(row, 'stop_cooldown', contract, float(self._trade['stop_cooldown_minutes']) * 60)
+        position = row['position']
+        if position is None:
+            return
+        identity = position['id']
+        timing.missing_legacy_start(position, 'entry_confirm', identity, self._trade['entry_confirm_timeout'], strict=True)
+        if position['mode'] == 'PASSIVE':
+            timing.missing_legacy_start(position, 'passive_wait', identity, self._trade.get('passive_wait_seconds', '3'))
+        if position['mode'] != 'ACTIVE':
+            timing.missing_legacy_start(position, 'price_context', identity, 90, strict=True)
+        if 'close_request_at' in position:
+            timing.missing_legacy_start(position, 'protection_sync', identity, 5)
+        if 'close_started' in position:
+            timing.missing_legacy_start(position, 'close_span', identity, self._trade['close_before_seconds'])
+            timing.missing_legacy_start(position, 'close_refresh', identity, 3)
 
     def _update_stops(self, row, contract, day, spec, calendar):
         result = reduce_stops(
@@ -633,6 +678,8 @@ class DsvSession:
             reviews = {key: row[key] for key in ('detached_positions', 'native_conflicts') if row.get(key)}
             if 'expiry_days_checked' in row:
                 reviews['expiry_days_checked'] = row['expiry_days_checked']
+            if cooldown := row.get('timers', {}).get('stop_cooldown'):
+                reviews['timers'] = {'stop_cooldown': cooldown}
             row.clear()
             row.update(_initial_symbol(), position=position, last_stop=last_stop, month_stop=month, stop_days=history, **reviews)
             if position is not None:
@@ -734,9 +781,8 @@ class DsvSession:
             if not self._in_session(frame, market):
                 return [{'reason': 'OUTSIDE_SESSION', 'rule_ids': ['D06']}]
             age_limit = Decimal(self._trade['max_quote_age_seconds']) * NS_PER_SECOND
-            silence = int((market.get('quote_observation') or {}).get('silence_ns') or 0)
             source = _utc(tick['native_time']).replace(microsecond=0)
-            if age_limit > 0 and max(delta_ns(timing.sample.utc, source), silence) > age_limit:
+            if age_limit > 0 and delta_ns(timing.sample.utc, source) > age_limit:
                 return [{'reason': 'QUOTE_AGE', 'rule_ids': ['D01']}]
             throttle = timing.elapsed(row, 'entry_throttle')
             cooldown = timing.elapsed(row, 'stop_cooldown')
@@ -826,7 +872,9 @@ class DsvSession:
             if due:
                 position.pop('close_request_at')
                 return {'reason': 'PROTECTION_EXIT_SYNCHRONIZED', 'rule_ids': ['D08', 'I02']}
-        if market['tick'] is not None and self._in_session(frame, market):
+        quote_revision = (content_hash([frame['session_id'], market['tick']]) if timing and market['tick'] else None)
+        if (market['tick'] is not None and self._in_session(frame, market)
+                and (not timing or position.get('protection_request_quote') != quote_revision)):
             # The original may renew the same zero target before its account
             # sync is due. Recheck the trigger for timing without booking or
             # sending another target.
@@ -835,6 +883,7 @@ class DsvSession:
             if any(event.get('remaining') == 0 for event in events):
                 position['close_request_at'] = reads.get('protection', frame['wall_time'])
                 if timing:
+                    position['protection_request_quote'] = quote_revision
                     timing.arm(position, 'protection_sync', position['id'], 5)
         if not position['owned']:
             return {'reason': 'PROTECTION_EXIT_AWAITING_SYNC', 'rule_ids': ['D08', 'I02']}
@@ -936,6 +985,7 @@ class DsvSession:
                                              'price': reference, 'slip': None}
                 position['close_request_at'] = position['rollback_exit']['at']
                 if timing:
+                    position['protection_request_quote'] = content_hash([frame['session_id'], market['tick']])
                     timing.arm(position, 'protection_sync', position['id'], 5)
                 if reason in {'TAKE_PROFIT', 'TRAILING_STOP', 'PROTECTED_FLOOR'}:
                     row['stop_streak'] = 0
@@ -984,7 +1034,7 @@ class DsvSession:
         first = close is None
         if first:
             reason = frame['clock_health'].get('reason')
-            if position['exit_target'] == 0 or market.get('calendar_reason') or (
+            if position['exit_target'] == 0 or market.get('calendar_clock_unverified') or (
                     reason and reason != 'OWNER_SCHEDULING_GAP'):
                 return None
             end = market.get('liquidation_at')
@@ -1030,7 +1080,15 @@ class DsvSession:
                                   'calendar_event_id': identity, 'contract_id': market['contract_id'],
                                   'end_utc': end, 'handled_utc': sample.now_utc})
             position['close_started'] = str(sample.utc.timestamp())  # Existing rollback display.
-        refresh = first or timing.due(position, 'close_refresh', position['id'], consume=True)
+        refresh = first
+        if not first and self._in_session(frame, market):
+            checks = position.get('close_native_checks', 0)
+            if checks and not frame['clock_health'].get('reason'):
+                # The source gives its position reconciliation up to six
+                # actual SDK pumps before returning to the outer loop.
+                position['close_native_checks'] = checks - 1
+            else:
+                refresh = timing.due(position, 'close_refresh', position['id'], consume=True)
         if refresh:
             elapsed = timing.elapsed(position, 'close_span')
             if elapsed is not None:
@@ -1038,9 +1096,13 @@ class DsvSession:
                 position['close_mode'] = scheduled_close_mode(remaining_ms)
             timing.arm(position, 'close_refresh', position['id'], 3)
             position['close_refresh'] = str(sample.utc.timestamp())
+            position['close_native_checks'] = 6 if tick is not None and self._in_session(frame, market) else 0
         tighten_target(position, 0)
-        return {'reason': 'SCHEDULED_CLOSE' if first else 'SCHEDULED_CLOSE_PENDING',
-                'remaining': 0, 'price_mode': position.get('close_mode'), 'rule_ids': ['D06', 'D11']}
+        result = {'reason': 'SCHEDULED_CLOSE' if first else 'SCHEDULED_CLOSE_PENDING',
+                  'price_mode': position.get('close_mode'), 'rule_ids': ['D06', 'D11']}
+        if refresh:
+            result['remaining'] = 0
+        return result
 
     def _scheduled_close(self, row, position, market, frame):
         end = market.get('liquidation_at')

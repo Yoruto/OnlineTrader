@@ -74,6 +74,8 @@ def _load(archive):
     loop = codes['StrategyThread._run']
     verify('StrategyThread._run', loop.co_code,
            expected['gui_functions']['StrategyThread._run']['bytecode_sha256'])
+    name = 'StrategyThread._wait_position_closed'
+    verify(name, codes[name].co_code, expected['gui_functions'][name]['bytecode_sha256'])
     return root, codes, loop
 
 
@@ -173,7 +175,10 @@ class _SdkFeed:
 
     def wait_update(self, *, deadline):
         caller = sys._getframe(1)
-        if caller.f_lineno != 5892:
+        close_wait = caller.f_code.co_qualname == 'StrategyThread._wait_position_closed'
+        if close_wait:
+            caller = caller.f_back
+        if caller.f_code.co_qualname != 'StrategyThread._run' or (not close_wait and caller.f_lineno != 5892):
             raise _Finished(f'Unexpected SDK update during initialization at line {caller.f_lineno}')
         if self.frame is not None:
             fields = ('direction', 'volume', 'net_loss_points', 'pending_entry', 'days_to_expiry',
@@ -182,6 +187,12 @@ class _SdkFeed:
             state = {symbol: {key: row.get(key) for key in fields} for symbol, row in caller.f_locals['state'].items()}
             self.rows.append({'id': self.frame['id'], 'targets': self.targets, 'state': deepcopy(state),
                               'entry_trace_schema': SCHEMA, 'entry_rejections': deepcopy(self.entry_rejections)})
+            if close_wait or caller.f_locals.get('_close_mode') is not None:
+                position_loop = caller.f_locals
+                self.rows[-1]['frozen_close'] = {
+                    'nested_next_poll': close_wait, 'mode': position_loop.get('_close_mode'),
+                    'remaining_seconds': position_loop.get('_secs_left'), 'refresh_allowed': position_loop.get('retry_ok'),
+                }
             self.entry_rejections.clear()
             self.targets = []
         self.frame = next(self.frames, None)
@@ -268,6 +279,9 @@ def replay_original(archive: Path, settings, frames, scheduler=None):
         # Run the frozen daily-state writer against this replay's temporary BASE_DIR.
         persist = FunctionType(codes['StrategyThread.persist_daily_state'], namespace, argdefs=(None,))
         owner.persist_daily_state = persist.__get__(owner)
+        owner.api = sdk
+        wait_closed = FunctionType(codes['StrategyThread._wait_position_closed'], namespace)
+        owner._wait_position_closed = wait_closed.__get__(owner)
         observer = FrozenEntryObserver(loop, sdk)
         previous_trace = sys.gettrace()
         if previous_trace is not None:

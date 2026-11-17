@@ -139,6 +139,14 @@ class SimulationSession:
 
 
 def run_session(scope,credential_file,output,*,pipe=None,prepare=False):
+    if prepare:
+        return _run_session(scope, credential_file, output, pipe=pipe, prepare=True)
+    from online_trader.runtime.instance import ClockActivity
+    with ClockActivity():
+        return _run_session(scope, credential_file, output, pipe=pipe, prepare=False)
+
+
+def _run_session(scope,credential_file,output,*,pipe,prepare):
     grant=SimulationGrant.load(scope);output=Path(output);output.mkdir(parents=True,exist_ok=True)
     clock=measure_reference();port=TqKqPort.connect(credential_file,grant,clock,read_only=prepare);kernel=None;session=None
     try:

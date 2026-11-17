@@ -72,7 +72,21 @@ _STRATEGY_REASONS = {
     'SCHEDULED_CLOSE_PENDING': '收盘平仓待完成',
     'PROTECTION_EXIT_AWAITING_SYNC': '保护退出等待策略同步',
     'PROTECTION_EXIT_SYNCHRONIZED': '保护退出已完成策略同步',
+    'EXIT_WAITING_FOR_PRICE': '退出已登记，等待有效报价',
+    'EXIT_WAITING_FOR_SESSION': '退出已登记，等待交易时段',
+    'EXIT_WAITING_FOR_CLOCK_REVIEW': '退出已登记，等待时钟核对',
     'FIRST_MINUTE_JUMP_DAY_STOP': '首分钟跳空触发当日停开',
+}
+
+_QUOTE_REASONS = {
+    'QUOTE_UNAVAILABLE': '尚无有效报价',
+    'QUOTE_TIMESTAMP_INVALID': '源时间格式无效',
+    'QUOTE_SESSION_UNKNOWN': '报价的交易时段无法确认',
+    'QUOTE_OUTSIDE_CURRENT_SESSION': '当前休市',
+    'QUOTE_SESSION_MISMATCH': '报价属于其他交易时段',
+    'QUOTE_TIME_REGRESSION': '报价源时间发生倒退',
+    'QUOTE_LEADS_LOCAL_UTC': '报价领先本机时间',
+    'QUOTE_REFERENCE_CONFLICT': '报价时间与独立参考冲突',
 }
 
 
@@ -113,9 +127,12 @@ class OfflineWorkbench(QMainWindow):
         layout.addWidget(self.account)
         self.start = button('启动策略 (F5)', lambda: self._submit('START'))
         self.stop = button('停止策略 (F6)', lambda: self._submit('STOP'))
+        self.recover_clock = button('恢复时钟核对', self._recover_clock)
+        self.recover_clock.setObjectName('offlineRecoverClock')
+        self.recover_clock.hide()
         self.retry = button('查询原回执', self._query_receipt)
         self.refresh_button = button('刷新', self.refresh)
-        layout.addLayout(row(self.start, self.stop, self.refresh_button, self.retry))
+        layout.addLayout(row(self.start, self.stop, self.recover_clock, self.refresh_button, self.retry))
 
         self.quantity = QSpinBox(objectName='offlineQuantity')
         self.quantity.setRange(1, 2_147_483_647)
@@ -147,6 +164,16 @@ class OfflineWorkbench(QMainWindow):
         evidence = QTabWidget(objectName='offlineEvidence')
         evidence.addTab(self.activity, '策略事件')
         evidence.addTab(self.fills, '逐笔成交')
+        self.clock_status = QLabel(objectName='offlineClockStatus')
+        self.quote_health = table(('合约', '源报价时间', '源年龄', '观测静默', '行情状态', '退出等待'))
+        self.quote_health.setObjectName('offlineQuoteHealth')
+        clock_panel = QWidget()
+        clock_layout = QVBoxLayout(clock_panel)
+        clock_layout.addWidget(self.clock_status)
+        clock_layout.addWidget(self.quote_health)
+        self.evidence = evidence
+        self.clock_tab = evidence.addTab(clock_panel, '行情与时钟')
+        evidence.setTabVisible(self.clock_tab, False)
         layout.addWidget(evidence, 3)
         self.history_status = QLabel(objectName='offlineHistoryStatus')
         self.history_status.hide()
@@ -186,6 +213,10 @@ class OfflineWorkbench(QMainWindow):
                 self._job('command', self.pending)
             else:
                 self._job('receipt', {'id': self.pending['id'], 'expected_scope': self.pending['expected_scope']})
+
+    def _recover_clock(self):
+        if self._state and (recovery_id := self._state.get('clock_recovery_id')):
+            self._submit('CLOCK_RECOVER', clock_recovery_id=recovery_id)
 
     def _submit(self, action, **data):
         if self.request is None and self.pending is None and self._state is not None:
@@ -241,6 +272,7 @@ class OfflineWorkbench(QMainWindow):
         else:
             reason = result['decisions'][0]['reason']
             messages = {'START': '已请求启动', 'STOP': '已停止新增', 'USER_REDUCE': '已登记减仓目标',
+                        'CLOCK_RECOVERED': '时钟已核对，策略仍停止新增',
                         'USER_REDUCE_DETACHED': '已登记原周期减仓目标',
                         'USER_CANCEL': '已请求撤单', 'CANCEL_UNAVAILABLE': '该委托当前不可撤'}
             self.receipt.setText(f'{messages.get(reason, reason)} · {result["input_id"]}')
@@ -260,6 +292,8 @@ class OfflineWorkbench(QMainWindow):
         self._state = state
         if not state['synchronized']:
             status = '等待行情与订单核对'
+        elif state.get('clock_recovery_required'):
+            status = '时钟或长间隔待核对 · 已停止新增'
         elif any(row.get('native_conflicts') for row in state['symbols'].values()):
             status = '迟到平仓成交待核对原周期'
         elif any(row.get('detached_positions') for row in state['symbols'].values()):
@@ -269,7 +303,9 @@ class OfflineWorkbench(QMainWindow):
         else:
             status = '策略运行中' if state['running'] else '已停止新增'
         self.status.setText(status)
-        mode = 'SDK 模拟' if state.get('sdk_connection') else '离线回放'
+        mode = '替代执行链 · SDK 模拟' if state.get('sdk_connection') else '离线回放'
+        if entry_point := (state.get('runtime_identity') or {}).get('entry_point'):
+            mode += f' · {entry_point}'
         self.setWindowTitle(f'OnlineTrader · DSV {"SDK 模拟工作台" if state.get("sdk_connection") else "离线工作台"}')
         self.account.setText(f"{state['scope']['account_key']} · {state['trading_day']} · {mode}")
         positions = [(contract, data['position']) for contract, data in state['symbols'].items()
@@ -300,6 +336,31 @@ class OfflineWorkbench(QMainWindow):
                    'DEGRADED': '部分历史记录不完整；已继续读取后续记录，请查看诊断事件'}.get(state.get('history_status'), '')
         self.history_status.setText(message)
         self.history_status.setVisible(bool(message))
+        self._show_clock(state)
+
+    def _show_clock(self, state):
+        paired = state.get('time_semantics_version') is not None
+        self.evidence.setTabVisible(self.clock_tab, paired)
+        if not paired:
+            return
+        health = state.get('clock_health') or {}
+        reference = {'OBSERVED_OK': '已观测', 'REFERENCE_UNAVAILABLE': '暂不可用'}.get(
+            health.get('reference_status'), '尚未观测')
+        activity = state.get('sdk_activity')
+        self.clock_status.setText(f"独立参考 {reference} · SDK 更新 {activity if activity is not None else '—'} 次" +
+                                  (' · 需核对时钟与柜台' if state.get('clock_recovery_required') else ''))
+        rows = []
+        for code, row_state in state['symbols'].items():
+            quote = row_state.get('quote_observation') or {}
+            age, silence = (quote.get(name) for name in ('source_age_raw_ns', 'silence_ns'))
+            reason = _QUOTE_REASONS.get(quote.get('reason'), '已观测' if quote else '未知')
+            wait = _STRATEGY_REASONS.get(row_state.get('exit_wait_reason'), '—')
+            if row_state.get('timer_recovery_uncertain'):
+                wait = '计时起点待核对' if wait == '—' else wait + ' · 计时起点待核对'
+            rows.append((code, quote.get('source_time_raw') or '—',
+                         '—' if age is None else f'{int(age)/1_000_000:+.3f} ms',
+                         '—' if silence is None else f'{int(silence)/1_000_000:.3f} ms', reason, wait))
+        populate(self.quote_health, rows)
 
     @staticmethod
     def _activity_row(event):
@@ -356,7 +417,12 @@ class OfflineWorkbench(QMainWindow):
         idle = self.request is None and self.pending is None
         connected = self._transport_ok and self._state is not None
         state = self._state or {}
-        self.start.setEnabled(idle and connected and not state.get('running'))
+        fault = state.get('clock_recovery_required')
+        self.start.setEnabled(idle and connected and not state.get('running') and not fault
+                              and not state.get('scope_expired_at'))
+        self.recover_clock.setVisible(bool(fault))
+        self.recover_clock.setEnabled(bool(idle and connected and fault and state.get('clock_native_reconciled')
+                                           and (state.get('clock_health') or {}).get('continuous_samples', 0) >= 2))
         self.stop.setEnabled(idle and connected and state.get('running', False))
         selection = self._selected(self.positions, 0)
         contract = selection[0] if isinstance(selection, tuple) else selection

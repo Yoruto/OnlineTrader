@@ -7,6 +7,7 @@ from pathlib import Path
 from online_trader.contracts.codec import content_hash
 from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
+from online_trader.scheduling.clock import NS_PER_SECOND, quote_timestamp, sdk_deadline, source_age_ns
 from online_trader.gateway.ports import OnlineSimulationPort
 
 
@@ -96,8 +97,12 @@ class TqKqPort(OnlineSimulationPort):
                 if order.get('native_offset'):self._bindings[order['child_order_id']]['native_offset']=order['native_offset']
 
     def poll_updates(self,seconds=0.1):
-        self.api.wait_update(deadline=time.time()+seconds)
-        received = datetime.now(timezone.utc), time.monotonic_ns()
+        self.last_poll_updated = self.api.wait_update(deadline=sdk_deadline(seconds))
+        if hasattr(self.clock, 'capture'):
+            sample = self.clock.capture()
+            received = sample.utc, sample.monotonic
+        else:
+            received = datetime.now(timezone.utc), time.monotonic_ns()
         for key,item in self.api._data.get('notify',{}).items():
             if key in self._known_notifications:continue
             self._known_notifications.add(key);code=item.get('code')
@@ -109,11 +114,17 @@ class TqKqPort(OnlineSimulationPort):
 
     def fresh(self, code, *, check_age=True, now=None):
         try:
-            q=self.quotes[code];at=datetime.fromisoformat(q.datetime).replace(tzinfo=timezone(timedelta(hours=8)))
-            age=((self.clock.now() if now is None else now)-at).total_seconds()
+            q=self.quotes[code];at=quote_timestamp(q.datetime, timezone(timedelta(hours=8)))
+            now = self.clock.now() if now is None else now
+            age = source_age_ns(now, at, q.datetime)
             values=(q.bid_price1,q.ask_price1,q.last_price,q.price_tick,q.lower_limit,q.upper_limit)
-            return not q.expired and -1 <= age and (not check_age or age <= 5) and all(math.isfinite(v) and v>0 for v in values) and q.lower_limit<=q.bid_price1<=q.ask_price1<=q.upper_limit and q.bid_volume1>0 and q.ask_volume1>0
+            return (not q.expired and self._quote_age_acceptable(code, now, at, age, check_age)
+                    and all(math.isfinite(v) and v>0 for v in values)
+                    and q.lower_limit<=q.bid_price1<=q.ask_price1<=q.upper_limit and q.bid_volume1>0 and q.ask_volume1>0)
         except (KeyError,AttributeError,TypeError,ValueError,TraderError):return False
+
+    def _quote_age_acceptable(self, code, now, source, age, check_age):
+        return -NS_PER_SECOND <= age and (not check_age or age <= 5 * NS_PER_SECOND)
 
     def fresh_manual_reduction(self,code):
         """Validate a current native quote for a frozen manual reduction limit."""
@@ -122,10 +133,12 @@ class TqKqPort(OnlineSimulationPort):
     def _fresh_last(self, code, *, check_age=True):
         try:
             q = self.quotes[code]
-            stamp = datetime.fromisoformat(q.datetime).replace(tzinfo=timezone(timedelta(hours=8)))
-            age = (self.clock.now()-stamp).total_seconds()
+            stamp = quote_timestamp(q.datetime, timezone(timedelta(hours=8)))
+            now = self.clock.now()
+            age = source_age_ns(now, stamp, q.datetime)
             values = (q.last_price,q.price_tick,q.lower_limit,q.upper_limit)
-            return (not q.expired and -1 <= age and (not check_age or age <= 5) and all(math.isfinite(v) and v>0 for v in values)
+            return (not q.expired and self._quote_age_acceptable(code, now, stamp, age, check_age)
+                    and all(math.isfinite(v) and v>0 for v in values)
                     and q.lower_limit<=q.last_price<=q.upper_limit)
         except (KeyError,AttributeError,TypeError,ValueError,TraderError):
             return False

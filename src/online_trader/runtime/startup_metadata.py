@@ -17,6 +17,7 @@ from online_trader.errors import TraderError
 from online_trader.configuration.rollover import expiry_date, future_product
 from online_trader.gateway.tqkq import number
 from online_trader.scheduling.calendar import TradingCalendar
+from online_trader.scheduling.clock import NS_PER_SECOND, quote_age_quality, quote_timestamp, sdk_deadline, source_age_ns, utc_text
 
 
 BEIJING = timezone(timedelta(hours=8))
@@ -344,6 +345,7 @@ def read_offset_inputs(credential_reference, profile, formula, *, as_of_date=Non
             _error('所选合约不在共同交易时段。', 'E_OFFSET_SESSION')
         serials = {identity: api.get_kline_serial(identity, 86400, data_length=120)
                    for identity in sorted(set(series.values()))}
+        quality = {}
         while time.monotonic() < deadline:
             ranges = {}
             instant = now or datetime.now(timezone.utc)
@@ -351,15 +353,22 @@ def read_offset_inputs(credential_reference, profile, formula, *, as_of_date=Non
                 period = calendar.query(code, _utc(instant))
                 if not period['is_trading'] or period['trading_day'] != cutoff:
                     _error('行情取数未在同一交易时段完成。', 'E_OFFSET_SESSION')
+                raw_time = _get(quote, 'datetime')
                 try:
-                    source = datetime.fromisoformat(_get(quote, 'datetime'))
-                except (ValueError, TypeError):
+                    source = quote_timestamp(raw_time, BEIJING)
+                except (OverflowError, ValueError):
+                    quality[code] = {'reason': 'QUOTE_TIMESTAMP_INVALID', 'source_age_raw_ns': None}
                     continue
-                if source.tzinfo is None:
-                    source = source.replace(tzinfo=BEIJING)
-                source_period = calendar.query(code, _utc(source))
-                if (not 0 <= (instant-source).total_seconds() <= 15
-                        or source_period['session'] != period['session']):
+                age = source_age_ns(instant, source, raw_time)
+                age_quality, reason = quote_age_quality(age)
+                source_period = calendar.query(code, utc_text(source))
+                if source_period['session'] != period['session']:
+                    reason = 'QUOTE_SESSION_MISMATCH'
+                elif age > 15 * NS_PER_SECOND:
+                    reason = 'QUOTE_TOO_OLD'
+                quality[code] = {'source_time_raw': raw_time, 'source_time_utc': utc_text(source),
+                                 'source_age_raw_ns': str(age), 'age_quality': age_quality, 'reason': reason}
+                if reason in {'QUOTE_SESSION_MISMATCH', 'QUOTE_TOO_OLD'}:
                     continue
                 high = number(_get(quote, 'highest'))
                 low = number(_get(quote, 'lowest'))
@@ -374,8 +383,13 @@ def read_offset_inputs(credential_reference, profile, formula, *, as_of_date=Non
                 else:
                     return {'as_of_date': cutoff, 'last_completed_day': last,
                             'daily_rows': [row for row in daily if row['date'] < cutoff],
-                            'realized_ranges': ranges}
-            api.wait_update(deadline=time.time() + min(.3, max(0, deadline-time.monotonic())))
+                            'realized_ranges': ranges, 'quote_time_quality': quality}
+            api.wait_update(deadline=sdk_deadline(min(.3, max(0, deadline-time.monotonic()))))
+        if any(item['reason'] in {'QUOTE_SESSION_MISMATCH', 'QUOTE_TOO_OLD'} for item in quality.values()):
+            details = '，'.join(f"{code} {item['reason']} {item['source_age_raw_ns']} ns"
+                               for code, item in quality.items()
+                               if item['reason'] in {'QUOTE_SESSION_MISMATCH', 'QUOTE_TOO_OLD'})
+            _error(f'振幅报价时点不合格（{details}）。', 'E_OFFSET_QUOTE_TIME')
         _error('完整日线或当前振幅未同步，请检查行情后重试。', 'E_OFFSET_INPUTS')
 
     return _read_market(credential_reference, read, timeout_seconds=timeout_seconds, sdk_factory=sdk_factory)

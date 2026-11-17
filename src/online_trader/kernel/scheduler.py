@@ -21,7 +21,7 @@ from online_trader.gateway.ports import UnavailablePort
 from online_trader.kernel.dsv_strategy import DsvStrategyRuntime
 from online_trader.protection import ProtectionState, reduce_event
 from online_trader.scheduling.calendar import TradingCalendar
-from online_trader.scheduling.clock import ClockSample, ClockGuard, SystemClock
+from online_trader.scheduling.clock import ClockContinuity, ClockSample, ClockGuard, SystemClock, delta_ns
 
 
 def _ms(delta):
@@ -58,6 +58,8 @@ class ScheduledRuntime:
             elif any(reason.startswith(('CLOCK_','E_CLOCK')) for reason in data.get('reasons',[])):
                 self._fault=list(data['reasons']);self._fault_written=True
         self.strategy=DsvStrategyRuntime(kernel,profile=profile)
+        self._continuity = ClockContinuity() if self.strategy.online and isinstance(self.clock, SystemClock) else None
+        self.clock_health = None
         kernel._scheduled_runtime=self
 
     def descriptor(self):
@@ -77,12 +79,19 @@ class ScheduledRuntime:
         result=self.strategy.activate();self._enabled=True;self.preflight();return result
 
     def preflight(self):
-        if not self._enabled or self._busy or self._fault:
+        if not self._enabled or self._busy:
             return
         try:
-            sample = self.clock.sample()
+            paired = self.clock.capture() if self._continuity is not None else None
+            if paired is not None:
+                self.clock_health = self._continuity.observe(paired)
+            if self._fault:
+                return
+            sample = paired.to_record() if paired is not None else self.clock.sample()
             observed = self.guard.observe(sample)
-            if observed['valid']:
+            if paired is not None and self.clock_health['reason'] == 'OWNER_SCHEDULING_GAP':
+                self._fault = ['CLOCK_OWNER_SCHEDULING_GAP']
+            elif observed['valid']:
                 self._sample = ClockSample.from_record(sample)
             else:
                 self._fault = list(observed['reasons'])
@@ -237,8 +246,8 @@ class ScheduledRuntime:
         if not self.entry_quote_after_clock_reset(event):
             _allow_entry = False
             _entry_recovery = None
-        age=_ms(sample.utc-source)
-        if age < -self.max_wall_drift_ms:
+        age=delta_ns(sample.utc, source) // 1_000_000
+        if not self.strategy.online and age < -self.max_wall_drift_ms:
             raise TraderError('E_FACT_BARRIER','Quote source time is not fresh against the clock evidence')
         if age > self.kernel.max_quote_age_ms and not (
                 self.strategy.online and _allow_entry and event["path_complete"]):
@@ -251,7 +260,7 @@ class ScheduledRuntime:
         received=time.monotonic_ns()
         if fresh:
             self._quotes[contract]={'event':event,'instrument':copy.deepcopy(instrument),'signature':signature,
-                'received_ns':received,'sample':sample,'source_age_ms':max(0,age)}
+                'received_ns':received,'sample':sample,'source_age_ms':max(0,age), 'source_age_raw_ms':str(age)}
             self._register(received,sample,max(0,age))
         self._busy=True
         try:
@@ -260,7 +269,7 @@ class ScheduledRuntime:
             if fresh and latest:self._register(latest['received_ns'],sample,max(0,age))
             for cycle in self.kernel._staged.values():
                 if cycle['plan']['contract_id']==contract and self.cycle_day_current(cycle,event['trading_day']):
-                    if fresh:
+                    if fresh and not self.strategy.online:
                         prior=cycle.get('execution',{}).get('elapsed_ms',0)
                         origin=(cycle.get('strategy_metadata') or {}).get('candidate',{}).get('source_time_utc')
                         if origin is not None:prior=max(prior,_ms(sample.utc-datetime.fromisoformat(origin)))
@@ -304,10 +313,29 @@ class ScheduledRuntime:
         old=cycle.get('execution') or {}
         return max(self.kernel.kernel_epoch,old.get('source_epoch',0)),old.get('sequence',0)+1
 
+    def execution_origin(self):
+        return self._sample.to_record() | {'clock_epoch': self.kernel.boot_id}
+
+    def _elapsed_online(self, cycle, sample):
+        cid = cycle['position_cycle_id']
+        previous = (cycle.get('execution') or {}).get('elapsed_ms', 0)
+        origin = cycle.get('execution_clock_origin')
+        if origin and origin['clock_epoch'] == self.kernel.boot_id:
+            elapsed = max(0, (sample.monotonic - int(origin['monotonic_ns'])) // 1_000_000)
+        else:
+            # Only the interval since this boot's reconciled observation is
+            # proved. Retain already committed elapsed without projecting a
+            # previous market timestamp onto the wall clock.
+            anchor, committed = self._anchors.setdefault(cid, (sample.monotonic, previous))
+            elapsed = committed + max(0, (sample.monotonic - anchor) // 1_000_000)
+        return max(previous, elapsed)
+
     def execution_event(self,cycle,event,instrument):
         cached=self._quotes[event['contract_id']];sample=self._sample
         old=cycle.get('execution') or {};anchor=self._anchors.get(cycle['position_cycle_id'])
-        if anchor is None:
+        if self.strategy.online:
+            elapsed = self._elapsed_online(cycle, sample)
+        elif anchor is None:
             origin=(cycle.get('strategy_metadata') or {}).get('candidate',{}).get('source_time_utc',event['source_time_utc'])
             elapsed=max(old.get('elapsed_ms',0),_ms(sample.utc-datetime.fromisoformat(origin)))
         else:elapsed=anchor[1]+max(0,(sample.monotonic-anchor[0])//1000000)
@@ -321,27 +349,40 @@ class ScheduledRuntime:
                     ('last','bid1','ask1','day_high','day_low','native_time_ns','native_tick_id')})}
 
     def _execution(self,cycle,cached,at,elapsed,*,sample=None,price_only=False):
-        epoch,seq=self._sequence(cycle);event=cached['event'];sample=self._sample if sample is None else sample
+        epoch,seq=self._sequence(cycle);event=cached['event'] if cached else {};sample=self._sample if sample is None else sample
         current=at['session'];since=at['since_open_ms'] if current else 0
         policy=cycle['plan']['execution_policy'];deadline=cycle['schedule_binding']['forced_close_utc']
         close_due=(not price_only and deadline is not None
                    and _ms(datetime.fromisoformat(deadline)-sample.utc)<=cycle['plan']['close_session']['advance_seconds']*1000)
-        fresh=self.quote_age_ns(cached['received_ns'])<=self.kernel.max_quote_age_ms*1000000
+        same_session = bool(current and current['session_id'] == event.get('session_id')
+                            and current['trading_day'] == event.get('trading_day'))
+        fresh=bool(cached and self.quote_age_ns(cached['received_ns'])<=self.kernel.max_quote_age_ms*1000000
+                   and (same_session or not self.strategy.online))
+        ordinary = bool(not price_only and self.strategy.online and cycle.get('entry_origin') == 'STRATEGY'
+                        and ((cycle.get('strategy_metadata') or {}).get('candidate') or {}).get('entry_kind') == 'NORMAL')
+        ordinary_fresh = ordinary and cached and same_session and not self.strategy.ordinary_quote_stale(event, now=sample.utc)
+        if self.strategy.online and not price_only and (cycle.get('execution') or {}).get('close_start_ms') is not None:
+            close_due = False
+        time_only = not cached or self.strategy.online and not (fresh or ordinary_fresh)
+        source = {} if time_only else event
+        prices = {} if time_only else cached['instrument']
+        frozen_tick = (cycle.get('instrument') or {}).get('tick_size', self.kernel.tick_size)
         # Missing entry history blocks new signals, not fresh-price management
         # of an already proved owned position.
         market={'complete':at['complete'],
-            'fresh':fresh,'is_trading':at['is_trading'] is True and event['is_trading'],'quality':event['quality'],
-            'last':event['last'],'bid1':event['bid1'],'ask1':event['ask1'],'tick_size':event['tick_size'],
-            'upper_limit':cached['instrument'].get('upper_limit'),'lower_limit':cached['instrument'].get('lower_limit'),
+            'fresh':fresh,'is_trading':at['is_trading'] is True and event.get('is_trading', True),
+            'quality':source.get('quality', 'UNAVAILABLE'),
+            'last':source.get('last'),'bid1':source.get('bid1'),'ask1':source.get('ask1'),
+            'tick_size':source.get('tick_size', frozen_tick),
+            'upper_limit':prices.get('upper_limit'),'lower_limit':prices.get('lower_limit'),
             'since_open_ms':since,'near_open':bool(current and current['is_opening_session'] and 0<=since<=policy['chase_window_ms'])}
         result={'event_id':'scheduled-execution-'+content_hash({'cycle':cycle['position_cycle_id'],'clock':sample.to_record(),'sequence':seq}),
             'source_epoch':epoch,'sequence':seq,'elapsed_ms':quantity(elapsed),'trading_day':at['trading_day'] or cycle['plan']['trading_day'],
             'close_due':close_due,'market':market,'calendar_hash':self.calendar.content_hash,
             'observed_at_utc':sample.to_record()['now_utc']}
-        if (not price_only and self.strategy.online and cycle.get('entry_origin') == 'STRATEGY'
-                and ((cycle.get('strategy_metadata') or {}).get('candidate') or {}).get('entry_kind') == 'NORMAL'):
-            result['ordinary_entry_fresh'] = not self.strategy.ordinary_quote_stale(event, now=sample.utc)
-        if 'native_time_ns' in event:
+        if ordinary:
+            result['ordinary_entry_fresh'] = bool(ordinary_fresh)
+        if 'native_time_ns' in source:
             result['market_identity'] = self._native_identity(event)
             result['market_source'] = {'session_id': event['session_id'], 'source_epoch': event['source_epoch']}
         if price_only:
@@ -349,7 +390,12 @@ class ScheduledRuntime:
                                           'last_accepted_clock': self._sample.to_record()}
         if close_due:
             due=datetime.fromisoformat(deadline)-timedelta(seconds=cycle['plan']['close_session']['advance_seconds'])
-            result['close_start_elapsed_ms']=max(0,elapsed-max(0,_ms(sample.utc-due)))
+            result['close_start_elapsed_ms']=elapsed if self.strategy.online else max(0,elapsed-max(0,_ms(sample.utc-due)))
+            if self.strategy.online:
+                result['calendar_event'] = {
+                    'id': content_hash([cycle['plan']['position_cycle_id'], cycle['plan']['trading_day'],
+                                        cycle['schedule_binding']['schedule_policy_id'], deadline, 'SESSION_CLOSE']),
+                    'end_utc': deadline, 'missed_window': datetime.fromisoformat(deadline) <= sample.utc}
         return result
 
     def received_for(self,contract):return self._quotes[contract]['received_ns']
@@ -381,7 +427,7 @@ class ScheduledRuntime:
                 cid=cycle['position_cycle_id'];binding=cycle.get('schedule_binding')
                 if cycle['lifecycle']=='CLOSED' or not binding:continue
                 cached=self._quotes.get(cycle['plan']['contract_id'])
-                if cached is None:continue
+                if cached is None and not self.strategy.online:continue
                 at=self.calendar.query(cycle['plan']['contract_id'],sample.to_record()['now_utc'])
                 if (getattr(k.simulation,'strategy_enabled',False) and k.simulation.grant.multi_day
                         and at['is_trading'] and k.simulation.grant.permits_day(at['trading_day'])
@@ -397,7 +443,7 @@ class ScheduledRuntime:
                     return {'status':'CALENDAR_UNKNOWN'}
                 if cid in k._recovery_pending:continue
                 current=at['session'];policy=cycle['plan']['data_gap_exit']
-                if current is not None and policy['enabled'] and self._gaps.get(cid)!=current['session_id']:
+                if cached is not None and current is not None and policy['enabled'] and self._gaps.get(cid)!=current['session_id']:
                     elapsed=at['since_open_ms']
                     quiet=min(elapsed,max(0,(sample.monotonic-cached['sample'].monotonic)//1000000))
                     if elapsed>=60001 and quiet>=policy['active_trading_gap_ms']:
@@ -406,10 +452,13 @@ class ScheduledRuntime:
                 last=self._driven.get((cid,'clock'))
                 if last is not None and sample.monotonic-last<self.interval_ms*1000000:continue
                 self._driven[(cid,'clock')]=sample.monotonic
-                anchor=self._anchors.setdefault(cid,(sample.monotonic,cycle.get('execution',{}).get('elapsed_ms',0)))
-                elapsed=anchor[1]+max(0,(sample.monotonic-anchor[0])//1000000)
+                if self.strategy.online:
+                    elapsed = self._elapsed_online(cycle, sample)
+                else:
+                    anchor=self._anchors.setdefault(cid,(sample.monotonic,cycle.get('execution',{}).get('elapsed_ms',0)))
+                    elapsed=anchor[1]+max(0,(sample.monotonic-anchor[0])//1000000)
                 tick=self._execution(cycle,cached,at,elapsed)
-                k.execution.tick(cid,tick,_observe_quote=False,_market_received_ns=cached['received_ns'])
+                k.execution.tick(cid,tick,_observe_quote=False,_market_received_ns=cached['received_ns'] if cached else None)
                 return {'status':'PROCESSED','kind':'CLOCK'}
             return {'status':'IDLE'}
         finally:self._busy=False
@@ -432,6 +481,8 @@ class ScheduledRuntime:
     def reset_clock(self, *, sample=None):
         k=self.kernel;k._writable()
         if k._pending or k.recovery_required or k._has_unknown():raise TraderError('E_FACT_BARRIER','Reconcile original management facts before resetting the clock')
+        if self._continuity is not None and self._fault and self._continuity.continuous_samples < 2:
+            raise TraderError('E_CLOCK_FAULT', 'Wait for two continuous owner observations before resetting the clock')
         sample = self.clock.sample() if sample is None else sample
         ClockSample.from_record(sample)
         self._quotes.clear();self._ages.clear();self._anchors.clear();self._driven.clear();self._gaps.clear()

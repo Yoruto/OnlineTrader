@@ -25,6 +25,7 @@
       "hysteresis_ready": {"line": 1743, "bytecode_sha256": "a293345f242757dec804b1b79e751927c8e2031686e2470671aa05e80c704ab2"},
       "half_close_lots": {"line": 1820, "bytecode_sha256": "70224ef1f2fd20ac5b35a593c7009b2c8e2a17f3eaffdbf7618a6c1d8879d29f"},
       "StrategyThread._run": {"line": 3875, "bytecode_sha256": "19d2b437d5bb7312bd84a1cf7e02d86da1fc39083ed873bbb4e48fa742768761"},
+      "StrategyThread._wait_position_closed": {"line": 3859, "bytecode_sha256": "7801fce952ab09d4e863fc8cfcbaa1164a8314fbe82d2cd073cd9e886fdb6c2a"},
       "StrategyThread._run.<locals>.make_price_fn.<locals>._price_fn": {"line": 4850, "bytecode_sha256": "ade102b99b1a81d3e51b7543607dce7bf2019d29ff20f9f8f042a612334a8a16"},
       "StrategyThread._run.<locals>.calc_volume": {"line": 5231, "bytecode_sha256": "1c7760bc60192d5aac8f3247cc9a161e2b425d5ea5f64b98ea209c3f41b294a7"},
       "ManualTradeThread.run": {"line": 9113, "bytecode_sha256": "de0225449e28587967b7c99218e32ebdc6d2aaee052182d37a79c9e0dc211bdf"}

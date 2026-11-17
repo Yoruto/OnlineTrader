@@ -93,6 +93,10 @@ def serve(pipe_name, database, header, *, ready_file=None):
 
 def cli(args):
     try:
+        if args.offline_action == 'clock-migrate':
+            from online_trader.dsv_runtime.migration import migrate_time_copy
+            print(json.dumps(migrate_time_copy(args.source, args.target), ensure_ascii=False))
+            return 0
         if args.offline_action == 'rollback-review':
             from online_trader.dsv_runtime.migration import rollback_review
             result = rollback_review(args.source, args.db)

@@ -54,6 +54,8 @@ $env:PYTHONPATH = 'src'
 
 ## Windows 校时
 
+[时钟与计时器开发规格](docs/clock-and-timer-development-plan-20261117.md) · [实施说明与检查入口](docs/clock-timer-implementation-20261117.md)
+
 原脚本和使用说明见[历史校时说明](README.legacy-ddad472.md#windows-校时)。其中原内核的跳钟核对/F5流程仅适用于所记旧路径，不应套成替代入口的额外门禁。自动校时需求、运行中系统时间修改及新链路的完整验证仍单列，不由这次文档修订授予执行权限。
 
 即时校准前检查 W32Time 是否仍在渐进调速。已授权停机维护时，先停止服务并确认调速状态，再即时校准、恢复服务并重新同步。随后以独立样本跨自动同步周期复核偏差。 [实际操作与验证](docs/refactor/dsv-parity-20261114/29-clock-stability-and-four-contract-retest.md)

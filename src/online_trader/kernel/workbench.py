@@ -14,6 +14,7 @@ from online_trader.domain.values import decimal_text
 from online_trader.kernel.projection import projection_batch
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import number
+from online_trader.scheduling.clock import delta_ns
 
 
 def monitor_symbols(kernel, decisions):
@@ -194,6 +195,18 @@ def workbench_view(kernel):
                   'enabled':kernel.control.symbol_entry_enabled(code,committed=True),
                   'entry_switch_revision':kernel.control.symbol_entries.get(code,{}).get('revision',0),
                   'entry_reasons':['WAITING_FRESH_QUOTE']})
+    if scoped and scheduler and scheduler._sample is not None:
+        for row in markets:
+            at = scheduler.calendar.query(row['contract_id'], scheduler._sample.now_utc)
+            stamp = row['source_time_utc']
+            age = None if not stamp else delta_ns(scheduler._sample.utc, datetime.fromisoformat(stamp))
+            row['market_session_active'] = at['is_trading']
+            row['source_age_raw_ns'] = None if age is None else str(age)
+            row['quote_time_reason'] = (
+                'CALENDAR_COVERAGE_UNKNOWN' if not at['complete'] else
+                'QUOTE_OUTSIDE_CURRENT_SESSION' if not at['is_trading'] else
+                'QUOTE_UNAVAILABLE' if age is None else 'QUOTE_LEADS_LOCAL_UTC' if age < 0 else
+                None if row['fresh'] else 'QUOTE_STALE')
     day_stops={}
     for cycle in snapshot['cycles']:
         plan=cycle['plan'];protection=cycle['protection']
@@ -326,6 +339,9 @@ def workbench_view(kernel):
             'exit_reasons':copy.deepcopy(s.get('exit_reasons',[])),
             'exit_reason':(cycle.get('nominal_exit') or {}).get('exit_reason'),
             'exit_reference_price':(cycle.get('nominal_exit') or {}).get('nominal_exit_price'),
+            'exit_wait_reason': (None if not exit_pending else 'EXIT_WAITING_FOR_SESSION'
+                                 if market.get('market_session_active') is False else 'EXIT_WAITING_FOR_PRICE'
+                                 if not market.get('fresh') else None),
             'break_even_status':s.get('break_even_status'),'max_favorable_move':s.get('max_favorable_move'),
             'management_state':cycle.get('management_state'),'plan_id':p['plan_id'],'plan_revision':p['plan_revision'],'close_route_review':route_review})
         for order in cycle['orders']:
@@ -361,6 +377,9 @@ def workbench_view(kernel):
     diagnostics = getattr(kernel, '_dsv_diagnostics', None)
     if diagnostics:
         result['configuration']['strategy_diagnostics'] = diagnostics.copy()
+    if identity := getattr(kernel, '_dsv_runtime_identity', None):
+        result['configuration']['runtime_identity'] = identity | {'feed_epoch': port.source_epoch}
+        result['configuration']['clock_health'] = copy.deepcopy(scheduler.clock_health) if scheduler else None
     run_directory = getattr(kernel, '_dsv_run_directory', None)
     if run_directory is not None:
         result['configuration']['run_directory'] = run_directory

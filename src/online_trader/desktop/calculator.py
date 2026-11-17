@@ -149,8 +149,13 @@ class OffsetCalculatorDialog(QDialog):
         finally:
             self._rendering = False
         summary = dataset.summary()
+        quality = inputs.get('quote_time_quality', {})
+        leading = [(code, item) for code, item in quality.items() if item.get('reason') == 'QUOTE_LEADS_LOCAL_UTC']
         self.data_label.setText(f"原生行情 · {summary['bars']} 根已完成日线 · "
-                                f"最后完整交易日 {inputs['last_completed_day']} · {summary['data_hash']}")
+                                f"最后完整交易日 {inputs['last_completed_day']} · {summary['data_hash']}" +
+                                (f" · {len(leading)} 个合约报价领先本机" if leading else ""))
+        self.data_label.setToolTip("\n".join(f"{code} · 源报价 {item['source_time_raw']} · "
+                                               f"本机减源时间 {item['source_age_raw_ns']} ns" for code, item in leading))
         return self.calculate()
 
     def set_coefficients(self, raw):

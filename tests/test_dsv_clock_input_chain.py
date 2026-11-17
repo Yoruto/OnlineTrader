@@ -135,6 +135,19 @@ class DsvClockInputChainTests(unittest.TestCase):
         self.clock.advance(elapsed_ms)
         return self.adapter.step(self.session, trading_day=DAY, complete=True)
 
+    def confirm_open(self, price=1060, quantity=5):
+        order, = self.api.orders.values()
+        exchange_time = int(self.clock.utc.timestamp()) * 10**9
+        order.insert_date_time = exchange_time
+        order.exchange_order_id = 'cabinet-open'
+        order.volume_left -= quantity
+        if not order.volume_left:
+            order.status = 'FINISHED'
+        self.api.trades['entry-fill'] = SimpleNamespace(trade_id='entry-fill', order_id=order.order_id,
+            exchange_id=order.exchange_id, instrument_id=order.instrument_id, direction=order.direction,
+            offset='OPEN', volume=quantity, price=price, trade_date_time=exchange_time)
+        self.api.position.pos_long = self.api.position.pos_long_today = quantity
+
     def test_entry_timeout_advances_on_duplicate_quote_and_keeps_strict_boundary(self):
         self.start(entry_confirm_timeout=60)
         opening, = self.step()['effects']
@@ -162,3 +175,68 @@ class DsvClockInputChainTests(unittest.TestCase):
         result = self.step()
         self.assertEqual(result['effects'], [])
         self.assertEqual([row['reason'] for row in result['decisions']], ['QUOTE_AGE'])
+
+    def test_leading_quote_keeps_original_timestamp_and_uses_independent_decision_time(self):
+        self.start(max_quote_age_seconds=2)
+        self.api.update_quote(DAY + 'T01:40:00.970000Z')
+        initial = self.step()
+        row = self.session.snapshot()['symbols'][CONTRACT]
+        self.assertEqual(initial['evaluated_at'], DAY + 'T01:40:00Z')
+        self.assertEqual(row['quote_observation']['source_age_raw_ns'], '-970000000')
+        self.assertEqual(row['quote_observation']['reason'], 'QUOTE_LEADS_LOCAL_UTC')
+        self.assertEqual(self.api.quote.datetime, '2026-11-13 09:40:00.970000')
+        self.assertEqual([effect['kind'] for effect in initial['effects']], ['SEND'])
+
+    def test_passive_wait_is_inclusive_even_if_market_time_does_not_advance(self):
+        self.start(passive_entry_first=True)
+        self.step()
+        self.step(2999)
+        self.assertEqual(self.session.snapshot()['symbols'][CONTRACT]['position']['mode'], 'PASSIVE')
+        at_boundary = self.step(1)
+        self.assertEqual(self.session.snapshot()['symbols'][CONTRACT]['position']['mode'], 'CAP')
+        due = [event for event in at_boundary['time_events'] if event['result'] == 'DUE']
+        self.assertEqual([(event['kind'], event['lateness_ns']) for event in due], [('passive_wait', '0')])
+
+    def test_arriving_partial_fill_precedes_the_old_zero_fill_timeout(self):
+        self.start(entry_confirm_timeout=60)
+        self.step()
+        for _ in range(60):
+            self.step(1000)
+        self.confirm_open(quantity=2)
+        result = self.step(1)
+        position = self.session.snapshot()['symbols'][CONTRACT]['position']
+        self.assertEqual((position['owned'], position['quantity']), (2, 5))
+        self.assertNotIn('ENTRY_CONFIRM_TIMEOUT', [row['reason'] for row in result['decisions']])
+        self.assertEqual([call[0] for call in self.api.calls], ['SEND'])
+
+    def test_wall_jump_disarms_without_advancing_monotonic_entry_timeout(self):
+        self.start(entry_confirm_timeout=3)
+        self.step()
+        self.clock.advance(1000, wall_ms=31000)
+        self.assertEqual(self.step()['effects'], [])
+        self.assertEqual(self.session.snapshot()['clock_recovery_required'], 'WALL_CLOCK_DISCONTINUITY')
+        self.assertEqual(self.step(2000)['effects'], [])
+        late = self.step(1)
+        self.assertEqual([effect['kind'] for effect in late['effects']], ['CANCEL'])
+        self.assertFalse(self.session.snapshot()['running'])
+
+    def test_close_without_quote_is_durable_without_a_nominal_price_and_stays_closed(self):
+        self.start(time='06:59:20', no_open_before_close_minutes=0)
+        self.step()
+        self.confirm_open()
+        self.step(1000)
+        self.api.quote.datetime = ''
+        for _ in range(9):
+            self.step(1000)
+        state = self.session.snapshot()['symbols'][CONTRACT]
+        key = state['position']['calendar_exit']['id']
+        self.assertEqual(state['position']['exit_target'], 0)
+        self.assertIsNone(state['position']['rollback_exit']['price'])
+        self.assertEqual(state['exit_wait_reason'], 'EXIT_WAITING_FOR_PRICE')
+        for _ in range(31):
+            self.step(1000)
+        state = self.session.snapshot()['symbols'][CONTRACT]
+        self.assertFalse(state['market_session_active'])
+        self.assertEqual(state['position']['calendar_exit']['id'], key)
+        self.assertEqual(state['exit_wait_reason'], 'EXIT_WAITING_FOR_SESSION')
+        self.assertEqual([call[0] for call in self.api.calls], ['SEND'])
