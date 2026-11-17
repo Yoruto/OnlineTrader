@@ -58,8 +58,8 @@ _OTHER_LABELS = {
     "formula": "公式保存值", "ceiling": "上界原值", "floor": "下界原值", "coef": "品种系数原值",
     "enabled": "启用", "night_start_time": "夜盘启动时间", "day_start_time": "日盘启动时间",
     "catch_up_minutes": "错过时点窗口（分钟）", "name": "品种名称", "code": "保存合约",
-    "code_new": "候选换月合约", "open_offset": "开仓偏移", "stop_offset": "止损偏移",
-    "profit_offset": "止盈偏移", "order_volume": "手数原值", "half_close_ratio": "半仓同名参数原值",
+    "code_new": "候选换月合约", "open_offset": "开仓", "stop_offset": "止损",
+    "profit_offset": "止盈", "order_volume": "手数原值", "half_close_ratio": "半仓同名参数原值",
     "hysteresis_points": "滞回原值",
 }
 _MISSING = object()
@@ -161,7 +161,7 @@ class SettingsDialog(QDialog):
                        self.notice_label, self.error_label): layout.addWidget(widget)
         self.tabs = QTabWidget()
         self.parameters_table = _table(["参数", "已确认基准", "当前预览", "变化"])
-        self.symbols_table = _table(["品种", "保存合约", "开仓偏移", "止损偏移", "止盈偏移",
+        self.symbols_table = _table(["品种", "保存合约", "开仓", "止损", "止盈",
                                      "手数原值", "半仓参数原值", "滞回原值", "候选换月合约", "核对状态"])
         self.differences_table = _table(["变化项目", "已确认基准", "当前预览"])
         self.diagnostics_text = QTextEdit()

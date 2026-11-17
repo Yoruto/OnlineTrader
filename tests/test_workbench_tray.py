@@ -23,7 +23,7 @@ class WorkbenchTrayTests(unittest.TestCase):
 
     def test_default_close_to_tray_keeps_refresh_and_exit_closes_the_window(self):
         self.assertFalse(self.settings.contains('minimize_to_tray'))
-        with (patch('online_trader.desktop.workbench.QSettings', return_value=self.settings),
+        with (patch('online_trader.desktop.workbench.workbench_preferences', return_value=self.settings),
               patch('online_trader.desktop.tray.QSystemTrayIcon') as tray):
             tray.isSystemTrayAvailable.return_value = True
             tray.Trigger = QSystemTrayIcon.Trigger
@@ -49,7 +49,7 @@ class WorkbenchTrayTests(unittest.TestCase):
             icon.hide.assert_called_once()
 
     def test_minimize_button_hides_same_window_and_tray_restores_maximized_state(self):
-        with (patch('online_trader.desktop.workbench.QSettings', return_value=self.settings),
+        with (patch('online_trader.desktop.workbench.workbench_preferences', return_value=self.settings),
               patch('online_trader.desktop.tray.QSystemTrayIcon') as tray):
             tray.isSystemTrayAvailable.return_value = True
             tray.Trigger = QSystemTrayIcon.Trigger
@@ -77,7 +77,7 @@ class WorkbenchTrayTests(unittest.TestCase):
         for enabled, available in ((False, True), (True, False)):
             with self.subTest(enabled=enabled, available=available):
                 self.settings.setValue('minimize_to_tray', enabled)
-                with (patch('online_trader.desktop.workbench.QSettings', return_value=self.settings),
+                with (patch('online_trader.desktop.workbench.workbench_preferences', return_value=self.settings),
                       patch('online_trader.desktop.tray.QSystemTrayIcon.isSystemTrayAvailable',
                             return_value=available)):
                     window = WorkbenchWindow(None)
@@ -94,7 +94,7 @@ class WorkbenchTrayTests(unittest.TestCase):
 
     def test_saved_preference_shows_icon_before_first_close_and_updates_status(self):
         self.settings.setValue('minimize_to_tray', True)
-        with (patch('online_trader.desktop.workbench.QSettings', return_value=self.settings),
+        with (patch('online_trader.desktop.workbench.workbench_preferences', return_value=self.settings),
               patch('online_trader.desktop.tray.QSystemTrayIcon') as tray):
             tray.isSystemTrayAvailable.return_value = True
             icon = tray.return_value
@@ -116,7 +116,7 @@ class WorkbenchTrayTests(unittest.TestCase):
 
     def test_saved_opt_out_closes_normally(self):
         self.settings.setValue('minimize_to_tray', False)
-        with (patch('online_trader.desktop.workbench.QSettings', return_value=self.settings),
+        with (patch('online_trader.desktop.workbench.workbench_preferences', return_value=self.settings),
               patch('online_trader.desktop.tray.QSystemTrayIcon') as tray):
             tray.isSystemTrayAvailable.return_value = True
             window = WorkbenchWindow(None)

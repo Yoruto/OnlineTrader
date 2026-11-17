@@ -358,7 +358,7 @@ class WorkbenchDesktopTests(unittest.TestCase):
         self.assertEqual(dashboard.home_money['float_profit'][0].text(), '-¥340.00')
         self.assertEqual(dashboard.home_money['available'][1].text(), '保证金占用 ¥14,580.00')
         self.assertEqual([dashboard.home_symbols.horizontalHeaderItem(index).text() for index in range(8)],
-                         ['品种名', '合约代码', '开仓偏移', '止损偏移', '止盈偏移', '下单手数', '半仓参数', '滞回点'])
+                         ['品种名', '合约代码', '开仓', '止损', '止盈', '下单手数', '半仓参数', '滞回点'])
         self.assertEqual(dashboard.home_symbols.columnCount(), 8)
         self.assertEqual(dashboard.home_symbols.item(0, 2).text(), '57')
         self.assertEqual(dashboard.home_positions.item(0, 3).text(), '-¥340.00')

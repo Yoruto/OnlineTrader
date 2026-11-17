@@ -88,7 +88,7 @@ class SymbolEditorTests(unittest.TestCase):
         dialog.fields['code'].setText('p2701')
         self.assertFalse(dialog.validate_symbol()); self.assertIn('已在列表', dialog.error_label.text())
         dialog.fields['code'].setText('cu2701'); dialog.fields['stop_offset'].setText('-1')
-        self.assertFalse(dialog.validate_symbol()); self.assertIn('止损偏移', dialog.error_label.text())
+        self.assertFalse(dialog.validate_symbol()); self.assertIn('止损请填写大于等于 0 的数字。', dialog.error_label.text())
         dialog.fields['stop_offset'].setText('12'); dialog.fields['half_close_ratio'].setText('101')
         self.assertFalse(dialog.validate_symbol()); self.assertTrue(dialog.more_button.isChecked())
         self.assertIn('0～100', dialog.error_label.text())

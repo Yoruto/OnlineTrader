@@ -10,7 +10,7 @@ import re
 import time
 from typing import NamedTuple
 
-from PySide6.QtCore import QBuffer, QIODevice, QItemSelectionModel, QPointF, QRectF, QSettings, QSize, Qt, QTimer
+from PySide6.QtCore import QBuffer, QIODevice, QItemSelectionModel, QPointF, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QGroupBox,
@@ -25,6 +25,7 @@ from online_trader.configuration.files import load_profile, publish_new_bytes
 from online_trader.configuration.rollover import expiry_date, expiry_warning, future_product, preview_rollover
 from online_trader.configuration.symbol_csv import ALIASES, PRODUCT_NAMES
 from online_trader.contracts.codec import strict_loads
+from online_trader.desktop.preferences import workbench_preferences
 from online_trader.desktop.reports import EquityChart
 from online_trader.desktop.runtime_logs import (
     JsonLogTail, comparison_file, executor_log_path, matches_operation_log_recovery, matches_run_identity,
@@ -61,7 +62,7 @@ ORDER_HEADERS = ('报单号','合约','方向','开平','委托量','未成交',
 TRADE_HEADERS = ('成交号','合约','方向','开平','手数','成交价','手续费','成交时间')
 POSITION_HEADERS = ('合约','方向','持仓量','成交价','止损价','止盈价','实时价格',
                     '盈利价差','持仓盈亏','浮盈比例','保证金','手续费')
-SYMBOL_HEADERS = ('品种名', '合约代码', '开仓偏移', '止损偏移', '止盈偏移', '下单手数', '半仓参数', '滞回点')
+SYMBOL_HEADERS = ('品种名', '合约代码', '开仓', '止损', '止盈', '下单手数', '半仓参数', '滞回点')
 LOG_EVENT_FILTERS = {
     '开仓': {'open', 'auto'}, '平仓': {'close', 'auto', 'half', 'close_win', 'close_loss'},
     '错误': {'error'}, '手动': {'manual'},
@@ -585,7 +586,7 @@ class WorkbenchLayout:
         self.buttons = window.command_buttons
         self.tables = window.tables
         self.paired = window.paired_launcher
-        self.settings = QSettings('OnlineTrader', 'Workbench')
+        self.settings = workbench_preferences()
         self.dsv_config = Path(dsv_config) if dsv_config is not None and not self.paired else None
         self.require_reviewed_profile = require_reviewed_profile
         self.dsv_profile_loaded = False
@@ -1747,7 +1748,7 @@ class WorkbenchLayout:
                 actions.addWidget(self.quote_reference_button)
             actions.addStretch(1)
             contracts.addLayout(actions)
-        self.symbol_grid = table(['品种名','合约代码','主力合约','换月提醒（到期日）','候选换月','开仓偏移','止损偏移','止盈偏移',
+        self.symbol_grid = table(['品种名','合约代码','主力合约','换月提醒（到期日）','候选换月','开仓','止损','止盈',
                                   '下单手数','半仓参数','滞回点','建议手数'])
         self.symbol_grid.horizontalHeader().setSectionResizeMode(3,QHeaderView.ResizeToContents)
         contracts.addWidget(self.symbol_grid)

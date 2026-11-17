@@ -37,7 +37,7 @@ class OffsetCalculatorDialog(QDialog):
         layout.addLayout(controls)
         ratios = QHBoxLayout()
         for widget in (QLabel("当日振幅上限比例（非负）"), self.ceiling_input,
-                       QLabel("开仓偏移下限比例（非负）"), self.floor_input): ratios.addWidget(widget)
+                       QLabel("开仓下限比例（非负）"), self.floor_input): ratios.addWidget(widget)
         ratios.addStretch(); layout.addLayout(ratios)
         self.data_label = QLabel("尚未加载日线。CSV列：series_id,date,high,low,close；具体合约与KQ.m@主连分开提供。")
         self.data_label.setWordWrap(True); layout.addWidget(self.data_label)

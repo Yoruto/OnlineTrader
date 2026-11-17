@@ -185,7 +185,7 @@ class AccountStore:
         return base/row['account_key'].split(':')[-1]/'ledger.db'
     def pipe_name(self,row):return 'OnlineTrader.Account.'+hashlib.sha256(str(self.ledger_path(row)).casefold().encode()).hexdigest()[:24]
 
-    def _settled(self,row):
+    def _settled(self,row,*,for_update=False):
         path=self.ledger_path(row)
         if not path.exists():return
         try:
@@ -198,6 +198,10 @@ class AccountStore:
                 unknown=connection.execute("SELECT 1 FROM send_attempts WHERE send_state IN ('UNKNOWN','SEND_POSSIBLE') LIMIT 1").fetchone()
                 reservations=connection.execute("SELECT 1 FROM reservations WHERE status IN ('HELD','UNKNOWN') LIMIT 1").fetchone()
                 if unsettled or unknown or reservations:_error('Original positions, orders or reservations need reconciliation before switching','E_FACT_BARRIER')
+                if for_update and connection.execute(
+                        "SELECT 1 FROM child_orders WHERE broker_state NOT IN ('FILLED','CANCELLED','REJECTED') LIMIT 1"
+                ).fetchone():
+                    _error('Original orders lack terminal evidence before update','E_FACT_BARRIER')
             finally:connection.close()
         except sqlite3.Error:_error('Account ledger cannot prove a safe switch','E_FACT_BARRIER')
 

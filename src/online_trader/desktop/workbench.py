@@ -9,7 +9,9 @@ from PySide6.QtWidgets import (QApplication,QLabel,QLineEdit,QPushButton,QTableW
 
 from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.app import StatusWindow
+from online_trader.desktop.dingtalk import WorkbenchDingTalk
 from online_trader.desktop.notifications import WorkbenchSounds
+from online_trader.desktop.preferences import workbench_preferences
 from online_trader.desktop.tray import WorkbenchTray
 from online_trader.desktop.workbench_layout import ACTIVATION_MESSAGES,WorkbenchLayout
 from online_trader.errors import TraderError
@@ -84,7 +86,7 @@ def display_cell(key,value):
 
 class WorkbenchWindow(StatusWindow):
     def __init__(self,pipe_name,*,store=None,account_id=None,client_factory=StatusClient,paired_launcher=None,
-                 dsv_config=None, use_desktop_dsv=False, autostart=False):
+                 dsv_config=None, use_desktop_dsv=False, autostart=False, notification=None):
         super().__init__(pipe_name,client_factory=client_factory)
         self.store=store;self.selected_account=store.get(account_id) if store is not None and account_id is not None else None
         self.paired_launcher=paired_launcher
@@ -99,8 +101,10 @@ class WorkbenchWindow(StatusWindow):
         self.home_feedback = ''
         self.home_issue = ''
         self._account_login = self._read_account_login()
-        preferences = QSettings('OnlineTrader','Workbench')
-        self._sounds=WorkbenchSounds(preferences, log=self._notification_log)
+        preferences = workbench_preferences()
+        dingtalk = WorkbenchDingTalk(QSettings('OnlineTrader', 'Workbench'), log=self._notification_log,
+                                   initial_config=notification)
+        self._sounds = WorkbenchSounds(preferences, dingtalk=dingtalk)
         self._tray = WorkbenchTray(self, preferences)
         self.setWindowTitle('OnlineTrader · 交易工作台');self.resize(1360,820)
         self.tables={}
@@ -1045,11 +1049,15 @@ class WorkbenchWindow(StatusWindow):
         self.timer.stop();super().closeEvent(event)
 
 
-def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None,autostart=False):
+def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None,autostart=False,
+        update_root=None, notification=None):
     app=QApplication.instance() or QApplication([])
     window=WorkbenchWindow(pipe_name,store=store,account_id=account_id,paired_launcher=paired_launcher,
-                           dsv_config=dsv_config,use_desktop_dsv=True,autostart=autostart)
+                           dsv_config=dsv_config,use_desktop_dsv=True,autostart=autostart, notification=notification)
     window.setAttribute(Qt.WA_DeleteOnClose)
     window.destroyed.connect(app.quit)
     window.show();QTimer.singleShot(0,window.refresh)
+    if update_root is not None:
+        from online_trader.desktop.update_ui import install_update_menu
+        install_update_menu(window, update_root)
     return app.exec()
