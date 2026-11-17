@@ -315,3 +315,67 @@ def quote_reference(api, quotes, deadline):
     if time.monotonic() >= deadline:
         _error('读取行情超时。', 'E_STARTUP_METADATA_TIMEOUT')
     return rows
+
+
+def read_offset_inputs(credential_reference, profile, formula, *, as_of_date=None, now=None,
+                       timeout_seconds=45, sdk_factory=None):
+    """Read DSV calculation inputs from the existing market-only SDK path."""
+    from online_trader.configuration.offsets import formula_source
+    from online_trader.gateway.daily_facts import native_daily_rows
+
+    settings = profile.to_record()['settings']
+    symbols = settings['symbols']
+    if not symbols:
+        _error('请先在策略参数里添加合约。', 'E_OFFSET')
+    series = {symbol['code']: formula_source(formula, symbol['name'], symbol['code'])[1] for symbol in symbols}
+
+    def read(api, deadline, provider):
+        quotes = {code: api.get_quote(code) for code in series}
+        current = now or datetime.now(timezone.utc)
+        day = current.astimezone(BEIJING).date()
+        start, end = day - timedelta(days=20), day + timedelta(days=20)
+        dates = _calendar_dates(api.get_trading_calendar(start, end), start, end)
+        metadata = build_metadata(dates, quotes, list(series), now=current, provider=provider)
+        cutoff, last = metadata['trading_day'], metadata['last_completed_day']
+        if as_of_date and cutoff != as_of_date:
+            _error('填写的截止交易日与当前行情交易日不一致。', 'E_OFFSET_DAY')
+        calendar = TradingCalendar.from_record(metadata['calendar'])
+        if not all(calendar.query(code, _utc(current))['is_trading'] for code in series):
+            _error('所选合约不在共同交易时段。', 'E_OFFSET_SESSION')
+        serials = {identity: api.get_kline_serial(identity, 86400, data_length=120)
+                   for identity in sorted(set(series.values()))}
+        while time.monotonic() < deadline:
+            ranges = {}
+            instant = now or datetime.now(timezone.utc)
+            for code, quote in quotes.items():
+                period = calendar.query(code, _utc(instant))
+                if not period['is_trading'] or period['trading_day'] != cutoff:
+                    _error('行情取数未在同一交易时段完成。', 'E_OFFSET_SESSION')
+                try:
+                    source = datetime.fromisoformat(_get(quote, 'datetime'))
+                except (ValueError, TypeError):
+                    continue
+                if source.tzinfo is None:
+                    source = source.replace(tzinfo=BEIJING)
+                source_period = calendar.query(code, _utc(source))
+                if (not 0 <= (instant-source).total_seconds() <= 15
+                        or source_period['session'] != period['session']):
+                    continue
+                high = number(_get(quote, 'highest'))
+                low = number(_get(quote, 'lowest'))
+                if high is not None and low is not None and 0 < Decimal(low) <= Decimal(high):
+                    ranges[code] = decimal_text(Decimal(high) - Decimal(low))
+            if len(ranges) == len(series):
+                try:
+                    daily, _ = native_daily_rows(api, serials, cutoff, last)
+                except TraderError as error:
+                    if error.code != 'E_NOT_READY':
+                        raise
+                else:
+                    return {'as_of_date': cutoff, 'last_completed_day': last,
+                            'daily_rows': [row for row in daily if row['date'] < cutoff],
+                            'realized_ranges': ranges}
+            api.wait_update(deadline=time.time() + min(.3, max(0, deadline-time.monotonic())))
+        _error('完整日线或当前振幅未同步，请检查行情后重试。', 'E_OFFSET_INPUTS')
+
+    return _read_market(credential_reference, read, timeout_seconds=timeout_seconds, sdk_factory=sdk_factory)

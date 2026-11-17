@@ -8,8 +8,10 @@ from dataclasses import dataclass
 import ctypes
 from ctypes import wintypes
 from pathlib import Path
+import re
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 
 import online_trader
 from online_trader import __version__
@@ -90,6 +92,30 @@ def resolve_environment():
         raise TraderError('E_DEPENDENCY', '模拟连接组件未就绪，请检查当前应用环境。')
     return runtime
 
+
+
+def fetch_offset_inputs(store, account_id, profile, formula, as_of_date):
+    """Run the read-only market request in the installed SDK environment."""
+    from online_trader.configuration.files import export_profile
+    from online_trader.marketdata import bounded_json
+
+    runtime = resolve_environment().probe()
+    with TemporaryDirectory(prefix='onlinetrader-offset-') as directory:
+        request, response = Path(directory)/'profile.json', Path(directory)/'inputs.json'
+        export_profile(profile, request)
+        command = runtime.command('data', 'offset-inputs', '--store', store.directory, '--account-id',
+                                  account_id, '--profile', request, '--output', response, '--formula', formula)
+        if as_of_date:
+            command.extend(('--as-of-date', as_of_date))
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=90,
+                                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        except (OSError, subprocess.TimeoutExpired):
+            raise TraderError('E_OFFSET_INPUTS', '联网取数未完成。') from None
+        if result.returncode:
+            code = re.findall(rb'^([A-Z][A-Z0-9_]{1,49}): ', result.stderr, re.MULTILINE)
+            raise TraderError(code[-1].decode() if code else 'E_OFFSET_INPUTS', '联网取数未完成。')
+        return bounded_json(response)
 
 def launch_bootstrap(request_path, output, *, runtime=None):
     """Start one explicitly confirmed desktop request in its existing SDK.

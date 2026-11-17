@@ -7,8 +7,10 @@ import unittest
 from unittest.mock import patch
 
 from online_trader.accounts import AccountStore
+from online_trader.configuration.baseline import load_confirmed_baseline
+from online_trader.configuration.dsv import DsvProfile
 from online_trader.errors import TraderError
-from online_trader.runtime.startup_metadata import _sdk_factory, build_metadata, read_contract_catalog, read_metadata
+from online_trader.runtime.startup_metadata import _sdk_factory, build_metadata, read_contract_catalog, read_metadata, read_offset_inputs
 from online_trader.scheduling.calendar import TradingCalendar
 from tests.test_accounts import MemoryVault
 
@@ -82,6 +84,47 @@ class StartupMetadataTests(unittest.TestCase):
         self.assertEqual((rows[0]['contract_id'], rows[0]['main_contract'], rows[0]['main_expiry_date']),
                          (CODE,'SHFE.ag2701','2027-01-15'))
         self.assertEqual((rows[0]['margin'],rows[0]['volume_multiple']),('1500','15'))
+
+    def test_market_offset_inputs_use_only_completed_daily_bars_and_same_session_range(self):
+        class OffsetApi(Api):
+            def __init__(self):
+                super().__init__()
+                self.quote.update(datetime='2026-11-12 14:00:00.000', highest=102, lowest=90)
+                self.history_calls = []
+
+            def get_kline_serial(self, code, duration, data_length):
+                self.history_calls.append((code, duration, data_length))
+                bars = [{'id': index, 'datetime': int(datetime(2026, 11, day, tzinfo=timezone.utc).timestamp()) * 10**9,
+                         'high': 101, 'low': 90, 'close': 97}
+                        for index, day in enumerate((10, 11, 12), start=1)]
+                return SimpleNamespace(to_dict=lambda orient: bars)
+
+            def is_serial_ready(self, serial):
+                return True
+
+        baseline = load_confirmed_baseline()[0].to_settings()
+        baseline['symbols'][0].update(name='白银', code=CODE)
+        baseline['symbols'] = baseline['symbols'][:1]
+        profile = DsvProfile.from_settings(baseline)
+        instant = datetime.fromisoformat('2026-11-12T14:00:01+08:00')
+        api = OffsetApi()
+        result = read_offset_inputs(self.reference, profile, 'atr20_main', now=instant,
+                                    sdk_factory=lambda *a, **kw: api)
+        self.assertEqual(api.history_calls, [('KQ.m@SHFE.ag', 86400, 120)])
+        self.assertEqual(result['as_of_date'], '2026-11-12')
+        self.assertEqual(result['last_completed_day'], '2026-11-11')
+        self.assertEqual([item['date'] for item in result['daily_rows']], ['2026-11-10', '2026-11-11'])
+        self.assertEqual(result['realized_ranges'], {CODE:'12'})
+        self.assertTrue(api.closed)
+
+        offline = OffsetApi()
+        with self.assertRaises(TraderError) as error:
+            read_offset_inputs(self.reference, profile, 'atr20_main',
+                               now=datetime.fromisoformat('2026-11-12T12:00:00+08:00'),
+                               sdk_factory=lambda *a, **kw: offline)
+        self.assertEqual(error.exception.code, 'E_OFFSET_SESSION')
+        self.assertEqual(offline.history_calls, [])
+        self.assertTrue(offline.closed)
 
     def test_catalog_queries_futures_and_closes_on_success_and_failure(self):
         api = Api()

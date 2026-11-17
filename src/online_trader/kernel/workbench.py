@@ -4,7 +4,7 @@ No SDK methods that wait for network data and no second execution state exist.
 Business rows come exclusively from accepted commits at the stated watermark.
 """
 import copy
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 import time
 
@@ -126,9 +126,12 @@ def workbench_view(kernel):
             native_error=error.code
     day=native['trading_day'] if native and native['complete'] else None
     symbols={row['code']:row for row in runtime.profile.to_record()['settings']['symbols']} if runtime else {}
+    decision_states = {}
     for row in kernel.ledger.query('SELECT payload_json FROM strategy_proposals WHERE recorded_event_seq<=? ORDER BY recorded_event_seq DESC LIMIT 512',(kernel._durable_seq,)):
         value=strict_loads(row['payload_json']);state=value.get('state',{})
-        decisions.setdefault((state.get('contract_id'),state.get('trading_day')),value.get('report') or {})
+        decision_key = state.get('contract_id'), state.get('trading_day')
+        decisions.setdefault(decision_key, value.get('report') or {})
+        decision_states.setdefault(decision_key, state)
     latest={}
     for (code,trading_day),row in sorted((runtime._latest if runtime else {}).items()):
         if day is None or trading_day==day:
@@ -162,11 +165,25 @@ def workbench_view(kernel):
                         'upper_limit','lower_limit','margin','commission','price_tick','bid_volume1','ask_volume1','volume_multiple')}
             except (TypeError,ValueError,AttributeError):
                 pass
+        decision_key = name, event['trading_day']
+        decision_state = decision_states.get(decision_key, {})
+        decision_report = decisions.get(decision_key, {})
+        decision_details = {}
+        if all(decision_state.get(state_key) == event[event_key] for state_key, event_key in (
+                ('session_id', 'session_id'), ('source_epoch', 'source_epoch'), ('last_sequence', 'sequence'))):
+            levels = {side: price for side, price in decision_state.get('last_trigger_prices', {}).items()
+                      if side in {'LONG', 'SHORT'} and price is not None}
+            if levels:
+                decision_details['trigger_prices'] = levels
+            decision_time = (decision_report.get('market_log') or {}).get('decision_time_utc')
+            if decision_time:
+                decision_details['decision_time_utc'] = datetime.fromisoformat(decision_time).astimezone(
+                    timezone.utc).isoformat().replace('+00:00', 'Z')
         markets.append({key:event.get(key) for key in ('contract_id','trading_day','session_id','last','bid1','ask1','day_high','day_low','source_time_utc','path_complete')}
             |{'name':symbol.get('name',name),'fresh':fresh,'enabled':kernel.control.symbol_entry_enabled(name,committed=True),
               'entry_switch_revision':kernel.control.symbol_entries.get(name,{}).get('revision',0),
               'entry_reasons':copy.deepcopy(decisions.get((name,event['trading_day']),{}).get('reasons',[]))}
-            |quote_details)
+            |quote_details|decision_details)
     if scoped:
         displayed={row['contract_id'] for row in markets}
         for code in kernel.simulation.grant.value['contracts']:
@@ -316,10 +333,13 @@ def workbench_view(kernel):
             broker_order=broker_orders.get(native_id)
             native_time=getattr(broker_order,'insert_date_time',None)
             orders.append({key:order.get(key) for key in ('child_order_id','intent_id','attempt_id','effect','original_qty','filled_qty',
-                'limit_price','native_offset','native_trading_day','send_state','broker_state','cancel_status','terminal_confirmed')}
+                'limit_price','native_offset','native_trading_day','send_state','broker_state','cancel_status','terminal_confirmed','reported_fill_qty')}
                 |{'native_order_id':native_id,'direction':p['direction'],
                   'source_time_ns':str(native_time) if type(native_time) is int and native_time>0 else None,
-                  'native_message':str(getattr(broker_order,'last_msg',''))[:200] if broker_order is not None else None}
+                  'native_message':str(getattr(broker_order,'last_msg',''))[:200] if broker_order is not None else None,
+                  'order_source': ('MANUAL' if (order['effect'] == 'OPEN' and cycle.get('manual_limit_order')) or
+                                   order['child_order_id'] in (cycle.get('execution') or {}).get('manual_reduction_children', {})
+                                   else 'STRATEGY' if (cycle.get('strategy_metadata') or {}).get('candidate') else None)}
                 |{'position_cycle_id':cid,'contract_id':p['contract_id'],'potential_remaining':OrderState.from_dict(order).potential_remaining})
     commands=[copy.deepcopy(s['receipt']) for s in kernel.control.states.values() if s.get('receipt')]
     policies=[]

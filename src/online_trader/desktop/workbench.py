@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 import uuid
-from PySide6.QtCore import QItemSelectionModel,QSettings,QStandardPaths,Qt,QThread,QTimer,Signal
+from PySide6.QtCore import QEvent,QItemSelectionModel,QSettings,QStandardPaths,Qt,QThread,QTimer,Signal
 from PySide6.QtWidgets import (QApplication,QLabel,QLineEdit,QPushButton,QTableWidget,
     QTableWidgetItem,QInputDialog,QFileDialog,QMessageBox)
 
@@ -991,6 +991,12 @@ class WorkbenchWindow(StatusWindow):
         return self.dashboard.checked_start_profile()
 
     def _result(self,result):super()._result(result)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.WindowStateChange and hasattr(self, '_tray')
+                and self.isMinimized() and not event.oldState() & Qt.WindowState.WindowMinimized):
+            self._tray.on_minimized()
 
     def closeEvent(self,event):
         if self._strategy_starter is not None and self._strategy_starter.is_preparing():

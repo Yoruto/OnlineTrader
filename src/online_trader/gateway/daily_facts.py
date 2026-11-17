@@ -12,6 +12,40 @@ from online_trader.gateway.dsv_facts import native_integer,utc
 from online_trader.gateway.tqkq import number
 
 
+def native_daily_rows(api, serials, cutoff, last):
+    """Validate exact initialized bars and the explicitly completed source day."""
+    rows=[];native=[]
+    for identity,serial in serials.items():
+        if not api.is_serial_ready(serial):raise TraderError('E_NOT_READY','Daily history has not synchronized')
+        bars=[];indices=[]
+        for raw in serial.to_dict('records'):
+            try:index=native_integer(raw.get('id'))
+            except TraderError:continue  # SDK uninitialized padding
+            stamp=native_integer(raw.get('datetime'),minimum=1)
+            seconds,nanos=divmod(stamp,1_000_000_000)
+            # Same conversion as DSV time_to_datetime(...).strftime(date).
+            at=(datetime(1970,1,1,tzinfo=timezone.utc)+timedelta(seconds=seconds,microseconds=nanos//1000)).astimezone(timezone(timedelta(hours=8)))
+            day=at.date().isoformat();values={k:number(raw.get(k)) for k in ('high','low','close')}
+            if any(v is None for v in values.values()):raise TraderError('E_NOT_READY','Daily history contains incomplete price fields')
+            if not Decimal(0)<Decimal(values['low'])<=Decimal(values['close'])<=Decimal(values['high']):
+                raise TraderError('E_FACT_BARRIER','Native daily OHLC values are inconsistent')
+            bars.append({'series_id':identity,'date':day,**values})
+            indices.append(index)
+            native.append({'series_id':identity,'native_id':str(index),'datetime_ns':str(stamp),'daily_date_label':day,**values})
+        if not bars:raise TraderError('E_NOT_READY','No initialized daily bars are available')
+        if len(set(indices))!=len(indices) or any(b!=a+1 for a,b in zip(indices,indices[1:])):
+            raise TraderError('E_FACT_BARRIER','Native daily history has a duplicate or missing initialized index')
+        if len({b['date'] for b in bars})!=len(bars):raise TraderError('E_FACT_BARRIER','Daily history contains duplicate date labels')
+        if any(b['date']<a['date'] for a,b in zip(bars,bars[1:])):raise TraderError('E_FACT_BARRIER','Daily history date labels regress')
+        # An active current-day label proves the SDK has rolled its daily
+        # series. Never mistake a stale/in-progress prior label for a close.
+        if bars[-1]['date']!=cutoff:raise TraderError('E_NOT_READY','The daily series has not rolled to the explicit cabinet-day label')
+        completed=[b for b in bars if b['date']<cutoff]
+        if not completed or completed[-1]['date']!=last:raise TraderError('E_NOT_READY','The exact last completed daily label is missing')
+        rows.extend(bars)
+    return rows, native
+
+
 class NativeDailyFeed:
     def __init__(self,port,profile):
         if (not port.grant.automatic_offsets or profile.content_hash!=port.grant.value['profile_hash']
@@ -27,35 +61,7 @@ class NativeDailyFeed:
     def snapshot(self):
         p=self.port;policy=p.grant.value['auto_offsets'];cutoff=policy['as_of_date'];last=policy['last_completed_day']
         if not p.grant.in_window(p.clock.now()):raise TraderError('E_AUTO_OFFSETS','Daily calculation is outside its finite source window')
-        rows=[];native=[]
-        for identity,serial in self.serials.items():
-            if not p.api.is_serial_ready(serial):raise TraderError('E_NOT_READY','Daily history has not synchronized')
-            bars=[];indices=[]
-            for raw in serial.to_dict('records'):
-                try:index=native_integer(raw.get('id'))
-                except TraderError:continue  # SDK uninitialized padding
-                stamp=native_integer(raw.get('datetime'),minimum=1)
-                seconds,nanos=divmod(stamp,1_000_000_000)
-                # Same conversion as DSV time_to_datetime(...).strftime(date).
-                at=(datetime(1970,1,1,tzinfo=timezone.utc)+timedelta(seconds=seconds,microseconds=nanos//1000)).astimezone(timezone(timedelta(hours=8)))
-                day=at.date().isoformat();values={k:number(raw.get(k)) for k in ('high','low','close')}
-                if any(v is None for v in values.values()):raise TraderError('E_NOT_READY','Daily history contains incomplete price fields')
-                if not Decimal(0)<Decimal(values['low'])<=Decimal(values['close'])<=Decimal(values['high']):
-                    raise TraderError('E_FACT_BARRIER','Native daily OHLC values are inconsistent')
-                bars.append({'series_id':identity,'date':day,**values})
-                indices.append(index)
-                native.append({'series_id':identity,'native_id':str(index),'datetime_ns':str(stamp),'daily_date_label':day,**values})
-            if not bars:raise TraderError('E_NOT_READY','No initialized daily bars are available')
-            if len(set(indices))!=len(indices) or any(b!=a+1 for a,b in zip(indices,indices[1:])):
-                raise TraderError('E_FACT_BARRIER','Native daily history has a duplicate or missing initialized index')
-            if len({b['date'] for b in bars})!=len(bars):raise TraderError('E_FACT_BARRIER','Daily history contains duplicate date labels')
-            if any(b['date']<a['date'] for a,b in zip(bars,bars[1:])):raise TraderError('E_FACT_BARRIER','Daily history date labels regress')
-            # An active current-day label proves the SDK has rolled its daily
-            # series. Never mistake a stale/in-progress prior label for a close.
-            if bars[-1]['date']!=cutoff:raise TraderError('E_NOT_READY','The daily series has not rolled to the explicit cabinet-day label')
-            completed=[b for b in bars if b['date']<cutoff]
-            if not completed or completed[-1]['date']!=last:raise TraderError('E_NOT_READY','The exact last completed daily label is missing')
-            rows.extend(bars)
+        rows,native=native_daily_rows(p.api,self.serials,cutoff,last)
         ranges={};quotes=[]
         for code in self.series:
             window=p.calendar.query(code,utc(p.clock.now()))

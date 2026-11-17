@@ -86,6 +86,12 @@ def main(argv=None):
         if name in {'calendar-import','calendar-review'}:command.add_argument('--as-of-utc',required=True)
         if name=='daily-export':
             command.add_argument('--hash',required=True);command.add_argument('--output',type=Path,required=True)
+    offset_inputs = data_actions.add_parser('offset-inputs', help='只读取得当前合约的 DSV 偏移计算行情输入')
+    for field in ('store', 'profile', 'output'):
+        offset_inputs.add_argument('--' + field, type=Path, required=True)
+    offset_inputs.add_argument('--account-id', required=True)
+    offset_inputs.add_argument('--formula', required=True)
+    offset_inputs.add_argument('--as-of-date')
     from online_trader.configuration.commands import add_parameter_parser
     add_parameter_parser(commands)
     simulation=commands.add_parser('simulation',help='显式的一手快期在线模拟测试；默认内核仍禁开')
@@ -208,6 +214,16 @@ def main(argv=None):
                     fields['line']=fields['line'] or ('TqAccount' if args.provider=='TQ_SIMNOW' else 'TqKq')
                 result=store.change(args.account_action,expected_revision=args.expected_revision,**fields)
             print(json.dumps(result,ensure_ascii=False,indent=2));return 0
+        elif args.action == 'data' and args.data_action == 'offset-inputs':
+            from online_trader.accounts import AccountStore
+            from online_trader.configuration.files import load_profile, publish_new_bytes
+            from online_trader.contracts.codec import canonical_bytes
+            from online_trader.runtime.startup_metadata import read_offset_inputs
+            reference = AccountStore(args.store).credential_reference(args.account_id)
+            result = read_offset_inputs(reference, load_profile(args.profile), args.formula,
+                                        as_of_date=args.as_of_date)
+            publish_new_bytes(canonical_bytes(result), args.output)
+            return 0
         elif args.action=='data':
             from online_trader.marketdata import ReferenceStore,bounded_json,review_calendar
             store=ReferenceStore(args.store)

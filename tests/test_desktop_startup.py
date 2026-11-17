@@ -196,6 +196,7 @@ class DesktopStartupTests(unittest.TestCase):
         window.tabs.setCurrentWidget(window.dashboard.home_tab)
         self.assertFalse(window.dashboard.template_picker.isVisible())
         window.tabs.setCurrentWidget(window.dashboard.parameter_tab)
+        window.dashboard.parameter_sections.setCurrentIndex(1)
         self.assertTrue(window.dashboard.template_picker.isVisible())
         changed = self.profile.to_settings()
         changed['trade']['max_volume'] = 7

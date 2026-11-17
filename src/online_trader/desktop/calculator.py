@@ -1,4 +1,4 @@
-"""Offline DSV offset calculator: cached data, comparison, explicit preview apply."""
+"""DSV offset calculator with completed daily data and explicit preview apply."""
 import json
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QFileDialog, QHBoxLayout,
@@ -17,7 +17,7 @@ class OffsetCalculatorDialog(QDialog):
         self.base_hash = profile.content_hash
         self.dataset, self.calculation = None, None
         self._rendering = False
-        self.setWindowTitle("OnlineTrader · DSV离线偏移计算器"); self.resize(1240, 780)
+        self.setWindowTitle("OnlineTrader · DSV偏移计算器"); self.resize(1240, 780)
         layout = QVBoxLayout(self)
         notice = QLabel("加载离线日线CSV后计算。截止交易日当天及之后的日线不参与；当日振幅留空时按DSV不启用上限。勾选结果并应用只更新参数预览。")
         notice.setWordWrap(True); layout.addWidget(notice)
@@ -124,6 +124,34 @@ class OffsetCalculatorDialog(QDialog):
         self.dataset = dataset; self.invalidate(); summary = dataset.summary()
         self.data_label.setText(f"已缓存{summary['bars']}根日线、{len(summary['series'])}个序列。数据哈希：{summary['data_hash']}")
         self.error_label.clear(); return True
+
+
+    def calculation_input(self):
+        return (self.base_profile, self.formula_combo.currentData(), self.date_input.text().strip(),
+                self.ceiling_input.text(), self.floor_input.text(),
+                tuple(self.table.item(row, 2).text() for row in range(self.table.rowCount())))
+
+    def calculate_with_market(self, inputs):
+        from online_trader.runtime.auto_offsets import dataset_from_rows
+        symbols = self.base_profile.to_record()['settings']['symbols']
+        try:
+            dataset = dataset_from_rows(inputs['daily_rows'])
+            ranges = [inputs['realized_ranges'][symbol['code']] for symbol in symbols]
+        except (KeyError, TypeError, TraderError):
+            self.error_label.setText('行情返回的日线或振幅未通过校验，原数据缓存保留。')
+            return False
+        self.dataset = dataset
+        self.date_input.setText(inputs['as_of_date'])
+        self._rendering = True
+        try:
+            for index, variation in enumerate(ranges):
+                self.table.item(index, 2).setText(variation)
+        finally:
+            self._rendering = False
+        summary = dataset.summary()
+        self.data_label.setText(f"原生行情 · {summary['bars']} 根已完成日线 · "
+                                f"最后完整交易日 {inputs['last_completed_day']} · {summary['data_hash']}")
+        return self.calculate()
 
     def set_coefficients(self, raw):
         values = form_values(self.base_profile); values["auto_offset"]["coef"] = raw

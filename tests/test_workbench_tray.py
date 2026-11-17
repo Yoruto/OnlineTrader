@@ -48,6 +48,50 @@ class WorkbenchTrayTests(unittest.TestCase):
             self.assertFalse(window.timer.isActive())
             icon.hide.assert_called_once()
 
+    def test_minimize_button_hides_same_window_and_tray_restores_maximized_state(self):
+        with (patch('online_trader.desktop.workbench.QSettings', return_value=self.settings),
+              patch('online_trader.desktop.tray.QSystemTrayIcon') as tray):
+            tray.isSystemTrayAvailable.return_value = True
+            tray.Trigger = QSystemTrayIcon.Trigger
+            tray.DoubleClick = QSystemTrayIcon.DoubleClick
+            icon = tray.return_value
+            icon.isVisible.return_value = True
+            window = WorkbenchWindow(None)
+            self.addCleanup(window.deleteLater)
+            try:
+                window.showMaximized()
+                self.app.processEvents()
+                self.assertTrue(window.isMaximized())
+                window.showMinimized()
+                self.app.processEvents()
+                self.assertFalse(window.isVisible())
+                self.assertTrue(window.timer.isActive())
+                window._tray.on_activate(tray.DoubleClick)
+                self.assertTrue(window.isVisible())
+                self.assertFalse(window.isMinimized())
+                self.assertTrue(window.isMaximized())
+            finally:
+                window._tray.close_window()
+
+    def test_minimize_uses_taskbar_if_tray_setting_is_off_or_unavailable(self):
+        for enabled, available in ((False, True), (True, False)):
+            with self.subTest(enabled=enabled, available=available):
+                self.settings.setValue('minimize_to_tray', enabled)
+                with (patch('online_trader.desktop.workbench.QSettings', return_value=self.settings),
+                      patch('online_trader.desktop.tray.QSystemTrayIcon.isSystemTrayAvailable',
+                            return_value=available)):
+                    window = WorkbenchWindow(None)
+                    self.addCleanup(window.deleteLater)
+                    try:
+                        window.show()
+                        window.showMinimized()
+                        self.app.processEvents()
+                        self.assertTrue(window.isMinimized())
+                        self.assertTrue(window.isVisible())
+                        self.assertTrue(window.timer.isActive())
+                    finally:
+                        window._tray.close_window()
+
     def test_saved_preference_shows_icon_before_first_close_and_updates_status(self):
         self.settings.setValue('minimize_to_tray', True)
         with (patch('online_trader.desktop.workbench.QSettings', return_value=self.settings),

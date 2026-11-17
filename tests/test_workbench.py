@@ -257,12 +257,16 @@ class WorkbenchDesktopTests(unittest.TestCase):
             self.assertFalse(window._stale)
             self.assertIn('未连接', window.connection_detail.text())
             self.assertEqual([window.tabs.tabText(index) for index in range(window.tabs.count())],
-                             ['策略主控', '实时监控', '挂单汇总', '手动下单', '运行日志',
-                              '品种信息', '偏移计算', '系统设置', '账号信息', '交易参数'])
+                             ['交易工作台', '订单与成交', '策略参数', '日志与诊断', '账户与设置'])
             dashboard = window.dashboard
             window.show()
             self.app.processEvents()
-            self.assertTrue(dashboard.symbol_grid.isVisible())
+            self.assertTrue(dashboard.dashboard_markets.isVisible())
+            self.assertFalse(dashboard.symbol_grid.isVisible())
+            self.assertFalse(dashboard.home_positions.isVisible())
+            dashboard.home_sections.setCurrentWidget(dashboard.position_tab)
+            self.assertFalse(dashboard.dashboard_markets.isVisible())
+            self.assertTrue(dashboard.home_empty_positions.isVisible())
             self.assertTrue(window.command_buttons['arm'].isVisible())
             self.assertFalse(dashboard.home_account.isVisible())
             self.assertFalse(dashboard.parameter_fields['max_volume'].isVisible())
@@ -270,12 +274,40 @@ class WorkbenchDesktopTests(unittest.TestCase):
             self.assertTrue(dashboard.home_account.isVisible())
             self.assertTrue(window.command_buttons['arm'].isVisible())
             window.tabs.setCurrentWidget(dashboard.parameter_tab)
+            self.assertTrue(dashboard.symbol_grid.isVisible())
+            dashboard.parameter_sections.setCurrentIndex(1)
             self.assertTrue(dashboard.parameter_fields['max_volume'].isVisible())
             self.assertFalse(dashboard.home_account.isVisible())
             self.assertFalse(window.dashboard.submit_button.isEnabled())
             self.assertIn('未知',window.funds_label.text());window.filter_input.setText('p2701');self.assertFalse(window.tables['markets'].isRowHidden(0))
             window.filter_input.setText('铜');self.assertTrue(window.tables['markets'].isRowHidden(0))
         finally:window.close();self.app.processEvents()
+    def test_market_break_uses_owner_session_status_instead_of_quote_lag(self):
+        window = WorkbenchWindow(None)
+        try:
+            window.timer.stop()
+            snapshot = view()
+            snapshot['connection'].update(broker_connected=True, synchronized=True)
+            snapshot['configuration']['scoped_contracts'] = ['DCE.p2701']
+            snapshot['configuration']['strategy_monitor'] = {'quote_status': '休市', 'symbols': []}
+            quote = {'contract_id': 'DCE.p2701', 'fresh': False, 'source_time_utc': None}
+            snapshot['markets'] = [quote]
+            window.view = snapshot
+            window._stale = False
+            dashboard = window.dashboard
+            dashboard.render_home()
+            self.assertEqual(dashboard.toolbar_status[0][1].text(), '行情 休市')
+            self.assertEqual(dashboard.dashboard_markets.item(0, 4).text(), '休市')
+            snapshot['configuration']['strategy_monitor']['quote_status'] = '等待行情'
+            dashboard.render_home()
+            self.assertEqual(dashboard.toolbar_status[0][1].text(), '行情 等待行情')
+            quote['source_time_utc'] = '2026-11-17T05:30:00Z'
+            dashboard.render_home()
+            self.assertEqual(dashboard.toolbar_status[0][1].text(), '行情 1 个合约滞后')
+        finally:
+            window.close()
+            self.app.processEvents()
+
     def test_home_reads_bound_account_and_runtime_symbols_and_hides_resolved_items(self):
         account = {'account_id': 'account-local', 'account_key': 'account-test',
                    'masked_login': '****82', 'environment': 'ONLINE_SIM'}

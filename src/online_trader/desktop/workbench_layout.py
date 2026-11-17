@@ -3,18 +3,19 @@ from collections import deque
 import csv
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from html import escape
 from io import StringIO
 from pathlib import Path
 import re
 import time
 from typing import NamedTuple
 
-from PySide6.QtCore import QBuffer, QIODevice, QItemSelectionModel, QPointF, QSettings, Qt, QTimer
-from PySide6.QtGui import QColor, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtCore import QBuffer, QIODevice, QItemSelectionModel, QPointF, QRectF, QSettings, QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox,
+    QApplication, QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
-    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
+    QPushButton, QScrollArea, QSplitter, QSizePolicy, QSpinBox, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QTabBar, QTabWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
@@ -31,6 +32,7 @@ from online_trader.desktop.runtime_logs import (
 )
 from online_trader.errors import TraderError
 from online_trader.runtime.comparison import dsv_log_category
+from online_trader.runtime.strategy_log import BLOCK_MESSAGES, ENTRY_FILTERS
 
 
 BEIJING = timezone(timedelta(hours=8))
@@ -139,37 +141,136 @@ TRADE_SWITCHES = (
     ('protect_80_enabled','80% 止盈保护'), ('protect_stop_day','触发后停开'), ('half_close_enabled','启用半仓减仓'),
 )
 STYLE = """
-QWidget { color: #172438; }
-QWidget#tradingWorkspace, QTabWidget::pane, QGroupBox { background: #f2f5f9; }
-QTabWidget::pane { border: 1px solid #d7dfe9; }
-QTabBar::tab { background: #e0e6ee; border: 1px solid #aab5c2; padding: 8px 17px; }
-QTabBar::tab:selected { background: #235de6; color: white; font-weight: bold; }
-QGroupBox { border: 1px solid #d8e1ed; margin-top: 13px; font-weight: bold; }
-QGroupBox::title { subcontrol-origin: margin; left: 3px; padding-right: 5px; color: #1746a1; }
+QWidget { color: #162236; }
+QWidget#tradingWorkspace { background: #f4f7fb; }
+QWidget#workspacePage, QScrollArea#workbenchScroll, QTabWidget::pane {
+    background: #fafcff; border: 0;
+}
+QFrame#workspaceTop { background: #fafdff; border-bottom: 1px solid #d7e1ef; }
+QLabel#brand { color: #111d30; font-size: 22px; font-weight: 700; padding-right: 10px; }
+QLabel#topStatus { font-size: 13px; color: #314057; padding-right: 7px; }
+QLabel#workspaceTitle { font-size: 26px; font-weight: 700; color: #101a2b; padding: 1px 0 5px; }
+
+QGroupBox {
+    background: #ffffff; border: 1px solid #d8e2ef; border-radius: 8px;
+    margin-top: 13px; font-weight: 600;
+}
+QGroupBox::title { subcontrol-origin: margin; left: 9px; padding: 0 4px; color: #2d435e; }
 QGroupBox QWidget { font-weight: normal; }
-QPushButton { background: #e0e7f0; border: 1px solid #dce4ee; padding: 4px 10px; }
-QPushButton:hover { background: #d4e1f4; border-color: #a8bdd9; }
-QPushButton:disabled { color: #70839b; background: #e7edf4; }
-QPushButton#strategyStart, QPushButton#strategyPause { font-weight: bold; padding: 9px 16px; }
-QPushButton#strategyStart { background: #e52024; border-color: #e52024; color: white; }
-QPushButton#strategyPause { background: #536b89; border-color: #536b89; color: white; }
-QPushButton#strategyStart:disabled, QPushButton#strategyPause:disabled { background: #cbd5e3; color: #6c7e96; border-color: #cbd5e3; }
-QLineEdit, QSpinBox, QComboBox { background: white; border: 1px solid #c6d4e7; padding: 2px 4px; }
-QTableWidget { background: white; alternate-background-color: #f5f8fc; border: 1px solid #a9bbd3; }
-QHeaderView::section { background: #1b2638; color: white; border: 0; padding: 7px 4px; font-weight: bold; }
-QLabel#brand { color: #16479c; font-weight: bold; padding: 5px 4px; }
-QTabWidget#workspaceNavigation::tab-bar { alignment: left; }
-QScrollArea#workbenchScroll, QWidget#workbenchPage { background: #f2f5f9; border: 0; }
-QLabel#homeMoney { font-size: 22px; font-weight: bold; }
+QGroupBox#workspaceCard {
+    background: #ffffff; margin-top: 0; padding-top: 24px;
+}
+QGroupBox#workspaceCard::title {
+    subcontrol-origin: padding; top: 10px; left: 12px; padding: 0 0 0 8px;
+    border-left: 3px solid #2b7bf4; color: #111c2e; font-size: 15px; font-weight: 700;
+}
+QFrame#workspaceFunds {
+    background: #f7faff; border: 1px solid #d8e3f2; border-radius: 8px;
+}
+QLabel#fundMetric { color: #172438; font-size: 14px; font-weight: 600; padding: 5px 8px; }
+QLabel#fundMetric[gain="true"] { color: #bd263e; }
+QLabel#fundMetric[loss="true"] { color: #08764d; }
+QFrame#fundDivider { background: #d5e0ef; }
+QSplitter::handle { background: transparent; }
+
+QTabBar::tab {
+    background: #eff4fa; color: #43546b; border: 1px solid #dee7f2;
+    padding: 7px 13px;
+}
+QTabBar::tab:selected { background: #e4efff; color: #075de5; font-weight: 600; }
+QTabWidget#workspaceNavigation::pane {
+    background: #fafcff; border: 1px solid #e3eaf4; border-radius: 9px;
+}
+QTabWidget#workspaceSection::pane { border-top: 1px solid #e4ebf4; }
+QTabWidget#workspaceSection > QTabBar::tab {
+    background: transparent; color: #34465e; border: 0; border-bottom: 2px solid transparent;
+    padding: 8px 15px;
+}
+QTabWidget#workspaceSection > QTabBar::tab:hover { background: #eef5ff; }
+QTabWidget#workspaceSection > QTabBar::tab:selected {
+    color: #075de5; border-bottom-color: #0963f7; font-weight: 700;
+}
+
+QPushButton {
+    background: #ffffff; color: #253750; border: 1px solid #d4e0ef;
+    border-radius: 6px; padding: 5px 10px;
+}
+QPushButton:hover { background: #eef5ff; border-color: #a7c8fa; }
+QPushButton:pressed { background: #dceaff; }
+QPushButton:focus { border-color: #4388f5; }
+QPushButton:disabled { color: #6a7b91; background: #f0f3f8; border-color: #e1e8f1; }
+QPushButton#strategyStart, QPushButton#strategyPause { font-weight: 700; padding: 7px 15px; }
+QPushButton#strategyStart { background: #0963f7; color: white; border-color: #0963f7; }
+QPushButton#strategyStart:hover { background: #074fc8; border-color: #074fc8; }
+QPushButton#strategyPause { background: #fff7f2; border-color: #e8a082; color: #a03816; }
+QPushButton#strategyPause:hover { background: #ffece0; border-color: #d47550; }
+QPushButton#strategyStart:disabled, QPushButton#strategyPause:disabled {
+    background: #ebf0f7; color: #657891; border-color: #dce5f0;
+}
+QPushButton#workspaceAccount {
+    background: #e8f1ff; border-color: #d5e5ff; color: #1459b9; font-weight: 600;
+}
+QPushButton#workspaceAccount:hover { background: #dceaff; }
+
+QLineEdit, QSpinBox, QComboBox {
+    background: #ffffff; border: 1px solid #d3dfed; border-radius: 5px; padding: 3px 6px;
+}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: #4388f5; }
+QTableWidget {
+    background: #ffffff; alternate-background-color: #f9fbfe;
+    border: 1px solid #e0e8f3; border-radius: 6px;
+    selection-background-color: #dceaff; selection-color: #172438;
+    outline: 0;
+}
+QTableWidget::item { padding: 3px 7px; border-bottom: 1px solid #edf2f8; }
+QTableWidget::item:selected, QTableWidget::item:selected:!active {
+    background: #dceaff; color: #172438; border-bottom: 1px solid #d5e6ff;
+}
+QHeaderView::section {
+    background: #eff4fa; color: #33455d; border: 0;
+    border-bottom: 1px solid #e0e8f3; padding: 6px 5px; font-weight: 600;
+}
+QTableWidget#dashboardGrid { border: 0; }
+QLabel#decisionStatus {
+    background: #e7f1ff; color: #084caf; border-radius: 6px;
+    font-size: 16px; font-weight: 700; padding: 9px 11px;
+}
+QLabel#workspaceDetail { color: #26384f; padding: 2px 3px; }
+QFrame#decisionField { background: #f4f8fd; border-radius: 3px; }
+QLabel#decisionValue { font-weight: 600; color: #152640; }
+QLabel#decisionReason {
+    background: #f1f7ff; border: 1px solid #dceafe; border-radius: 6px;
+    padding: 8px 10px; color: #2a4363;
+}
+QLabel#chartTitle { font-size: 15px; font-weight: 700; }
+QLabel#chartSource, QLabel#workspaceNote { color: #5b6d84; }
+QLabel#homeMoney { font-size: 22px; font-weight: 700; }
 QLabel#homeAccountType { color: #214da5; background: #eaf1ff; border-radius: 4px; padding: 3px 7px; }
 QLabel#homeAccountType[live="true"] { color: #7c4c08; background: #fff3df; }
-QLabel#homePending { color: #7c4c08; background: #fff3df; border-radius: 6px; padding: 6px 10px; }
+QLabel#homePending {
+    color: #8b4e0e; background: #fff6e4; border: 1px solid #f3dfb8;
+    border-radius: 6px; padding: 5px 9px;
+}
 QLabel#waiting, QLabel#blocked, QLabel#pending { padding: 7px; }
 QLabel#waiting { background: #ecfaf2; color: #195d40; }
 QLabel#blocked { background: #fff0f0; color: #9d252c; }
 QLabel#pending { background: #fff5e8; color: #884605; }
-QPlainTextEdit#runtimeLog { background: #1d202a; color: #e4ebfa; border: 1px solid #394355; font-family: Consolas; }
+QPlainTextEdit#runtimeLog {
+    background: #1d202a; color: #e4ebfa; border: 1px solid #394355;
+    border-radius: 6px; font-family: Consolas;
+}
 """
+
+
+def detail_markup(lines):
+    cells = []
+    for index, line in enumerate(lines):
+        label, separator, value = line.partition('    ')
+        background = '#f5f8fd' if index % 2 == 0 else '#ffffff'
+        row = (f'<td>{escape(label)}</td><td><b>{escape(value)}</b></td>' if separator
+               else f'<td colspan="2"><b>{escape(label)}</b></td>')
+        cells.append(f'<tr bgcolor="{background}">{row}</tr>')
+    return '<table width="100%" cellpadding="4" cellspacing="0">' + ''.join(cells) + '</table>'
 
 
 def row(*widgets):
@@ -192,7 +293,11 @@ def group(title, parent_layout, *, stretch=0, horizontal=False):
     layout = QHBoxLayout(box) if horizontal else QVBoxLayout(box)
     layout.setContentsMargins(8, 8, 8, 8)
     layout.setSpacing(6)
-    parent_layout.addWidget(box, stretch)
+    if isinstance(parent_layout, QSplitter):
+        parent_layout.addWidget(box)
+        parent_layout.setStretchFactor(parent_layout.indexOf(box), stretch)
+    else:
+        parent_layout.addWidget(box, stretch)
     return layout
 
 
@@ -318,6 +423,7 @@ class MinuteCandles(QWidget):
     def __init__(self):
         super().__init__()
         self.native_series = {}
+        self.trigger_lines = {}
         self.code = ''
         self.setMinimumHeight(105)
 
@@ -338,26 +444,139 @@ class MinuteCandles(QWidget):
         if not candles:
             painter.drawText(12, 27, '等待原生分钟 K 线')
             return
-        low = min(item[3] for item in candles)
-        high = max(item[2] for item in candles)
-        span = high-low or Decimal(1)
-        last = candles[-1][0]
-        plot = self.rect().adjusted(66, 12, -14, -22)
-        painter.drawText(4, 18, str(high))
-        painter.drawText(4, plot.bottom(), str(low))
-        painter.drawText(plot.right()-38, self.height()-5, datetime.fromtimestamp(last*60, BEIJING).strftime('%H:%M'))
+        trigger_prices = [Decimal(value) for value in self.trigger_lines.values()]
+        low = min([item[3] for item in candles] + trigger_prices)
+        high = max([item[2] for item in candles] + trigger_prices)
+        span = high-low
+        plot = self.rect().adjusted(10, 15, -80, -24)
         painter.setPen(QColor('#d7e0eb'))
         painter.drawRect(plot)
-        step = plot.width()/60
+        step = plot.width()/max(len(candles), 8)
+
         def y(price):
-            return plot.bottom()-4-(plot.height()-8)*float((price-low)/span)
+            return (plot.bottom()-8-(plot.height()-16)*float((price-low)/span)
+                    if span else float(plot.center().y()))
+
+        for index in range(5):
+            level = high - (high-low)*index/4
+            position = y(level)
+            painter.setPen(QColor('#eff3f8'))
+            painter.drawLine(QPointF(plot.left(), position), QPointF(plot.right(), position))
+            painter.setPen(QColor('#52647d'))
+            painter.drawText(QPointF(plot.right()+9, position+4),
+                             format(level.quantize(Decimal('0.01')).normalize(), 'f'))
+            if not span:
+                break
+        for index in range(0, len(candles), max(1, (len(candles)+4)//5)):
+            x = plot.left()+(index+.5)*step
+            stamp = datetime.fromtimestamp(candles[index][0]*60, BEIJING).strftime('%H:%M')
+            painter.drawText(QPointF(max(plot.left(), min(x-18, plot.right()-36)), self.height()-5), stamp)
+        for side, value in self.trigger_lines.items():
+            position = y(Decimal(value))
+            color = QColor('#0963f7' if side == 'LONG' else '#8a52b8')
+            painter.setPen(QPen(color, 1, Qt.DashLine))
+            painter.drawLine(QPointF(plot.left(), position), QPointF(plot.right(), position))
+            tag = QRectF(plot.right()+4, position-8, 70, 16)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(tag, 3, 3)
+            painter.setPen(QColor('#ffffff'))
+            painter.drawText(tag, Qt.AlignCenter, str(value))
+            painter.setPen(color)
+            label_y = position + 15 if position < plot.top() + 18 else position - 4
+            painter.drawText(QPointF(plot.left()+8, label_y), '多头触发' if side == 'LONG' else '空头触发')
         for index, (_, opening, maximum, minimum, closing) in enumerate(candles):
-            x = plot.right()-(len(candles)-index-.5)*step
+            x = plot.left() + (index+.5)*step
             color = QColor('#c8323c' if closing >= opening else '#23845b')
             painter.setPen(QPen(color, 1))
             painter.drawLine(QPointF(x, y(maximum)), QPointF(x, y(minimum)))
-            painter.setPen(QPen(color, max(2, step*.52)))
+            painter.setPen(QPen(color, min(12, max(2, step*.52))))
             painter.drawLine(QPointF(x, y(opening)), QPointF(x, y(closing)+1))
+
+
+class StatusBadge(QStyledItemDelegate):
+    """Draw text and color together without changing the table's data or selection."""
+
+    colors = {
+        '保护中': ('#dff4e6', '#107041'),
+        '价格保护中': ('#dff4e6', '#107041'),
+        '持仓中': ('#dff4e6', '#107041'),
+        '等待触发': ('#e1edff', '#0758c9'),
+        '行情滞后': ('#fff1d3', '#945215'),
+        '平仓待确认': ('#fff1d3', '#945215'),
+        '保护待核对': ('#fff1d3', '#945215'),
+        '当日停开': ('#fff1d3', '#945215'),
+    }
+
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        if index.data(Qt.DisplayRole) in self.colors:
+            size.setWidth(size.width() + 12)
+        return size
+
+    def paint(self, painter, option, index):
+        text = index.data(Qt.DisplayRole)
+        colors = self.colors.get(text)
+        if not colors or option.fontMetrics.horizontalAdvance(text) + 16 > option.rect.width():
+            super().paint(painter, option, index)
+            return
+        background = QStyleOptionViewItem(option)
+        self.initStyleOption(background, index)
+        background.text = ''
+        option.widget.style().drawControl(QStyle.CE_ItemViewItem, background, painter, option.widget)
+        width = option.fontMetrics.horizontalAdvance(text) + 16
+        badge = QRectF(option.rect.center().x() - width / 2, option.rect.center().y() - 9, width, 19)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(colors[0]))
+        painter.drawRoundedRect(badge, 9, 9)
+        painter.setPen(QColor(colors[1]))
+        painter.drawText(badge, Qt.AlignCenter, text)
+        painter.restore()
+
+
+class WorkspaceNavigation(QTabBar):
+    """West placement with horizontal labels and native tab keyboard navigation."""
+
+    icons = ('\ue7f4', '\ue8a5', '\ue9e9', '\ue9d5', '\ue713')
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.icon_family = next((family for family in ('Segoe Fluent Icons', 'Segoe MDL2 Assets')
+                                 if family in QFontDatabase.families()), None)
+
+    def tabSizeHint(self, index):
+        return QSize(155, 47)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        hover = self.tabAt(self.mapFromGlobal(self.cursor().pos())) if self.underMouse() else -1
+        for index in range(self.count()):
+            rect = self.tabRect(index).adjusted(1, 2, -9, -2)
+            selected = index == self.currentIndex()
+            if selected or index == hover:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor('#dceaff' if selected else '#eaf2ff'))
+                painter.drawRoundedRect(rect, 8, 8)
+            painter.setPen(QColor('#075de5' if selected else '#28394e'))
+            if self.icon_family:
+                icon_font = QFont(self.icon_family)
+                icon_font.setPixelSize(17)
+                painter.setFont(icon_font)
+                painter.drawText(rect.adjusted(12, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft, self.icons[index])
+            label_font = QFont(self.font())
+            label_font.setBold(selected)
+            painter.setFont(label_font)
+            painter.drawText(rect.adjusted(38 if self.icon_family else 14, 0, -6, 0),
+                             Qt.AlignVCenter | Qt.AlignLeft, self.tabText(index))
+            if selected and self.hasFocus():
+                painter.setPen(QPen(QColor('#75a9f6'), 1, Qt.DotLine))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 6, 6)
+
 
 
 class WorkbenchLayout:
@@ -385,6 +604,7 @@ class WorkbenchLayout:
             elif require_reviewed_profile:
                 self.profile_source = '未找到本机 DSV 配置 · 显示历史基准'
         self.symbols = self.profile.to_record()['settings']['symbols']
+        self.preview_symbols = self.symbols
         self.names = {item['code']: item['name'] for item in self.symbols}
         self.activity = deque(maxlen=200)
         self.last_state = None
@@ -400,6 +620,8 @@ class WorkbenchLayout:
         self.chart_owner = None
         self.rendered_view = None
         self.last_reasons = {}
+        self.dashboard_alerts = {}
+        self.dashboard_alert_owner = None
         self.manual_price_scope = None
         self.manual_catalog = []
         self.fund_values = {}
@@ -419,12 +641,14 @@ class WorkbenchLayout:
         window.setCentralWidget(panel)
         self.panel = panel
         shell = QVBoxLayout(panel)
-        shell.setContentsMargins(8, 4, 8, 5)
-        shell.setSpacing(6)
+        shell.setContentsMargins(8, 0, 10, 6)
+        shell.setSpacing(7)
 
         self.tabs = window.tabs = QTabWidget()
         self.tabs.setObjectName('workspaceNavigation')
         self.tabs.setUsesScrollButtons(True)
+        self.tabs.setTabBar(WorkspaceNavigation(self.tabs))
+        self.tabs.setTabPosition(QTabWidget.West)
         self.tabs.setElideMode(Qt.ElideNone)
         self.buttons['arm'].setObjectName('strategyStart')
         window.pause_button.setObjectName('strategyPause')
@@ -432,16 +656,32 @@ class WorkbenchLayout:
         QShortcut(QKeySequence('F5'), panel, self.buttons['arm'].click)
         QShortcut(QKeySequence('F6'), panel, window.pause_button.click)
         self.toolbar(shell)
-        self.home_tab = self.add_page(self.tabs, '策略主控', self.home_page)
-        self.monitor_tab = self.add_page(self.tabs, '实时监控', self.monitor_page, scroll=True)
-        self.add_page(self.tabs, '挂单汇总', self.orders_page)
-        self.add_page(self.tabs, '手动下单', self.manual_page, scroll=True)
-        self.log_tab = self.add_page(self.tabs, '运行日志', self.logs_page)
-        self.add_page(self.tabs, '品种信息', self.instruments_page)
-        self.add_page(self.tabs, '偏移计算', self.offset_page, scroll=True)
-        self.add_page(self.tabs, '系统设置', self.system_page, scroll=True)
-        self.account_tab = self.add_page(self.tabs, '账号信息', self.account_page, scroll=True)
-        self.parameter_tab = self.add_page(self.tabs, '交易参数', self.strategy_page, scroll=True)
+        self.sections = {}
+        self.home_tab, self.home_sections = self.section('交易工作台')
+        self.market_tab = self.add_page(self.home_sections, '行情监控', self.home_page)
+        self.position_tab = self.add_page(self.home_sections, '策略持仓', self.position_page)
+
+        _, self.order_sections = self.section('订单与成交')
+        self.order_tab = self.add_page(self.order_sections, '当前委托', self.orders_page)
+        self.add_page(self.order_sections, '成交记录', self.fills_page)
+        self.history_tab = self.add_page(self.order_sections, '历史订单', self.history_page)
+        self.add_page(self.order_sections, '对账与报表', self.reports_page, scroll=True)
+        self.manual_tab = self.add_page(self.order_sections, '手动下单', self.manual_page, scroll=True)
+
+        self.parameter_tab, self.parameter_sections = self.section('策略参数')
+        self.symbol_tab = self.add_page(self.parameter_sections, '监控合约', self.symbol_parameters_page, scroll=True)
+        self.add_page(self.parameter_sections, '交易参数与模板', self.strategy_page, scroll=True)
+        self.add_page(self.parameter_sections, '偏移计算', self.offset_page, scroll=True)
+
+        _, self.diagnostic_sections = self.section('日志与诊断')
+        self.log_tab = self.add_page(self.diagnostic_sections, '运行事件', self.logs_page)
+        self.monitor_tab = self.add_page(self.diagnostic_sections, '连接与行情', self.monitor_page, scroll=True)
+        self.add_page(self.diagnostic_sections, '命令回执', self.receipts_page)
+
+        _, self.account_sections = self.section('账户与设置')
+        self.account_tab = self.add_page(self.account_sections, '账户', self.account_page, scroll=True)
+        self.add_page(self.account_sections, '系统设置', self.system_page, scroll=True)
+        self.add_page(self.account_sections, '品种信息', self.instruments_page, scroll=True)
         self.render_parameters(self.profile)
         shell.addWidget(self.tabs, 1)
         window.notice_label.setText('未连接 · 等待启动')
@@ -453,19 +693,45 @@ class WorkbenchLayout:
         if self.settings.value('template_directory','',str):
             self.parameter_dialog()
         self.tabs.currentChanged.connect(self.page_changed)
+        self.diagnostic_sections.currentChanged.connect(self.update_logs)
         self.render_home()
+        self.workspace_clock = QLabel()
+        window.statusBar().setStyleSheet(
+            'QStatusBar { background:#f5f8fc; border-top:1px solid #dbe5f2; }'
+            'QStatusBar QLabel { color:#485b75; padding:2px 7px; }'
+            'QStatusBar::item { border:0; }')
+        window.statusBar().addWidget(self.workspace_clock)
+        self.update_workspace_clock()
         self.log_timer = QTimer(window)
         self.log_timer.setInterval(400)
         self.log_timer.timeout.connect(self.update_logs)
+        self.log_timer.timeout.connect(self.update_workspace_clock)
         self.log_timer.start()
         for grid in (*self.tables.values(), window.cycles):
             configure_table(grid)
+
+    def section(self, title):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(15, 11, 15, 12)
+        layout.setSpacing(8)
+        heading = QLabel(title)
+        heading.setObjectName('workspaceTitle')
+        layout.addWidget(heading)
+        if not self.sections:
+            self.home_header(layout)
+        tabs = QTabWidget()
+        tabs.setObjectName('workspaceSection')
+        layout.addWidget(tabs, 1)
+        self.tabs.addTab(page, title)
+        self.sections[page] = tabs
+        return page, tabs
 
     @staticmethod
     def add_page(tabs, title, build, *, scroll=False):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setContentsMargins(0, 9, 0, 0)
         layout.setSpacing(8)
         build(layout)
         if scroll:
@@ -483,31 +749,50 @@ class WorkbenchLayout:
         self.update_logs()
 
     def show_details(self, page):
+        for section, tabs in self.sections.items():
+            if tabs.indexOf(page) >= 0:
+                self.tabs.setCurrentWidget(section)
+                tabs.setCurrentWidget(page)
+                return
         self.tabs.setCurrentWidget(page)
 
     def show_account_settings(self):
         self.reload_accounts()
-        self.tabs.setCurrentWidget(self.account_tab)
+        self.show_details(self.account_tab)
+
+    def update_workspace_clock(self):
+        view = self.window.view
+        trading_day = self.current_trading_day(view) if view and not self.window._stale and not view['truncated'] else None
+        self.workspace_clock.setText(f"北京时间 {datetime.now(BEIJING):%H:%M:%S}    交易日 {trading_day or '—'}")
 
     def toolbar(self, shell):
-        bar = QHBoxLayout()
-        bar.setContentsMargins(0, 5, 0, 4)
-        brand = QLabel('OnlineTrader')
-        brand.setObjectName('brand')
+        header = QFrame(objectName='workspaceTop')
+        bar = QHBoxLayout(header)
+        bar.setContentsMargins(9, 5, 9, 5)
+        bar.setSpacing(8)
+        brand = QLabel('OnlineTrader', objectName='brand')
         bar.addWidget(brand)
+        self.toolbar_account = QPushButton('账户 · —', objectName='workspaceAccount')
+        self.toolbar_account.clicked.connect(self.show_account_settings)
+        bar.addWidget(self.toolbar_account)
+        self.toolbar_status = []
+        for _ in range(4):
+            dot = QFrame()
+            dot.setFixedSize(8, 8)
+            label = QLabel(objectName='topStatus')
+            label.setTextFormat(Qt.PlainText)
+            bar.addWidget(dot)
+            bar.addWidget(label)
+            self.toolbar_status.append((dot, label))
         bar.addStretch(1)
-        bar.addWidget(self.buttons['arm'])
-        bar.addWidget(self.window.pause_button)
-        bar.addStretch(1)
-        bar.addSpacing(8)
-        bar.addWidget(QLabel('字号：'))
-        self.font_size = QSpinBox()
-        self.font_size.setRange(8, 13)
-        self.font_size.setValue(self.settings.value('font_size', 12, int))
-        bar.addWidget(self.font_size)
         bar.addWidget(button('快捷键', self.shortcuts))
-        bar.addWidget(button('按屏幕自适应', self.window.showMaximized))
-        shell.addLayout(bar)
+        shell.addWidget(header)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 2, 0)
+        actions.addStretch(1)
+        actions.addWidget(self.buttons['arm'])
+        actions.addWidget(self.window.pause_button)
+        shell.addLayout(actions)
 
     def apply_font(self, size):
         font = self.panel.font()
@@ -574,45 +859,431 @@ class WorkbenchLayout:
             if not dialog.delete_template(name):
                 QMessageBox.warning(self.window,'删除模板',dialog.error_label.text())
 
-    def home_page(self, layout):
-        status = group('策略状态', layout)
-        self.home_state = QLabel()
-        self.home_state.setStyleSheet('font-weight: bold; color: #1746a1;')
-        self.home_connection = QLabel()
-        self.home_connection.setWordWrap(True)
-        self.home_quote_delay = QLabel('整体行情延迟（抽样）   —')
-        status_line = QHBoxLayout()
-        status_line.addWidget(self.home_state)
-        status_line.addWidget(self.home_connection, 1)
-        status_line.addWidget(self.home_quote_delay)
-        status.addLayout(status_line)
-        self.home_pending = QLabel()
-        self.home_pending.setObjectName('homePending')
+    def home_header(self, layout):
+        frame = QFrame(objectName='workspaceFunds')
+        frame.setAccessibleName('资金概览')
+        funds = QHBoxLayout(frame)
+        funds.setContentsMargins(5, 5, 5, 5)
+        funds.setSpacing(2)
+        layout.addWidget(frame)
+        self.dashboard_money = {}
+        for key, caption in (
+            ('equity', '账户权益'), ('available', '可用资金'),
+            ('today_pnl', '当日权益变动'), ('float_profit', '浮动盈亏'),
+        ):
+            if self.dashboard_money:
+                divider = QFrame(objectName='fundDivider')
+                divider.setFixedSize(1, 20)
+                funds.addWidget(divider)
+            value = QLabel(f'{caption}   —', objectName='fundMetric')
+            value.setAlignment(Qt.AlignCenter)
+            funds.addWidget(value, 1)
+            self.dashboard_money[key] = value, caption
+        self.home_pending = QLabel(objectName='homePending')
         self.home_pending.setTextFormat(Qt.PlainText)
         self.home_pending.setWordWrap(True)
         layout.addWidget(self.home_pending)
 
-        self.symbols_page(layout)
-
-        positions = group('策略持仓', layout)
-        self.home_position_title = QLabel('策略持仓')
-        position_heading = row(self.home_position_title)
-        position_heading.addWidget(button('查看明细', lambda: self.show_details(self.monitor_tab)))
-        positions.addLayout(position_heading)
-        self.home_positions = table(('合约', '方向', '手数', '浮盈亏', '持仓状态'))
-        positions.addWidget(self.home_positions)
-        self.home_empty_positions = QLabel()
-        positions.addWidget(self.home_empty_positions)
-
-        self.home_event = QLabel()
+    def home_page(self, layout):
+        split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.setHandleWidth(10)
+        layout.addWidget(split, 1)
+        market, detail = QWidget(), QSplitter(Qt.Vertical)
+        detail.setChildrenCollapsible(False)
+        detail.setHandleWidth(8)
+        split.addWidget(market)
+        split.addWidget(detail)
+        split.setSizes([950, 440])
+        market_layout = QVBoxLayout(market)
+        market_layout.setContentsMargins(0, 0, 0, 0)
+        listing = group('监控合约', market_layout)
+        listing.parentWidget().setObjectName('workspaceCard')
+        self.dashboard_markets = table(('合约', '最新价', '当前关注', '持仓', '状态'))
+        self.dashboard_markets.setObjectName('dashboardGrid')
+        self.dashboard_markets.verticalHeader().setDefaultSectionSize(29)
+        for column in (0, 2):
+            self.dashboard_markets.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.dashboard_markets.setItemDelegateForColumn(4, StatusBadge(self.dashboard_markets))
+        self.dashboard_markets.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.dashboard_market_rows = {}
+        listing.addWidget(self.dashboard_markets)
+        prices = group('行情', market_layout, stretch=1)
+        prices.parentWidget().setObjectName('workspaceCard')
+        self.candle_panel = prices.parentWidget()
+        self.candle_header = QLabel(objectName='chartTitle')
+        self.candle_source = QLabel(objectName='chartSource')
+        self.candle_contract = QComboBox(prices.parentWidget())
+        self.candle_contract.hide()
+        self.candle_contract.currentTextChanged.connect(self.select_candles)
+        self.candles = MinuteCandles()
+        self.candles.setMinimumHeight(180)
+        chart_heading = row(self.candle_header)
+        chart_heading.addWidget(self.candle_source)
+        prices.addLayout(chart_heading)
+        prices.addWidget(self.candles, 1)
+        explanation = group('策略解释', detail)
+        self.explanation_card = explanation.parentWidget()
+        self.explanation_card.setObjectName('workspaceCard')
+        self.decision_status = QLabel('等待行情', objectName='decisionStatus')
+        self.decision_status.setTextFormat(Qt.PlainText)
+        self.decision_status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.decision_status.setMinimumHeight(38)
+        explanation.addWidget(self.decision_status)
+        self.decision_fields = {}
+        for field in ('多头触发', '空头触发', '距离最近触发', '最近判断', '最后报价'):
+            band = QFrame(objectName='decisionField')
+            line = QHBoxLayout(band)
+            line.setContentsMargins(8, 2, 8, 2)
+            label = QLabel(field)
+            value = QLabel('—', objectName='decisionValue')
+            value.setTextFormat(Qt.PlainText)
+            line.addWidget(label, 1)
+            line.addWidget(value, 1)
+            explanation.addWidget(band)
+            self.decision_fields[field] = band, value
+        self.decision_reason = QLabel(objectName='decisionReason')
+        self.decision_reason.setTextFormat(Qt.RichText)
+        self.decision_reason.setWordWrap(True)
+        self.decision_reason.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        explanation.addWidget(self.decision_reason)
+        events = group('重要事件', detail, stretch=1)
+        detail.handle(1).setEnabled(False)
+        events.parentWidget().setObjectName('workspaceCard')
+        self.dashboard_events = table(('时间', '事件'))
+        self.dashboard_events.setObjectName('dashboardGrid')
+        self.dashboard_events.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.dashboard_events.cellDoubleClicked.connect(self.open_dashboard_event)
+        events.addWidget(self.dashboard_events)
+        self.home_event = QLabel(objectName='workspaceNote')
         self.home_event.setTextFormat(Qt.PlainText)
         self.home_event.setWordWrap(True)
         self.home_event.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        events.addWidget(self.home_event)
         self.home_updated = QLabel()
-        footer = QHBoxLayout()
-        footer.addWidget(self.home_event, 1)
-        footer.addWidget(self.home_updated)
-        layout.addLayout(footer)
+        self.home_updated.hide()
+        self.dashboard_markets.currentCellChanged.connect(self.select_dashboard_market)
+
+    def position_page(self, layout):
+        split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
+        split.setHandleWidth(10)
+        layout.addWidget(split, 1)
+        master, detail = QWidget(), QWidget()
+        split.addWidget(master)
+        split.addWidget(detail)
+        split.setSizes([950, 440])
+        left, right = QVBoxLayout(master), QVBoxLayout(detail)
+        left.setContentsMargins(0, 0, 0, 0)
+        right.setContentsMargins(0, 0, 0, 0)
+        positions = group('当前策略持仓', left, stretch=1)
+        positions.parentWidget().setObjectName('workspaceCard')
+        self.home_position_title = QLabel('策略持仓', objectName='workspaceNote')
+        positions.addWidget(self.home_position_title)
+        self.home_positions = table(('合约', '方向', '手数', '浮动盈亏', '状态', '开仓均价', '最新价'))
+        self.home_positions.setObjectName('dashboardGrid')
+        self.home_positions.verticalHeader().setDefaultSectionSize(31)
+        for column in (0, 3, 4, 5, 6):
+            self.home_positions.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.home_positions.setItemDelegateForColumn(4, StatusBadge(self.home_positions))
+        self.home_positions.setSelectionMode(QAbstractItemView.SingleSelection)
+        positions.addWidget(self.home_positions, 1)
+        self.home_empty_positions = QLabel()
+        positions.addWidget(self.home_empty_positions)
+        events = group('近期持仓事件', left)
+        events.parentWidget().setObjectName('workspaceCard')
+        self.position_events = table(('时间', '合约', '事件'))
+        self.position_events.setObjectName('dashboardGrid')
+        events.addWidget(self.position_events)
+        protection = group('持仓保护', right)
+        protection.parentWidget().setObjectName('workspaceCard')
+        self.position_status = QLabel(objectName='decisionStatus')
+        self.position_status.setTextFormat(Qt.PlainText)
+        self.position_detail = QLabel(objectName='workspaceDetail')
+        self.position_detail.setTextFormat(Qt.RichText)
+        for label in (self.position_status, self.position_detail):
+            label.setWordWrap(True)
+            protection.addWidget(label)
+        self.related_orders = button('查看关联委托', self.open_position_orders)
+        self.related_orders.setObjectName('workspaceAccount')
+        protection.addWidget(self.related_orders)
+        protection.addWidget(button('持仓明细与平仓', self.open_position_controls))
+        right.addStretch(1)
+        self.home_positions.currentCellChanged.connect(self.render_position_detail)
+
+    def symbol_parameters_page(self, layout):
+        self.symbols_page(layout)
+        comparison = group('所选合约 · 运行中与草稿', layout)
+        self.parameter_comparison = table(('参数', '运行中', '编辑草稿'))
+        self.parameter_comparison.setFixedHeight(175)
+        comparison.addWidget(self.parameter_comparison)
+        comparison.addWidget(button('编辑所选草稿', self.edit_selected_symbol))
+        self.symbol_grid.currentCellChanged.connect(self.render_symbol_comparison)
+
+    def render_symbol_comparison(self, *_):
+        cell = self.symbol_grid.item(self.symbol_grid.currentRow(), 1)
+        code = cell.text() if cell else None
+        view = self.window.view if not self.window._stale else None
+        active = next((item for item in (view or {}).get('configuration', {}).get('strategy_symbols', ())
+                       if item['code'] == code), {})
+        draft = next((item for item in self.preview_symbols if item['code'] == code), {})
+        fields = ('open_offset', 'stop_offset', 'profit_offset', 'order_volume', 'half_close_ratio', 'hysteresis_points')
+        def value(record, key):
+            return '自动' if key == 'order_volume' and record.get(key) == 0 else display_value(record.get(key))
+        rows = [(title, value(active, key), value(draft, key)) for title, key in zip(SYMBOL_HEADERS[2:], fields)] if draft else []
+        populate(self.parameter_comparison, rows)
+        for index, (_, current, edited) in enumerate(rows):
+            if current != '—' and current != edited:
+                self.parameter_comparison.item(index, 2).setForeground(QColor('#075de5'))
+
+    @staticmethod
+    def fill_selectable(grid, rows, keys):
+        current = grid.item(grid.currentRow(), 0)
+        selected = current.data(Qt.UserRole) if current is not None else None
+        blocked = grid.blockSignals(True)
+        try:
+            populate(grid, rows)
+            for index, key in enumerate(keys):
+                grid.item(index, 0).setData(Qt.UserRole, key)
+            if keys:
+                grid.setCurrentCell(keys.index(selected) if selected in keys else 0, 0)
+        finally:
+            grid.blockSignals(blocked)
+
+    def render_dashboard_markets(self, view, cycles, available):
+        config = (view or {}).get('configuration', {})
+        markets = {item['contract_id']: item for item in (view or {}).get('markets', ())}
+        symbols = config.get('strategy_symbols') or self.symbols
+        names = {item['code']: item['name'] for item in symbols}
+        codes = list(dict.fromkeys(config.get('scoped_contracts') or [*markets, *names]))
+        if config.get('strategy_symbols') and not config.get('scoped_contracts'):
+            codes = list(dict.fromkeys([*names, *markets]))
+        monitor = config.get('strategy_monitor') or {}
+        owner_states = {item['contract_id']: item for item in monitor.get('symbols', ())}
+        resting = monitor.get('quote_status') == '休市'
+        self.dashboard_market_rows = {}
+        rows = []
+        for code in codes:
+            quote = markets.get(code, {})
+            report = owner_states.get(code, {})
+            owned = [cycle for cycle in cycles if cycle['contract_id'] == code]
+            quantities = {side: sum(cycle['remaining_quantity'] for cycle in owned if cycle['direction'] == direction)
+                          for side, direction in (('多', 'LONG'), ('空', 'SHORT'))}
+            position = ' / '.join(f'{side} {qty}' for side, qty in quantities.items() if qty) or ('0' if available else '—')
+            reasons = quote.get('entry_reasons', ())
+            explanation = [self.entry_reason_text(reason) for reason in reasons
+                           if reason != 'DUPLICATE_MARKET_EVENT']
+            quote_current = self.market_view_current(view) and quote.get('fresh')
+            lines = (quote.get('trigger_prices') or {}) if quote_current else {}
+            decision = quote.get('decision_time_utc')
+            if not self.market_view_current(view):
+                status = '状态待同步'
+            elif any(cycle.get('exit_pending') for cycle in owned) or report.get('state') == 'PENDING':
+                status = '平仓待确认'
+            elif quote.get('enabled') is False:
+                status = '已停用'
+            elif quote.get('day_stop_reason') or report.get('state') == 'STOPPED':
+                status = '当日停开'
+                explanation.insert(0, quote.get('day_stop_reason') or report.get('status') or status)
+            elif not quote.get('fresh'):
+                status = '休市' if resting else '行情滞后' if quote.get('source_time_utc') else '等待行情'
+            elif owned:
+                status = '持仓中'
+            elif not available:
+                status = '交易待同步'
+            elif view['entry_authority'] != 'ARMED':
+                status = '已停止开仓'
+            elif 'GEOMETRY_BLOCK' in reasons:
+                status = '几何条件暂不满足'
+            elif any(reason not in QUIET_ENTRY_REASONS and reason != 'TRIGGER_NOT_REACHED' for reason in reasons):
+                status = '当前条件未满足'
+            else:
+                status = '等待触发'
+            nearby = None
+            last = quote.get('last')
+            if status == '等待触发' and last is not None and lines:
+                nearby = min(lines, key=lambda side: abs(Decimal(lines[side]) - Decimal(last)))
+            focus = f'{("多头" if nearby == "LONG" else "空头")}触发 {lines[nearby]}' if nearby else '—'
+            rows.append((f'{code}  {names[code]}' if code in names else code,
+                         display_value(last if self.market_view_current(view) else None), focus, position, status))
+            self.dashboard_market_rows[code] = (status, quote, lines, decision, explanation, nearby)
+        self.fill_selectable(self.dashboard_markets, rows, codes)
+        self.dashboard_markets.setFixedHeight(
+            self.dashboard_markets.horizontalHeader().sizeHint().height()
+            + max(1, min(6, len(codes))) * self.dashboard_markets.verticalHeader().defaultSectionSize() + 4)
+        for index, (_, _, _, position, status) in enumerate(rows):
+            contract = self.dashboard_markets.item(index, 0)
+            font = QFont(self.dashboard_markets.font())
+            font.setWeight(QFont.DemiBold)
+            contract.setFont(font)
+            if position.startswith(('多', '空')) and '/' not in position:
+                self.dashboard_markets.item(index, 3).setForeground(
+                    QColor('#bd263e' if position.startswith('多') else '#08764d'))
+            item = self.dashboard_markets.item(index, 4)
+            color = ('#087453' if status == '持仓中' else '#965619'
+                     if status in {'平仓待确认', '行情滞后', '当日停开', '已停用'} else '#075de5')
+            item.setForeground(QColor(color))
+        self.select_dashboard_market()
+
+    def market_view_current(self, view):
+        return bool(view and not self.window._stale and not view['truncated'])
+
+    @staticmethod
+    def entry_reason_text(reason):
+        code = reason.rsplit(':', 1)[-1]
+        if code == 'TRIGGER_NOT_REACHED':
+            return '价格尚未达到触发位'
+        return (ENTRY_MESSAGES.get(reason) or ACTIVATION_MESSAGES.get(reason)
+                or BLOCK_MESSAGES.get(code) or ENTRY_FILTERS.get(code, (None, None))[1]
+                or f'策略条件待核对（{code}）')
+
+    @staticmethod
+    def market_time(stamp):
+        if not stamp:
+            return '—'
+        return datetime.fromisoformat(stamp).astimezone(BEIJING).strftime('%H:%M:%S')
+
+    def select_dashboard_market(self, *_):
+        cell = self.dashboard_markets.item(self.dashboard_markets.currentRow(), 0)
+        code = cell.data(Qt.UserRole) if cell is not None else ''
+        record = self.dashboard_market_rows.get(code)
+        self.candles.trigger_lines = {}
+        details = {}
+        explanation = ()
+        if record is None:
+            self.decision_status.setText('等待行情')
+        else:
+            status, quote, lines, decision, explanation, nearby = record
+            self.decision_status.setText(f'{code} · {status}')
+            details = {
+                '多头触发': display_value(lines.get('LONG')),
+                '空头触发': display_value(lines.get('SHORT')),
+                '最近判断': self.market_time(decision),
+                '最后报价': self.market_time(quote.get('source_time_utc')),
+            }
+            if nearby and quote.get('price_tick') and Decimal(quote['price_tick']) > 0:
+                ticks = abs(Decimal(lines[nearby]) - Decimal(quote['last'])) / Decimal(quote['price_tick'])
+                details['距离最近触发'] = f'{ticks.normalize():f} 跳'
+            self.candles.trigger_lines = lines
+        for key, (band, value) in self.decision_fields.items():
+            value.setText(details.get(key, '—'))
+            band.setVisible(key in details)
+        self.decision_reason.setVisible(bool(explanation))
+        if explanation:
+            reasons = escape(' / '.join(dict.fromkeys(explanation)))
+            self.decision_reason.setText(f'<b>本轮判断依据</b><br>{reasons}')
+            self.decision_reason.setMinimumHeight(max(42, self.decision_reason.heightForWidth(
+                max(180, self.explanation_card.width() - 18))))
+            self.decision_reason.setToolTip(reasons)
+        layout = self.explanation_card.layout()
+        layout.invalidate()
+        self.explanation_card.setFixedHeight(layout.sizeHint().height() + 26)
+        self.select_candles(code)
+
+    def selected_position(self):
+        row = self.home_positions.currentRow()
+        cell = self.home_positions.item(row, 0)
+        return cell.data(Qt.UserRole) if cell is not None else None
+
+    def render_position_detail(self, *_):
+        selected = self.selected_position()
+        view = self.window.view
+        self.related_orders.setEnabled(bool(selected))
+        if view is None or not selected:
+            synchronized = view and not self.window._stale and view['connection'].get('synchronized')
+            self.position_status.setText('当前无策略持仓' if synchronized else '等待持仓同步')
+            self.position_detail.clear()
+            self.position_events.setRowCount(0)
+            return
+        code, direction = selected
+        cycles = [cycle for cycle in view['cycles'] if cycle['contract_id'] == code
+                  and cycle['direction'] == direction and cycle['remaining_quantity'] > 0]
+        status = self.home_positions.item(self.home_positions.currentRow(), 4).text()
+        self.position_status.setText(f'{code} · {"多" if direction == "LONG" else "空"} · {status}')
+        lines = []
+        current = (not self.window._stale and not view['truncated'] and view['connection'].get('synchronized')
+                   and not view['connection'].get('fault') and not view['connection'].get('storage_failed'))
+        for index, cycle in enumerate(cycles, 1):
+            if len(cycles) > 1:
+                lines.append(f'持仓周期 {index}')
+            lines.append(f'剩余持仓    {cycle["remaining_quantity"]} 手')
+            if current:
+                confirmation = cycle.get('initial_open_confirmation') or {}
+                confirmed = confirmation.get('quantity')
+                lines.append(f'首次确认成交    {confirmed} 手' if confirmed is not None else '首次确认成交    —')
+                covered = cycle['remaining_quantity'] if status in {'保护中', '价格保护中'} and cycle.get('stop_price') is not None else None
+                lines.append(f'本地保护覆盖    {covered} 手' if covered is not None else '本地保护覆盖    待核对')
+                lines.append(f'当前保护价    {display_value(cycle.get("stop_price"))}')
+                lines.append(f'止盈价    {display_value(cycle.get("take_profit_price"))}')
+                floor = (display_value(cycle.get('stop_price')) if cycle.get('mode') == 'PROTECTED'
+                         else '未激活' if cycle.get('mode') == 'NORMAL' else '—')
+                lines.append(f'留利线    {floor}')
+        self.position_detail.setText(detail_markup(lines))
+        cycle_ids = {cycle['position_cycle_id'] for cycle in cycles}
+        rows = [(native_time(item.get('source_time_ns')), code,
+                 f'{"开仓" if item["effect"] == "OPEN" else "平仓"}成交 {item["quantity"]} 手')
+                for item in view['trades'] if item.get('position_cycle_id') in cycle_ids]
+        self.fill_home_table(self.position_events, rows[-6:])
+
+    def open_position_controls(self):
+        self.show_details(self.monitor_tab)
+        self.monitor_details.setCurrentWidget(self.window.cycles)
+
+    def open_position_orders(self):
+        selected = self.selected_position()
+        if selected and self.window.view is not None:
+            code, direction = selected
+            self.order_cycles = frozenset(cycle['position_cycle_id'] for cycle in self.window.view['cycles']
+                                          if cycle['contract_id'] == code and cycle['direction'] == direction
+                                          and cycle['remaining_quantity'] > 0)
+            self.order_scope.setText(f'关联持仓 · {code} · {"多" if direction == "LONG" else "空"}')
+            self.order_scope.show()
+            self.clear_order_scope.show()
+            self.history_scope.setText(self.order_scope.text())
+            self.history_scope.show()
+            self.clear_history_scope.show()
+            for combo in (self.order_contract, self.order_effect, self.order_side, self.order_source):
+                combo.setCurrentIndex(0)
+            self.filter_orders()
+            self.show_details(self.history_tab if self.order_active_count == 0 and self.historical_orders.rowCount()
+                              else self.order_tab)
+
+    def record_dashboard_alerts(self, view):
+        if not self.market_view_current(view):
+            return
+        owner = view['account_key'], view['kernel_boot_id']
+        if owner != self.dashboard_alert_owner:
+            self.dashboard_alert_owner = owner
+            self.dashboard_alerts.clear()
+        active = {}
+        actionable = {'平仓待确认', '行情滞后', '当日停开', '已停用'}
+        for code, (status, quote, _lines, _decision, explanation, _nearby) in self.dashboard_market_rows.items():
+            if status in actionable:
+                latest = self.market_time(quote.get('source_time_utc'))
+                detail = f'最后报价 {latest}' if status == '行情滞后' else (explanation[0] if explanation else '')
+                active[(code, status)] = detail if detail != status else ''
+        for index, (code, _direction) in enumerate(self.position_groups):
+            status = self.home_positions.item(index, 4).text()
+            if status in {'平仓待确认', '平仓待核对', '保护待核对', '本地自动保护待恢复'}:
+                active.setdefault((code, status), '')
+        for (code, status), detail in active.items():
+            if (code, status) not in self.dashboard_alerts:
+                self.add_activity(f'{code} · {status}' + (f' · {detail}' if detail else ''), category='warning')
+        self.dashboard_alerts = active
+
+    def render_dashboard_events(self, view):
+        events = [(line.timestamp.strftime('%H:%M:%S') if line.timestamp else '—',
+                   line.text.split('] ', 2)[-1]) for line in reversed(self.activity)]
+        populate(self.dashboard_events, events[:20] if view is not None else [])
+
+    def open_dashboard_event(self, row, _):
+        event = self.dashboard_events.item(row, 1)
+        if event is not None:
+            for combo in (self.log_filter, self.log_event_filter, self.log_time_filter, self.log_contract_filter):
+                combo.setCurrentIndex(0)
+            self.log_search.setText(event.text())
+            self.log_view_tabs.setCurrentIndex(0)
+            self.show_details(self.log_tab)
 
     def account_page(self, layout):
         w = self.window
@@ -680,11 +1351,16 @@ class WorkbenchLayout:
         """Discard the previous account's display facts before requesting a new view."""
         self.rendered_view = None
         self.quote_reference.clear()
+        if getattr(self.quote_worker, 'offset_query', None) is not None:
+            self.quote_worker.requestInterruption()
+            self.offset_preview.setText('账户已切换，请按当前账号重新联网计算。')
         self.fund_values.clear()
         self.home_updated_at = None
         self.chart_owner = None
         self.last_state = None
         self.last_reasons.clear()
+        self.dashboard_alerts.clear()
+        self.dashboard_alert_owner = None
         if not preserve_logs:
             self.activity.clear()
             self.log_binding = None
@@ -697,6 +1373,12 @@ class WorkbenchLayout:
         self.candles.native_series.clear()
         self.candles.select('')
         self.candle_contract.clear()
+        self.dashboard_market_rows = {}
+        self.position_events.setRowCount(0)
+        self.historical_orders.setRowCount(0)
+        self.reset_order_scope()
+        self.order_detail.clear()
+        self.historical_orders.detail_label.clear()
         self.manual_code.clear()
         self.manual_price_scope = None
         self.manual_catalog = []
@@ -718,6 +1400,9 @@ class WorkbenchLayout:
             self.visible_log_lines.clear()
             self.last_log_text = None
             self.log_text.clear()
+            self.log_record_keys = []
+            self.log_records.setRowCount(0)
+            self.render_log_detail()
             self.log_count.setText('0 行')
         self.render_equity_chart()
         self.render_home()
@@ -759,9 +1444,9 @@ class WorkbenchLayout:
             state = '状态待核对'
             description = '上次状态已过期' if stale else '柜台或执行器状态待核对'
             if truncated:
-                description = '状态数据不完整，请在实时监控中核对'
+                description = '状态数据不完整，请在日志与诊断中核对'
         elif not connected:
-            state, description = '尚未连接', '连接设置位于「账号信息」'
+            state, description = '尚未连接', '连接设置位于「账户与设置」'
         elif not synced or connection.get('recovery_required'):
             state, description = '正在核对', '账户已连接 · 等待柜台或持仓核对'
         elif armed and config.get('manual_workbench'):
@@ -771,11 +1456,56 @@ class WorkbenchLayout:
             state, description = '策略运行中', f'账户已连接 · 正在监控 {count} 个合约'
         else:
             state = '已停止新开仓'
-            description = f'仍有 {quantity} 手策略持仓 · 保护状态见下方' if quantity else '账户已连接 · 等待启动'
+            description = f'仍有 {quantity} 手策略持仓 · 保护状态见「策略持仓」' if quantity else '账户已连接 · 等待启动'
+        account = w.selected_account
+        view_key = view['account_key'] if view else w.paired_account_key
+        if account and view_key in (None, account['account_key']):
+            provider = {'TQ_SIMNOW': 'SimNow 模拟', 'TQKQ': '快期模拟'}.get(account.get('provider'), account_type)
+            login = account['masked_login']
+        else:
+            provider = account_type
+            login = f'****{account_login[-4:]}' if account_login not in {'未提供', '未选择'} and '*' not in account_login else account_login
+        self.toolbar_account.setText(' · '.join(filter(None, (provider, login))))
+        clock_diagnostic = config.get('strategy_diagnostics', {}).get('ntp')
+        clock = ('异常' if connection.get('clock_fault') or clock_diagnostic == 'NTP_SKEW'
+                 else '待核对' if not available or clock_diagnostic == 'NTP_UNAVAILABLE' else '无已知异常')
+        health = ('待核对' if stale or fault or truncated else '已连接' if connected else '未连接')
+        quotes = (view or {}).get('markets', ())
+        monitor_state = (config.get('strategy_monitor') or {}).get('quote_status')
+        lagging = sum(not item.get('fresh') and bool(item.get('source_time_utc')) for item in quotes)
+        if not available or not quotes:
+            market_health = '待同步'
+        elif monitor_state == '休市' and not any(item.get('fresh') for item in quotes):
+            market_health = '休市'
+        elif lagging:
+            market_health = f'{lagging} 个合约滞后'
+        elif any(not item.get('fresh') for item in quotes):
+            market_health = '等待行情'
+        else:
+            market_health = '已更新'
+        for (dot, label), (title, value, good, alert) in zip(self.toolbar_status, (
+            ('行情', market_health, market_health == '已更新', market_health.endswith('个合约滞后')),
+            ('交易', health, health == '已连接', stale or fault or truncated),
+            ('策略', state, armed and available, state in {'状态待核对', '正在核对'}),
+            ('校时', clock, clock == '无已知异常', clock == '异常'),
+        )):
+            label.setText(f'{title} {value}')
+            label.setToolTip(description if title == '策略' else label.text())
+            color = '#14a163' if good else '#eea124' if alert else '#a1afc1'
+            dot.setStyleSheet(f'background:{color}; border-radius:4px;')
         self.home_state.setText(state)
         self.home_connection.setText(description)
 
         funds = self.fund_values if available else {}
+        for key, (value, caption) in self.dashboard_money.items():
+            amount = funds.get(key)
+            value.setText(f'{caption}   {self.yuan(amount)}')
+            for name, enabled in (('gain', bool(amount and amount.startswith('+'))),
+                                  ('loss', bool(amount and amount.startswith('-')))):
+                if value.property(name) != enabled:
+                    value.setProperty(name, enabled)
+                    value.style().unpolish(value)
+                    value.style().polish(value)
         for key, (value, caption) in self.home_money.items():
             amount = funds.get(key)
             value.setText(self.yuan(amount))
@@ -794,11 +1524,14 @@ class WorkbenchLayout:
                                   (f'；另有 {len(pending) - 2} 项' if len(pending) > 2 else '') if pending else '')
         self.home_pending.setToolTip('\n'.join(pending))
         self.home_position_title.setText(f"策略持仓  {'上次 ' if not available else ''}{quantity} 手" if quantity else '策略持仓')
-        self.fill_home_table(self.home_positions, positions)
+        self.fill_selectable(self.home_positions, positions, self.position_groups)
+        self.render_position_detail()
         self.home_positions.setVisible(bool(positions))
         self.home_empty_positions.setVisible(not positions)
         self.home_empty_positions.setText('当前无策略持仓' if available else '持仓待同步')
         for index, position in enumerate(positions):
+            direction = self.home_positions.item(index, 1)
+            direction.setForeground(QColor('#bd263e' if position[1] == '多' else '#08764d'))
             color = {'+': '#a22c37', '-': '#07634d'}.get(position[3][:1])
             if color:
                 self.home_positions.item(index, 3).setForeground(QColor(color))
@@ -829,6 +1562,11 @@ class WorkbenchLayout:
             effect = '开仓' if latest['effect'] == 'OPEN' else '平仓'
             event = f"{native_time(latest['source_time_ns'])}  {latest['contract_id']} {effect}成交 {latest['quantity']} 手"
         self.home_event.setText(w.home_feedback or event)
+        self.home_event.setToolTip(self.home_event.text())
+        self.render_dashboard_markets(view, cycles, available)
+        self.record_dashboard_alerts(view)
+        self.render_dashboard_events(view)
+        self.render_symbol_comparison()
         updated = self.home_updated_at if view is not None else None
         self.home_updated.setText(('最后更新 ' if stale else '状态更新 ') + updated if updated else '')
 
@@ -839,6 +1577,7 @@ class WorkbenchLayout:
         return f'{amount[0]}¥{amount[1:]}' if amount[:1] in ('+', '-') else f'¥{amount}'
 
     def home_position_rows(self, view, cycles, available):
+        self.position_groups = []
         if view is None:
             return [], []
         connection = view['connection']
@@ -912,7 +1651,7 @@ class WorkbenchLayout:
                 pending.append(f'{code} {status}')
             else:
                 status = '保护中'
-            grouped.setdefault((code, cycle['direction']), []).append((cycle['remaining_quantity'], floating, status))
+            grouped.setdefault((code, cycle['direction']), []).append((cycle, floating, status))
 
         names = self.names | {item['code']: item['name'] for item in view['configuration'].get('strategy_symbols', [])}
         status_order = ('本地自动保护待恢复', '待核对', '平仓待核对', '平仓待确认', '交接待确认', '保护待核对',
@@ -920,11 +1659,18 @@ class WorkbenchLayout:
         rows = []
         for (code, direction), items in grouped.items():
             name = names.get(code)
-            quantity = sum(item[0] for item in items)
+            quantity = sum(item[0]['remaining_quantity'] for item in items)
             floating = sum(Decimal(item[1]) for item in items) if all(item[1] is not None for item in items) else None
             status = min((item[2] for item in items), key=status_order.index)
-            rows.append((f'{name}  {code}' if name else code, '多' if direction == 'LONG' else '空',
-                         f'{quantity} 手', self.yuan(f'{floating:+,.2f}' if floating is not None else None), status))
+            members = [item[0] for item in items]
+            self.position_groups.append((code, direction))
+            entries = [item.get('entry_price') for item in members]
+            average = (sum(Decimal(price) * item['remaining_quantity'] for price, item in zip(entries, members)) / quantity
+                       if all(price is not None for price in entries) else None)
+            last = members[0].get('last_price') if available else None
+            rows.append((f'{code}  {name}' if name else code, '多' if direction == 'LONG' else '空',
+                         f'{quantity} 手', self.yuan(f'{floating:+,.2f}' if floating is not None else None), status,
+                         format(average, ',.2f') if average is not None else '—', display_value(last)))
         return list(dict.fromkeys(pending)), rows
 
     def strategy_page(self, layout):
@@ -1002,6 +1748,9 @@ class WorkbenchLayout:
 
     def render_parameters(self, profile):
         settings = profile.to_record()['settings']
+        self.preview_symbols = settings['symbols']
+        selected_item = self.symbol_grid.item(self.symbol_grid.currentRow(), 1)
+        selected_code = selected_item.text() if selected_item else None
         if self.calculator.base_hash != profile.content_hash:
             self.calculator.set_base_profile(profile)
             self.offset_preview.setText('参数预览已更新，请重新计算偏移。')
@@ -1024,6 +1773,11 @@ class WorkbenchLayout:
             for s in settings['symbols']])
         self.render_rollover_status({item['contract_id']:item
                                      for item in (self.rendered_view or {}).get('markets',[])})
+        if self.symbol_grid.rowCount():
+            index = next((index for index, item in enumerate(self.preview_symbols)
+                          if item['code'] == selected_code), 0)
+            self.symbol_grid.setCurrentCell(index, 1)
+        self.render_symbol_comparison()
 
     def choose_dsv_parameters(self):
         path, _ = QFileDialog.getOpenFileName(self.window, '选择 DSV config.json',
@@ -1118,23 +1872,37 @@ class WorkbenchLayout:
             self.start_market_read(account['account_id'], codes)
         self.window._action(start)
 
-    def start_market_read(self, account_id, codes=(), *, catalog=False):
+    def start_market_read(self, account_id, codes=(), *, catalog=False, offset_query=None):
         from online_trader.desktop.startup import QuoteReferenceWorker
-        worker = (QuoteReferenceWorker(self.window.store,account_id,codes,self.window,catalog=True) if catalog
-                  else QuoteReferenceWorker(self.window.store,account_id,codes,self.window))
+        options = {'catalog': True} if catalog else {}
+        if offset_query is not None:
+            options['offset_query'] = offset_query
+        worker = QuoteReferenceWorker(self.window.store, account_id, codes, self.window, **options)
         self.quote_worker = worker
-        self.quote_reference_button.setEnabled(False)
-        self.manual_catalog_button.setEnabled(False)
+        self.set_market_read_busy(True)
         worker.received.connect(self.window._quote_reference_received)
         worker.failed.connect(self.window._quote_reference_failed)
         worker.finished.connect(self.window._quote_reference_finished)
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
+    def set_market_read_busy(self, busy):
+        for name in ('quote_reference_button', 'manual_catalog_button', 'offset_market_button'):
+            control = getattr(self, name, None)
+            if control is not None:
+                control.setEnabled(not busy)
+
     def reference_quotes_received(self, rows):
         worker = self.quote_worker
         account = self.window.selected_account
         if self.window._closing or worker is None or account is None or account['account_id'] != worker.account_id:
+            return
+        if getattr(worker, 'offset_query', None) is not None:
+            if self.offset_requested_input != self.calculator.calculation_input():
+                self.offset_preview.setText('账号或计算输入已变化，请按当前参数重新联网计算。')
+                return
+            self.offset_preview.setText('请核对计算结果，勾选后可应用到本地参数预览。'
+                                        if self.calculator.calculate_with_market(rows) else '联网数据已读取，计算未完成。')
             return
         if getattr(worker,'catalog',False):
             self.manual_catalog = rows
@@ -1159,6 +1927,16 @@ class WorkbenchLayout:
         account = self.window.selected_account
         if (not self.window._closing and self.quote_worker is not None and account is not None
                 and self.quote_worker.account_id == account['account_id']):
+            if getattr(self.quote_worker, 'offset_query', None) is not None:
+                messages = {
+                    'E_OFFSET_DAY': '截止交易日与可核对的当前交易日不一致。',
+                    'E_OFFSET_SESSION': '所选合约未处于共同交易时段，可继续使用离线计算。',
+                    'E_CREDENTIALS': '所选账户的行情凭据不完整。',
+                    'E_DEPENDENCY': '本机行情组件未就绪。',
+                }
+                detail = messages.get(code, '未取得完整的已完成日线和当日振幅。')
+                self.offset_preview.setText(f'{detail} 原缓存及参数预览仍可用。 · {code}')
+                return
             if getattr(self.quote_worker,'catalog',False):
                 feedback = '已保留原合约目录' if self.manual_catalog else '仍可选择已配置合约'
                 message = f'合约加载失败 · {feedback}（{code}）'
@@ -1170,8 +1948,7 @@ class WorkbenchLayout:
 
     def reference_quotes_finished(self):
         self.quote_worker = None
-        self.quote_reference_button.setEnabled(True)
-        self.manual_catalog_button.setEnabled(True)
+        self.set_market_read_busy(False)
 
     def render_rollover_status(self, markets):
         profile = self.window._settings_dialog.profile if self.window._settings_dialog is not None else self.profile
@@ -1305,6 +2082,10 @@ class WorkbenchLayout:
         w = self.window
         account = group('账户实时信息', layout)
         w.funds_label.hide()
+        self.home_state = QLabel()
+        self.home_connection = QLabel()
+        self.home_quote_delay = QLabel()
+        account.addLayout(row(self.home_state, self.home_connection, self.home_quote_delay))
         metrics = QGridLayout()
         self.fund_metrics = {}
         fields = (
@@ -1320,8 +2101,6 @@ class WorkbenchLayout:
             metrics.addWidget(metric,index//7,index%7)
             self.fund_metrics[key] = (metric,title)
         account.addLayout(metrics)
-        self.monitor_quote_delay = QLabel('整体行情延迟（抽样）   —')
-        account.addWidget(self.monitor_quote_delay)
         self.quote_status = QLabel('合约行情 · 等待首份快照')
         self.quote_status.setWordWrap(True)
         account.addWidget(self.quote_status)
@@ -1361,10 +2140,8 @@ class WorkbenchLayout:
         positions.addLayout(row(self.buttons['close'], self.buttons['flatten']))
         self.monitor_details = details
 
-        self.charts = QWidget()
-        charts = QHBoxLayout(self.charts)
-        charts.setContentsMargins(0, 0, 0, 0)
-        equity = group('权益曲线', charts, stretch=6)
+    def reports_page(self, layout):
+        equity = group('权益曲线', layout, stretch=1)
         self.equity_panel = equity.parentWidget()
         self.equity_mode = QComboBox()
         self.equity_mode.addItems(['权益曲线','收益曲线'])
@@ -1373,25 +2150,16 @@ class WorkbenchLayout:
         self.equity_mode.currentIndexChanged.connect(self.render_equity_chart)
         equity.addLayout(row(QLabel('曲线'),self.equity_mode,QLabel('起'),self.equity_from,
                              QLabel('止'),self.equity_to,button('应用',self.render_equity_chart)))
-        equity.addLayout(row(w.reports_button,button('导出 PNG',self.export_equity_png),
+        equity.addLayout(row(self.window.reports_button,button('导出 PNG',self.export_equity_png),
                              button('导出 CSV',self.export_equity_csv)))
         self.equity = EquityChart()
-        self.equity.setMinimumHeight(105)
+        self.equity.setMinimumHeight(160)
         equity.addWidget(self.equity)
-        prices = group('K线图', charts, stretch=5)
-        self.candle_panel = prices.parentWidget()
-        self.candle_contract = QComboBox()
-        self.candle_contract.addItems(self.names)
-        self.candles = MinuteCandles()
-        self.candle_source = QLabel()
-        self.candle_contract.currentTextChanged.connect(self.select_candles)
-        self.select_candles(self.candle_contract.currentText())
-        prices.addLayout(row(QLabel('选择品种'),self.candle_contract,self.candle_source))
-        prices.addWidget(self.candles)
-        layout.addWidget(self.charts, 2)
+        layout.addLayout(row(button('导出日报', self.open_daily_report)))
 
     def select_candles(self, code):
         self.candles.select(code)
+        self.candle_header.setText(f'{code} · 1 分钟' if code else '1 分钟')
         self.candle_source.setText('原生 1 分钟' if code in self.candles.native_series else '等待原生 K 线')
 
     def market_panel(self):
@@ -1416,23 +2184,119 @@ class WorkbenchLayout:
         self.order_effect.addItems(['全部开平','开仓','平仓'])
         self.order_side = QComboBox()
         self.order_side.addItems(['全部方向','买','卖'])
+        self.order_source = QComboBox()
+        self.order_source.addItems(['全部来源', '策略', '手动', '未知'])
+        self.order_source.currentTextChanged.connect(self.filter_orders)
         self.order_count = QLabel('等待柜台同步')
         self.order_contract.currentTextChanged.connect(self.filter_orders)
         self.order_effect.currentTextChanged.connect(self.filter_orders)
         self.order_side.currentTextChanged.connect(self.filter_orders)
         controls = row(QLabel('品种'),self.order_contract,QLabel('方向'),self.order_side,QLabel('开平'),self.order_effect)
+        controls.insertWidget(6, self.order_source)
         controls.addWidget(self.order_count)
         controls.addWidget(button('刷新', self.window.refresh))
         filters.addLayout(controls)
-        orders = group('当日挂单 / 委托', layout, stretch=1)
-        orders.addWidget(self.tables['orders'])
-        self.tables['orders'].setColumnCount(len(ORDER_HEADERS))
-        self.tables['orders'].setHorizontalHeaderLabels(ORDER_HEADERS)
-        orders.addLayout(row(self.buttons['cancel'],self.buttons['cancel_entries'],self.buttons['cancel_account']))
-        fills = group('当日成交明细', layout, stretch=1)
-        fills.addWidget(self.tables['trades'])
-        self.tables['trades'].setColumnCount(len(TRADE_HEADERS))
-        self.tables['trades'].setHorizontalHeaderLabels(TRADE_HEADERS)
+        controls.addWidget(button('手动下单', lambda: self.show_details(self.manual_tab)))
+        self.order_scope = QLabel()
+        self.clear_order_scope = button('清除关联筛选', self.reset_order_scope)
+        layout.addLayout(row(self.order_scope, self.clear_order_scope))
+        self.order_cycles = frozenset()
+        self.clear_order_scope.hide()
+        self.order_scope.hide()
+        split = QSplitter(Qt.Horizontal)
+        layout.addWidget(split, 1)
+        orders = QWidget()
+        order_layout = QVBoxLayout(orders)
+        grid = self.tables['orders']
+        grid.setObjectName('dashboardGrid')
+        grid.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        grid.setColumnCount(len(ORDER_HEADERS))
+        grid.setHorizontalHeaderLabels(ORDER_HEADERS)
+        grid.horizontalHeader().setStretchLastSection(True)
+        grid.currentCellChanged.connect(self.render_order_detail)
+        order_layout.addWidget(grid)
+        order_layout.addLayout(row(self.buttons['cancel'],self.buttons['cancel_entries'],self.buttons['cancel_account']))
+        split.addWidget(orders)
+        split.addWidget(self.order_details_panel(grid))
+        split.setSizes([950, 440])
+
+    def fills_page(self, layout):
+        grid = self.tables['trades']
+        grid.setColumnCount(len(TRADE_HEADERS))
+        grid.setHorizontalHeaderLabels(TRADE_HEADERS)
+        grid.setObjectName('dashboardGrid')
+        layout.addWidget(grid)
+
+    def history_page(self, layout):
+        self.history_scope = QLabel()
+        self.clear_history_scope = button('清除关联筛选', self.reset_order_scope)
+        layout.addLayout(row(self.history_scope, self.clear_history_scope))
+        self.history_scope.hide()
+        self.clear_history_scope.hide()
+        self.historical_orders = table(ORDER_HEADERS)
+        self.historical_orders.setObjectName('dashboardGrid')
+        self.historical_orders.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.historical_orders.currentCellChanged.connect(self.render_order_detail)
+        split = QSplitter(Qt.Horizontal)
+        layout.addWidget(split, 1)
+        split.addWidget(self.historical_orders)
+        split.addWidget(self.order_details_panel(self.historical_orders))
+        split.setSizes([950, 440])
+
+    def order_details_panel(self, grid):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        details = group('委托详情', layout)
+        label = QLabel('选择委托查看详情', objectName='workspaceDetail')
+        label.setTextFormat(Qt.PlainText)
+        label.setWordWrap(True)
+        details.addWidget(label)
+        layout.addStretch()
+        grid.detail_label = label
+        if grid is self.tables['orders']:
+            self.order_detail = label
+        return panel
+
+    def reset_order_scope(self):
+        self.order_cycles = frozenset()
+        self.order_scope.clear()
+        self.order_scope.hide()
+        self.clear_order_scope.hide()
+        self.history_scope.clear()
+        self.history_scope.hide()
+        self.clear_history_scope.hide()
+        self.filter_orders()
+
+    def render_order_detail(self, *_):
+        view = self.rendered_view
+        if view is None or not hasattr(self, 'historical_orders'):
+            return
+        for grid in (self.tables['orders'], self.historical_orders):
+            row = grid.currentRow()
+            cell = grid.item(row, 0)
+            order_id = cell.data(Qt.UserRole) if cell is not None and not grid.isRowHidden(row) else None
+            order = next((item for item in view['orders'] if item.get('child_order_id') == order_id), None) if order_id else None
+            if order is None:
+                grid.detail_label.setText('选择委托查看详情')
+                continue
+            cells = order_cells(order)
+            lines = [f"{order['contract_id']} · {cells[2]} · {cells[3]}", f'委托编号    {cells[0]}',
+                     f'来源    {self.order_source_title(order)}', f'委托量    {cells[4]} 手',
+                     f'已成交    {display_value(order.get("filled_qty"))} 手', '', '委托与成交记录']
+            if order.get('source_time_ns'):
+                lines.append(f'{cells[8]}    柜台报单时间')
+            fills = sorted((trade for trade in view['trades'] if trade.get('child_order_id') == order_id),
+                           key=lambda trade: int(trade.get('source_time_ns') or 0))
+            lines.extend(f'{native_time(trade.get("source_time_ns"))}    成交 {trade["quantity"]} 手 @ {trade["price"]}'
+                         for trade in fills)
+            lines.append(f'当前柜台回报    {cells[7]}')
+            if order.get('cancel_status'):
+                states = {'SEND_POSSIBLE': '撤单已请求', 'CALL_RETURNED': '等待柜台结果', 'UNKNOWN': '撤单结果待核对'}
+                status = order['cancel_status']
+                lines.append('撤单回报    ' + states.get(status, status))
+            if order.get('native_message'):
+                lines.append(order['native_message'])
+            grid.detail_label.setText('\n'.join(lines))
 
     @staticmethod
     def current_trading_day(view):
@@ -1442,27 +2306,48 @@ class WorkbenchLayout:
         days = {item['trading_day'] for item in view['markets'] if item.get('fresh') and item.get('trading_day')}
         return next(iter(days)) if len(days)==1 else None
 
+    @staticmethod
+    def order_source_title(order):
+        return {'STRATEGY': '策略', 'MANUAL': '手动'}.get(order.get('order_source'), '未知')
+
     def filter_orders(self, *_):
         if self.rendered_view is None:
             return
         chosen = self.order_contract.currentText()
         effect = {'开仓':'OPEN','平仓':'REDUCE'}.get(self.order_effect.currentText())
         side = self.order_side.currentText()
+        source = self.order_source.currentText()
         view = self.rendered_view
         current = self.current_trading_day(view)
         def visible(item, day):
-            return (current is None or item.get(day)==current) and (
+            return (day is None or current is None or item.get(day)==current) and (
                 chosen == '全部品种' or item.get('contract_id') == chosen) and (
                 effect is None or item.get('effect') == effect) and (side=='全部方向' or side==native_side(item))
-        counts = []
-        for name, day in (('orders','native_trading_day'),('trades','trading_day')):
-            matches = 0
-            for index, item in enumerate(view[name]):
-                keep = visible(item, day)
-                self.tables[name].setRowHidden(index, not keep)
-                matches += keep
-            counts.append(matches)
-        self.order_count.setText(f'委托 {counts[0]} 笔   /   成交 {counts[1]} 笔' if current else '等待柜台交易日')
+        active_count = 0
+        historical = []
+        for index, item in enumerate(view['orders']):
+            terminal = item.get('terminal_confirmed', item.get('broker_state') in {'FILLED', 'CANCELLED', 'REJECTED'})
+            fills_consistent = item.get('reported_fill_qty', item.get('filled_qty')) == item.get('filled_qty')
+            unresolved = (item.get('send_state') in {'UNKNOWN', 'SEND_POSSIBLE'} or item.get('cancel_status') == 'UNKNOWN'
+                          or not fills_consistent)
+            keep = visible(item, None) and (source == '全部来源' or source == self.order_source_title(item))
+            if self.order_cycles:
+                keep = item.get('position_cycle_id') in self.order_cycles
+            if terminal and not unresolved and (not self.order_cycles or keep):
+                historical.append(item)
+            active = keep and (not terminal or unresolved)
+            self.tables['orders'].setRowHidden(index, not active)
+            active_count += active
+        self.order_active_count = active_count
+        self.fill_selectable(self.historical_orders, [order_cells(item) for item in historical],
+                             [item.get('child_order_id') for item in historical])
+        fill_count = 0
+        for index, item in enumerate(view['trades']):
+            keep = visible(item, 'trading_day')
+            self.tables['trades'].setRowHidden(index, not keep)
+            fill_count += keep
+        self.order_count.setText(f'当前委托 {active_count} 笔   /   成交 {fill_count} 笔')
+        self.render_order_detail()
 
     def manual_page(self, layout):
         account = group('连接', layout)
@@ -1731,34 +2616,66 @@ class WorkbenchLayout:
         self.log_filter.addItems(['全部','执行器','工作台','DSV 对照'])
         self.log_filter.currentTextChanged.connect(self.update_logs)
         self.log_event_filter = QComboBox()
-        self.log_event_filter.addItems(['全部事件', *LOG_EVENT_FILTERS])
+        self.log_event_filter.addItems(['全部事件', *LOG_EVENT_FILTERS, '警告'])
         self.log_event_filter.currentTextChanged.connect(self.update_logs)
+        self.log_time_filter = QComboBox()
+        self.log_time_filter.addItems(['全部时间', '最近 15 分钟', '最近 1 小时'])
+        self.log_time_filter.currentIndexChanged.connect(self.update_logs)
+        self.log_contract_filter = QComboBox()
+        self.log_contract_filter.addItem('全部合约')
+        self.log_contract_filter.currentTextChanged.connect(self.update_logs)
         self.log_search = QLineEdit()
         self.log_search.setPlaceholderText('搜索已加载日志')
         self.log_search.textChanged.connect(self.update_logs)
         self.log_count = QLabel('0 行')
         self.log_source_status = QLabel('日志来源未绑定')
-        tools = row(button('复制全部',self.copy_log),button('导出Excel',self.export_log),
-                    button('清空',self.clear_log),button('导出日报',self.open_daily_report),self.log_filter,
-                    self.log_event_filter,self.log_search)
-        tools.addWidget(self.log_count)
-        layout.addLayout(tools)
+        layout.addLayout(row(self.log_time_filter, self.log_contract_filter, self.log_filter,
+                             self.log_event_filter, self.log_search, self.log_count))
+        layout.addLayout(row(button('复制全部',self.copy_log),button('导出Excel',self.export_log),
+                             button('清空',self.clear_log),button('导出日报',self.open_daily_report)))
         layout.addWidget(self.log_source_status)
-        logs = group('运行日志',layout,stretch=1)
+        self.log_view_tabs = QTabWidget()
+        self.log_view_tabs.setObjectName('workspaceSection')
+        records = QSplitter(Qt.Horizontal)
+        self.log_records = table(('时间', '级别', '合约', '事件'))
+        self.log_records.setObjectName('dashboardGrid')
+        self.log_records.setSelectionMode(QAbstractItemView.SingleSelection)
+        for column in (0, 1, 2):
+            self.log_records.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        records.addWidget(self.log_records)
+        detail = QWidget()
+        detail_layout = QVBoxLayout(detail)
+        info = group('事件详情', detail_layout)
+        info.parentWidget().setObjectName('workspaceCard')
+        self.log_event_detail = QLabel(objectName='workspaceDetail')
+        self.log_event_detail.setTextFormat(Qt.PlainText)
+        self.log_event_detail.setWordWrap(True)
+        self.log_event_detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        info.addWidget(self.log_event_detail)
+        detail_layout.addStretch(1)
+        records.addWidget(detail)
+        records.setSizes([950, 440])
+        self.log_records.currentCellChanged.connect(self.render_log_detail)
+        self.log_view_tabs.addTab(records, '事件列表')
         self.log_text = QPlainTextEdit()
         self.log_text.setObjectName('runtimeLog')
         self.log_text.setReadOnly(True)
         self.log_text.setLineWrapMode(QPlainTextEdit.NoWrap)
-        logs.addWidget(self.log_text)
-        recovery = QTabWidget()
-        recovery.addTab(self.tables['commands'],'命令回执')
-        recovery.addTab(QWidget(),'原单核对')
-        recovery.setMaximumHeight(150)
-        panel = QVBoxLayout(recovery.widget(1))
-        panel.addLayout(row(self.buttons['order_archive'],self.buttons['historical_orders']))
-        panel.addStretch()
-        layout.addLayout(row(self.buttons['receipt']))
-        layout.addWidget(recovery)
+        self.log_view_tabs.addTab(self.log_text, '原始文本')
+        layout.addWidget(self.log_view_tabs, 1)
+        self.render_log_detail()
+
+    def render_log_detail(self, *_):
+        row = self.log_records.currentRow()
+        if row < 0 or row >= self.log_records.rowCount():
+            self.log_event_detail.setText('选择事件查看详情')
+            return
+        time_text, severity, contract, summary = [self.log_records.item(row, column).text() for column in range(4)]
+        self.log_event_detail.setText(f'发生时间    {time_text}\n级别    {severity}\n合约    {contract}\n\n{summary}')
+
+    def receipts_page(self, layout):
+        layout.addLayout(row(self.buttons['receipt'], self.buttons['order_archive'], self.buttons['historical_orders']))
+        layout.addWidget(self.tables['commands'], 1)
 
     def copy_log(self):
         self.update_logs()
@@ -2038,7 +2955,8 @@ class WorkbenchLayout:
         return product, dsv
 
     def update_logs(self, *_):
-        if self.tabs.currentWidget() is not self.log_tab:
+        if (self.tabs.currentWidget() is not self.diagnostic_sections.parentWidget()
+                or self.diagnostic_sections.currentWidget() is not self.log_tab):
             return
         mode = self.log_filter.currentIndex()
         run = self.latest_run()
@@ -2059,10 +2977,40 @@ class WorkbenchLayout:
         self.log_source_status.setVisible(run is None and mode != 2)
         if mode in (0,2):lines.extend(self.activity)
         lines.sort(key=lambda line: line.timestamp or datetime.min.replace(tzinfo=BEIJING))
-        allowed = LOG_EVENT_FILTERS.get(event_filter)
+        allowed = {'warning'} if event_filter == '警告' else LOG_EVENT_FILTERS.get(event_filter)
         query = self.log_search.text().strip().casefold()
-        self.visible_log_lines = [line.text for line in lines if (allowed is None or line.category in allowed)
-                                  and query in line.text.casefold()]
+        view = self.window.view or {}
+        codes = sorted(set(self.names) | {item['contract_id'] for item in view.get('markets', ())
+                                        } | {item['contract_id'] for item in view.get('cycles', ())})
+        options = ['全部合约', *codes]
+        if [self.log_contract_filter.itemText(index) for index in range(self.log_contract_filter.count())] != options:
+            selected = self.log_contract_filter.currentText()
+            blocked = self.log_contract_filter.blockSignals(True)
+            self.log_contract_filter.clear()
+            self.log_contract_filter.addItems(options)
+            if selected in options:
+                self.log_contract_filter.setCurrentText(selected)
+            self.log_contract_filter.blockSignals(blocked)
+        code_filter = self.log_contract_filter.currentText()
+        minutes = (None, 15, 60)[self.log_time_filter.currentIndex()]
+        since = datetime.now(BEIJING) - timedelta(minutes=minutes) if minutes else None
+        visible = [line for line in lines if (allowed is None or line.category in allowed)
+                   and (since is None or line.timestamp is not None and line.timestamp >= since)
+                   and (code_filter == '全部合约' or code_filter in line.text)
+                   and query in line.text.casefold()]
+        self.visible_log_lines = [line.text for line in visible]
+        recent = visible[-200:][::-1]
+        keys = [(line.text, line.timestamp) for line in recent]
+        if keys != getattr(self, 'log_record_keys', None):
+            self.log_record_keys = keys
+            rows = []
+            for line in recent:
+                message = line.text.split('] ', 2)[-1]
+                code = next((code for code in codes if code in message), '—')
+                severity = {'error': '异常', 'warning': '警告'}.get(line.category, '信息')
+                rows.append((line.timestamp.strftime('%H:%M:%S') if line.timestamp else '—', severity, code, message))
+            self.fill_selectable(self.log_records, rows, keys)
+            self.render_log_detail()
         content = '\n'.join(self.visible_log_lines) or '当前没有可显示的运行记录'
         self.log_count.setText(f'{len(self.visible_log_lines)} 行')
         if content != self.last_log_text:
@@ -2136,6 +3084,9 @@ class WorkbenchLayout:
         calculator.cancel_button.hide()
         calculator.apply_button.setText('应用所选到本地预览')
         self.offset_preview = QLabel('计算结果在此核对')
+        self.offset_preview.setWordWrap(True)
+        self.offset_market_button = button('一键计算（联网）', self.calculate_market_offsets)
+        layout.addLayout(row(self.offset_market_button, self.offset_preview))
         def applied():
             candidate = calculator.result_profile
             dialog = self.parameter_dialog()
@@ -2146,8 +3097,22 @@ class WorkbenchLayout:
             calculator.show()
         calculator.accepted.connect(applied)
         layout.addWidget(calculator,1)
-        layout.addWidget(self.offset_preview)
         self.calculator = calculator
+
+    def calculate_market_offsets(self):
+        if self.quote_worker is not None:
+            return
+        account = self.window.selected_account
+        if self.window.store is None or account is None:
+            self.offset_preview.setText('请先在「账户与设置」选用有行情凭据的账号。')
+            return
+        requested = self.calculator.calculation_input()
+        if not requested[0].to_record()['settings']['symbols']:
+            self.offset_preview.setText('请先在策略参数里添加合约。')
+            return
+        self.offset_requested_input = requested
+        self.offset_preview.setText('正在读取原生日线和当前振幅…')
+        self.start_market_read(account['account_id'], offset_query=requested[:3])
 
     def system_page(self, layout):
         sound_settings = getattr(self.window,'create_sound_settings',None)
@@ -2155,19 +3120,45 @@ class WorkbenchLayout:
             layout.addWidget(sound_settings())
         appearance = group('界面偏好', layout)
         appearance.addWidget(self.window._tray.preference_checkbox())
+        self.font_size = QSpinBox()
+        self.font_size.setRange(8, 13)
+        self.font_size.setValue(self.settings.value('font_size', 12, int))
+        appearance.addLayout(row(QLabel('字号'), self.font_size, button('按屏幕自适应', self.fit_current_screen)))
         appearance.addWidget(button('授权状态', self.show_license_status))
         for title,key,panel in (('显示 K 线图','show_candles',self.candle_panel),
                                 ('显示权益曲线','show_equity',self.equity_panel)):
             chart = QCheckBox(title)
             chart.setChecked(self.settings.value(key,self.settings.value('show_charts',True,bool),bool))
             panel.setVisible(chart.isChecked())
-            if key == 'show_equity':
-                chart.toggled.connect(panel.setVisible)
-            else:
-                chart.setToolTip('重开工作台后生效')
+            chart.toggled.connect(panel.setVisible)
             chart.toggled.connect(lambda visible,k=key:self.settings.setValue(k,visible))
             appearance.addWidget(chart)
         layout.addStretch()
+
+    def fit_current_screen(self):
+        window = self.window
+        screen = window.screen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        if window.isMaximized() or window.isFullScreen():
+            window.showNormal()
+        window.layout().activate()
+        # Fit the native frame inside the current monitor's work area, including its taskbar.
+        frame_extra = window.frameGeometry().size() - window.geometry().size()
+        usable = available.size() - frame_extra
+        minimum = window.minimumSizeHint().expandedTo(window.minimumSize())
+        while (minimum.width() > usable.width() or minimum.height() > usable.height()) and self.font_size.value() > self.font_size.minimum():
+            self.font_size.setValue(self.font_size.value() - 1)
+            window.layout().activate()
+            minimum = window.minimumSizeHint().expandedTo(window.minimumSize())
+        size = window.size().expandedTo(minimum).boundedTo(usable)
+        window.resize(size)
+        frame = window.frameGeometry()
+        x = max(available.left(), min(frame.left(), available.right() - frame.width() + 1))
+        y = max(available.top(), min(frame.top(), available.bottom() - frame.height() + 1))
+        window.move(x, y)
+        window._tray.save_geometry()
 
     def show_license_status(self):
         from online_trader.desktop.entrypoint import license_status_text
@@ -2317,8 +3308,6 @@ class WorkbenchLayout:
             value = display_quote_delay(delay) if monitor else '—'
         self.home_quote_delay.setText(f'整体行情延迟（抽样）   {value}')
         self.home_quote_delay.setToolTip('最近一笔有效行情的抽样延迟。各合约的新鲜度见下方合约行情。')
-        self.monitor_quote_delay.setText(self.home_quote_delay.text())
-        self.monitor_quote_delay.setToolTip(self.home_quote_delay.toolTip())
         if not monitor:
             return
         armed = (self.rendered_view or {}).get('entry_authority') == 'ARMED'
@@ -2353,8 +3342,21 @@ class WorkbenchLayout:
     def render(self, view):
         self.rendered_view = view
         self.render_session_hours(view)
-        populate(self.tables['orders'],[order_cells(item) for item in view['orders']])
+        orders = self.tables['orders']
+        populate(orders, [order_cells(item) for item in view['orders']])
+        for index, item in enumerate(view['orders']):
+            orders.item(index, 0).setData(Qt.UserRole, item.get('child_order_id'))
         populate(self.tables['trades'],[trade_cells(item) for item in view['trades']])
+        codes = ['全部品种', *dict.fromkeys([*self.names, *(item['contract_id'] for item in view['orders']),
+                                          *(item['contract_id'] for item in view['markets'])])]
+        if [self.order_contract.itemText(index) for index in range(self.order_contract.count())] != codes:
+            selected = self.order_contract.currentText()
+            blocked = self.order_contract.blockSignals(True)
+            self.order_contract.clear()
+            self.order_contract.addItems(codes)
+            if selected in codes:
+                self.order_contract.setCurrentText(selected)
+            self.order_contract.blockSignals(blocked)
         self.filter_orders()
         self.render_positions(view)
         self.manual_status.setText(self.window.connection_detail.text())
@@ -2391,7 +3393,7 @@ class WorkbenchLayout:
         self.record_balance(account,view)
         self.render_equity_chart()
         self.candles.show_native_bars(view.get('minute_bars',{}) | view['configuration'].get('native_minute_bars',{}))
-        self.select_candles(self.candle_contract.currentText())
+        self.select_dashboard_market()
         run = self.latest_run()
         strategy_records = self.logged_strategy_reasons(run)
         waiting, blocked, pending = [], [], []
@@ -2462,4 +3464,5 @@ class WorkbenchLayout:
         if state != self.last_state:
             self.last_state = state
             self.add_activity(self.window.connection_detail.text())
+        self.render_dashboard_events(view)
         self.update_logs()

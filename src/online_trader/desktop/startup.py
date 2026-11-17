@@ -62,15 +62,19 @@ class QuoteReferenceWorker(QThread):
     received = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, store, account_id, codes, parent, *, catalog=False):
+    def __init__(self, store, account_id, codes, parent, *, catalog=False, offset_query=None):
         super().__init__(parent)
         self.store, self.account_id, self.codes = store, account_id, codes
         self.catalog = catalog
+        self.offset_query = offset_query
 
     def run(self):
         from online_trader.runtime.startup_metadata import read_contract_catalog, read_startup_metadata
         try:
-            if self.catalog:
+            if self.offset_query is not None:
+                from online_trader.runtime.startup_environment import fetch_offset_inputs
+                result = fetch_offset_inputs(self.store, self.account_id, *self.offset_query)
+            elif self.catalog:
                 result = read_contract_catalog(self.store,self.account_id)
             else:
                 result = read_startup_metadata(self.store,self.account_id,self.codes,quote_preview=True)
