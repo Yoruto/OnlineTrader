@@ -3118,6 +3118,8 @@ class WorkbenchLayout:
     def calculate_market_offsets(self):
         if self.quote_worker is not None:
             return
+        self.calculator.invalidate()
+        self.calculator.error_label.clear()
         account = self.window.selected_account
         if self.window.store is None or account is None:
             self.offset_preview.setText('请先在「账户与设置」选用有行情凭据的账号。')
