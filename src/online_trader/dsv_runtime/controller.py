@@ -389,10 +389,7 @@ class ExplicitOrderController:
         if row['position'] is not None:
             positions.append(row['position'])
         children = [order for position in positions for order in self.child_orders(state, position) if not terminal(order)]
-        opening = [order for order in children if order['effect'] == 'OPEN']
-        if opening or row.get('native_conflicts'):
-            return [request for order in opening if (request := self.cancel(order, 'TARGET_REDUCED'))]
-        if children or market.get('external_orders') or not market.get('allow_new_order', True):
+        if children or row.get('native_conflicts') or market.get('external_orders'):
             return []
         contract, day = market['contract_id'], state['trading_day']
         buckets = {key: 0 for key in ('long_today', 'long_historical', 'short_today', 'short_historical')}
@@ -453,8 +450,12 @@ class ExplicitOrderController:
         direction = position['direction']
         if effect == 'OPEN':
             mode = position['mode']
-            if mode != 'ACTIVE' and wall_time - float(position['context_at']) > 90:
-                mode = 'ACTIVE'
+            if mode != 'ACTIVE':
+                expired = market.get('price_context_expired')
+                if expired is None:
+                    expired = wall_time - float(position['context_at']) > 90
+                if expired:
+                    mode = 'ACTIVE'
             reference = position['theory'] if mode == 'PASSIVE' else position['cap']
         else:
             direction = 'SHORT' if direction == 'LONG' else 'LONG'
@@ -475,11 +476,17 @@ class ExplicitOrderController:
             mode, reference = 'ACTIVE', None
         return legal_price(tick, entry_price(tick, direction, mode, None if reference is None else float(reference)))
 
-    def plan(self, state, row, market, wall_time):
+    @staticmethod
+    def _needed(position, effect):
+        if effect == 'OPEN':
+            if position.get('preserve_open_on_stop') and position['exit_target'] is None:
+                return None
+            return 0 if position['entry_stopped'] else position['quantity'] - position['entry_filled']
+        return 0 if position['exit_target'] is None else position['owned'] - position['exit_target']
+
+    def plan_maintenance(self, state, row, market):
+        """Cancel provably owned residual orders using identity and quantity alone."""
         position = row['position']
-        tick = market.get('tick')
-        if tick is None:
-            return []
         prior = [
             order for order in state['orders'].values()
             if order['contract_id'] == market['contract_id'] and not terminal(order)
@@ -487,42 +494,56 @@ class ExplicitOrderController:
         if prior:
             current = [] if position is None else self.child_orders(state, position)
             return [request for order in prior + current if order['effect'] == 'OPEN' and not order.get('terminal_conflict')
-                    and (request := self.cancel(order, 'TARGET_REDUCED'))]
+                    and (request := self.cancel(order, 'TARGET_REDUCED'))], False
         if row.get('detached_positions') or row.get('native_conflicts'):
-            return self.plan_detached(state, row, market, wall_time)
+            owners = [state['retired_positions'][identity] for identity in row.get('detached_positions', [])]
+            if position is not None:
+                owners.append(position)
+            opening = [order for owner in owners for order in self.child_orders(state, owner, 'OPEN')
+                       if not terminal(order)]
+            return [request for order in opening if not order.get('terminal_conflict')
+                    and (request := self.cancel(order, 'TARGET_REDUCED'))], not opening and not row.get('native_conflicts')
         if position is None:
-            return []
-        proven_position = self.proves_position(state, position, market)
+            return [], False
         children = self.child_orders(state, position)
         if any(order['native_trading_day'] != state['trading_day'] and not terminal(order) for order in children):
-            return []
+            return [], False
         if any(order.get('terminal_conflict') and not terminal(order) for order in children):
             return [request for order in children if not order.get('terminal_conflict')
-                    and (request := self.cancel(order, 'TARGET_REDUCED'))]
+                    and (request := self.cancel(order, 'TARGET_REDUCED'))], False
+        effects = []
+        for order in children:
+            if terminal(order):
+                continue
+            needed = self._needed(position, order['effect'])
+            if needed is not None and order['original_qty'] - order['filled_qty'] > max(0, needed):
+                if request := self.cancel(order, 'TARGET_REDUCED'):
+                    effects.append(request)
+        return effects, True
+
+    def plan_priced_effects(self, state, row, market, wall_time):
+        if row.get('detached_positions'):
+            return self.plan_detached(state, row, market, wall_time)
+        position = row['position']
+        proven_position = self.proves_position(state, position, market)
         effects = []
         for effect in ('OPEN', 'REDUCE'):
             previous = self.child_orders(state, position, effect)
             outstanding = [order for order in previous if not terminal(order)]
+            needed = self._needed(position, effect)
+            if needed is None or needed <= 0:
+                continue
             opening = effect == 'OPEN'
-            if opening:
-                needed = 0 if position['entry_stopped'] else position['quantity'] - position['entry_filled']
-                if position.get('preserve_open_on_stop') and position['exit_target'] is None:
-                    continue
-            else:
-                needed = 0 if position['exit_target'] is None else position['owned'] - position['exit_target']
-            desired = self._desired(position, market, effect, wall_time) if needed > 0 and market.get('allow_new_order', True) else None
-            for order in outstanding:
-                pending = order['original_qty'] - order['filled_qty']
-                reason = 'TARGET_REDUCED' if pending > max(0, needed) else None
-                if reason is None and proven_position and pending and desired is not None:
+            desired = self._desired(position, market, effect, wall_time)
+            if proven_position and desired is not None:
+                for order in outstanding:
+                    pending = order['original_qty'] - order['filled_qty']
                     current = Decimal(order['limit_price'])
                     proposed = Decimal(desired)
                     worse = proposed > current if order['direction'] == 'BUY' else proposed < current
-                    if worse:
-                        reason = 'REPRICE'
-                if reason and (request := self.cancel(order, reason)):
-                    effects.append(request)
-            if not proven_position or outstanding or desired is None or needed <= 0:
+                    if worse and 0 < pending <= needed and (request := self.cancel(order, 'REPRICE')):
+                        effects.append(request)
+            if not proven_position or outstanding or desired is None:
                 continue
             maximum = market.get('max_order_qty', 2_147_483_647)
             if opening and not market.get('min_order_qty', 1) <= needed <= maximum:
@@ -546,8 +567,15 @@ class ExplicitOrderController:
                     route = routes[0]
                     effects.append(self.new_order(state, position, market, effect,
                                                   min(route['quantity'], maximum), desired, route['native_offset']))
-        self.settle(state, row)
         return effects
+
+    def plan(self, state, row, market, wall_time):
+        maintenance, can_price = self.plan_maintenance(state, row, market)
+        if can_price and market.get('tick') is not None and market.get('allow_new_order', True):
+            maintenance.extend(self.plan_priced_effects(state, row, market, wall_time))
+        if can_price and not row.get('detached_positions'):
+            self.settle(state, row)
+        return maintenance
 
     def settle(self, state, row):
         position = row['position']

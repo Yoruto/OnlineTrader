@@ -18,6 +18,11 @@ from online_trader.gateway.tqkq import number
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.scheduling.calendar import TradingCalendar
+from online_trader.scheduling.clock import (
+    ClockContinuity, ClockSample, SystemClock, TIME_SEMANTICS, sdk_deadline,
+    source_age_ns, source_fraction_tail, utc_text,
+)
+from online_trader.scheduling.timers import poll_slice
 from online_trader.strategy.entry import is_night_session
 
 
@@ -52,7 +57,7 @@ class DsvSdkAdapter:
     """
 
     def __init__(self, api, account, *, account_key, profile, calendar, sdk_version, clock=None, _connection=None,
-                 _legacy_native_orders=None):
+                 _legacy_native_orders=None, continuity=None):
         if sdk_version != SDK_VERSION or not isinstance(profile, DsvProfile) or not isinstance(calendar, TradingCalendar):
             raise TraderError('E_DSV_SDK_SCOPE', 'Expected the pinned SDK, normalized profile and explicit calendar')
         identifier(account_key)
@@ -73,7 +78,13 @@ class DsvSdkAdapter:
             raise TraderError('E_DSV_SDK_SCOPE', 'The calendar must cover every selected contract')
         day_sets = [{period['trading_day'] for period in self.periods[code]} for code in self.contracts]
         self.trading_days = sorted(set.intersection(*day_sets)) if day_sets else []
-        self.clock = clock if clock is not None else lambda: (datetime.now(timezone.utc), time.monotonic_ns() // 1_000_000)
+        self.clock = clock if clock is not None else SystemClock()
+        self._clock_epoch = uuid4().hex
+        self._continuity = continuity if continuity is not None else ClockContinuity()
+        self._health = None
+        self._sdk_activity = 0
+        self._last_pump_ns = None
+        self.metrics = {}
         self.owner = get_ident()
         self.session = None
         self.epoch = uuid4().hex
@@ -81,7 +92,7 @@ class DsvSdkAdapter:
         self.synchronized = False
         self.flat_confirmed = False
         self.dispatch_market = {}
-        self.quote_times = {}
+        self.quote_observations = {}
         self._seen_effects = set()
         self._local_returns = set()
         self._foreign_trades = None
@@ -93,11 +104,31 @@ class DsvSdkAdapter:
         return self.grant is not None and (account, provider) == (self.account_key, self.provider)
 
     def check_start(self, state):
-        now, _ = self.clock()
-        if not self.synchronized or not state['synchronized'] or not self.grant.in_window(now):
+        sample = self._clock_sample()
+        if not self.synchronized or not state['synchronized'] or not self.grant.in_window(sample.utc):
             raise TraderError('E_DSV_SDK_SYNC', 'Start needs a current synchronized account within the reviewed window')
         if not self.grant.permits_day(state['trading_day']):
             raise TraderError('E_DSV_SDK_SCOPE', 'Start needs the authorized cabinet day')
+        if state.get('clock_recovery_required') or self._continuity.compare(sample)['reason']:
+            raise TraderError('E_DSV_SDK_CLOCK', 'Review and recover the clock before enabling entries')
+
+    def check_clock_recovery(self, state):
+        sample = self._clock_sample()
+        windows = [self.calendar.query(code, sample.now_utc) for code in self.contracts]
+        if (not self.synchronized or not self.grant.permits_day(state['trading_day'])
+                or self._continuity.compare(sample)['reason']
+                or any(not window['complete'] or window['is_trading'] and window['trading_day'] != state['trading_day']
+                       for window in windows)):
+            raise TraderError('E_DSV_SDK_CLOCK', 'Clock recovery needs a consistent bound account, day and calendar')
+
+    def _clock_sample(self):
+        if hasattr(self.clock, 'capture'):
+            return self.clock.capture()
+        # Keep the existing offline harness callable (aware UTC, milliseconds).
+        now, mono = self.clock()
+        if type(mono) is not int:
+            raise TraderError('E_DSV_SDK_CLOCK', 'Expected integer monotonic milliseconds')
+        return ClockSample(utc_text(now), str(mono * 1_000_000), getattr(self, '_clock_epoch', None))
 
     def opening_window(self, day, now):
         return self.grant.permits_day(day) and self.grant.in_window(now)
@@ -126,7 +157,7 @@ class DsvSdkAdapter:
         self.synchronized = False
         self.flat_confirmed = False
         self.dispatch_market = {}
-        self.quote_times = {}
+        self.quote_observations = {}
         self._local_returns.clear()
         self.epoch = uuid4().hex
         session.disconnect('SDK_DISCONNECTED')
@@ -144,39 +175,35 @@ class DsvSdkAdapter:
         state = self._bind(session)
         self.enabled = False
         try:
+            timers = session.active_timers()
+            wait = poll_slice(timers, self._clock_sample()) if timers else 0.5
+            started = time.monotonic_ns()
             if self.connection is None:
-                self.api.wait_update(deadline=time.time() + 0.5)
+                updated = self.api.wait_update(deadline=sdk_deadline(wait))
             else:
                 epoch = self.connection.source_epoch
-                self.connection.poll_updates(0.5)
+                self.connection.poll_updates(wait)
+                updated = getattr(self.connection, 'last_poll_updated', None)
                 if self.connection.source_epoch != epoch:
                     self.disconnect(session)
                     state = session.snapshot()
+            after_pump = time.monotonic_ns()
+            self.metrics = {'sdk_pump_ns': str(after_pump - started), 'sdk_pump_gap_ns': (
+                None if self._last_pump_ns is None else str(started - self._last_pump_ns))}
+            self._last_pump_ns = started
+            if updated is True:
+                self._sdk_activity += 1
+            sample = self._clock_sample()
+            self._health = self._continuity.observe(sample)
             synchronized = complete() if callable(complete) else complete
             if type(synchronized) is not bool:
                 raise TraderError('E_DSV_SDK_SYNC', 'SDK synchronization must be supplied as a complete fact')
-            now, mono = self.clock()
-            if not isinstance(now, datetime) or now.utcoffset() is None or type(mono) is not int or mono < 0:
-                raise TraderError('E_DSV_SDK_CLOCK', 'Expected an explicit wall and monotonic clock sample')
             if not synchronized:
                 self.disconnect(session)
                 return {'type': 'DISCONNECTED', 'synchronized': False}
-            quotes = {}
-            for code, quote in self.quotes.items():
-                moment = self._quote_time(quote)
-                if moment is None:
-                    continue
-                window = self.calendar.query(code, utc(moment))
-                if not window['complete'] or window['is_trading'] and window['trading_day'] < state['trading_day']:
-                    continue
-                if moment >= self.quote_times.get(code, moment):
-                    self.quote_times[code] = moment
-                    quotes[code] = moment
-            market_time = max(self.quote_times.values(), default=None)
             if callable(trading_day):
-                trading_day = (state['trading_day'] if market_time is None else
-                               trading_day(state['trading_day'], market_time))
-            frame, market = self._frame(state, market_time, mono, trading_day, quotes, now)
+                trading_day = trading_day(state['trading_day'], sample.utc)
+            frame, market = self._frame(state, sample, trading_day)
             self.enabled = True
             self.dispatch_market = market
             receipt = session.apply_round(frame)
@@ -188,7 +215,7 @@ class DsvSdkAdapter:
             self.synchronized = False
             self.flat_confirmed = False
             self.dispatch_market = {}
-            self.quote_times = {}
+            self.quote_observations = {}
             self._local_returns.clear()
             self.epoch = uuid4().hex
             if not session._failed:
@@ -197,13 +224,13 @@ class DsvSdkAdapter:
         finally:
             self.enabled = False
 
-    def _frame(self, state, now, mono, day, quotes, authorization_time):
+    def _frame(self, state, sample, day):
         if day not in self.trading_days or day < state['trading_day']:
             raise TraderError('E_DSV_SDK_SCOPE', 'Cabinet day is outside of the selected calendar')
-        active_days = {window['trading_day'] for code in self.contracts
-                       if now is not None and (window := self.calendar.query(code, utc(now)))['is_trading']}
-        if active_days and active_days != {day} or day != state['trading_day'] and not active_days:
-            raise TraderError('E_DSV_SDK_SCOPE', 'A cabinet-day change requires a matching active calendar session')
+        windows = {code: self.calendar.query(code, sample.now_utc) for code in self.contracts}
+        if day != state['trading_day'] and not all(
+                window['is_trading'] and window['trading_day'] == day for window in windows.values()):
+            raise TraderError('E_DSV_SDK_SCOPE', 'A cabinet-day change requires matching active calendar sessions')
         bindings = {self.order_id(child): order for child, order in state['orders'].items()}
         orders = self.api.get_order(account=self.account)
         trades = self.api.get_trade(account=self.account)
@@ -214,17 +241,18 @@ class DsvSdkAdapter:
         accepted.update({fact['native_order_id']: fact['source_time_ns'] for fact in native if 'source_time_ns' in fact})
         details, foreign_trades = self._trade_facts(trades, bindings, day, accepted, needs_recovery=bool(state['orders']))
         funds = self.api.get_account(account=self.account)
-        markets = [self._market(code, day, now, funds, state['symbols'][code],
-                                code in foreign_orders or code in foreign_trades, state['orders'], quote_time=quotes.get(code))
-                   for code in self.contracts]
-        if any(row.get('native_coverage') is False for row in markets):
-            raise TraderError('E_DSV_SDK_SCOPE', 'Market time is outside the complete calendar coverage')
+        markets = []
+        for code in self.contracts:
+            quote_time, observation = self._observe_quote(code, sample, windows[code], day)
+            markets.append(self._market(code, day, sample.utc, funds, state['symbols'][code],
+                                        code in foreign_orders or code in foreign_trades, state['orders'],
+                                        quote_time=quote_time, window=windows[code], observation=observation))
         sequence = state['sequence'] + 1
-        # A quote-less startup can reconcile account facts without advancing strategy time.
-        stamp = utc(now) if now is not None else min(row['session_open'] for row in markets)
         frame = {'id': f'sdk-{self.epoch}-{sequence}', 'sequence': sequence, 'session_id': self.epoch,
-                 'wall_time': stamp, 'authorization_time': utc(authorization_time.astimezone(timezone.utc)),
-                 'market_clock': True, 'monotonic_ms': str(mono), 'trading_day': day,
+                 'time_semantics_version': TIME_SEMANTICS, 'time_sample': sample.paired_record(),
+                 'wall_time': sample.now_utc, 'decision_utc': sample.now_utc, 'authorization_time': sample.now_utc,
+                 'clock_health': self._health, 'sdk_activity': self._sdk_activity,
+                 'monotonic_ms': str(sample.monotonic // 1_000_000), 'trading_day': day,
                  'trading_days': self.trading_days, 'calendar_hash': self.calendar.content_hash,
                  'synchronized': True, 'market': markets,
                  'sync_orders': [fact['child_order_id'] for fact in native if fact['kind'] == 'ORDER'],
@@ -355,22 +383,77 @@ class DsvSdkAdapter:
     def _contract(item):
         return item.exchange_id + '.' + item.instrument_id
 
-    def _market(self, code, day, now, funds, previous, external, orders, *, quote_time=None):
-        window = (self.calendar.query(code, utc(now)) if now is not None else
-                  {'is_trading': False, 'complete': True})
+    def _observe_quote(self, code, sample, current_window, day):
+        quote = self.quotes[code]
+        previous = self.quote_observations.get(code)
+        last_change = None if previous is None else previous[2]
+        raw = getattr(quote, 'datetime', None)
+        malformed = False
+        try:
+            source = self._quote_time(quote)
+        except (TypeError, ValueError, OverflowError):
+            source, malformed = None, True
+        session = None
+        if source is not None:
+            session = self.calendar.query(code, utc(source))['session']
+        raw_age = None if source is None else source_age_ns(sample.utc, source, raw)
+        quality, reason = 'UNKNOWN', 'QUOTE_UNAVAILABLE'
+        if malformed:
+            quality, reason = 'SOURCE_ANOMALY', 'QUOTE_TIMESTAMP_INVALID'
+        elif source is not None:
+            precise_time = source, source_fraction_tail(raw)
+            active = current_window['session']
+            if session is None:
+                quality, reason = 'SOURCE_ANOMALY', 'QUOTE_SESSION_UNKNOWN'
+            elif active is None:
+                reason = 'QUOTE_OUTSIDE_CURRENT_SESSION'
+            elif (session['session_id'], session['trading_day']) != (active['session_id'], day):
+                quality, reason = 'SOURCE_ANOMALY', 'QUOTE_SESSION_MISMATCH'
+            elif previous is not None and precise_time < previous[0]:
+                quality, reason = 'SOURCE_ANOMALY', 'QUOTE_TIME_REGRESSION'
+            else:
+                if previous is None or raw != previous[1]:
+                    last_change = sample.monotonic
+                    self.quote_observations[code] = precise_time, raw, last_change
+                quality, reason = ('CLOCK_UNVERIFIED', 'QUOTE_LEADS_LOCAL_UTC') if raw_age < 0 else ('VALID', None)
+        observation = {'source_time_raw': raw if source is not None else None,
+                       'source_time_utc': None if source is None else utc(source),
+                       'observed_at_utc': sample.now_utc, 'observed_mono_ns': sample.monotonic_ns,
+                       'source_epoch': self.epoch, 'quote_identity': raw if source is not None else None,
+                       'last_distinct_quote_mono_ns': None if last_change is None else str(last_change),
+                       'source_age_raw_ns': None if raw_age is None else str(raw_age),
+                       'silence_ns': None if last_change is None else str(max(0, sample.monotonic - last_change)),
+                       'age_quality': quality, 'reason': reason,
+                       'quote_session': None if session is None else session['session_id']}
+        return (source if quality in {'VALID', 'CLOCK_UNVERIFIED'} else None), observation
+
+    def _market(self, code, day, now, funds, previous, external, orders, *, quote_time=None, window=None, observation=None):
+        if window is None:
+            window = self.calendar.query(code, utc(now))
+        active = bool(window['is_trading'] and window['trading_day'] == day)
         periods = [period for period in self.periods[code] if period['trading_day'] == day]
-        session = window['session'] if window['is_trading'] else next(
-            (period for period in periods if now is None or datetime.fromisoformat(period['open_utc']) > now), periods[-1])
+        session = window['session'] if active else next(
+            (period for period in periods if datetime.fromisoformat(period['open_utc']) > now), periods[-1])
         position = self.api.get_position(code, account=self.account)
         quote = self.quotes[code]
-        tick = self._tick(code, quote, session, quote_time) if window['is_trading'] else None
+        tick = self._tick(code, quote, session, quote_time) if active else None
         result = {'contract_id': code, 'session_open': session['open_utc'], 'session_close': session['close_utc'],
                   'opening_session': session['is_opening_session'], 'ticks': [] if tick is None else [tick],
                   'external_orders': external, 'native_coverage': window['complete'],
-                  'market_session_active': window['is_trading']}
+                  'market_session_active': active}
+        if observation is not None:
+            prior_liquidation = next((period for period in reversed(periods) if period['force_close_at_end']
+                                      and datetime.fromisoformat(period['close_utc']) <= now), None)
+            result.update(calendar_session_id=session['session_id'] if active else None,
+                          calendar_reason=('CALENDAR_COVERAGE_UNKNOWN' if not window['complete'] else
+                                           'CABINET_DAY_UNPROVED' if window['is_trading'] and not active else None),
+                          prior_liquidation=prior_liquidation,
+                          quote_observation=observation | {
+                              'native_candle_id': None if tick is None else tick['candle_id'],
+                              'native_candle_ns': None if tick is None else tick['native_candle_ns']})
         for field, native in _POSITION.items():
             result[field] = native_integer(getattr(position, native))
-        if window['is_trading']:
+        if active:
             if self.grant is not None and previous.get('position'):
                 result['max_order_qty'] = self.grant.value['max_order_quantity']
             end_hour = datetime.fromisoformat(session['close_utc']).astimezone(_BEIJING).hour
@@ -409,7 +492,7 @@ class DsvSdkAdapter:
             result['days_to_expiry'] = str((midnight - (quote_time or now).astimezone(_BEIJING)).days)
         for field, native in (('min_order_qty', 'min_limit_order_volume'), ('max_order_qty', 'max_limit_order_volume')):
             value = getattr(quote, native, None)
-            if value is not None and window['is_trading']:
+            if value is not None and active:
                 actual = native_integer(value, minimum=1)
                 result[field] = min(actual, result.get(field, actual))
         return result
@@ -419,10 +502,9 @@ class DsvSdkAdapter:
         stamp = getattr(quote, 'datetime', None)
         if not stamp or getattr(quote, 'expired', False):
             return None
-        try:
-            moment = datetime.fromisoformat(stamp)
-        except ValueError as error:
-            raise TraderError('E_DSV_SDK_FACT', 'Invalid SDK quote time') from error
+        if type(stamp) is not str or len(stamp) > 48:
+            raise ValueError('Invalid SDK quote timestamp')
+        moment = datetime.fromisoformat(stamp)
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=_BEIJING)
         return moment.astimezone(timezone.utc)
@@ -492,11 +574,19 @@ class DsvSdkAdapter:
                     legal_price(tick, Decimal(effect['limit_price'])) != effect['limit_price']):
                 rejection_reason = 'QUOTE_OR_PRICE_SCOPE'
                 raise TraderError('E_DSV_SDK_SCOPE', 'A native dispatch requires a legal price and current scoped quote')
+            clock = self._clock_sample()
+            if 'calendar_session_id' in market:
+                window = self.calendar.query(effect['contract_id'], clock.now_utc)
+                if (self._continuity.compare(clock)['reason'] or not window['is_trading']
+                        or window['trading_day'] != effect['trading_day']
+                        or window['session']['session_id'] != market['calendar_session_id']
+                        or self.quotes[effect['contract_id']].datetime != tick['native_quote_stamp']):
+                    rejection_reason = 'QUOTE_OR_PRICE_SCOPE'
+                    raise TraderError('E_DSV_SDK_SCOPE', 'The selected quote or trading session changed before dispatch')
             if self.grant is not None:
-                now, _ = self.clock()
                 if (effect['contract_id'] not in self.grant.value['contracts'] or
                         not self.grant.permits_day(effect['trading_day']) or
-                        effect['native_offset'] == 'OPEN' and not self.grant.in_window(now)):
+                        effect['native_offset'] == 'OPEN' and not self.grant.in_window(clock.utc)):
                     rejection_reason = 'ACCOUNT_SCOPE_OR_WINDOW'
                     raise TraderError('E_DSV_SDK_SCOPE', 'The SDK request exceeded its explicit account scope')
             request = dict(symbol=effect['contract_id'], direction=effect['direction'],

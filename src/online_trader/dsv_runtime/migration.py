@@ -14,7 +14,7 @@ from online_trader.contracts.codec import canonical_bytes, content_hash, strict_
 from online_trader.domain.values import decimal_value, identifier
 from online_trader.dsv_runtime.legacy_history import selected_native_history
 from online_trader.dsv_runtime.runner import _day, _utc, initial_state
-from online_trader.dsv_storage.journal import Journal, _APPLICATION_ID
+from online_trader.dsv_storage.journal import Journal, TIME_SCHEMA, _APPLICATION_ID
 from online_trader.errors import TraderError
 from online_trader.kernel.statistics import strategy_open_counts
 from online_trader.ledger.dsv_rollback import EVENT as REVERSE_EVENT
@@ -398,7 +398,7 @@ def rollback_snapshots(source, target):
 
 def read_migration_receipt(db):
     signature = (db.execute('PRAGMA application_id').fetchone()[0], db.execute('PRAGMA user_version').fetchone()[0])
-    if signature != (_APPLICATION_ID, 2):
+    if signature[0] != _APPLICATION_ID or signature[1] not in (2, TIME_SCHEMA):
         raise TraderError('E_DSV_ROLLBACK', 'Expected a migrated DSV fact store')
     found = db.execute("SELECT payload FROM events WHERE seq=1 AND kind='LEGACY_MIGRATION'").fetchone()
     if not found:
