@@ -135,9 +135,15 @@ class OffsetCalculatorDialog(QDialog):
         from online_trader.runtime.auto_offsets import dataset_from_rows
         self.invalidate()
         if inputs.get('status') == 'QUOTE_TIME_REJECTED':
-            reasons = {'QUOTE_SESSION_MISMATCH': '报价属于其他交易时段', 'QUOTE_TOO_OLD': '报价已超过 15 秒'}
-            details = [f"{code} {reasons[item['reason']]}，本机减源时间 {int(item['source_age_raw_ns'])/1_000_000:+.3f} ms"
-                       for code, item in inputs['quote_time_quality'].items() if item['reason'] in reasons]
+            reasons = {'QUOTE_SESSION_MISMATCH': '报价属于其他交易时段', 'QUOTE_TOO_OLD': '报价已超过 15 秒',
+                       'QUOTE_TOO_FAR_AHEAD': '报价领先本机超过 15 秒', 'QUOTE_UNAVAILABLE': '尚无报价时间',
+                       'QUOTE_TIMESTAMP_INVALID': '报价时间格式无效'}
+            details = []
+            for code, item in inputs['quote_time_quality'].items():
+                detail = f"{code} {reasons.get(item['reason'], '报价时间待核对')}"
+                if item['source_age_raw_ns'] is not None:
+                    detail += f"，本机减源时间 {int(item['source_age_raw_ns'])/1_000_000:+.3f} ms"
+                details.append(detail)
             self.error_label.setText('；'.join(details) or '振幅报价时间待核对。')
             return False
         symbols = self.base_profile.to_record()['settings']['symbols']

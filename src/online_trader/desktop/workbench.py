@@ -43,8 +43,10 @@ class _WorkbenchRequest(QThread):
 TABLES={
  'external_positions':(['合约','方向','柜台手数','自有手数','差额','今仓','昨仓','参考开仓价','可调整','核对异常'],
             ['contract_id','direction','native_quantity','owned_quantity','difference','today','historical','reference_price','eligible','review_error']),
- 'markets':(['合约','名称','允许该品种新增','最新','买一','卖一','日高','日低','交易日','来源时间','新鲜','路径完整','阻挡原因'],
-            ['contract_id','name','enabled','last','bid1','ask1','day_high','day_low','trading_day','source_time_utc','fresh','path_complete','entry_reasons']),
+ 'markets':(['合约','名称','允许该品种新增','最新','买一','卖一','日高','日低','交易日','来源时间','新鲜','路径完整','阻挡原因',
+             '原始报价时间','本机减源时间（毫秒）','报价时间状态'],
+            ['contract_id','name','enabled','last','bid1','ask1','day_high','day_low','trading_day','source_time_utc','fresh','path_complete','entry_reasons',
+             'source_time_raw','source_age_raw_ns','quote_time_reason']),
  'orders':(['合约','子单','柜台单号','柜台日','开平','手数','已成','在途占量','价格','原生开平','发送','柜台','撤单'],
             ['contract_id','child_order_id','native_order_id','native_trading_day','effect','original_qty','filled_qty','potential_remaining','limit_price','native_offset','send_state','broker_state','cancel_status']),
  'trades':(['合约','成交身份','方向','开平','手数','价格','交易日'],['contract_id','trade_key','direction','effect','quantity','price','trading_day']),
@@ -61,6 +63,13 @@ DISPLAY={'LONG':'多','SHORT':'空','OPEN':'开仓','REDUCE':'减仓','NORMAL':'
 
 
 def display_cell(key,value):
+    if key=='source_age_raw_ns' and value is not None:
+        return f'{int(value)/1_000_000:+.3f}'
+    if key=='quote_time_reason':
+        return {'CALENDAR_COVERAGE_UNKNOWN':'当前时段无完整日历', 'QUOTE_OUTSIDE_CURRENT_SESSION':'当前休市',
+                'QUOTE_TIMESTAMP_INVALID':'报价时间格式无效', 'QUOTE_UNAVAILABLE':'尚无当前报价',
+                'QUOTE_SESSION_MISMATCH':'报价属于其他交易时段', 'QUOTE_LEADS_LOCAL_UTC':'源报价时间领先本机',
+                'QUOTE_STALE':'当前报价已过时'}.get(value, value or '—')
     if key=='close_route_review' and isinstance(value,dict):
         if value.get('status')=='BLOCKED':return '待核对 · '+value['error_code']
         if value.get('status')=='NO_OWNED_QUANTITY':return '无自有持仓'

@@ -1078,6 +1078,8 @@ class WorkbenchLayout:
                     'CALENDAR_COVERAGE_UNKNOWN': '当前时段无完整日历',
                     'QUOTE_OUTSIDE_CURRENT_SESSION': '当前休市',
                     'QUOTE_UNAVAILABLE': '尚无当前报价',
+                    'QUOTE_TIMESTAMP_INVALID': '报价时间格式无效',
+                    'QUOTE_SESSION_MISMATCH': '报价属于其他交易时段',
                     'QUOTE_LEADS_LOCAL_UTC': '源报价时间领先本机',
                     'QUOTE_STALE': '当前报价已过时',
                 }.get(quote.get('quote_time_reason'))
@@ -1946,7 +1948,9 @@ class WorkbenchLayout:
                 messages = {
                     'E_OFFSET_DAY': '截止交易日与可核对的当前交易日不一致。',
                     'E_OFFSET_SESSION': '所选合约未处于共同交易时段，可继续使用离线计算。',
-                    'E_OFFSET_QUOTE_TIME': '振幅报价已超过 15 秒或属于其他交易时段。',
+                    'E_OFFSET_QUOTE_TIME': '振幅报价时间未通过核对。',
+                    'E_OFFSET_DAILY_NOT_READY': '所需的已完成日线尚未同步。',
+                    'E_OFFSET_INPUTS': '当前振幅尚未同步。',
                     'E_CREDENTIALS': '所选账户的行情凭据不完整。',
                     'E_DEPENDENCY': '本机行情组件未就绪。',
                 }

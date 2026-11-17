@@ -14,7 +14,8 @@ from online_trader.domain.values import decimal_text
 from online_trader.kernel.projection import projection_batch
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import number
-from online_trader.scheduling.clock import delta_ns
+from online_trader.scheduling.clock import delta_ns, quote_timestamp, source_age_ns, utc_text
+from online_trader.strategy.entry import CHINA_TIME
 
 
 def monitor_symbols(kernel, decisions):
@@ -158,7 +159,6 @@ def workbench_view(kernel):
                 stamp=datetime.fromisoformat(event['source_time_utc'])
                 quote_stamp=datetime.fromisoformat(quote.datetime)
                 if quote_stamp.tzinfo is None:
-                    from online_trader.strategy.entry import CHINA_TIME
                     quote_stamp=quote_stamp.replace(tzinfo=CHINA_TIME)
                 if quote_stamp==stamp:
                     quote_details={key:number(getattr(quote,key,None)) for key in (
@@ -197,15 +197,32 @@ def workbench_view(kernel):
                   'entry_reasons':['WAITING_FRESH_QUOTE']})
     if scoped and scheduler and scheduler._sample is not None:
         for row in markets:
-            at = scheduler.calendar.query(row['contract_id'], scheduler._sample.now_utc)
+            code = row['contract_id']
+            at = scheduler.calendar.query(code, scheduler._sample.now_utc)
             stamp = row['source_time_utc']
-            age = None if not stamp else delta_ns(scheduler._sample.utc, datetime.fromisoformat(stamp))
+            source = datetime.fromisoformat(stamp) if stamp else None
+            raw = getattr(getattr(port, 'quotes', {}).get(code), 'datetime', None)
+            invalid_stamp = False
+            if raw:
+                try:
+                    source = quote_timestamp(raw, CHINA_TIME)
+                except (ValueError, OverflowError):
+                    invalid_stamp = True
+            age = None
+            source_session = None
+            if source is not None and not invalid_stamp:
+                age = (source_age_ns(scheduler._sample.utc, source, raw) if raw
+                       else delta_ns(scheduler._sample.utc, source))
+                source_session = scheduler.calendar.query(code, utc_text(source))['session']
             row['market_session_active'] = at['is_trading']
+            row['source_time_raw'] = raw if isinstance(raw, str) and raw else stamp
             row['source_age_raw_ns'] = None if age is None else str(age)
             row['quote_time_reason'] = (
                 'CALENDAR_COVERAGE_UNKNOWN' if not at['complete'] else
                 'QUOTE_OUTSIDE_CURRENT_SESSION' if not at['is_trading'] else
-                'QUOTE_UNAVAILABLE' if age is None else 'QUOTE_LEADS_LOCAL_UTC' if age < 0 else
+                'QUOTE_TIMESTAMP_INVALID' if invalid_stamp else 'QUOTE_UNAVAILABLE' if age is None else
+                'QUOTE_SESSION_MISMATCH' if source_session != at['session'] else
+                'QUOTE_LEADS_LOCAL_UTC' if age < 0 else
                 None if row['fresh'] else 'QUOTE_STALE')
     day_stops={}
     for cycle in snapshot['cycles']:
