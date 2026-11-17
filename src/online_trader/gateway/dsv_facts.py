@@ -50,8 +50,18 @@ class DsvFactFeed:
             if not at['complete'] or not at['is_trading']:continue
             if not self.port.grant.permits_day(at['trading_day']):
                 raise TraderError('E_SCOPE','Current native quotes belong to a different proved trading day')
+            session = at['session']
+            start = datetime.fromisoformat(session['open_utc'])
+            key = (code, self.port.source_epoch, session['session_id'])
+            accepted_key = (code, self.port.source_epoch)
+            previous = self._accepted.get(accepted_key)
+            incremental = getattr(self.port, 'incremental_tick_records', None)
+            same_path = (previous is not None and self._path.get(key) and key not in self.rebuild_paths
+                         and int(self._last_native[accepted_key]['native_time_ns']) >= int(start.timestamp()) * 1_000_000_000)
+            records = (incremental(code, previous) if incremental is not None and same_path
+                       else self.port.tick_records(code))
             rows=[]
-            for raw in self.port.tick_records(code):
+            for raw in records:
                 try:index=native_integer(raw['id'])
                 except (TraderError,KeyError):continue # SDK's uninitialized padding is not a market event.
                 native_time=raw.get('datetime')

@@ -1,6 +1,7 @@
 """A local, read-only pipe serving the last complete owner publication."""
 
 from datetime import datetime, timezone
+import logging
 from threading import Event, Thread
 import time
 
@@ -29,6 +30,7 @@ class WorkbenchPublication:
         self._stop = Event()
         self._frame = None
         self._next_publication = 0
+        self.status = {'error_code': None, 'last_success_monotonic_ns': None}
         self._thread = Thread(target=self._serve, daemon=True)
         self._thread.start()
 
@@ -44,7 +46,16 @@ class WorkbenchPublication:
                 'protocol': 'ONLINE_TRADER_WORKBENCH_SNAPSHOT/1',
                 'published_ns': str(now), 'published_utc': stamp, 'base': base, 'view': view,
             })
-        except Exception:
+            code = 'PUBLICATION_OVERSIZE' if view.get('detail_unavailable') == 'CURRENT_STATE_OVERSIZE' else None
+            if code and self.status['error_code'] != code:
+                logging.getLogger(__name__).warning('%s', code)
+            self.status = {'error_code': code, 'last_success_monotonic_ns': str(now)}
+        except Exception as error:
+            code = ('PUBLICATION_OVERSIZE' if getattr(error, 'code', None) in
+                    {'E_FRAME', 'E_WORKBENCH_CAPACITY'} else 'PUBLICATION_FAILED')
+            if self.status['error_code'] != code:
+                logging.getLogger(__name__).warning('%s', code)
+            self.status = self.status | {'error_code': code}
             # Keep serving the previous complete frame with its original age.
             return
 
@@ -73,7 +84,7 @@ def read_workbench_publication(pipe, account_key):
         records = message['base']['records']
         accounts = [row for row in records if row['record_type'] == 'ACCOUNT']
         published_ns = int(message['published_ns'])
-        if (view['view_schema'] != 'workbench/1' or published_ns > time.monotonic_ns()
+        if (view['view_schema'] != 'workbench/1' or not 0 <= time.monotonic_ns() - published_ns < MAX_AGE_NS
                 or len(accounts) != 1 or accounts[0]['record_id'] != view['account_key']
                 or accounts[0]['record_revision'] != view['checkpoint_event_seq']
                 or account_key is not None and view['account_key'] != account_key):

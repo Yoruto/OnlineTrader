@@ -292,7 +292,10 @@ class OfflineWorkbench(QMainWindow):
 
     def _show_state(self, state):
         self._state = state
-        if state.get('clock_resume_pending'):
+        if ((state.get('clock_health') or {}).get('protection_ready') is False
+                and any(row.get('position') or row.get('detached_positions') for row in state['symbols'].values())):
+            status = '原委托和持仓继续核对 · 等待可靠时间后执行退出'
+        elif state.get('clock_resume_pending'):
             status = '已暂停新增 · 等待授时和柜台行情恢复'
         elif not state['synchronized']:
             status = '等待行情与订单核对'

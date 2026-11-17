@@ -11,6 +11,7 @@ import json
 from math import ceil
 from pathlib import Path
 import re
+import sys
 import time
 
 from online_trader.errors import exception_record
@@ -128,9 +129,34 @@ class RuntimeDiagnostics:
                               'logged_at_utc': self._now(), 'time_sample': state.get('time_sample'),
                               'clock_health': health, 'recovery_reason': state.get('clock_recovery_required'),
                               'timings': elapsed, 'quote_count': len(quotes),
+                              'process': self._process_resources(),
                               'quotes': dict(list(quotes.items())[:24])})
         except Exception:
             self._failed_write()
+
+    @staticmethod
+    def _process_resources():
+        values = {'cpu_time_ns': str(time.process_time_ns())}
+        if sys.platform == 'win32':
+            import ctypes
+            from ctypes import wintypes
+
+            class MemoryCounters(ctypes.Structure):
+                _fields_ = [('cb', wintypes.DWORD), ('page_faults', wintypes.DWORD),
+                            *[(name, ctypes.c_size_t) for name in (
+                                'peak_working_set', 'working_set', 'peak_paged_pool', 'paged_pool',
+                                'peak_nonpaged_pool', 'nonpaged_pool', 'pagefile', 'peak_pagefile')]]
+
+            counters = MemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel.GetCurrentProcess.restype = wintypes.HANDLE
+            read = ctypes.WinDLL('psapi', use_last_error=True).GetProcessMemoryInfo
+            read.argtypes = (wintypes.HANDLE, ctypes.POINTER(MemoryCounters), wintypes.DWORD)
+            read.restype = wintypes.BOOL
+            if read(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+                values['rss_bytes'] = str(counters.working_set)
+        return values
 
     def _failed_write(self):
         self._degraded = True

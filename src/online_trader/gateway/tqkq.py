@@ -131,7 +131,8 @@ class TqKqPort(OnlineSimulationPort):
             return False
         try:
             q=self.quotes[code];at=quote_timestamp(q.datetime, timezone(timedelta(hours=8)))
-            now = self.clock.now() if now is None else now
+            if now is None:
+                now = self.clock.utc_now() if hasattr(self.clock, 'utc_now') else self.clock.now()
             age = source_age_ns(now, at, q.datetime)
             values=(q.bid_price1,q.ask_price1,q.last_price,q.price_tick,q.lower_limit,q.upper_limit)
             return (not q.expired and self._quote_age_acceptable(code, now, at, age, check_age)
@@ -150,7 +151,7 @@ class TqKqPort(OnlineSimulationPort):
         try:
             q = self.quotes[code]
             stamp = quote_timestamp(q.datetime, timezone(timedelta(hours=8)))
-            now = self.clock.now()
+            now = self.clock.utc_now() if hasattr(self.clock, 'utc_now') else self.clock.now()
             age = source_age_ns(now, stamp, q.datetime)
             values = (q.last_price,q.price_tick,q.lower_limit,q.upper_limit)
             return (not q.expired and self._quote_age_acceptable(code, now, stamp, age, check_age)

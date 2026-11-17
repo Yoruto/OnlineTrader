@@ -8,7 +8,7 @@ import socket,statistics,struct,time
 from threading import Thread
 from online_trader.errors import TraderError
 from online_trader.scheduling.clock import NS_PER_SECOND, SystemClock
-from online_trader.scheduling.holdover import within_holdover_budget
+from online_trader.scheduling.holdover import HOLDOVER_DRIFT_PER_SECOND, within_holdover_budget
 
 @dataclass(frozen=True,slots=True)
 class ReferenceClock:
@@ -158,6 +158,8 @@ class CalibratedClock(LocalWallClock):
         self._entry_ready_since = None
         self._results = SimpleQueue()
         self._worker = None
+        self._pending_reference = None
+        self._reference_state = 'REFERENCE_PENDING'
         if lazy:
             self._reference = self._utc = None
             self._valid = False
@@ -179,6 +181,7 @@ class CalibratedClock(LocalWallClock):
             self._reference = None
             self._holding = True
         self._valid = not self._holding
+        self._reference_state = 'HOLDOVER_PROTECTION' if self._holding else 'CALIBRATED'
         self._last_poll = time.monotonic()
         self._next_refresh = self._anchor + 120 if self._valid else self._last_poll
         if self._valid:
@@ -195,6 +198,9 @@ class CalibratedClock(LocalWallClock):
 
     def utc_now(self):
         return datetime.fromtimestamp(self._timestamp(time.monotonic()), timezone.utc)
+
+    def capture_live(self):
+        return SystemClock.capture(self)
 
     def _checkpoint(self, now):
         if self._recovery_anchor is not None:
@@ -218,27 +224,43 @@ class CalibratedClock(LocalWallClock):
 
     def protection_ready(self):
         anchor = self._trusted_reference_mono
-        return anchor is not None and within_holdover_budget(time.monotonic() - anchor, self._trusted_error)
+        now = time.monotonic()
+        remaining = self._correction - self._applied_correction(now)
+        return anchor is not None and within_holdover_budget(now - anchor, self._trusted_error + abs(remaining))
 
     def entry_stable(self):
         since = self._entry_ready_since
         return since is not None and self.entry_ready() and time.monotonic() - since >= 2
 
     def record(self):
+        remaining = self._correction - self._applied_correction(time.monotonic())
         return {'mode': 'PERSISTED_NTP_HOLDOVER' if self._holding else 'APPLICATION_UTC',
                 'entry_ready': self.entry_ready(), 'protection_ready': self.protection_ready(),
                 'recovery_anchor_saved': self._checkpoint_saved,
+                'reference_state': self._reference_state,
+                'remaining_correction_seconds': str(remaining),
+                'maximum_convergence_seconds': str(abs(remaining) / .01),
                 'os_clock_changed': False}
 
     def health(self, sample):
-        if not self.entry_ready():
-            return {'reference_status': 'REFERENCE_UNAVAILABLE', 'utc_error_ns': None}
+        if not self.protection_ready():
+            return {'reference_status': self._reference_state, 'utc_error_ns': None,
+                    'protection_ready': self.protection_ready(), 'recovery_anchor_saved': self._checkpoint_saved}
         reference = self._reference
-        age = sample.monotonic / NS_PER_SECOND - reference.monotonic_anchor
-        uncertainty = reference.error_seconds + max(0, age) / 1000
-        offset = reference.wall_anchor + age - sample.utc.timestamp()
-        return {'reference_status': 'OBSERVED_OK',
-                'reference': {'source': 'APPLICATION_UTC_NTP', 'offset_ns': str(round(offset * NS_PER_SECOND)),
+        now = sample.monotonic / NS_PER_SECOND
+        if reference is None:
+            age = now - self._trusted_reference_mono
+            uncertainty = (self._trusted_error + abs(self._correction - self._applied_correction(now))
+                           + max(0, age) * HOLDOVER_DRIFT_PER_SECOND)
+            offset = 0
+        else:
+            age = now - reference.monotonic_anchor
+            uncertainty = reference.error_seconds + max(0, age) / 1000
+            offset = reference.wall_anchor + age - sample.utc.timestamp()
+        return {'reference_status': 'OBSERVED_OK' if self.entry_ready() else self._reference_state,
+                'protection_ready': True, 'recovery_anchor_saved': self._checkpoint_saved,
+                'reference': {'source': 'PERSISTED_NTP_HOLDOVER' if reference is None else 'APPLICATION_UTC_NTP',
+                              'offset_ns': str(round(offset * NS_PER_SECOND)),
                               'estimated_error_ns': str(round(uncertainty * NS_PER_SECOND))},
                 'utc_error_ns': str(round((uncertainty + abs(offset)) * NS_PER_SECOND))}
 
@@ -260,7 +282,14 @@ class CalibratedClock(LocalWallClock):
             if self._valid:
                 candidate = reference.wall_anchor + now - reference.monotonic_anchor
                 current = candidate if self._utc is None else self._timestamp(now)
-                self._valid = abs(candidate - current) <= .25
+                conflict = abs(candidate - current) > .25
+                previous = self._pending_reference
+                if previous is None and self._reference_state == 'RECALIBRATING':
+                    previous = self._reference
+                consistent = (previous is not None
+                              and reference.monotonic_anchor > previous.monotonic_anchor
+                              and abs(candidate - (previous.wall_anchor + now - previous.monotonic_anchor)) <= .25)
+                self._valid = not conflict or consistent
                 if self._valid:
                     if before_install is not None:
                         self._valid = False
@@ -270,11 +299,22 @@ class CalibratedClock(LocalWallClock):
                     self._anchor, self._utc = now, current
                     self._correction = candidate - current
                     self._reference = reference
+                    self._pending_reference = None
+                    self._reference_state = 'RECALIBRATING' if conflict else 'CALIBRATED'
+                    self._trusted_reference_mono = reference.monotonic_anchor
+                    self._trusted_error = reference.error_seconds
+                    self._holding = False
+                    if self.protection_ready():
+                        self._checkpoint(now)
+                else:
+                    self._pending_reference = reference
+                    self._reference_state = 'REFERENCE_CONFLICT'
+            else:
+                self._pending_reference = None
+                self._reference_state = 'HOLDOVER_PROTECTION' if self.protection_ready() else 'REFERENCE_EXPIRED'
             self._next_refresh = now + (120 if self.entry_ready() else 10)
-        if self.entry_ready() and self._reference.monotonic_anchor != self._trusted_reference_mono:
-            self._trusted_reference_mono = self._reference.monotonic_anchor
-            self._trusted_error = self._reference.error_seconds + abs(self._correction)
-            self._holding = False
+        if self.entry_ready() and self._reference_state == 'RECALIBRATING':
+            self._reference_state = 'CALIBRATED'
             self._checkpoint(now)
         if not self.entry_ready():
             self._entry_ready_since = None

@@ -10,7 +10,7 @@ from uuid import uuid4
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.rollover import expiry_date
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
-from online_trader.dsv_runtime.controller import SendNotAttempted, legal_price, terminal
+from online_trader.dsv_runtime.controller import CancelNotAttempted, SendNotAttempted, legal_price, terminal
 from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.dsv_facts import native_integer, utc
 from online_trader.gateway.native_days import native_day
@@ -20,7 +20,7 @@ from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.scheduling.calendar import TradingCalendar
 from online_trader.scheduling.clock import (
     ClockContinuity, ClockSample, NS_PER_SECOND, SystemClock, TIME_SEMANTICS, quote_age_quality, quote_timestamp, sdk_deadline,
-    source_age_ns, source_fraction_tail, utc_text,
+    delta_ns, source_age_ns, source_fraction_tail, utc_text,
 )
 from online_trader.scheduling.timers import poll_slice
 from online_trader.strategy.entry import is_night_session
@@ -99,6 +99,7 @@ class DsvSdkAdapter:
         self._local_returns = set()
         self._foreign_trades = None
         self._legacy_native_orders = _legacy_native_orders or {}
+        self._native_fact_cache = {}
         self.quotes = {code: api.get_quote(code) for code in self.contracts}
         self.minutes = {code: api.get_kline_serial(code, 60, data_length=500) for code in self.contracts}
 
@@ -136,7 +137,10 @@ class DsvSdkAdapter:
         return ClockSample(utc_text(now), str(mono * 1_000_000), getattr(self, '_clock_epoch', None))
 
     def opening_window(self, day, now):
-        return self._entry_clock_ready() and self.grant.permits_day(day) and self.grant.in_window(now)
+        return self._entry_clock_ready() and self.in_grant_window(day, now)
+
+    def in_grant_window(self, day, now):
+        return self.grant.permits_day(day) and self.grant.in_window(now)
 
     def _entry_clock_ready(self):
         ready = getattr(getattr(self, 'clock', None), 'entry_ready', None)
@@ -151,7 +155,7 @@ class DsvSdkAdapter:
         return self._clock_resume_day is not None
 
     def expired(self, now):
-        return now > datetime.fromisoformat(self.grant.value['not_after_utc'])
+        return self._protection_clock_ready() and now > datetime.fromisoformat(self.grant.value['not_after_utc'])
 
     @staticmethod
     def order_id(child):
@@ -254,6 +258,9 @@ class DsvSdkAdapter:
             self.enabled = True
             self.dispatch_market = market
             receipt = session.apply_round(frame)
+            for fact in frame['native']:
+                key = (fact['kind'], fact['child_order_id'], fact.get('native_trade_id'))
+                self._native_fact_cache[key] = fact
             self.metrics.update(session.round_timing)
             state = session.snapshot()
             self.synchronized = state['synchronized']
@@ -287,7 +294,6 @@ class DsvSdkAdapter:
         if not self.synchronized or not self.clock.entry_stable() or not session.clock_resume_native_safe(state, market):
             return
         limit = Decimal(self.profile.to_record()['settings']['trade']['max_quote_age_seconds'])
-        limit = min(limit, Decimal(5)) if limit > 0 else Decimal(5)
         for code, row in market.items():
             observed = row['quote_observation']
             if (not row['ticks'] or observed['age_quality'] != 'VALID'
@@ -298,8 +304,11 @@ class DsvSdkAdapter:
                     or window['session']['session_id'] != row['calendar_session_id']):
                 continue
             stamp = observed['source_time_raw']
-            age = source_age_ns(sample.utc, quote_timestamp(stamp, _BEIJING), stamp)
-            if not 0 <= age <= limit * NS_PER_SECOND:
+            source = quote_timestamp(stamp, _BEIJING)
+            age = source_age_ns(sample.utc, source, stamp)
+            health = self.clock.health(sample) if hasattr(self.clock, 'health') else self._health
+            elapsed = delta_ns(sample.utc, source.replace(microsecond=0))
+            if quote_age_quality(age, health)[0] != 'VALID' or (limit > 0 and elapsed > limit * NS_PER_SECOND):
                 continue
             session.resume_entries_for_clock()
             self._clock_resume_day = None
@@ -309,8 +318,8 @@ class DsvSdkAdapter:
         if day not in self.trading_days or day < state['trading_day']:
             raise TraderError('E_DSV_SDK_SCOPE', 'Cabinet day is outside of the selected calendar')
         windows = {code: self.calendar.query(code, sample.now_utc) for code in self.contracts}
-        if day != state['trading_day'] and not all(
-                window['is_trading'] and window['trading_day'] == day for window in windows.values()):
+        active = [window for window in windows.values() if window['is_trading']]
+        if day != state['trading_day'] and (not active or any(window['trading_day'] != day for window in active)):
             raise TraderError('E_DSV_SDK_SCOPE', 'A cabinet-day change requires matching active calendar sessions')
         bindings = {self.order_id(child): order for child, order in state['orders'].items()}
         orders = self.api.get_order(account=self.account)
@@ -321,6 +330,18 @@ class DsvSdkAdapter:
         accepted = {self.order_id(order['child_order_id']): order.get('native_order_time_ns') for order in state['orders'].values()}
         accepted.update({fact['native_order_id']: fact['source_time_ns'] for fact in native if 'source_time_ns' in fact})
         details, foreign_trades = self._trade_facts(trades, bindings, day, accepted, needs_recovery=bool(state['orders']))
+        reconcile = (not state['synchronized'] or day != state['trading_day']
+                     or state.get('clock_recovery_required') or self._health.get('reason'))
+        coverage = [fact['child_order_id'] for fact in native if fact['kind'] == 'ORDER']
+        if not reconcile:
+            coverage = []
+        changes = native + details
+        self.metrics['native_facts_observed'] = len(changes)
+        if not reconcile:
+            changes = [fact for fact in changes if fact['kind'] == 'LOCAL_ORDER' or
+                       self._native_fact_cache.get((fact['kind'], fact['child_order_id'],
+                                                    fact.get('native_trade_id'))) != fact]
+        self.metrics['native_facts_changed'] = len(changes)
         funds = self.api.get_account(account=self.account)
         markets = []
         for code in self.contracts:
@@ -336,8 +357,8 @@ class DsvSdkAdapter:
                  'monotonic_ms': str(sample.monotonic // 1_000_000), 'trading_day': day,
                  'trading_days': self.trading_days, 'calendar_hash': self.calendar.content_hash,
                  'synchronized': True, 'market': markets,
-                 'sync_orders': [fact['child_order_id'] for fact in native if fact['kind'] == 'ORDER'],
-                 'native': native + details}
+                 'sync_orders': coverage,
+                 'native': changes}
         return frame, {row['contract_id']: row for row in markets}
 
     def _order_facts(self, orders, bindings):
@@ -609,8 +630,9 @@ class DsvSdkAdapter:
                 'native_candle_ns': str(minute) if candle is not None else None, 'native_quote_stamp': stamp,
                 **{name: _amount(getattr(quote, field, None)) for name, field in _PRICE_FIELDS.items()}}
 
-    def _authorized(self, effect, kind):
-        if get_ident() != self.owner or not self.enabled or self.session is None or self.session._closed:
+    def _authorized(self, effect, kind, *, require_enabled=True):
+        if (get_ident() != self.owner or (require_enabled and not self.enabled)
+                or self.session is None or self.session._closed):
             raise TraderError('E_DSV_SDK_OWNER', 'SDK dispatch requires a synchronized, bound owner')
         if (effect['kind'] != kind or effect['account_key'] != self.account_key or effect['provider'] != self.provider
                 or effect['id'] in self._seen_effects or
@@ -665,6 +687,18 @@ class DsvSdkAdapter:
                         or self.quotes[effect['contract_id']].datetime != tick['native_quote_stamp']):
                     rejection_reason = 'QUOTE_OR_PRICE_SCOPE'
                     raise TraderError('E_DSV_SDK_SCOPE', 'The selected quote or trading session changed before dispatch')
+                stamp = tick['native_quote_stamp']
+                source = quote_timestamp(stamp, _BEIJING)
+                age = source_age_ns(clock.utc, source, stamp)
+                self.metrics.update(pre_dispatch_monotonic_ns=clock.monotonic_ns, pre_dispatch_quote_age_ns=str(age))
+                health = self.clock.health(clock) if hasattr(self.clock, 'health') else self._health
+                limit = Decimal(self.profile.to_record()['settings']['trade']['max_quote_age_seconds'])
+                # Ordinary DSV entries compare against the source's whole second.
+                elapsed = delta_ns(clock.utc, source.replace(microsecond=0))
+                if (quote_age_quality(age, health)[0] == 'SOURCE_ANOMALY'
+                        or (effect['native_offset'] == 'OPEN' and limit > 0 and elapsed > limit * NS_PER_SECOND)):
+                    rejection_reason = 'QUOTE_AGE'
+                    raise TraderError('E_DSV_SDK_SCOPE', 'The selected quote aged beyond its execution policy')
             if self.grant is not None:
                 if (effect['contract_id'] not in self.grant.value['contracts'] or
                         not self.grant.permits_day(effect['trading_day']) or
@@ -687,8 +721,14 @@ class DsvSdkAdapter:
         return None
 
     def cancel(self, effect):
-        native = self._authorized(effect, 'CANCEL')
-        if native != effect['native_order_id']:
-            raise TraderError('E_DSV_SDK_SCOPE', 'SDK cancellation requires the original native order identity')
+        native = self._authorized(effect, 'CANCEL', require_enabled=False)
+        try:
+            if not self.enabled:
+                raise TraderError('E_DSV_SDK_OWNER', 'SDK cancellation is waiting for the owner dispatch phase')
+            if native != effect['native_order_id']:
+                raise TraderError('E_DSV_SDK_SCOPE', 'SDK cancellation requires the original native order identity')
+        except Exception as error:
+            return CancelNotAttempted(effect['id'], effect['native_order_id'],
+                                      getattr(error, 'code', 'E_DSV_PRE_CANCEL'), exception_record(error))
         self._seen_effects.add(effect['id'])
         return self.api.cancel_order(native, account=self.account)

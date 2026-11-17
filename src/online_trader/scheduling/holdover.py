@@ -98,7 +98,7 @@ class ProtectionClockAnchor:
             if (not all(type(value) in (int, float) and math.isfinite(value)
                         for value in (utc, monotonic, reference, correction, error))
                     or not 0 < utc < 4_000_000_000 or not 0 <= reference <= monotonic <= now
-                    or not within_holdover_budget(now - reference, error) or abs(correction) > .25):
+                    or not within_holdover_budget(now - reference, error + abs(correction))):
                 return None
             return utc, monotonic, reference, correction, error
         except (KeyError, OSError, ValueError, TypeError, OverflowError):

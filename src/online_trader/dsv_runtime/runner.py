@@ -231,7 +231,14 @@ class DsvSession:
 
     def disable_entries_for_clock(self):
         self._check_owner()
-        self.command({'id': 'sdk-clock-stop-' + uuid4().hex, 'action': 'STOP'})
+
+        def pause(state, command):
+            decisions, effects = self._operate(state, command, defer_cancels=True)
+            self._journal.event('CLOCK_ENTRIES_PAUSED', {
+                'trading_day': state['trading_day'], 'cancel_on_stop': self._trade['cancel_on_stop']})
+            return decisions, effects
+
+        return self._run('COMMAND', {'id': 'sdk-clock-stop-' + uuid4().hex, 'action': 'STOP'}, pause)
 
     def clock_resume_native_safe(self, state, markets):
         if any(not terminal(order) or order.get('terminal_conflict') for order in state['orders'].values()):
@@ -533,7 +540,8 @@ class DsvSession:
                 state['scope_expired_at'] = timing.sample.now_utc
                 timing.events.append({'result': 'OPENING_SCOPE_EXPIRED', 'handled_utc': timing.sample.now_utc})
             if (state.get('scope_expired_at') or not state.get('clock_recovery_required')
-                    and not self._sdk_port.opening_window(day, authorization_time)):
+                    and self._sdk_port._protection_clock_ready()
+                    and not self._sdk_port.in_grant_window(day, authorization_time)):
                 state['running'] = False
                 for row in state['symbols'].values():
                     if position := row['position']:
@@ -651,6 +659,8 @@ class DsvSession:
                 reason = 'EXIT_WAITING_FOR_SESSION'
             elif state.get('clock_recovery_required'):
                 reason = 'EXIT_WAITING_FOR_CLOCK_REVIEW'
+            elif (market.get('quote_observation') or {}).get('reason') == 'CLOCK_PROTECTION_WINDOW_EXPIRED':
+                reason = 'EXIT_WAITING_FOR_UTC_REFERENCE'
             elif market['tick'] is None or not market['allow_new_order']:
                 reason = 'EXIT_WAITING_FOR_PRICE'
         row['exit_wait_reason'] = reason
@@ -1182,7 +1192,7 @@ class DsvSession:
         return {'reason': 'SCHEDULED_CLOSE' if first else 'SCHEDULED_CLOSE_PENDING',
                 'remaining': 0, 'price_mode': position['close_mode'], 'rule_ids': ['D06', 'D11']}
 
-    def _operate(self, state, command):
+    def _operate(self, state, command, *, defer_cancels=False):
         action = command['action']
         if action == 'CLOCK_RECOVER':
             if (not state.get('clock_recovery_required') or not state.get('clock_native_reconciled')
@@ -1210,7 +1220,7 @@ class DsvSession:
                     if row['position'] is not None:
                         row['position']['entry_stopped'] = True
                         row['position']['preserve_open_on_stop'] = not self._trade['cancel_on_stop']
-                        if state['synchronized'] and not row['position']['preserve_open_on_stop']:
+                        if not defer_cancels and state['synchronized'] and not row['position']['preserve_open_on_stop']:
                             for order in self._controller.child_orders(state, row['position'], 'OPEN'):
                                 request = self._controller.cancel(order, 'USER_STOP')
                                 if request:

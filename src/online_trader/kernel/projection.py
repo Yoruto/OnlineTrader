@@ -1,7 +1,7 @@
 """Read-only protocol projections: unknown money remains unknown."""
 
 
-def projection_batch(snapshot: dict) -> dict:
+def projection_batch(snapshot: dict, *, include_orders=True) -> dict:
     state="MAINTENANCE" if snapshot.get("maintenance_state") not in {None,"NONE","COMPLETE","FAILED","RELEASED"} else "DEGRADED" if snapshot["storage_failed"] or not snapshot["recovery_required"] else "RECONCILING"
     online=snapshot.get('execution_scope')=='ONLINE_SIMULATION'
     if online and not snapshot['storage_failed'] and not snapshot['recovery_required']:state='READY'
@@ -17,7 +17,7 @@ def projection_batch(snapshot: dict) -> dict:
             "confirmed_open_quantity":s["entry_filled_qty"],"confirmed_close_quantity":s["exit_filled_qty"],"remaining_quantity":s["owned_qty"],
             "target_remaining_quantity":s.get("target_remaining_qty"),"plan_id":p["plan_id"],"plan_revision":p["plan_revision"],
             "protection_mode":s["mode"],"protection_quality":s["quality"],"protection_persistence":"DURABLE","takeover_state":cycle.get("management_state")})
-        for order in cycle["orders"]:
+        for order in cycle["orders"] if include_orders else ():
             records.append({"record_type":"ORDER","record_id":order["child_order_id"],"record_revision":str(order["revision"]),
                 "child_order_id":order["child_order_id"],"intent_id":order["intent_id"],"position_cycle_id":cycle["position_cycle_id"],"contract_id":p["contract_id"],
                 "origin":cycle.get("entry_origin","MANUAL") if order["effect"]=="OPEN" else "PROTECTION","order_quantity":order["original_qty"],"confirmed_fill_quantity":order["filled_qty"],

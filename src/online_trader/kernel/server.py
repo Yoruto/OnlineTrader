@@ -301,6 +301,12 @@ class ControlServer:
                 self._service_inbound();self._flush_receipts()
                 if publication is not None:
                     publication.publish(lambda: workbench_publication(self.kernel))
+                    diagnostics = getattr(self.kernel, '_dsv_diagnostics', None)
+                    if diagnostics is not None:
+                        if publication.status['error_code']:
+                            diagnostics['workbench_publication'] = publication.status.copy()
+                        else:
+                            diagnostics.pop('workbench_publication', None)
                 if owner_tick is not None:owner_tick()
                 self._sync_streams()
                 self._service_inbound(closing=bool(self._stop.is_set() or (stop_event and stop_event.is_set())))

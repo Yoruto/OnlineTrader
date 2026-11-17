@@ -20,6 +20,12 @@ from online_trader.transport.status_client import StatusClient
 from online_trader.transport.workbench_snapshot import MAX_AGE_NS, read_workbench_publication
 
 
+OWNER_RECHECK_OPERATIONS = frozenset({
+    'STOP_DSV_STRATEGY', 'PAUSE_NEW_ENTRIES', 'CANCEL_SELECTED', 'CANCEL_OWNED',
+    'MANUAL_CLOSE', 'MANUAL_CLOSE_ALL', 'FLATTEN_THEN_STOP', 'REQUEST_RECONCILIATION',
+})
+
+
 class _WorkbenchRequest(QThread):
     result=Signal(object);failed=Signal(object)
     def __init__(self,pipe,factory,action,args,account_key,boot,*,publication_after_ns=0):
@@ -37,9 +43,18 @@ class _WorkbenchRequest(QThread):
                     return
             client=self.factory(self.pipe,expected_account_key=self.account_key,expected_kernel_boot_id=self.boot)
             if self.action=='refresh':
-                base=client.snapshot();metadata=client.last_metadata
-                client.expected_kernel_boot_id=metadata['kernel_boot_id'];view=client.workbench()
-                value={'base':base,'metadata':metadata,'view':view}
+                requested_ns = time.monotonic_ns()
+                view=client.workbench();metadata=client.last_metadata
+                base=view.get('status_projection')
+                if base is None:
+                    client.expected_kernel_boot_id=metadata['kernel_boot_id']
+                    base=client.snapshot();metadata=client.last_metadata
+                accounts = [row for row in base['records'] if row['record_type'] == 'ACCOUNT']
+                if (len(accounts) != 1 or accounts[0]['record_id'] != view['account_key']
+                        or accounts[0]['record_revision'] != view['checkpoint_event_seq']
+                        or metadata['kernel_boot_id'] != view['kernel_boot_id']):
+                    raise TraderError('E_SNAPSHOT', '账户与工作台快照版本不一致，请重新刷新。')
+                value={'base':base,'metadata':metadata,'view':view,'published_ns':requested_ns}
             elif self.action=='status':value=client.command_status(self.args)
             elif self.action=='monitor':
                 value = {'monitor': client.workbench_monitor(), 'metadata': client.last_metadata}
@@ -221,11 +236,14 @@ class WorkbenchWindow(StatusWindow):
 
     def _enable_commands(self,enabled):
         for button in self.command_buttons.values():button.setEnabled(enabled)
+        owner_controls = not self._closing and self._worker is None and self.view is not None
+        for name in ('close', 'flatten', 'cancel', 'cancel_entries', 'reconcile'):
+            self.command_buttons[name].setEnabled(owner_controls)
         self.command_buttons['arm'].setEnabled(not self._startup_in_progress and ((enabled and self.view['entry_authority']!='ARMED'
             and not self.view['configuration'].get('stop_cancel_pending')
             and not self.view['configuration'].get('strategy_stop_requested')) or
             (self.view is None and not self._closing)))
-        self.pause_button.setEnabled(self._scheduled_start is not None or (enabled and (
+        self.pause_button.setEnabled(self._scheduled_start is not None or (owner_controls and (
             self.view['entry_authority']=='ARMED' or ('cancel_on_stop' in self.view['configuration']
             and not self.view['configuration'].get('strategy_stop_requested')))))
         self.dashboard.update_manual_controls(enabled)
@@ -233,7 +251,8 @@ class WorkbenchWindow(StatusWindow):
 
     def _start_job(self,action,args=None):
         if self._closing:return
-        if action == 'command' and self.published_snapshot_expired():
+        if (action == 'command' and self.published_snapshot_expired()
+                and args[0] not in OWNER_RECHECK_OPERATIONS):
             self._stale = True
             self._enable_commands(False)
             self.show_home_feedback('上次确认的快照已过期，请等待更新。')
@@ -354,7 +373,7 @@ class WorkbenchWindow(StatusWindow):
 
     def pause_entries(self):
         self.cancel_timed_start()
-        if self._stale or self.view is None:
+        if self.view is None:
             return
         scope={'scope_type':'ACCOUNT','scope_ids':[]}
         config=self.view['configuration']
@@ -366,7 +385,8 @@ class WorkbenchWindow(StatusWindow):
             return
         params={}
         review=config.get('native_cancel_review',{})
-        if config['cancel_on_stop'] and review.get('eligible') and review.get('external_count'):
+        if (not self._stale and not self.published_snapshot_expired() and config['cancel_on_stop']
+                and review.get('eligible') and review.get('external_count')):
             identity=self._command_binding()
             contracts='、'.join(f'{code} {count} 笔' for code,count in sorted(review['by_contract'].items()))
             message=f"停止策略时，是否同时撤销当前 {review['external_count']} 笔外部委托？\n{contracts}\n选择否仍会停止策略，并按设置处理自有委托。"
@@ -524,7 +544,8 @@ class WorkbenchWindow(StatusWindow):
             return
         identity,action,args=deferred
         if (self.view is None or identity!=self._command_binding() or
-                (action=='command' and (self._stale or self.view['truncated']))):
+                (action=='command' and (self._stale or self.view['truncated'])
+                 and args[0] not in OWNER_RECHECK_OPERATIONS)):
             self._control_notice='请求未发送。请核对当前账户、执行器与参数状态。'
             self.notice_label.setText(self._control_notice)
             self.show_home_feedback(self._control_notice)
@@ -566,7 +587,13 @@ class WorkbenchWindow(StatusWindow):
         self.dashboard.render(v)
         if not self._stale:
             self._sounds.observe(v)
-        self.notice_label.setText('视图超过容量，已截断；批量操作关闭。' if v['truncated'] else
+        history_notice = ('历史列表已限量显示，省略 ' +
+                          str(sum(v.get('history_omitted', {}).values())) + ' 条。' if v.get('history_truncated') else '')
+        capacity_notice = ('当前明细超过容量，省略 ' + str(sum(v.get('detail_omitted', {}).values())) +
+                           ' 条。可停止策略、撤自有开仓单或平仓后停开；具体持仓请查询执行器完整快照。')
+        self.notice_label.setText(capacity_notice if v.get('detail_unavailable') else
+            '当前摘要不完整，请通过执行器核对控制请求。' if v['truncated'] else
+            history_notice or
             self._control_notice or '状态来自原内核；行情来源时间与新鲜度单独显示。关闭工作台保留原持仓保护。')
 
     def filter_markets(self):
@@ -580,7 +607,7 @@ class WorkbenchWindow(StatusWindow):
         return items[0]
 
     def send(self,operation,scope,parameters):
-        if self._stale or self.view is None or self.view['truncated']:
+        if self.view is None or ((self._stale or self.view['truncated']) and operation not in OWNER_RECHECK_OPERATIONS):
             self.notice_label.setText('状态未知或已过期，请先刷新。')
             self.show_home_feedback(self.notice_label.text())
             return
@@ -674,7 +701,7 @@ class WorkbenchWindow(StatusWindow):
             message = f"按{mode}平掉 {len(positions)} 个自有持仓周期，共 {sum(positions.values())} 手？"
             if QMessageBox.question(self, '平所有自有持仓', message) != QMessageBox.Yes:
                 return
-            if self._stale or self.view is None or identity != self._command_binding():
+            if self.view is None or identity != self._command_binding():
                 self.notice_label.setText('批量平仓未发送。请核对当前账户和持仓。')
                 return
             self.send('MANUAL_CLOSE_ALL', {'scope_type': 'ACCOUNT', 'scope_ids': []},

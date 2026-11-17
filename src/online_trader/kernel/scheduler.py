@@ -85,6 +85,8 @@ class ScheduledRuntime:
             paired = self.clock.capture() if self._continuity is not None else None
             if paired is not None:
                 self.clock_health = self._continuity.observe(paired)
+                if hasattr(self.clock, 'health'):
+                    self.clock_health.update(self.clock.health(paired))
             if self._fault:
                 return
             sample = paired.to_record() if paired is not None else self.clock.sample()

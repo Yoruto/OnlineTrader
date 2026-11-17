@@ -460,21 +460,84 @@ def workbench_view(kernel, *, snapshot=None):
             result['account_metrics']={key:funds.get(key) for key in
                 ('balance','available','margin','risk_ratio','pre_balance','close_profit','position_profit','float_profit','commission')}
             result['account_metrics'].update(trading_day=day,opening_orders=opening_orders)
-    # Every table has an explicit cap. Keep the last records; state that the view
-    # is incomplete and disable bulk actions at the desktop when it is truncated.
-    for key in ('markets','cycles','orders','trades','blocks','commands','policies','external_positions'):
-        if key not in result:continue
-        if len(result[key])>512:result['truncated']=True;result[key]=result[key][-512:]
-    if len(canonical_bytes(result)) > 800000:
-        result['configuration'].pop('native_minute_bars', None)
-    while len(canonical_bytes(result))>800000:
-        key=max(('trades','commands','orders','cycles','blocks','markets','external_positions'),key=lambda k:len(canonical_bytes(result.get(k,[]))))
-        result[key]=result[key][len(result[key])//2+1:];result['truncated']=True
+    # Historical rows may be omitted. Current execution responsibility stays
+    # complete, including active children of an otherwise closed cycle.
+    current_cycles = {
+        cycle['position_cycle_id'] for cycle in snapshot['cycles']
+        if cycle['lifecycle'] != 'CLOSED' or cycle['protection']['owned_qty']
+        or cycle.get('statistics_review_required') or cycle['protection'].get('reconciliation_required')
+        or cycle.get('management_state') == 'TAKEOVER_PENDING'
+        or any(OrderState.from_dict(order).potential_remaining or order.get('terminal_conflict')
+               or order['send_state'] in {'UNKNOWN', 'SEND_POSSIBLE'}
+               or (order['cancel_status'] in {'UNKNOWN', 'SEND_POSSIBLE', 'CALL_RETURNED'}
+                   and (not order['terminal_confirmed'] or order['reported_fill_qty'] != order['filled_qty']))
+               for order in cycle['orders'])
+    }
+    historical = {
+        'cycles': [row for row in result['cycles'] if row['position_cycle_id'] not in current_cycles],
+        'orders': [row for row in result['orders'] if row['position_cycle_id'] not in current_cycles],
+        'trades': list(result['trades']),
+        'commands': [row for row in result['commands'] if row['status'] in {'SUCCEEDED', 'REJECTED', 'FAILED', 'SUPERSEDED'}],
+    }
+    result['history_omitted'] = {key: 0 for key in historical}
+    result['history_truncated'] = False
+
+    def omit_history(key, count):
+        omitted = historical[key][:count]
+        historical[key] = historical[key][count:]
+        identities = {id(row) for row in omitted}
+        result[key] = [row for row in result[key] if id(row) not in identities]
+        result['history_omitted'][key] += len(omitted)
+        result['history_truncated'] = True
+
+    for key, rows in historical.items():
+        if len(rows) > 512:
+            omit_history(key, len(rows) - 512)
+    while True:
+        visible_cycles = {row['position_cycle_id'] for row in result['cycles']}
+        projection = projection_batch(snapshot | {
+            'cycles': [cycle for cycle in snapshot['cycles'] if cycle['position_cycle_id'] in visible_cycles],
+        }, include_orders=False)
+        base = {'records': [row for row in projection['records'] if row['record_type'] in {'ACCOUNT', 'CYCLE'}]}
+        result['status_projection'] = base
+        # Include the duplicated base and leave room for both IPC envelopes.
+        if len(canonical_bytes({'base': base, 'view': result})) <= 950_000:
+            break
+        if 'native_minute_bars' in result['configuration']:
+            bars = result['configuration'].pop('native_minute_bars')
+            result['history_omitted']['minute_bars'] = sum(len(rows) for rows in bars.values())
+            result['history_truncated'] = True
+            continue
+        key = max(historical, key=lambda name: len(canonical_bytes(historical[name])))
+        if not historical[key]:
+            if result['truncated']:
+                raise TraderError('E_WORKBENCH_CAPACITY', 'Owner control summary exceeds workbench capacity')
+            result['truncated'] = True
+            result['detail_unavailable'] = 'CURRENT_STATE_OVERSIZE'
+            result['current_responsibility'] = {
+                'cycles': len(current_cycles),
+                'owned_quantity': sum(cycle['protection']['owned_qty'] for cycle in snapshot['cycles']),
+                'active_orders': sum(bool(OrderState.from_dict(order).potential_remaining)
+                                     for cycle in snapshot['cycles'] for order in cycle['orders']),
+            }
+            result['detail_omitted'] = {name: len(result.get(name, [])) for name in (
+                'cycles', 'orders', 'trades', 'markets', 'blocks', 'commands', 'external_positions')}
+            for name in result['detail_omitted']:
+                result[name] = []
+            result['blocks'] = [{'reason_code': 'WORKBENCH_DETAIL_CAPACITY', 'active': True}]
+            result['configuration'] = {name: value for name, value in result['configuration'].items() if name in {
+                'rule_set_id', 'config_revision', 'payload_hash', 'runtime_identity', 'run_directory',
+                'manual_workbench', 'scoped_contracts', 'cancel_on_stop', 'stop_cancel_pending',
+                'strategy_stop_requested', 'strategy_stop_wait', 'manual_close_price_mode',
+            }}
+            result.pop('minute_bars', None)
+            result.pop('equity_history', None)
+            continue
+        omit_history(key, max(1, len(historical[key]) // 2))
     return result
 
 
 def workbench_publication(kernel):
     snapshot = kernel._make_snapshot()
-    base = projection_batch(snapshot)
-    base['records'] = [row for row in base['records'] if row['record_type'] in {'ACCOUNT', 'CYCLE'}]
-    return base, workbench_view(kernel, snapshot=snapshot)
+    view = workbench_view(kernel, snapshot=snapshot)
+    return view['status_projection'], view

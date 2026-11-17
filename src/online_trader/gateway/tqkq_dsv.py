@@ -11,7 +11,7 @@ from online_trader.domain.values import order_price
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import TqKqPort, number
 from online_trader.online_scope import DsvSimulationGrant
-from online_trader.scheduling.clock import NS_PER_SECOND, quote_timestamp, source_age_ns, utc_text
+from online_trader.scheduling.clock import NS_PER_SECOND, quote_age_quality, quote_timestamp, source_age_ns, utc_text
 
 
 def _missing_book_price(value):
@@ -36,6 +36,10 @@ class TqKqDsvPort(TqKqPort):
         return stamp == datetime.fromisoformat(event['source_time_utc']) and number(quote.last_price) == event['last']
 
     def _quote_age_acceptable(self, code, now, source, age, check_age):
+        if hasattr(self.clock, 'health') and hasattr(self.clock, 'capture'):
+            sample = self.clock.capture_live() if hasattr(self.clock, 'capture_live') else self.clock.capture()
+            if quote_age_quality(age, self.clock.health(sample))[0] == 'SOURCE_ANOMALY':
+                return False
         if self.calendar is None or self.grant.manual_workbench:
             return super()._quote_age_acceptable(code, now, source, age, check_age)
         current = self.calendar.query(code, utc_text(now))
@@ -81,8 +85,9 @@ class TqKqDsvPort(TqKqPort):
         runtime = getattr(getattr(self, 'kernel', None), '_dsv_runtime', None)
         try:
             quote = self.quotes[code]
+            now = self.clock.utc_now() if hasattr(self.clock, 'utc_now') else self.clock.now()
             if (not self._matches_strategy_quote(quote, event) or
-                    (runtime is not None and runtime.ordinary_quote_stale(event))):
+                    (runtime is not None and runtime.ordinary_quote_stale(event, now=now))):
                 return False
             field = 'ask1' if side == 'BUY' else 'bid1'
             opponent, other, volume = ((getattr(quote,'ask_price1',None), getattr(quote,'bid_price1',None),
@@ -430,15 +435,22 @@ class TqKqDsvPort(TqKqPort):
             offset=request['native_offset'],volume=request['original_qty'],
             limit_price=float(Decimal(request['limit_price'])),order_id=self.order_id(child),account=self.account)
 
-    def tick_records(self,code):
+    def tick_records(self,code,*,after_id=None):
         serial=self.tick_serials[code]
         backfill=self._tick_backfill_serials.get(code)
         if (backfill is not None and self.api.is_serial_ready(backfill)
                 and backfill.iloc[-1]['id']>=serial.iloc[-1]['id']):
             serial=self.tick_serials[code]=self._tick_backfill_serials.pop(code)
+            after_id = None
         if not self.api.is_serial_ready(serial):return []
         self.subscription_ready_at.setdefault(code,self.clock.now())
+        if after_id is not None:
+            serial = serial.loc[serial['id'] >= after_id]
         return serial.to_dict('records')
+
+    def incremental_tick_records(self, code, after_id):
+        """Include the accepted boundary row to detect corrections and gaps."""
+        return self.tick_records(code, after_id=after_id)
 
     def latest_tick_record(self, code):
         serial = self.tick_serials[code]

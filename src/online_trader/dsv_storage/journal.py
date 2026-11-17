@@ -1,6 +1,8 @@
 """One SQLite writer; round, checkpoint, facts and prepared effects commit together."""
 
 from contextlib import contextmanager
+from pathlib import Path
+import shutil
 import sqlite3
 
 from online_trader.contracts.codec import canonical_bytes, strict_loads
@@ -44,6 +46,7 @@ class Journal:
     def __init__(self, path, scope, initial):
         validate_sqlite_runtime(scope.get('provider'))
         self._db = sqlite3.connect(path, isolation_level=None, timeout=2)
+        self._path = Path(path)
         self._journal_mode = 'unknown'
         try:
             self._journal_mode = self._db.execute('PRAGMA journal_mode').fetchone()[0].lower()
@@ -155,10 +158,25 @@ class Journal:
     def command_receipt(self, identity):
         return self._read("SELECT payload FROM receipts WHERE kind='COMMAND' AND id=?", (identity,))
 
+    def storage_metrics(self):
+        values = {'sqlite_changes': self._db.total_changes,
+                  'event_highwater': self._db.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0],
+                  'checkpoint_bytes': self._db.execute('SELECT length(payload) FROM checkpoint WHERE id=1').fetchone()[0]}
+        for name, suffix in (('database_bytes', ''), ('wal_bytes', '-wal'), ('shm_bytes', '-shm')):
+            try:
+                values[name] = Path(str(self._path) + suffix).stat().st_size
+            except FileNotFoundError:
+                values[name] = 0
+        values['disk_free_bytes'] = shutil.disk_usage(self._path.resolve().parent).free
+        return values
+
     def record_order(self, child, native_id, fact):
         try:
-            self._db.execute('INSERT INTO native_orders VALUES(?,?,?,?) ON CONFLICT(child) DO UPDATE SET payload=excluded.payload',
-                             (child, fact['native_trading_day'], native_id, canonical_bytes(fact)))
+            changed = self._db.execute(
+                'INSERT INTO native_orders VALUES(?,?,?,?) ON CONFLICT(child) DO UPDATE SET payload=excluded.payload '
+                'WHERE native_orders.payload != excluded.payload',
+                (child, fact['native_trading_day'], native_id, canonical_bytes(fact)))
+            return changed.rowcount > 0
         except sqlite3.IntegrityError as error:
             raise TraderError('E_DSV_NATIVE_ID', 'A native order ID is already bound to another child') from error
 

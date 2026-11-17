@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal, localcontext
 import sqlite3
+import time
 from uuid import uuid4
 from typing import NamedTuple
 
@@ -24,6 +25,14 @@ class SendNotAttempted(NamedTuple):
     error_code: str
     exception: dict
     rejection_reason: str | None = None
+
+
+class CancelNotAttempted(NamedTuple):
+    """Proof bound to a prepared cancellation before its native request is queued."""
+    effect_id: str
+    native_order_id: str
+    error_code: str
+    exception: dict
 
 
 def terminal(order):
@@ -106,10 +115,11 @@ class ExplicitOrderController:
                         raise TraderError('E_DSV_NATIVE_FACT', 'Original native order timestamp changed')
                     order['native_order_time_ns'] = stamp
                 self._order_update(order, fact)
-                self.journal.event('NATIVE_ORDER', fact)
+                if self.journal.record_order(child_id, native_id, order):
+                    self.journal.event('NATIVE_ORDER', fact)
             else:
                 self._trade_update(state, order, native_id, fact)
-            self.journal.record_order(child_id, native_id, order)
+                self.journal.record_order(child_id, native_id, order)
 
     @staticmethod
     def _order_update(order, fact):
@@ -323,11 +333,15 @@ class ExplicitOrderController:
             identity = order.get('local_order_id')
         if order['terminal_confirmed'] or order['cancel_status'] or identity is None:
             return None
+        order['cancel_attempt'] = order.get('cancel_attempt', 0) + 1
         order.update(cancel_status='SEND_POSSIBLE', cancel_reason=reason)
         return self._prepare(order, 'CANCEL', native_order_id=identity, reason=reason)
 
     def _prepare(self, order, kind, **parameters):
-        effect = {'id': order['child_order_id'] + '-' + kind.lower(), 'kind': kind,
+        effect_id = order['child_order_id'] + '-' + kind.lower()
+        if kind == 'CANCEL' and order.get('cancel_attempt', 1) > 1:
+            effect_id += '-' + str(order['cancel_attempt'])
+        effect = {'id': effect_id, 'kind': kind,
                   'child_order_id': order['child_order_id'], 'contract_id': order['contract_id'],
                   'account_key': self.scope['account_key'], 'provider': self.scope['provider'],
                   'trading_day': order['native_trading_day'], **parameters}
@@ -406,7 +420,8 @@ class ExplicitOrderController:
             if old and old[-1]['filled_qty'] < old[-1]['original_qty']:
                 last = old[-1]
                 newer_target = position.get('exit_revision', 0) > last.get('exit_revision', 0)
-                if not self._retry_unsent_exit(last, market, newer_target) and (
+                rejected_retry = last['broker_state'] == 'REJECTED' and terminal(last) and newer_target
+                if not rejected_retry and not self._retry_unsent_exit(last, market, newer_target) and (
                         last['broker_state'] != 'CANCELLED' or not newer_target):
                     continue
             side = position['direction'].lower()
@@ -556,7 +571,8 @@ class ExplicitOrderController:
                 rolled_exit = not opening and old['native_trading_day'] != state['trading_day']
                 newer_target = not opening and position.get('exit_revision', 0) > old.get('exit_revision', 0)
                 local_retry = self._retry_unsent_exit(old, market, newer_target)
-                if not local_retry and (old['broker_state'] != 'CANCELLED' or not (
+                rejected_retry = not opening and old['broker_state'] == 'REJECTED' and terminal(old) and newer_target
+                if not rejected_retry and not local_retry and (old['broker_state'] != 'CANCELLED' or not (
                         allowed_retry or newer_target or rolled_exit and old['cancel_reason'] != 'USER_CANCEL')):
                     continue
             if opening:
@@ -600,7 +616,8 @@ class ExplicitOrderController:
             sender = self.port.send if effect['kind'] == 'SEND' else self.port.cancel
             details = {'id': effect['id'], 'child_order_id': effect['child_order_id'],
                        'contract_id': effect['contract_id'],
-                       'kind': effect['kind'], 'stage': 'PORT_CALL'}
+                       'kind': effect['kind'], 'stage': 'PORT_CALL',
+                       'dispatch_monotonic_ns': str(time.monotonic_ns())}
             try:
                 outcome = sender(dict(effect))
                 if isinstance(outcome, SendNotAttempted):
@@ -613,6 +630,14 @@ class ExplicitOrderController:
                                    exception=outcome.exception)
                     if outcome.rejection_reason is not None:
                         details['rejection_reason'] = outcome.rejection_reason
+                elif isinstance(outcome, CancelNotAttempted):
+                    if (effect['kind'] != 'CANCEL' or outcome.effect_id != effect['id']
+                            or outcome.native_order_id != effect['native_order_id']
+                            or order['cancel_status'] != 'SEND_POSSIBLE'):
+                        raise TraderError('E_DSV_DISPATCH_RESULT', 'Unattempted cancellation proof differs from its effect')
+                    result = 'DEFINITELY_NOT_SENT'
+                    details.update(stage='PRE_CANCEL_VALIDATION', native_order_id=outcome.native_order_id,
+                                   error_code=outcome.error_code, exception=outcome.exception)
                 else:
                     result = 'CALL_RETURNED'
             except Exception as error:
@@ -629,7 +654,12 @@ class ExplicitOrderController:
                     if position is not None and position['id'] == order['position_id'] and order['effect'] == 'OPEN':
                         position.update(entry_stopped=True, preserve_open_on_stop=False)
             else:
-                order['cancel_status'] = result
+                if result == 'DEFINITELY_NOT_SENT':
+                    order['cancel_status'] = None
+                    order['local_cancel_rejection'] = {'effect_id': effect['id'], **details}
+                else:
+                    order['cancel_status'] = result
+            details['returned_monotonic_ns'] = str(time.monotonic_ns())
             if 'error_code' in details:
                 order['last_dispatch_error'] = dict(details)
             try:

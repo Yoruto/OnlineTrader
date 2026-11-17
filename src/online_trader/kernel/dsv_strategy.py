@@ -536,7 +536,8 @@ class DsvStrategyRuntime:
         return {'authorization':{'context_id':context['context_id'],'peer_id':peer,'authority_revision':k._authority_revision,
                                 'purpose':'ENTRY_PROPOSAL','operation':'DSV_ENTRY'},'gate':ready}
 
-    def rebuild_observation(self,events,*,evidence_id,extend=False,_preserve_authority=False,_resume_anchor=None):
+    def rebuild_observation(self,events,*,evidence_id,extend=False,_preserve_authority=False,_resume_anchor=None,
+                            _progress=None):
         """Commit a complete path or its contiguous suffix without executing signals."""
         from online_trader.domain.values import identifier
         identifier(evidence_id);self._development();k=self.kernel
@@ -582,7 +583,9 @@ class DsvStrategyRuntime:
             if (night is not None and datetime.fromisoformat(night['source_time_utc'])<
                     datetime.fromisoformat(first['source_time_utc'])):
                 state['night_reference']=copy.deepcopy(night)
-        for event in events:
+        for index, event in enumerate(events):
+            if _progress is not None and index and index % 256 == 0:
+                _progress()
             if (type(event) is not dict or event.get("account_key")!=k.account_key
                     or (event.get("contract_id"),event.get("trading_day"))!=key
                     or event.get("source_epoch")!=first.get("source_epoch") or event.get("session_id")!=first.get("session_id")

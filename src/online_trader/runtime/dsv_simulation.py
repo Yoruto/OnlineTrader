@@ -24,6 +24,7 @@ from online_trader.runtime.market_monitor import DsvMarketMonitor, append_latenc
 from online_trader.scheduling.calendar import TradingCalendar
 from online_trader.scheduling.holdover import ProtectionClockAnchor, legacy_protection_pending
 from online_trader.scheduling.reference import CalibratedClock, LocalWallClock, check_wall_clock
+from online_trader.scheduling.clock import quote_age_quality, source_age_ns
 from online_trader.runtime.comparison import ComparisonRecorder, verify_dsv_profile
 from online_trader.runtime.strategy_log import DsvEntryLog
 
@@ -165,7 +166,7 @@ class DsvSimulationSession(SimulationSession):
     def _utc_resume_binding(self):
         k = self.kernel
         return (k.control.entry_stop_generation, self._managed_day, k._authority_revision,
-                k._config_revision, k.active_epoch, self.port.source_epoch)
+                k.active_epoch, self.port.source_epoch)
 
     def _poll_clock_diagnostic(self):
         clock = self.port.clock
@@ -174,6 +175,7 @@ class DsvSimulationSession(SimulationSession):
             ready = clock.entry_ready()
             k = self.kernel
             k._dsv_diagnostics['ntp'] = 'NTP_ALIGNED' if ready else 'NTP_UNAVAILABLE'
+            k._dsv_diagnostics['application_utc'] = clock.record()
             if self._utc_resume is not None and (
                     self._utc_resume != self._utc_resume_binding()
                     or k.control.strategy_stop_requested() or not self.owner.entry_window(clock.now())):
@@ -388,13 +390,29 @@ class DsvSimulationSession(SimulationSession):
             anchor_key=(code,events[0]['source_epoch'])
             evidence='native-path-'+self.kernel.boot_id+'-'+str(events[0]['source_epoch'])+'-'+code+'-'+content_hash(enriched)[:16]
             future=self.driver.strategy.rebuild_observation(enriched,evidence_id=evidence,extend=extend,
-                _preserve_authority=preserve_authority,_resume_anchor=self.feed.resume_anchors.get(anchor_key))
+                _preserve_authority=preserve_authority,_resume_anchor=self.feed.resume_anchors.get(anchor_key),
+                _progress=self._pump_rebuild_responsibilities)
             self.kernel.wait_idle();future.result()
             self.feed.resume_anchors.pop(anchor_key,None)
             self.feed.accept(events[-1])
             return events[-1]
         finally:
             self._path_rebuild_ns += time.monotonic_ns() - started
+
+    def _pump_rebuild_responsibilities(self):
+        """Let the original owner process native facts while rebuilding observations."""
+        clock = self.port.clock
+        if isinstance(clock, LocalWallClock):
+            clock.end_turn()
+        self.port.poll_updates(0)
+        if isinstance(clock, CalibratedClock):
+            self._poll_clock_diagnostic()
+        if isinstance(clock, LocalWallClock):
+            clock.begin_turn()
+        self.owner.observe_native_orders()
+        self.kernel.wait_idle()
+        self.driver.poll()
+        self.kernel.wait_idle()
 
     def _extend_late_path(self,code,events):
         first=events[0];state=self.driver.strategy._states.get((code,first['trading_day']))
@@ -439,16 +457,22 @@ class DsvSimulationSession(SimulationSession):
             return
         k = self.kernel
         generation, original_day = pending[:2]
-        now = self.port.clock.now()
+        now = self.port.clock.utc_now() if hasattr(self.port.clock, 'utc_now') else self.port.clock.now()
         if (generation != k.control.entry_stop_generation or event['trading_day'] != original_day
                 or not self.owner.entry_window(now) or k.control.strategy_stop_requested()
                 or clock_recovery and pending != self._utc_resume_binding()):
             self._entry_resume = None
             self._utc_resume = None
             return
-        if clock_recovery and (not self.port.clock.entry_stable()
-                               or not 0 <= (now - datetime.fromisoformat(event['source_time_utc'])).total_seconds() <= 5):
-            return
+        if clock_recovery:
+            if not self.port.clock.entry_stable():
+                return
+            sample = self.port.clock.capture_live()
+            stamp = self.port.quotes[event['contract_id']].datetime
+            source = datetime.fromisoformat(event['source_time_utc'])
+            age = source_age_ns(now, source, stamp)
+            if quote_age_quality(age, self.port.clock.health(sample))[0] != 'VALID':
+                return {'reason_code': 'ENTRY_RESUME_NATIVE_QUOTE'}
         key = event['contract_id'], event['trading_day']
         strategy = self.driver.strategy
         state = strategy._states.get(key)
@@ -776,6 +800,10 @@ class DsvSimulationSession(SimulationSession):
                 except (OSError, TraderError) as error:
                     self.kernel._dsv_diagnostics['status'] = getattr(error, 'code', 'E_SESSION_STATUS_WRITE')
                 self.stop.set()
+            elif (isinstance(clock, CalibratedClock) and not clock.protection_ready()
+                  and any(c['lifecycle'] != 'CLOSED' for c in k._staged.values())):
+                self.status('DSV_UTC_PROTECTION_WAIT', armed=False,
+                            reason='原委托和持仓继续核对，等待可靠时间后执行退出')
             elif self._entry_resume is not None or self._utc_resume is not None:
                 self.status('DSV_ENTRY_RECOVERY_PENDING', armed=False)
             else:self.status('DSV_MANAGING_OWNED' if any(c['lifecycle']!='CLOSED' for c in k._staged.values())

@@ -5,6 +5,7 @@ from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 import os
 from pathlib import Path
+import sqlite3
 from tempfile import NamedTemporaryFile
 import time
 
@@ -26,6 +27,7 @@ from online_trader.runtime.identity import runtime_identity
 from online_trader.runtime.instance import AccountLock, ClockActivity
 from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.scheduling.holdover import ProtectionClockAnchor
+from online_trader.scheduling.clock import utc_text
 from online_trader.scheduling.reference import CalibratedClock
 from online_trader.transport.named_pipe import PipeListener
 
@@ -102,11 +104,17 @@ def prepare(scope, profile_path, calendar_path, database, output):
 
 
 def _date_resolver(grant, calendar):
-    # The locked SDK snapshot labels the day with the bound calendar. It is
-    # useful for showing the civil session but is not independent cabinet proof.
-    def cabinet_day(previous, _now):
+    # The calendar selects the session day. The owner separately reconciles
+    # original orders, fills and native today/historical position buckets.
+    def cabinet_day(previous, now):
         if not grant.permits_day(previous):
             raise TraderError('E_DSV_SDK_SYNC', 'Retained cabinet day is outside the approved scope')
+        active_days = {window['trading_day'] for code in grant.value['contracts']
+                       if (window := calendar.query(code, utc_text(now)))['is_trading']}
+        if len(active_days) == 1:
+            day = next(iter(active_days))
+            if day > previous and grant.permits_day(day):
+                return day
         return previous
     return cabinet_day
 
@@ -205,6 +213,8 @@ def _serve(session, adapter, listener, day, status_path, complete, *, diagnostic
     previous = None
     previous_turn = None
     stopping = False
+    next_storage_sample = 0
+    storage_metrics = {}
 
     def on_request(request):
         nonlocal stopping
@@ -237,7 +247,13 @@ def _serve(session, adapter, listener, day, status_path, complete, *, diagnostic
         if error_code is None and state['synchronized']:
             diagnostics.recovered()
         if receipt and receipt.get('type') == 'ROUND':
-            diagnostics.clock_turn(state, adapter.metrics | {
+            if time.monotonic_ns() >= next_storage_sample:
+                next_storage_sample = time.monotonic_ns() + 60_000_000_000
+                try:
+                    storage_metrics = session._journal.storage_metrics()
+                except (OSError, sqlite3.Error) as error:
+                    diagnostics.report(error, stage='RUNTIME')
+            diagnostics.clock_turn(state, adapter.metrics | storage_metrics | {
                 'owner_turn_ns': str(time.monotonic_ns() - started),
                 'owner_turn_gap_ns': None if previous_turn is None else str(started - previous_turn)},
                                    receipt.get('time_events', ()))
