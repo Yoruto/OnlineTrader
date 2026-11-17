@@ -19,7 +19,7 @@ from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.scheduling.calendar import TradingCalendar
 from online_trader.scheduling.clock import (
-    ClockContinuity, ClockSample, SystemClock, TIME_SEMANTICS, sdk_deadline,
+    ClockContinuity, ClockSample, SystemClock, TIME_SEMANTICS, quote_age_quality, quote_timestamp, sdk_deadline,
     source_age_ns, source_fraction_tail, utc_text,
 )
 from online_trader.scheduling.timers import poll_slice
@@ -57,7 +57,7 @@ class DsvSdkAdapter:
     """
 
     def __init__(self, api, account, *, account_key, profile, calendar, sdk_version, clock=None, _connection=None,
-                 _legacy_native_orders=None, continuity=None):
+                 _legacy_native_orders=None, continuity=None, reference=None):
         if sdk_version != SDK_VERSION or not isinstance(profile, DsvProfile) or not isinstance(calendar, TradingCalendar):
             raise TraderError('E_DSV_SDK_SCOPE', 'Expected the pinned SDK, normalized profile and explicit calendar')
         identifier(account_key)
@@ -81,6 +81,7 @@ class DsvSdkAdapter:
         self.clock = clock if clock is not None else SystemClock()
         self._clock_epoch = uuid4().hex
         self._continuity = continuity if continuity is not None else ClockContinuity()
+        self._reference = reference
         self._health = None
         self._sdk_activity = 0
         self._last_pump_ns = None
@@ -105,7 +106,8 @@ class DsvSdkAdapter:
 
     def check_start(self, state):
         sample = self._clock_sample()
-        if not self.synchronized or not state['synchronized'] or not self.grant.in_window(sample.utc):
+        if (not self.synchronized or not state['synchronized'] or state.get('scope_expired_at')
+                or not self.grant.in_window(sample.utc)):
             raise TraderError('E_DSV_SDK_SYNC', 'Start needs a current synchronized account within the reviewed window')
         if not self.grant.permits_day(state['trading_day']):
             raise TraderError('E_DSV_SDK_SCOPE', 'Start needs the authorized cabinet day')
@@ -132,6 +134,9 @@ class DsvSdkAdapter:
 
     def opening_window(self, day, now):
         return self.grant.permits_day(day) and self.grant.in_window(now)
+
+    def expired(self, now):
+        return now > datetime.fromisoformat(self.grant.value['not_after_utc'])
 
     @staticmethod
     def order_id(child):
@@ -194,7 +199,14 @@ class DsvSdkAdapter:
             if updated is True:
                 self._sdk_activity += 1
             sample = self._clock_sample()
+            prior_sample = self._continuity.previous
             self._health = self._continuity.observe(sample)
+            if self._health['reason'] and prior_sample is not None:
+                self._health['previous_sample'] = prior_sample.paired_record()
+            if self._reference is not None:
+                self._health.update(self._reference.poll(sample, invalidate=bool(self._health['reason'])))
+            else:
+                self._health['reference_status'] = 'UNOBSERVED'
             synchronized = complete() if callable(complete) else complete
             if type(synchronized) is not bool:
                 raise TraderError('E_DSV_SDK_SYNC', 'SDK synchronization must be supplied as a complete fact')
@@ -203,10 +215,13 @@ class DsvSdkAdapter:
                 return {'type': 'DISCONNECTED', 'synchronized': False}
             if callable(trading_day):
                 trading_day = trading_day(state['trading_day'], sample.utc)
+            facts_started = time.monotonic_ns()
             frame, market = self._frame(state, sample, trading_day)
+            self.metrics['native_facts_ns'] = str(time.monotonic_ns() - facts_started)
             self.enabled = True
             self.dispatch_market = market
             receipt = session.apply_round(frame)
+            self.metrics.update(session.round_timing)
             self.synchronized = session.snapshot()['synchronized']
             self.flat_confirmed = self.synchronized and all(
                 row['long_qty'] == row['short_qty'] == 0 and not row['external_orders'] for row in market.values())
@@ -412,10 +427,10 @@ class DsvSdkAdapter:
             elif previous is not None and precise_time < previous[0]:
                 quality, reason = 'SOURCE_ANOMALY', 'QUOTE_TIME_REGRESSION'
             else:
-                if previous is None or raw != previous[1]:
+                quality, reason = quote_age_quality(raw_age, self._health)
+                if quality != 'SOURCE_ANOMALY' and (previous is None or raw != previous[1]):
                     last_change = sample.monotonic
                     self.quote_observations[code] = precise_time, raw, last_change
-                quality, reason = ('CLOCK_UNVERIFIED', 'QUOTE_LEADS_LOCAL_UTC') if raw_age < 0 else ('VALID', None)
         observation = {'source_time_raw': raw if source is not None else None,
                        'source_time_utc': None if source is None else utc(source),
                        'observed_at_utc': sample.now_utc, 'observed_mono_ns': sample.monotonic_ns,
@@ -502,12 +517,7 @@ class DsvSdkAdapter:
         stamp = getattr(quote, 'datetime', None)
         if not stamp or getattr(quote, 'expired', False):
             return None
-        if type(stamp) is not str or len(stamp) > 48:
-            raise ValueError('Invalid SDK quote timestamp')
-        moment = datetime.fromisoformat(stamp)
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=_BEIJING)
-        return moment.astimezone(timezone.utc)
+        return quote_timestamp(stamp, _BEIJING)
 
     def _tick(self, code, quote, session, moment):
         start, end = map(datetime.fromisoformat, (session['open_utc'], session['close_utc']))
@@ -543,7 +553,7 @@ class DsvSdkAdapter:
         if self.grant is None:
             return None
         value = self.grant.value
-        if not self.opening_window(state['trading_day'], now):
+        if state.get('scope_expired_at') or not self.opening_window(state['trading_day'], now):
             return 'SCOPE_OPENING_WINDOW_CLOSED'
         if state.get('sdk_scope_targets', 0) >= value['opening_attempts']:
             return 'SCOPE_TARGET_LIMIT'
@@ -586,7 +596,8 @@ class DsvSdkAdapter:
             if self.grant is not None:
                 if (effect['contract_id'] not in self.grant.value['contracts'] or
                         not self.grant.permits_day(effect['trading_day']) or
-                        effect['native_offset'] == 'OPEN' and not self.grant.in_window(clock.utc)):
+                        effect['native_offset'] == 'OPEN' and (
+                            getattr(self.session, '_state', {}).get('scope_expired_at') or not self.grant.in_window(clock.utc))):
                     rejection_reason = 'ACCOUNT_SCOPE_OR_WINDOW'
                     raise TraderError('E_DSV_SDK_SCOPE', 'The SDK request exceeded its explicit account scope')
             request = dict(symbol=effect['contract_id'], direction=effect['direction'],

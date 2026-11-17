@@ -18,7 +18,8 @@ from online_trader.kernel import Kernel
 from online_trader.kernel.scheduler import ExpiredMarketQuote,ScheduledRuntime
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.simulation import SimulationSession
-from online_trader.runtime.instance import AccountLock
+from online_trader.runtime.instance import AccountLock, ClockActivity
+from online_trader.runtime.identity import runtime_identity
 from online_trader.runtime.market_monitor import DsvMarketMonitor, append_latency
 from online_trader.scheduling.calendar import TradingCalendar
 from online_trader.scheduling.reference import LocalWallClock, check_wall_clock
@@ -47,7 +48,7 @@ class DsvSimulationSession(SimulationSession):
             self.kernel._dsv_diagnostics['status'] = 'E_SESSION_STATUS_WRITE'
             self._status_signature = None
 
-    def __init__(self,kernel,output,*,profile,calendar,clock=None,emit=None,dsv_config=None,dsv_log_dir=None):
+    def __init__(self,kernel,output,*,profile,calendar,clock=None,emit=None,dsv_config=None,dsv_log_dir=None,entry_point=None):
         if not getattr(kernel.simulation,'strategy_enabled',False):
             raise TraderError('E_ONLINE_SCOPE','A manual simulation owner cannot activate the DSV runtime')
         if profile.content_hash!=kernel.simulation.grant.value['profile_hash'] or calendar.content_hash!=kernel.simulation.grant.value['calendar_hash']:
@@ -66,6 +67,15 @@ class DsvSimulationSession(SimulationSession):
         self.driver = ScheduledRuntime(kernel, calendar, profile=profile,
                                        clock=clock or (source_clock if isinstance(source_clock, LocalWallClock)
                                                        else NativeReferenceClock(self.port)))
+        if entry_point is None:
+            entry_point = ('simnow' if self.grant.provider == 'TQ_SIMNOW' else 'dsv') + ' run'
+        kernel._dsv_runtime_identity = runtime_identity(
+            entry_point, 'DSV_LEGACY_KERNEL', kernel.boot_id, self.port.source_epoch, kernel.boot_id, calendar=calendar,
+            profile=profile, grant=self.grant)
+        try:
+            publish_new_bytes(canonical_bytes(kernel._dsv_runtime_identity), self.output / 'runtime-identity.json')
+        except (OSError, TraderError):
+            kernel._dsv_diagnostics['run_identity'] = 'E_RUN_IDENTITY_WRITE'
         self.driver.activate();kernel.wait_idle()
         self.feed=DsvFactFeed(self.port,profile,calendar);self.last_decisions={};self._primed=False
         scoped = set(self.grant.value['contracts'])
@@ -387,7 +397,7 @@ class DsvSimulationSession(SimulationSession):
         generation, original_day = self._entry_resume
         now = self.port.clock.now()
         if (generation != k.control.entry_stop_generation or event['trading_day'] != original_day
-                or not self.grant.in_window(now) or k.control.strategy_stop_requested()):
+                or not self.owner.entry_window(now) or k.control.strategy_stop_requested()):
             self._entry_resume = None
             return
         key = event['contract_id'], event['trading_day']
@@ -609,6 +619,7 @@ class DsvSimulationSession(SimulationSession):
                             armed=False, reasons=list(self.driver._fault), clock_protection=protection)
                 return
             k._dsv_diagnostics.pop('clock_protection', None)
+            expired = self.owner.observe_scope_expiration(clock.now())
             reset = self.driver.last_clock_reset
             if reset is not self._clock_reset_seen:
                 self._calendar_anchor = reset.now_utc
@@ -646,7 +657,7 @@ class DsvSimulationSession(SimulationSession):
             if self._arm_request_revision is not None:
                 if k._authority_revision!=self._arm_request_revision:
                     self._arm_request_revision=None
-                elif self.grant.in_window(self.port.clock.now()):
+                elif self.owner.entry_window(self.port.clock.now()):
                     try:self.owner.arm();k.wait_idle();self._arm_request_revision=None
                     except TraderError as error:
                         if error.code!='E_NOT_READY':raise
@@ -686,7 +697,6 @@ class DsvSimulationSession(SimulationSession):
             if time.monotonic()-self._last_funds_capture>=10:
                 self.owner.capture('ONLINE_DSV_ACCOUNT_REFRESH',{'snapshot':self.port.snapshot()})
                 self._last_funds_capture=time.monotonic()
-            expired=self.port.clock.now()>datetime.fromisoformat(self.grant.value['not_after_utc'])
             if expired:
                 self._entry_resume = None
                 if k._armed:
@@ -760,6 +770,12 @@ class DsvSimulationSession(SimulationSession):
 def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=False,dsv_config=None,dsv_log_dir=None,
         _execution_lock=None):
     """Future explicitly scoped connection path. Offline tests never call it."""
+    with ClockActivity():
+        return _run(scope, credentials, profile_path, calendar_path, output, pipe=pipe, arm=arm,
+                    dsv_config=dsv_config, dsv_log_dir=dsv_log_dir, _execution_lock=_execution_lock)
+
+
+def _run(scope,credentials,profile_path,calendar_path,output,*,pipe,arm,dsv_config,dsv_log_dir,_execution_lock):
     grant,profile,calendar=load_inputs(scope,profile_path,calendar_path)
     if grant.replacement:
         raise TraderError('E_ONLINE_SCOPE','A replacement grant requires the replacement SDK startup')
@@ -804,7 +820,8 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
                 'preparation':preparation,
                 'restored_original_calculation':restored is not None,'existing_plans_changed':False})
         restoring=any(not kernel.simulation.archived_cycle(cycle) for cycle in kernel._staged.values())
-        session=DsvSimulationSession(kernel,output,profile=profile,calendar=calendar,dsv_config=dsv_config,dsv_log_dir=dsv_log_dir)
+        session=DsvSimulationSession(kernel,output,profile=profile,calendar=calendar,dsv_config=dsv_config,
+                                     dsv_log_dir=dsv_log_dir,entry_point='desktop-start' if _execution_lock is not None else None)
         session._poll_clock_diagnostic()
         session.prime()
         reference.end_turn()

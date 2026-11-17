@@ -64,7 +64,6 @@ class DsvFactFeed:
                 except TraderError:raise TraderError('E_FACT_BARRIER','A native tick identity has no valid source time') from None
                 moment=datetime.fromtimestamp(stamp//1_000_000_000,timezone.utc)
                 moment=moment.replace(microsecond=(stamp%1_000_000_000)//1000)
-                if moment>now:continue
                 rows.append((index,moment,raw))
             rows.sort(key=lambda row:row[0])
             if len({row[0] for row in rows})!=len(rows):

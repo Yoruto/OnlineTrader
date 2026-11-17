@@ -1495,6 +1495,9 @@ class WorkbenchLayout:
             dot.setStyleSheet(f'background:{color}; border-radius:4px;')
         self.home_state.setText(state)
         self.home_connection.setText(description)
+        identity = config.get('runtime_identity') or {}
+        engine = {'DSV_LEGACY_KERNEL': '原 DSV 执行链', 'DSV_REPLACEMENT': 'DSV 替代执行链'}.get(identity.get('engine_kind'))
+        self.home_connection.setToolTip(f"{engine} · {identity['entry_point']}" if engine else '')
 
         funds = self.fund_values if available else {}
         for key, (value, caption) in self.dashboard_money.items():
@@ -1931,6 +1934,7 @@ class WorkbenchLayout:
                 messages = {
                     'E_OFFSET_DAY': '截止交易日与可核对的当前交易日不一致。',
                     'E_OFFSET_SESSION': '所选合约未处于共同交易时段，可继续使用离线计算。',
+                    'E_OFFSET_QUOTE_TIME': '振幅报价已超过 15 秒或属于其他交易时段。',
                     'E_CREDENTIALS': '所选账户的行情凭据不完整。',
                     'E_DEPENDENCY': '本机行情组件未就绪。',
                 }

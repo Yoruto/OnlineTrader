@@ -328,7 +328,8 @@ def migrate(source, manifest, target=None):
         if db.execute('SELECT 1 FROM position_cycles WHERE trading_day > ?', (scope['trading_day'],)).fetchone():
             blockers.add('LEGACY_NEWER_TRADING_DAY')
         archived = _material(db, state, scope, manifest, profile, blockers)
-        receipt = {'type': 'DSV_OFFLINE_MIGRATION/1', 'source_schema': '1', 'target_schema': '2',
+        target_schema = 2 if scope['provider'] == 'OFFLINE' else TIME_SCHEMA
+        receipt = {'type': 'DSV_OFFLINE_MIGRATION/1', 'source_schema': '1', 'target_schema': str(target_schema),
                    'source_release': manifest['source_release'], 'source_event_seq': watermark,
                    'source_digest': _source_digest(db), 'source_account_hash': content_hash(manifest['source_account_key']),
                    'target_scope': scope, 'target_state_digest': content_hash(state),
@@ -364,10 +365,52 @@ def _publish(target, scope, state, receipt):
         temporary = Path(directory) / 'ledger.sqlite'
         with closing(Journal(temporary, scope, state)) as journal, journal.transaction():
             journal.event('LEGACY_MIGRATION', receipt | {'mode': 'IMPORTED'})
+            if receipt['target_schema'] == str(TIME_SCHEMA):
+                journal.activate_time_schema({'mode': 'LEGACY_IMPORT', 'migration_id': receipt['migration_id']})
         try:
             os.link(temporary, target)
         except FileExistsError as error:
             raise TraderError('E_DUPLICATE_CONFLICT', 'Migration destination already exists') from error
+
+
+def migrate_time_copy(source, target):
+    """Publish a consistent, time-versioned copy while the original owner is stopped."""
+    source, target = Path(source).resolve(), Path(target).absolute()
+    if not source.is_file() or target.exists() or target.is_symlink():
+        raise TraderError('E_DSV_STORE_VERSION', 'Clock migration needs an existing original and a new destination')
+    with _readonly(source) as db:
+        row = db.execute('SELECT payload FROM scope WHERE id=1').fetchone()
+        if row is None:
+            raise TraderError('E_DSV_STORE_VERSION', 'Clock migration requires a scoped replacement ledger')
+        scope = strict_loads(row[0])
+    with AccountLock(scope['account_key']), _readonly(source) as db:
+        version = db.execute('PRAGMA user_version').fetchone()[0]
+        checkpoint = db.execute('SELECT payload FROM checkpoint WHERE id=1').fetchone()
+        if (db.execute('PRAGMA application_id').fetchone()[0] != _APPLICATION_ID or version not in (1, 2)
+                or strict_loads(db.execute('SELECT payload FROM scope WHERE id=1').fetchone()[0]) != scope
+                or checkpoint is None or db.execute('PRAGMA quick_check').fetchone()[0] != 'ok'):
+            raise TraderError('E_DSV_STORE_VERSION', 'Clock migration requires an intact older replacement ledger')
+        receipt = {'type': 'DSV_TIME_MIGRATION/1', 'mode': 'COLD_COPY', 'source_schema': version,
+                   'target_schema': TIME_SCHEMA, 'minimum_writer': TIME_SCHEMA,
+                   'scope_hash': content_hash(scope), 'source_checkpoint_hash': content_hash(strict_loads(checkpoint[0])),
+                   'source_event_seq': str(db.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0]),
+                   'timer_recovery': 'VERIFY_AFTER_NATIVE_SYNC', 'broker_connected': False}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(dir=target.parent, prefix='.dsv-clock-') as directory:
+            temporary = Path(directory) / 'ledger.sqlite'
+            with closing(sqlite3.connect(temporary)) as copy:
+                db.backup(copy)
+            with closing(Journal(temporary, scope, {})) as journal, journal.transaction():
+                journal.activate_time_schema(receipt)
+            with _readonly(temporary) as candidate:
+                if (candidate.execute('PRAGMA quick_check').fetchone()[0] != 'ok' or
+                        candidate.execute('SELECT payload FROM checkpoint WHERE id=1').fetchone()[0] != checkpoint[0]):
+                    raise TraderError('E_DSV_STORE_VERSION', 'Clock migration failed integrity or checkpoint verification')
+            try:
+                os.link(temporary, target)
+            except FileExistsError as error:
+                raise TraderError('E_DUPLICATE_CONFLICT', 'Clock migration destination already exists') from error
+    return receipt
 
 
 @contextmanager

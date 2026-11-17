@@ -5,10 +5,13 @@ on recovery/change. An abrupt crash can lose the unsummarized repeat count.
 No raw exception text, locals, account snapshots or absolute paths are written.
 """
 
+from collections import deque
 from datetime import datetime, timezone
 import json
+from math import ceil
 from pathlib import Path
 import re
+import time
 
 from online_trader.errors import exception_record
 
@@ -27,6 +30,9 @@ class RuntimeDiagnostics:
         self._last_exception_id = None
         self._degraded = False
         self._write_failures = 0
+        self._metrics = {}
+        self._clock_status = None
+        self._next_clock_summary = 0
 
     def status(self):
         return {'state': 'DEGRADED' if self._degraded else 'OK',
@@ -95,6 +101,37 @@ class RuntimeDiagnostics:
         except Exception:
             self._failed_write()
 
+    def clock_turn(self, state, metrics, events):
+        try:
+            health = state.get('clock_health') or {}
+            quotes = {contract: row['quote_observation']
+                      for contract, row in state['symbols'].items() if row.get('quote_observation')}
+            signature = (state.get('clock_recovery_required'), health.get('reference_status'),
+                         tuple((code, item['reason']) for code, item in quotes.items()))
+            for key, value in metrics.items():
+                if value is not None:
+                    self._metrics.setdefault(key, deque(maxlen=512)).append(int(value))
+            for event in events:
+                value = event.get('lateness_ns')
+                if value is not None:
+                    self._metrics.setdefault('timer_lateness_ns', deque(maxlen=512)).append(int(value))
+            now = time.monotonic_ns()
+            if signature != self._clock_status or now >= self._next_clock_summary:
+                self._clock_status = signature
+                self._next_clock_summary = now + 60_000_000_000
+                elapsed = {}
+                for name, values in self._metrics.items():
+                    ordered = sorted(values)
+                    elapsed[name] = {f'p{fraction}': str(ordered[ceil(len(ordered) * fraction / 100)-1])
+                                     for fraction in (50, 95, 99)} | {'samples': len(ordered), 'max': str(ordered[-1])}
+                self._append({'kind': 'CLOCK_SUMMARY', 'schema_version': 'DSV_RUNTIME_DIAGNOSTIC/1',
+                              'logged_at_utc': self._now(), 'time_sample': state.get('time_sample'),
+                              'clock_health': health, 'recovery_reason': state.get('clock_recovery_required'),
+                              'timings': elapsed, 'quote_count': len(quotes),
+                              'quotes': dict(list(quotes.items())[:24])})
+        except Exception:
+            self._failed_write()
+
     def _failed_write(self):
         self._degraded = True
         self._write_failures = min(2_147_483_647, self._write_failures + 1)
@@ -103,6 +140,12 @@ class RuntimeDiagnostics:
         limit = min(65_536, self.max_bytes)
         raw = (json.dumps(record, ensure_ascii=True, separators=(',', ':')) + '\n').encode('utf-8')
         if len(raw) > limit:
+            if 'exception' not in record:
+                raw = (json.dumps({key: value for key, value in record.items() if key != 'quotes'} |
+                                  {'quotes_truncated': True}, ensure_ascii=True, separators=(',', ':')) + '\n').encode('utf-8')
+                if len(raw) > limit:
+                    raise ValueError('Diagnostic record exceeds its bound')
+                return raw
             detail = record['exception']
             minimal = {**detail, 'truncated': True,
                        'stack': [{'type': item['type'], 'code': item['code'], 'frames': []}

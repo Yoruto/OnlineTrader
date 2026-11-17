@@ -1,14 +1,17 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [switch]$Watch,
+    [switch]$Apply,
+    [switch]$ScopeFlatConfirmed,
     [ValidateRange(30, 3600)]
     [int]$PollSeconds = 60,
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [string]$Python
 )
 
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
-$python = Join-Path $project '.venv\Scripts\python.exe'
+if (-not $Python) { $Python = Join-Path $project '.venv\Scripts\python.exe' }
 $runner = Join-Path $PSScriptRoot 'run_online_trader.py'
 $clockScript = Join-Path $PSScriptRoot 'clock.ps1'
 if (-not $OutputDirectory) {
@@ -18,7 +21,7 @@ if (-not $OutputDirectory) {
 
 function Read-ClockObservation {
     param([string]$Path)
-    & $python -I $runner compare clock --output $Path | Out-Null
+    & $Python -I $runner compare clock --output $Path | Out-Null
     $code = $LASTEXITCODE
     if ($code -notin @(0, 2) -or -not (Test-Path -LiteralPath $Path)) {
         throw 'The read-only reference measurement failed.'
@@ -30,26 +33,8 @@ function Read-ClockObservation {
     return $fact
 }
 
-function Test-TradingProcess {
-    $processes = Get-CimInstance Win32_Process -Filter "Name='trading.exe' OR Name='online-trader.exe' OR Name='python.exe' OR Name='pythonw.exe'"
-    foreach ($process in $processes) {
-        if ($process.Name -ieq 'trading.exe' -or
-            ($process.CommandLine -match '(?i)online[_-]trader' -and
-             $process.CommandLine -match '(?i)\b(?:simnow|dsv|simulation|simulate)\s+run\b')) {
-            return $true
-        }
-    }
-    return $false
-}
-
-function Test-ClockAdmin {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-if ($Watch -and -not $WhatIfPreference -and -not (Test-ClockAdmin)) {
-    throw 'Start the automatic watch from an Administrator PowerShell.'
+if ($Watch -and $Apply) {
+    throw 'Watch is read-only. Invoke -Apply once after reconciling the stopped scope.'
 }
 
 $mutex = [Threading.Mutex]::new($false, 'Local\OnlineTrader.ClockSyncOnce')
@@ -75,32 +60,27 @@ try {
             continue
         }
         $aligned = $fact.system_aligned
-        if ($aligned -or (Test-TradingProcess)) {
-            $next = if ($aligned) { 'ALIGNED' } else { 'DEFERRED_TRADING_PROCESS' }
+        if ($aligned -or -not $Apply) {
+            $next = if ($aligned) { 'ALIGNED' } else { 'OUTSIDE_TOLERANCE' }
             if ($next -ne $state) {
                 Write-Output "$next ($($fact.reference_minus_system_ms) ms) · $sample"
                 $state = $next
             }
             if (-not $Watch) {
                 if ($aligned) { exit 0 }
-                exit 3
+                exit 2
             }
             Start-Sleep -Seconds $PollSeconds
             continue
         }
 
-        $before = Join-Path $directory.FullName 'before.json'
-        Move-Item -LiteralPath $sample -Destination $before -WhatIf:$false
         if (-not $PSCmdlet.ShouldProcess('Windows Time', 'Synchronize once against the configured source')) { exit 0 }
-        if (-not (Test-ClockAdmin)) {
-            throw 'Run from an Administrator PowerShell to apply the one-time correction.'
-        }
-        if (Test-TradingProcess) { throw 'A trading process started during the preflight. Retry when it has exited.' }
-
         $after = Join-Path $directory.FullName 'after.json'
         $attemptLog = Join-Path $directory.FullName 'sync.log'
         $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        & $powershell -NoProfile -File $clockScript -Sync -Output $after *> $attemptLog
+        $arguments = @('-NoProfile', '-File', $clockScript, '-Sync', '-Output', $after, '-Python', $Python)
+        if ($ScopeFlatConfirmed) { $arguments += '-ScopeFlatConfirmed' }
+        & $powershell @arguments *> $attemptLog
         $syncExit = $LASTEXITCODE
         if ($syncExit -ne 0 -or -not (Test-Path -LiteralPath $after)) {
             throw "The single synchronization attempt did not pass. See $attemptLog"

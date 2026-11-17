@@ -198,7 +198,8 @@ def _calendar(packet):
     first = packet['rounds'][0]['market'][0]
     starts, ends = first['session_open'], first['session_close']
     window = {'session_id': 'replay', 'trading_day': packet['trading_day'], 'open_utc': starts,
-              'close_utc': ends, 'is_opening_session': True, 'force_close_at_end': False}
+              'close_utc': ends, 'is_opening_session': first['opening_session'],
+              'force_close_at_end': first.get('force_close_at_end', False)}
     return TradingCalendar.from_record({'schema_version': 'TRADING_CALENDAR/1', 'calendar_id': 'offline-replay',
         'calendar_version': '1', 'complete': True, 'coverage_from_utc': starts, 'coverage_to_utc': ends,
         'contracts': [{'contract_id': first['contract_id'], 'sessions': [window]}]})
@@ -239,6 +240,10 @@ def candidate(packet, sdk_api, loop, database):
                 elif decision.get('remaining') == 0:
                     api.current['targets'].append(0)
             api.current['decisions'] = [row['reason'] for row in receipt['decisions']]
+            if 'time_events' in receipt:
+                api.current['time_events'] = receipt['time_events']
+            if close := next((row for row in receipt['decisions'] if row['reason'].startswith('SCHEDULED_CLOSE')), None):
+                api.current['close_price_mode'] = close['price_mode']
             snapshot = session.snapshot()
             position = snapshot['symbols'][market['contract_id']]['position'] or {}
             if ((requested := position.get('close_request_at')) is not None

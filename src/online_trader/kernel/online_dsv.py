@@ -24,6 +24,19 @@ class OnlineDsvSimulation(OnlineSimulation):
         from online_trader.kernel.historical_orders import HistoricalOrders
         self.days=DayRecovery(self)
         self.historical_orders=HistoricalOrders(self)
+        self._scope_expired = bool(kernel.ledger.query(
+            "SELECT 1 FROM event_journal WHERE event_type='ONLINE_DSV_SCOPE_EXPIRED' "
+            "AND json_extract(payload_json,'$.data.grant_hash')=? LIMIT 1", (grant.content_hash,)))
+
+    def entry_window(self, now):
+        return not self._scope_expired and self.grant.in_window(now)
+
+    def observe_scope_expiration(self, now):
+        if not self._scope_expired and now > datetime.fromisoformat(self.grant.value['not_after_utc']):
+            self._scope_expired = True
+            self.capture('ONLINE_DSV_SCOPE_EXPIRED', {'grant_hash': self.grant.content_hash,
+                                                      'observed_at_utc': now.isoformat()})
+        return self._scope_expired
 
     def accepts_cycle(self, cycle):
         if super().accepts_cycle(cycle):
@@ -139,6 +152,8 @@ class OnlineDsvSimulation(OnlineSimulation):
         k=self.kernel;scheduler=getattr(k,'_scheduled_runtime',None)
         if not self.port.entry_clock_ready():
             raise TraderError('E_CLOCK','A valid Windows wall clock is required to enable new entries')
+        if not self.entry_window(self.port.clock.now()):
+            raise TraderError('E_NOT_READY', 'The original opening scope is outside its finite window')
         if (scheduler is None or not scheduler._enabled or scheduler._fault or scheduler.clock_rebuild_pending
                 or scheduler.calendar.content_hash!=self.grant.value['calendar_hash']
                 or scheduler.strategy.epoch!=k.active_epoch or not k.control.can_increase()
@@ -154,7 +169,7 @@ class OnlineDsvSimulation(OnlineSimulation):
             raise TraderError('E_CLOCK','A valid Windows wall clock is required for DSV/SimNow entries')
         if not self._configured or self.port.fault or not self.port.complete():
             raise TraderError('E_GATEWAY_SYNC', '当前柜台事实未完整同步。')
-        if not self.grant.in_window(self.port.clock.now()):
+        if not self.entry_window(self.port.clock.now()):
             raise TraderError('E_ENTRY_WINDOW_EXPIRED', '当前时刻超出已确认的开仓窗口。')
         if not self.target_quota(plan['contract_id'], plan['trading_day']):
             code = 'DAILY_ORDER_LIMIT' if self.grant.daily_targets_per_contract is not None else 'E_ENTRY_ATTEMPT_LIMIT'
@@ -341,7 +356,7 @@ class OnlineDsvSimulation(OnlineSimulation):
         ex=cycle.get('execution',{});state=cycle['protection'];k=self.kernel
         pending=(not ex.get('entry_stopped') and not cycle.get('cancel_entries') and state.get('target_remaining_qty') is None
                  and k._armed and cycle['strategy_epoch']==k.active_epoch and not self.consumed()
-                 and self.grant.in_window(self.port.clock.now())
+                 and self.entry_window(self.port.clock.now())
                  and state['entry_filled_qty']<cycle['plan']['initial_open_quantity']
                  and any(ex.get('cancel_reasons',{}).get(o['child_order_id']) in {'NEW_QUOTE_PRICE_WORSENED','TARGET_QUANTITY_REDUCED'}
                          for o in cycle['orders'] if o['effect']=='OPEN'))

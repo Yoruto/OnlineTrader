@@ -1,8 +1,12 @@
 """Explicit read-only NTP calibration for the optional simulation boundary."""
 from dataclasses import dataclass
 from datetime import datetime,timezone
+from decimal import Decimal
+from queue import Empty, SimpleQueue
 import socket,statistics,struct,time
+from threading import Thread
 from online_trader.errors import TraderError
+from online_trader.scheduling.clock import NS_PER_SECOND, SystemClock
 
 @dataclass(frozen=True,slots=True)
 class ReferenceClock:
@@ -18,23 +22,23 @@ class ReferenceClock:
         return {'mode':'READ_ONLY_NTP_MONOTONIC','offset_seconds':str(self.offset_seconds),'samples':list(self.samples),'os_clock_changed':False}
 
 
-class LocalWallClock:
+class LocalWallClock(SystemClock):
     """DSV startup and execution read the Windows wall clock."""
     def __init__(self):
+        super().__init__()
         self._sample = None
 
-    def sample(self):
-        wall, monotonic = self._sample or (datetime.now(timezone.utc), time.monotonic_ns())
-        return {'now_utc': wall.isoformat().replace('+00:00', 'Z'), 'monotonic_ns': str(monotonic)}
+    def capture(self):
+        return self._sample if self._sample is not None else super().capture()
 
     def begin_turn(self):
-        self._sample = datetime.now(timezone.utc), time.monotonic_ns()
+        self._sample = super().capture()
 
     def end_turn(self):
         self._sample = None
 
     def now(self):
-        return self._sample[0] if self._sample is not None else datetime.now(timezone.utc)
+        return self._sample.utc if self._sample is not None else self.utc_now()
 
     def record(self):
         return {'mode':'SYSTEM_WALL_CLOCK','os_clock_changed':False}
@@ -93,3 +97,67 @@ def measure_reference():
         raise TraderError('E_CLOCK','Insufficient consistent NTP samples; no opening permitted')
     offset=statistics.median(row[1] for row in valid)
     return ReferenceClock(time.time()+offset,time.monotonic(),offset,tuple(samples))
+
+
+class ReferenceMonitor:
+    """A bounded, read-only diagnostic observer. No SDK or journal ownership."""
+
+    def __init__(self, clock, *, interval_seconds=3600, measurement=measure_reference):
+        self.clock = clock
+        self.interval_ns = interval_seconds * NS_PER_SECOND
+        self.measurement = measurement
+        self.results = SimpleQueue()
+        self.worker = None
+        self.generation = 0
+        self.next_ns = 0
+        self.latest = None
+
+    def _read(self, generation):
+        try:
+            reading = self.measurement()
+            offsets = [Decimal(row['offset_seconds']) for row in reading.samples if row['valid']]
+            rtt = max(Decimal(row['rtt_seconds']) for row in reading.samples if row['valid'])
+            offset = Decimal(str(reading.offset_seconds))
+            self.results.put((generation, self.clock.capture(), {
+                'source': 'NTP_TWO_SOURCE_READ_ONLY', 'offset_ns': str(int(offset * NS_PER_SECOND)),
+                'round_trip_ns': str(int(rtt * NS_PER_SECOND)),
+                'estimated_error_ns': str(int((rtt + max(offsets) - min(offsets)) * NS_PER_SECOND)),
+            }))
+        except Exception:
+            self.results.put((generation, self.clock.capture(), None))
+
+    def poll(self, sample, *, invalidate=False):
+        if invalidate:
+            self.generation += 1
+            self.latest = None
+            self.next_ns = 0
+        try:
+            generation, at, value = self.results.get_nowait()
+        except Empty:
+            pass
+        else:
+            if generation == self.generation:
+                self.latest = at, value
+        if sample.monotonic >= self.next_ns and (self.worker is None or not self.worker.is_alive()):
+            self.next_ns = sample.monotonic + self.interval_ns
+            self.worker = Thread(target=self._read, args=(self.generation,),
+                                 name='OnlineTrader-clock-reference', daemon=True)
+            try:
+                self.worker.start()
+            except RuntimeError:
+                self.latest = sample, None
+        if self.latest is None:
+            return {'reference_status': 'UNOBSERVED'}
+        at, reading = self.latest
+        age = sample.monotonic - at.monotonic
+        if not 0 <= age <= self.interval_ns or reading is None or at.clock_epoch != sample.clock_epoch:
+            return {'reference_status': 'REFERENCE_UNAVAILABLE'}
+        # NTP estimates are diagnostic. Use a short-lived, conservative bound
+        # only for elapsed-time recovery, with no correction of decision UTC.
+        utc_error = None
+        if age <= 30 * NS_PER_SECOND:
+            uncertainty = int(reading['estimated_error_ns']) + abs(int(reading['offset_ns']))
+            utc_error = str(uncertainty + int(at.sample_span_ns) + age // 1000)
+        return {'reference_status': 'OBSERVED_OK', 'reference': reading | {
+                    'observed_at_utc': at.now_utc, 'sample_age_ns': str(age)},
+                'utc_error_ns': utc_error}

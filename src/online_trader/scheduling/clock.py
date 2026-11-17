@@ -21,6 +21,9 @@ _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0
 _NS = re.compile(r"(?:0|[1-9][0-9]{0,18})\Z")
 _EPOCH = re.compile(r"[a-f0-9]{32}\Z")
 _FRACTION = re.compile(r"[T ][0-9]{2}:[0-9]{2}:[0-9]{2}[.,]([0-9]{1,9})(?![0-9])")
+_SOURCE_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.,][0-9]{1,9})?"
+    r"(?:Z|[+-][0-9]{2}:[0-9]{2})?\Z")
 
 
 def _error(message):
@@ -138,6 +141,26 @@ def source_fraction_tail(raw):
 
 def source_age_ns(now, source, raw):
     return delta_ns(now, source) - source_fraction_tail(raw)
+
+
+def quote_timestamp(raw, implicit_zone):
+    """Parse the SDK's ISO local form while keeping the untouched raw value."""
+    if type(raw) is not str or not _SOURCE_TIMESTAMP.fullmatch(raw):
+        raise ValueError("Invalid SDK quote timestamp")
+    source = datetime.fromisoformat(raw)
+    if source.tzinfo is None:
+        source = source.replace(tzinfo=implicit_zone)
+    return source.astimezone(timezone.utc)
+
+
+def quote_age_quality(age_ns, reference=None):
+    if reference and reference.get('utc_error_ns') is not None:
+        observed = reference['reference']
+        corrected_age = age_ns + int(observed['offset_ns'])
+        if corrected_age < -int(observed['estimated_error_ns']):
+            return 'SOURCE_ANOMALY', 'QUOTE_REFERENCE_CONFLICT'
+        return 'VALID', None
+    return ('CLOCK_UNVERIFIED', 'QUOTE_LEADS_LOCAL_UTC') if age_ns < 0 else ('VALID', None)
 
 
 class ClockContinuity:

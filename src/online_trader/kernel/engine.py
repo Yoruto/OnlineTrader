@@ -449,6 +449,8 @@ class Kernel:
             cycle['statistics_observed_at_utc']=_strategy['metadata']['candidate']['source_time_utc']
         if scheduler is not None and cycle['strategy_metadata'] is not None:
             cycle['schedule_binding']=scheduler.binding_for(plan,entry_time_utc=cycle['strategy_metadata']['candidate']['source_time_utc'])
+            if scheduler.strategy.online:
+                cycle['execution_clock_origin'] = scheduler.execution_origin()
         if _strategy is not None:
             self._entry_gates[order.attempt_id] = _strategy["gate"]
             cycle['strategy_target_accepted'] = True

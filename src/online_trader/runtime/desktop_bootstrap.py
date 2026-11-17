@@ -21,7 +21,7 @@ from online_trader.domain.values import decimal_text, decimal_value, identifier
 from online_trader.errors import TraderError, exception_record
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime import dsv_simulation
-from online_trader.runtime.instance import AccountLock
+from online_trader.runtime.instance import AccountLock, ClockActivity
 from online_trader.scheduling.calendar import TradingCalendar, _utc
 
 
@@ -278,7 +278,7 @@ def run_desktop_start(request_path, output, *, now=None):
             publish_new_bytes(canonical_bytes({'phase': name, 'message': _PHASE_MESSAGES[name],
                 'entry_authority': 'DISARMED', **extra}), directory / f'phase-{index:03}-bootstrap.json')
         phase(0, 'STARTUP_CHECKING')
-        with AccountLock(row['account_key']) as lease:
+        with ClockActivity(), AccountLock(row['account_key']) as lease:
             _check_existing_ledger(store, row)
             claim = store.directory / 'desktop-start-claims' / (request['request_id'] + '.json')
             if claim.exists():
