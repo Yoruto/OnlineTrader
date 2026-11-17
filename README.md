@@ -6,6 +6,8 @@
 
 2026-11-16 的[上午五合约迁移与模拟盘对照](docs/refactor/dsv-parity-20261114/23-simnow-migration-and-activation-parity.md)覆盖原账本副本恢复、同柜台日迁移和激活位修复。[下午四合约真实模拟盘复跑](docs/refactor/dsv-parity-20261114/24-afternoon-four-contract-acceptance.md)完成了几何拒绝、激活位与柜台空仓对照，记录了停开后的 SQLite 提交错误及读库修正。实际发单、成交保护和平仓仍待验证。
 
+2026-11-17 校时后的两轮四合约双跑共匹配 180 个同秒行情点和 20 条同分钟激活位拒开日志，塑料和沥青分钟缺口未复现。现有模拟柜台证据覆盖入场前判定，仍需有自然信号的开仓、成交后保护和退出闭环。 [现场复测记录](docs/refactor/dsv-parity-20261114/29-clock-stability-and-four-contract-retest.md)
+
 截至本次文档核对，源码基线为 `ddad472235b9fa0749646d7e3fded831040ca6c3`；该提交仅更新文档，运行代码沿用 `6468b003394315ee2fd1fa919ea6b1117db4cac9`。**A01、A02、A03、B01 所列场景的记录，不代表整个替代链、全部旧账本格式、真实柜台或正式发布已经验收。**
 
 `6468b00` 实现明确未发送减仓的同目标恢复、后台只读历史投影、策略决定与撤单异常展示，以及有序目标/轮次比较。第16篇记载作者的 Windows/Qt/IPC 复测及源码自检数量；原始报告存于本机 `output/`，本次远端文档核对未取得原件，不能把引用数字当作新增独立验证。[适用场景与复测方法](docs/refactor/dsv-parity-20261114/16-exit-recovery-and-evidence-acceptance.md)
@@ -53,6 +55,8 @@ $env:PYTHONPATH = 'src'
 ## Windows 校时
 
 原脚本和使用说明见[历史校时说明](README.legacy-ddad472.md#windows-校时)。其中原内核的跳钟核对/F5流程仅适用于所记旧路径，不应套成替代入口的额外门禁。自动校时需求、运行中系统时间修改及新链路的完整验证仍单列，不由这次文档修订授予执行权限。
+
+即时校准前检查 W32Time 是否仍在渐进调速。已授权停机维护时，先停止服务并确认调速状态，再即时校准、恢复服务并重新同步。随后以独立样本跨自动同步周期复核偏差。 [实际操作与验证](docs/refactor/dsv-parity-20261114/29-clock-stability-and-four-contract-retest.md)
 
 ## 打开账户管理与交易工作台
 

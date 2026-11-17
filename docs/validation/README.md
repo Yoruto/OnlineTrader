@@ -8,6 +8,10 @@
 
 [下午四合约真实模拟盘复跑](../refactor/dsv-parity-20261114/24-afternoon-four-contract-acceptance.md)补录了 29 条激活位匹配、柜台终查、停开后提交错误、读锁隔离复现和 QA 命令。
 
+## 2026-11-17 四合约与授时复测
+
+[运行记录和独立报告原件哈希](../refactor/dsv-parity-20261114/29-clock-stability-and-four-contract-retest.md)覆盖三轮 SimNow/TqKq 对照、SDK 行情时间复现和 30 分钟授时观察。
+
 ## 不把证据来源和执行结果混写
 
 `reported_result` 记录原作者说测到了什么；`evidence_status` 记录本次审核是否实际取得相应原件。`REPORTED_PASS / NOT_INSPECTED` 不等于失败，也不等于本次独立通过。原件不可取得时，哈希、实际命令、完整环境及未知计数保留 `null`，禁止补造。

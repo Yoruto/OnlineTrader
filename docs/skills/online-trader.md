@@ -46,6 +46,12 @@ Use `docs/refactor/dsv-parity-20261114/16-exit-recovery-and-evidence-acceptance.
 - For a no-order product test, keep entry disarmed, instrument and deny native order APIs, and collect actual startup, account and market decisions. Record attempt counts and the independent read-only final snapshot after the owner exits. A successful connection or comparison on a pure strategy replay covers less than the actual runtime.
 - Align two providers by source tick identity and timestamp. Record the fields and decision outputs compared. Compare live DSV only when its original running strategy is observed under the user's authorization. Source-formula verification covers that formula. An observed geometry block covers the rejected path. Natural entry, fills, cancellation, and post-fill protection have their own evidence.
 
+### Windows time and quote gaps
+
+- If an active-session round has no admitted tick, compare the same SDK update's raw quote timestamp, validity, session, minute key, and Windows observation time with the original DSV log. A synchronized account can still lack usable quotes. A later NTP measurement or run can reproduce the mechanism; it cannot recover raw timestamps missing from an earlier round.
+- A successful `w32tm /resync` may start a gradual clock-rate correction. For authorized immediate correction during a stopped trading window, stop W32Time first, verify the pending rate adjustment is cleared, measure against consistent NTP sources, and then set the clock. Restart W32Time, resync, and compare several fresh offsets across an automatic poll. Record the actual and nominal clock rates. Keep quote acceptance rules intact and record the measured stability window. [Windows clock and four-contract evidence](../refactor/dsv-parity-20261114/29-clock-stability-and-four-contract-retest.md)
+- For a live comparison, track admitted quote coverage for every selected symbol and bounded windows of raw DSV notices, candidate decisions, and native orders and fills. Count same-second price matches separately from same-minute activation matches. An aligned rejection window covers that rejection path. A natural entry still needs its own order, fill, protection, and exit evidence.
+
 ## Checks and documentation
 
 Use targeted `unittest` files in the project environment. For a Windows full source run use the `-X utf8` invocation in `AGENTS.md`. `scripts/check.ps1` records source and validation-input hashes. Select tests for the actual path instead of treating legacy checks as replacement acceptance.
