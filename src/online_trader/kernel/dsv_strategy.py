@@ -818,6 +818,8 @@ class DsvStrategyRuntime:
             report["reasons"]=list(dict.fromkeys(report["reasons"]+reasons))
         except TraderError as error:
             report["status"]="OBSERVED";report["reasons"].append(error.code)
+            if error.code == 'E_OWNERSHIP' and error.details is not None:
+                report['entry_block'] = error.details
         report["checks"] = {"strategy": "CANDIDATE" if report["candidates"] else "NO_CANDIDATE",
                             "owner": "EVALUATED", "risk": "EVALUATED" if "risk" in report else "SKIPPED"}
         persisted["report"]=copy.deepcopy(report)

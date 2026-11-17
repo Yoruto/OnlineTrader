@@ -39,7 +39,7 @@ class SessionDialog(QDialog):
         self.status_timer=QTimer(self);self.status_timer.setInterval(1500)
         self.status_timer.timeout.connect(self.update_launch_status)
         self.scheduled_request=None
-        self.schedule_timer=QTimer(self);self.schedule_timer.setInterval(30_000)
+        self.schedule_timer=QTimer(self);self.schedule_timer.setInterval(1_000)
         self.schedule_timer.timeout.connect(self.check_scheduled_start)
         self.finished.connect(lambda _result:self.clear_scheduled_start())
         self.cancel_timer_button.clicked.connect(self.cancel_scheduled_start)
@@ -96,6 +96,8 @@ class SessionDialog(QDialog):
             self.arm.setEnabled(False)
             self.cancel_timer_button.setEnabled(True)
             self.result.setPlainText('已登记本次定时启动，等待已保存的时点或开盘窗口。')
+            from online_trader.scheduling.reference import CalibratedClock
+            self._scheduled_clock = CalibratedClock(lazy=True)
             self.schedule_timer.start()
             self.check_scheduled_start()
         else:
@@ -122,7 +124,13 @@ class SessionDialog(QDialog):
         if self.scheduled_request is None:
             return
         request=self.scheduled_request
-        instant=datetime.now(timezone.utc) if now is None else now
+        if now is None:
+            self._scheduled_clock.poll()
+            if not self._scheduled_clock.entry_ready():
+                self.result.setPlainText('已登记定时启动，等待应用授时。')
+                return
+            now = self._scheduled_clock.now()
+        instant = now
         launcher,_,_,review_hash,_=request
         try:
             trigger=launcher.scheduled_trigger(expected_review_hash=review_hash,now=instant)

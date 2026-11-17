@@ -557,14 +557,22 @@ class DsvEntryLog:
                     missing = (decision.get('risk') or {}).get('metrics', {}).get('missing_fields', [])
                     if missing:
                         message += ' · ' + '、'.join(missing)
+            block = decision.get('entry_block') if kind == 'E_OWNERSHIP' else None
+            details = {}
+            signature = None
+            if block:
+                message = (f"开仓条件受阻 · {block['source']} {block['field']} · {block['reason']}"
+                           f"（实际 {block['actual']}，要求 {block['expected']}）")
+                details['entry_block'] = block
+                signature = (block['source'], block['field'], block['reason'])
             old = previous.get(reason)
-            if old and old['day'] == day:
+            if old and old['day'] == day and old.get('signature') == signature:
                 repeats = old['repeats'] + 1
                 interval = 300 if kind in {'OPENING_WAIT', 'CLOSE_SESSION_NO_OPEN'} else 60
                 if (now - old['written']).total_seconds() >= interval:
                     append(reason, '等待', f'仍受阻 · {message or kind}，累计 {repeats} 次',
-                           repeat_count=repeats)
-                    active[reason] = {'day': day, 'written': now, 'repeats': repeats}
+                           repeat_count=repeats, **details)
+                    active[reason] = {'day': day, 'written': now, 'repeats': repeats, 'signature': signature}
                 else:
                     active[reason] = old | {'repeats': repeats}
                 continue
@@ -572,10 +580,10 @@ class DsvEntryLog:
                 self.last_time.pop((code, kind), None)
                 self.timing_message(code, kind, now, event, append)
             elif message:
-                append(reason, '等待', message)
+                append(reason, '等待', message, **details)
             else:
                 self.filter_message(code, day, reason, now, event, symbol, decision, append)
-            active[reason] = {'day': day, 'written': now, 'repeats': 1}
+            active[reason] = {'day': day, 'written': now, 'repeats': 1, 'signature': signature}
 
         for reason, old in previous.items():
             if reason not in active:

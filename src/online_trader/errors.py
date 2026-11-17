@@ -69,6 +69,7 @@ def exception_record(error):
 
 
 class TraderError(ValueError):
-    def __init__(self, code: str, message: str = "Request refused") -> None:
+    def __init__(self, code: str, message: str = "Request refused", *, details=None) -> None:
         self.code = code
+        self.details = details
         super().__init__(message)

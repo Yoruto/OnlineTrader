@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "online-trader"
-version = "0.1.0.dev28"
+version = "0.1.0.dev29"
 description = "Independent Windows trading kernel engineering baseline"
 requires-python = ">=3.13,<3.14"
 dependencies = ["jsonschema==4.26.0", "referencing==0.37.0"]

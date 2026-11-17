@@ -1,8 +1,8 @@
 """Explicit optional simulation session using Kernel, OMS, protection and reports."""
-from datetime import datetime,timezone
+from datetime import datetime
 from pathlib import Path
 from decimal import Decimal
-import hashlib,json,queue,threading,time,uuid
+import hashlib,json,threading,time,uuid
 
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.files import publish_new_bytes
@@ -11,7 +11,9 @@ from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import TqKqPort
 from online_trader.kernel import Kernel
 from online_trader.online_scope import SimulationGrant
-from online_trader.scheduling.reference import measure_reference
+from online_trader.runtime.instance import AccountLock
+from online_trader.scheduling.holdover import ProtectionClockAnchor, legacy_protection_pending
+from online_trader.scheduling.reference import CalibratedClock
 
 
 class SimulationSession:
@@ -20,8 +22,7 @@ class SimulationSession:
         self.output=Path(output);self.output.mkdir(parents=True,exist_ok=True)
         self.emit=emit or (lambda value:print(json.dumps(value,ensure_ascii=False),flush=True))
         self.stop=threading.Event();self.phase=None;self._phase_sequence=0;self._quotes={};self._submitted_at={};self._cancelled=set();self._entered=False
-        self._last_money=0;self._last_reference=0;self._last_error=None;self.result=None
-        self._reference_results=queue.Queue(1);self._reference_worker=None;self._reference_closed=False
+        self._last_money=0;self._last_error=None;self.result=None
         self._start_sequence=kernel._durable_seq
         self._start_authority_revision=kernel._authority_revision
         if profile is None:profile,_=load_confirmed_baseline()
@@ -33,47 +34,17 @@ class SimulationSession:
     def status(self,phase,**values):
         if phase==self.phase:return
         self.phase=phase;self._phase_sequence+=1
-        value={'phase':phase,'observed_at_utc':datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),'account_key':self.kernel.account_key,**values}
+        value={'phase':phase,'observed_at_utc':self.port.clock.now().isoformat().replace('+00:00','Z'),'account_key':self.kernel.account_key,**values}
         self.write(f'phase-{self._phase_sequence:04}.json',value);self.emit(value)
 
-    def _refresh_reference(self):
-        """Only the owner installs a sampled clock and commits its evidence.
-
-        DNS/UDP sampling has no access to the SDK, kernel or writer. A slow or
-        failed sample neither blocks IPC/protection nor renews the old clock.
-        """
-        if self._reference_closed:return
-        try:clock=self._reference_results.get_nowait()
-        except queue.Empty:pass
-        else:
-            self._reference_worker=None
-            if clock is None:
-                self.port.clock.now()
-                self.status('CLOCK_REFRESH_RETRY_PROTECTION_ACTIVE')
-            else:
-                clock.now()  # A delayed result must still be valid when accepted.
-                self.owner.capture('ONLINE_CLOCK_REFERENCE_REFRESH',{'clock':clock.record()})
-                self.port.clock=clock
-        if (self._reference_worker is None and time.monotonic()-self.port.clock.monotonic_anchor>120
-                and time.monotonic()-self._last_reference>=10):
-            self._last_reference=time.monotonic()
-            results=self._reference_results
-            def sample():
-                try:clock=measure_reference()
-                except Exception:clock=None
-                results.put_nowait(clock)
-            self._reference_worker=threading.Thread(target=sample,name='OnlineTrader-clock-reference',daemon=True)
-            self._reference_worker.start()
-
-    def close(self):
-        # A sampling worker may finish after shutdown, but cannot publish its
-        # result, touch the SDK, or reopen the closed ledger.
-        self._reference_closed=True
+    def _capture_reference(self, reference):
+        self.owner.capture('ONLINE_CLOCK_REFERENCE_REFRESH', {'clock': reference.record()})
 
     def step(self):
         k=self.kernel;p=self.port
         try:
-            self._refresh_reference()
+            if isinstance(p.clock, CalibratedClock):
+                p.clock.poll(before_install=self._capture_reference)
             p.poll_updates(0.1);self.owner.tick()
             now=p.clock.now();value=self.grant.value
             if time.monotonic()-self._last_money>=10:
@@ -110,6 +81,8 @@ class SimulationSession:
                 self.result={'status':'NO_ENTRY_WITHIN_WINDOW','source':'PRODUCT_KERNEL_ORIGINAL_LEDGER'};self.write('result.json',self.result)
                 self.status('NO_ENTRY_WITHIN_WINDOW');self.stop.set();return
             if self._entered:return
+            if isinstance(p.clock, CalibratedClock) and not p.clock.entry_ready():
+                self.status('CLOCK_UNAVAILABLE_NEW_ENTRIES_PAUSED');return
             for code in value['contracts']:
                 if not p.fresh(code) or p.position(code)!={'long':0,'short':0} or p.active_orders(code):continue
                 market=p.market(code);seen=self._quotes.setdefault(code,set());seen.add(market['source_time'])
@@ -140,9 +113,15 @@ class SimulationSession:
 
 def run_session(scope,credential_file,output,*,pipe=None,prepare=False):
     grant=SimulationGrant.load(scope);output=Path(output);output.mkdir(parents=True,exist_ok=True)
-    clock=measure_reference();port=TqKqPort.connect(credential_file,grant,clock,read_only=prepare);kernel=None;session=None
+    lease = AccountLock(grant.account_key)
+    port = kernel = session = None
     try:
-        kernel=Kernel(grant.value['ledger_path'],grant.account_key,port=port,simulation_grant=grant,risk_budget='1000',max_quote_age_ms=5000)
+        anchor = ProtectionClockAnchor(grant.value['ledger_path'], grant.account_key)
+        clock = (CalibratedClock() if prepare else
+                 CalibratedClock(recovery_anchor=anchor, recovering=lambda: legacy_protection_pending(grant)))
+        port = TqKqPort.connect(credential_file, grant, clock, read_only=prepare)
+        kernel=Kernel(grant.value['ledger_path'],grant.account_key,port=port,simulation_grant=grant,risk_budget='1000',
+                      max_quote_age_ms=5000,_execution_lock=lease)
         baseline=kernel.simulation.initialize()
         start={'scope_hash':grant.content_hash,'execution_scope':'ONLINE_SIMULATION','kernel_boot_id':kernel.boot_id,'ledger_path':grant.value['ledger_path'],
             'clock':clock.record(),'baseline':baseline,'prepare_only':prepare}
@@ -201,7 +180,11 @@ def run_session(scope,credential_file,output,*,pipe=None,prepare=False):
             return 0 if verification is not None else 2
         return 2
     finally:
-        if session is not None:session.close()
         try:
             if kernel is not None:kernel.close()
-        finally:port.close()
+        finally:
+            try:
+                if port is not None:
+                    port.close()
+            finally:
+                lease.close()

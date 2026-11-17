@@ -9,6 +9,7 @@ from online_trader.contracts.codec import content_hash, strict_loads
 from online_trader.domain.values import decimal_value
 from online_trader.errors import TraderError
 from online_trader.gateway.ports import UnavailablePort
+from online_trader.scheduling.reference import CalibratedClock
 
 
 class MoneyOwner:
@@ -18,6 +19,10 @@ class MoneyOwner:
         for row in kernel.ledger.query('SELECT event_seq,payload_json,observed_at_utc,kernel_boot_id FROM event_journal ORDER BY event_seq'):
             data=strict_loads(row['payload_json']);self.accept(data.get('data',data),row['event_seq'],row['observed_at_utc'],kernel_boot_id=row['kernel_boot_id'])
 
+    def _now(self):
+        clock = getattr(self.kernel.port, 'clock', None)
+        return clock.now() if isinstance(clock, CalibratedClock) else datetime.now(timezone.utc)
+
     def accept(self,data,sequence,observed_at_utc=None,*,kernel_boot_id=None):
         if self.error:return
         try:
@@ -25,7 +30,7 @@ class MoneyOwner:
             account=data.get('money_account')
             if account is not None and account['evidence_id'] in self.book.account_evidence:
                 self._account_boots.setdefault(account['evidence_id'],kernel_boot_id or self.kernel.boot_id)
-                age=(datetime.now(timezone.utc)-datetime.fromisoformat(account['observed_at_utc'])).total_seconds()*1000
+                age=(self._now()-datetime.fromisoformat(account['observed_at_utc'])).total_seconds()*1000
                 if (self._account_boots[account['evidence_id']]==self.kernel.boot_id and account['complete'] and
                         0<=age<=self.kernel.max_quote_age_ms and account['evidence_id'] not in self._expired_accounts):
                     self._active_account=account['evidence_id']
@@ -41,6 +46,8 @@ class MoneyOwner:
         self.kernel._check_owner()
         if self.error:raise TraderError('E_MONEY_REPLAY','Financial view needs review; execution facts remain durable')
         scheduler=getattr(self.kernel,'_scheduled_runtime',None)
+        if as_of_utc is None and isinstance(getattr(self.kernel.port, 'clock', None), CalibratedClock):
+            as_of_utc = self._now().isoformat().replace('+00:00', 'Z')
         result=self.book.report(checkpoint_event_seq=self.kernel._durable_seq,as_of_utc=as_of_utc,
                                 valuation_boot_id='clock-fault' if scheduler and scheduler._fault else self.kernel.boot_id)
         result['boundary']='OWNER_ACCEPTED';return result
@@ -48,7 +55,7 @@ class MoneyOwner:
     def account_projection(self):
         if self.error or not self.book.account_facts:return None
         fact=self.book.account_facts[-1]
-        age=(datetime.now(timezone.utc)-datetime.fromisoformat(fact['observed_at_utc'])).total_seconds()*1000
+        age=(self._now()-datetime.fromisoformat(fact['observed_at_utc'])).total_seconds()*1000
         known=(fact['complete'] and self._account_boots.get(fact['evidence_id'])==self.kernel.boot_id and
                fact['evidence_id'] not in self._expired_accounts and
                0<=age<=self.kernel.max_quote_age_ms)
@@ -72,7 +79,7 @@ class MoneyOwner:
         if k._failed or self.error or k._pending or not self._active_account or self._expiry_queued:return
         fact=self.book.account_facts[-1]
         if fact['evidence_id']!=self._active_account:return
-        age=(datetime.now(timezone.utc)-datetime.fromisoformat(fact['observed_at_utc'])).total_seconds()*1000
+        age=(self._now()-datetime.fromisoformat(fact['observed_at_utc'])).total_seconds()*1000
         scheduler=getattr(k,'_scheduled_runtime',None)
         if not 0<=age<=k.max_quote_age_ms or (scheduler and scheduler._fault):
             self._expiry_queued=True

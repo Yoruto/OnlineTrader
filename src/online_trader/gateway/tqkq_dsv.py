@@ -25,7 +25,7 @@ class TqKqDsvPort(TqKqPort):
             if error.code != 'E_CLOCK':
                 raise
             return False
-        return True
+        return super().entry_clock_ready()
 
     def strategy_wall_time(self):
         return self.clock.now()
@@ -67,32 +67,60 @@ class TqKqDsvPort(TqKqPort):
 
     def fresh_strategy_entry(self, code, side, event):
         """Use the strategy age rule and verify the exact legal native quote."""
+        return self.strategy_entry_quote_block(code, side, event) is None
+
+    def strategy_entry_quote_block(self, code, side, event):
+        issue = self.quote_issue
         if event is None:
-            return False
+            return issue('event', '缺少策略行情', None, '当前合约的策略行情')
         runtime = getattr(getattr(self, 'kernel', None), '_dsv_runtime', None)
+        field, actual, expected = 'quote', None, '当前 SDK 行情'
         try:
             quote = self.quotes[code]
-            if (not self._matches_strategy_quote(quote, event) or
-                    (runtime is not None and runtime.ordinary_quote_stale(event))):
-                return False
-            field = 'ask1' if side == 'BUY' else 'bid1'
-            opponent, other, volume = ((getattr(quote,'ask_price1',None), getattr(quote,'bid_price1',None),
-                                        getattr(quote,'bid_volume1',None)) if side == 'BUY' else
-                                       (getattr(quote,'bid_price1',None), getattr(quote,'ask_price1',None),
-                                        getattr(quote,'ask_volume1',None)))
+            field, actual, expected = 'datetime', None, '有效的 SDK 和策略行情时间戳'
+            actual = quote.datetime
+            expected = event['source_time_utc']
+            stamp = datetime.fromisoformat(actual).replace(tzinfo=CHINA_TIME)
+            if stamp != datetime.fromisoformat(expected):
+                return issue(field, 'SDK 与策略行情时间戳不一致', stamp.isoformat(),
+                             datetime.fromisoformat(expected).astimezone(CHINA_TIME).isoformat())
+            field, actual, expected = 'last_price', None, '有效的 SDK 和策略最新价'
+            actual = quote.last_price
+            expected = event['last']
+            if number(actual) != expected:
+                return issue(field, 'SDK 与策略最新价不一致', actual, expected)
+            field, actual, expected = 'clock', None, '有效的策略时钟'
+            if runtime is not None and runtime.ordinary_quote_stale(event):
+                return issue('datetime', '超过策略行情时效上限', stamp.isoformat(),
+                             f'{runtime._quote_age_limit} 秒内的行情')
+            opponent_field, other_field, volume_field = (
+                ('ask_price1', 'bid_price1', 'bid_volume1') if side == 'BUY'
+                else ('bid_price1', 'ask_price1', 'ask_volume1'))
+            field, actual, expected = ('ask1' if side == 'BUY' else 'bid1'), None, '策略盘口字段'
             if event[field] is not None:
-                return (number(quote.ask_price1) == event['ask1'] and number(quote.bid_price1) == event['bid1']
-                        and self.fresh(code, check_age=runtime is None))
-            if not self._fresh_last(code, check_age=runtime is None) or not _missing_book_price(opponent):
-                return False
-            if not _missing_book_price(other) and not (type(other) in (int, float) and math.isfinite(other)
-                    and quote.lower_limit <= other <= quote.upper_limit and type(volume) in (int, float)
-                    and math.isfinite(volume) and volume > 0):
-                return False
-            order_price(event['last'], number(quote.price_tick))
-            return True
-        except (TraderError, KeyError, AttributeError, TypeError, ValueError):
-            return False
+                for field, event_field in (('ask_price1', 'ask1'), ('bid_price1', 'bid1')):
+                    actual, expected = getattr(quote, field, None), event[event_field]
+                    if number(actual) != expected:
+                        return issue(field, 'SDK 与策略盘口价不一致', actual, expected)
+                return self.quote_block(code, check_age=runtime is None)
+            if block := self.quote_block(code, check_age=runtime is None, book=False):
+                return block
+            opponent = getattr(quote, opponent_field, None)
+            if not _missing_book_price(opponent):
+                return issue(opponent_field, '策略对手价缺失，但 SDK 盘口仍有报价', opponent, '缺失')
+            other = getattr(quote, other_field, None)
+            if not _missing_book_price(other):
+                if not (type(other) in (int, float) and math.isfinite(other)
+                        and quote.lower_limit <= other <= quote.upper_limit):
+                    return issue(other_field, '单边盘口价无效', other, f'{quote.lower_limit}–{quote.upper_limit}')
+                volume = getattr(quote, volume_field, None)
+                if not (type(volume) in (int, float) and math.isfinite(volume) and volume > 0):
+                    return issue(volume_field, '单边盘口数量无效', volume, '有限正数')
+            field, actual, expected = 'last_price', event['last'], f'价格符合最小变动价位 {quote.price_tick}'
+            order_price(actual, number(quote.price_tick))
+            return None
+        except (KeyError, AttributeError, TypeError, ValueError):
+            return issue(field, '字段缺失或无效', actual, expected)
 
     def __init__(self,api,account,grant,clock):
         if type(grant) is not DsvSimulationGrant:
@@ -369,7 +397,7 @@ class TqKqDsvPort(TqKqPort):
             if (cycle['entry_origin']=='MANUAL')!=self.grant.manual_workbench:
                 raise TraderError('E_GATEWAY_SCOPE','Native opening origin differs from the finite scope')
             if not self.entry_clock_ready():
-                raise TraderError('E_CLOCK','A valid Windows wall clock is required immediately before native opening send')
+                raise TraderError('E_CLOCK','无法校准应用时间，已暂停新开仓。')
             current=datetime.fromisoformat(self.quotes[request['contract_id']].datetime).replace(tzinfo=timezone(timedelta(hours=8)))
             if facts is None or current!=datetime.fromisoformat(facts['event']['source_time_utc']):
                 raise TraderError('E_GATEWAY_SCOPE','The entry proposal does not reflect the latest native quote')

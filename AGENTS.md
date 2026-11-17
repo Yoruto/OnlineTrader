@@ -1,5 +1,7 @@
 # OnlineTrader development
 
+OnlineTrader is the active Windows futures trading assistant. Use this checkout for subsequent futures trading assistant work, including configuration and package questions, even if the session opened in the former V7 workspace. V7 ended at rc.41 and is retained for explicitly requested historical review or maintenance.
+
 Independent Windows product. G0 source specifications are recorded in docs/spec-source.json.
 Preserve existing work; do not import V7, vnpy, DSV, their credentials, databases or environments.
 

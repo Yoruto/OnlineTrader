@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$Python,
-    [Parameter(Mandatory=$true)][string]$Output
+    [Parameter(Mandatory=$true)][string]$Output,
+    [string]$DeliveryConfigDirectory
 )
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
@@ -27,6 +28,14 @@ if (-not (Test-Path -LiteralPath (Join-Path $bundle 'OnlineTrader.exe') -PathTyp
 }
 Get-ChildItem -LiteralPath (Join-Path $release 'portable') | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $bundle -Recurse
+}
+if ($DeliveryConfigDirectory) {
+    foreach ($name in @('OnlineTrader-defaults.json', 'OnlineTrader-parameters.json')) {
+        $source = Join-Path $DeliveryConfigDirectory $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            Copy-Item -LiteralPath $source -Destination $bundle
+        }
+    }
 }
 $cli = Join-Path $bundle 'OnlineTraderCLI.exe'
 $version = & $interpreter -I -c "import sys,tomllib; print(tomllib.load(open(sys.argv[1],'rb'))['project']['version'])" (Join-Path $project 'pyproject.toml')

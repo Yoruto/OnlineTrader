@@ -1,6 +1,6 @@
-# Independent OnlineTrader
+# OnlineTrader
 
-Use the verified OnlineTrader checkout (`E:\online-trader` on the recorded Windows workstation). Read `AGENTS.md` and `README.md` for current scope. For DSV parity, use `docs/refactor/dsv-parity-20261114/README.md` and its current replay notes. Keep the V7, WT9, OnlineTrader and reference DSV runtimes separate.
+OnlineTrader is the default for subsequent futures trading assistant work, including packaging and configuration reviews. V7 ended at rc.41. Use the verified OnlineTrader checkout (`E:\online-trader` on the recorded Windows workstation). Read `AGENTS.md` and `README.md` for current scope. For DSV parity, use `docs/refactor/dsv-parity-20261114/README.md` and its current replay notes. Keep the V7, WT9, OnlineTrader and reference DSV runtimes separate.
 
 - For OnlineTrader source commits, confirm the fetch and push targets are `https://github.com/Yoruto/OnlineTrader.git`. Fetch the branch refs before deciding what needs merging. Include relevant source, tests, documentation and release scripts. Runtime logs, accounts, ledgers, credentials and generated packages stay in local evidence or their authorized delivery location.
 

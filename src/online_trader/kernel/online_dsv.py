@@ -138,7 +138,7 @@ class OnlineDsvSimulation(OnlineSimulation):
     def arm(self):
         k=self.kernel;scheduler=getattr(k,'_scheduled_runtime',None)
         if not self.port.entry_clock_ready():
-            raise TraderError('E_CLOCK','A valid Windows wall clock is required to enable new entries')
+            raise TraderError('E_CLOCK','无法校准应用时间，已暂停新开仓。')
         if (scheduler is None or not scheduler._enabled or scheduler._fault or scheduler.clock_rebuild_pending
                 or scheduler.calendar.content_hash!=self.grant.value['calendar_hash']
                 or scheduler.strategy.epoch!=k.active_epoch or not k.control.can_increase()
@@ -151,7 +151,7 @@ class OnlineDsvSimulation(OnlineSimulation):
             raise TraderError('E_ONLINE_SCOPE','This scope does not authorize the requested entry origin')
         self.permit(plan)
         if not self.port.entry_clock_ready():
-            raise TraderError('E_CLOCK','A valid Windows wall clock is required for DSV/SimNow entries')
+            raise TraderError('E_CLOCK','无法校准应用时间，已暂停新开仓。')
         if not self._configured or self.port.fault or not self.port.complete():
             raise TraderError('E_GATEWAY_SYNC', '当前柜台事实未完整同步。')
         if not self.grant.in_window(self.port.clock.now()):
@@ -166,11 +166,20 @@ class OnlineDsvSimulation(OnlineSimulation):
         if not manual and entry_kind == 'NORMAL':
             facts = runtime._latest.get((code, plan['trading_day']))
             side = 'BUY' if plan['direction']=='LONG' else 'SELL'
-            fresh = self.port.fresh_strategy_entry(code, side, facts['event'] if facts is not None else None)
+            block = self.port.strategy_entry_quote_block(code, side, facts['event'] if facts is not None else None)
         else:
-            fresh = self.port.fresh(code)
-        if not fresh or self.port.position(code)!={'long':0,'short':0} or self.port.active_orders(code):
-            raise TraderError('E_OWNERSHIP','Strategy entry requires a fresh unoccupied selected contract')
+            block = self.port.quote_block(code)
+        if block is None:
+            position = self.port.position(code)
+            if position != {'long': 0, 'short': 0}:
+                block = {'source': '持仓', 'field': 'pos_long / pos_short', 'reason': '该合约已有柜台持仓',
+                         'actual': f"多 {position['long']} 手 / 空 {position['short']} 手", 'expected': '多空均为 0 手'}
+            elif orders := self.port.active_orders(code):
+                block = {'source': '挂单', 'field': 'active_orders', 'reason': '该合约还有活动委托',
+                         'actual': f'{len(orders)} 笔', 'expected': '0 笔'}
+        if block is not None:
+            raise TraderError('E_OWNERSHIP', 'Strategy entry requires a fresh unoccupied selected contract',
+                              details=block)
 
     def manual_entry_facts(self,candidate,quantity,*,exclude_decision=None):
         k=self.kernel;runtime=k._dsv_runtime;code=candidate['contract_id']

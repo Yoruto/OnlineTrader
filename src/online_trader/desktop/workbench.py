@@ -9,7 +9,9 @@ from PySide6.QtWidgets import (QApplication,QLabel,QLineEdit,QPushButton,QTableW
 
 from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.app import StatusWindow
+from online_trader.desktop.dingtalk import WorkbenchDingTalk
 from online_trader.desktop.notifications import WorkbenchSounds
+from online_trader.desktop.preferences import workbench_preferences
 from online_trader.desktop.tray import WorkbenchTray
 from online_trader.desktop.workbench_layout import ACTIVATION_MESSAGES,WorkbenchLayout
 from online_trader.errors import TraderError
@@ -75,7 +77,7 @@ def display_cell(key,value):
 
 class WorkbenchWindow(StatusWindow):
     def __init__(self,pipe_name,*,store=None,account_id=None,client_factory=StatusClient,paired_launcher=None,
-                 dsv_config=None, use_desktop_dsv=False, autostart=False):
+                 dsv_config=None, use_desktop_dsv=False, autostart=False, notification=None):
         super().__init__(pipe_name,client_factory=client_factory)
         self.store=store;self.selected_account=store.get(account_id) if store is not None and account_id is not None else None
         self.paired_launcher=paired_launcher
@@ -90,8 +92,10 @@ class WorkbenchWindow(StatusWindow):
         self.home_feedback = ''
         self.home_issue = ''
         self._account_login = self._read_account_login()
-        preferences = QSettings('OnlineTrader','Workbench')
-        self._sounds=WorkbenchSounds(preferences, log=self._notification_log)
+        preferences = workbench_preferences()
+        dingtalk = WorkbenchDingTalk(QSettings('OnlineTrader', 'Workbench'), log=self._notification_log,
+                                   initial_config=notification)
+        self._sounds = WorkbenchSounds(preferences, dingtalk=dingtalk)
         self._tray = WorkbenchTray(self, preferences)
         self.setWindowTitle('OnlineTrader · 交易工作台');self.resize(1360,820)
         self.tables={}
@@ -157,7 +161,7 @@ class WorkbenchWindow(StatusWindow):
         self._diagnostic_instance = uuid.uuid4().hex[:12]
         self._diagnostic_write_failed = False
         self.schedule_timer = QTimer(self)
-        self.schedule_timer.setInterval(30_000)
+        self.schedule_timer.setInterval(1_000)
         self.schedule_timer.timeout.connect(self.check_timed_start)
         if self._guard_launch and self.store is not None:
             QTimer.singleShot(0, self.check_timed_start)
@@ -497,7 +501,9 @@ class WorkbenchWindow(StatusWindow):
         diagnostic_notice = ''
         if diagnostics.get('comparison'):
             diagnostic_notice += ' · DSV 对照不可用或参数不一致'
-        if diagnostics.get('ntp') in {'NTP_UNAVAILABLE', 'NTP_SKEW'}:
+        if diagnostics.get('ntp') == 'NTP_UNAVAILABLE':
+            diagnostic_notice += ' · 应用授时不可用，已暂停新开仓'
+        elif diagnostics.get('ntp') == 'NTP_SKEW':
             diagnostic_notice += ' · 请核对本机时钟'
         operation_log = diagnostics.get('operation_log')
         if isinstance(operation_log, dict):
@@ -899,7 +905,7 @@ class WorkbenchWindow(StatusWindow):
             self.show_home_feedback('请先选择要定时启动的模拟账户。')
             return
         def arrange():
-            from online_trader.strategy.entry import CHINA_TIME
+            from online_trader.scheduling.reference import CalibratedClock
             profile = self.current_start_profile()
             settings = profile.to_record()['settings']
             schedule = settings['schedule']
@@ -907,16 +913,15 @@ class WorkbenchWindow(StatusWindow):
             if not (schedule['enabled'] or on_launch):
                 self.show_home_feedback('当前参数未启用定时启动或软件启动时自动启动。')
                 return
-            local = datetime.now(CHINA_TIME)
-            ends = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             message = (f"模拟账户 {self.selected_account['masked_login']}，{len(settings['symbols'])} 个品种。\n"
                        f"北京时间日盘 {schedule['day_start_time']}、夜盘 {schedule['night_start_time']}，"
                        f"补启动 {schedule['catch_up_minutes']} 分钟。\n"
-                       f"确认后仅启动一次，有效至 {ends:%m-%d %H:%M}。")
+                       "确认后仅启动一次，有效至北京时间次日零点。")
             if QMessageBox.question(self, '安排定时启动', message) != QMessageBox.Yes:
                 return
             self._scheduled_start = {'account_id':self.selected_account['account_id'],
-                                     'profile_hash':profile.content_hash, 'ends':ends}
+                                     'profile_hash': profile.content_hash, 'ends': None,
+                                     'clock': CalibratedClock(lazy=True), 'on_launch': on_launch}
             self.dashboard.timed_start_button.setText('取消定时启动')
             self.pause_button.setEnabled(True)
             self.show_home_feedback('已安排本次定时启动。')
@@ -940,8 +945,7 @@ class WorkbenchWindow(StatusWindow):
                 self.show_home_feedback('守护已打开工作台，请安排本次策略启动。')
                 self._guard_launch = False
             return
-        now = now or datetime.now(timezone.utc)
-        if now >= scheduled['ends'] or self._closing or self.selected_account is None or (
+        if self._closing or self.selected_account is None or (
                 self.selected_account['account_id'] != scheduled['account_id']):
             self.cancel_timed_start()
             return
@@ -951,6 +955,21 @@ class WorkbenchWindow(StatusWindow):
             return
         if self._startup_in_progress or self._worker is not None:
             return
+        if now is None:
+            clock = scheduled['clock']
+            clock.poll()
+            if not clock.entry_ready():
+                self.show_home_feedback('已安排定时启动，等待应用授时。')
+                return
+            now = clock.now()
+        if scheduled['ends'] is None:
+            from online_trader.strategy.entry import CHINA_TIME
+            local = now.astimezone(CHINA_TIME)
+            scheduled['ends'] = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if now >= scheduled['ends']:
+            self.cancel_timed_start()
+            return
+        on_launch = scheduled.pop('on_launch', on_launch)
         from online_trader.runtime.desktop_bootstrap import timed_start_trigger
         try:
             profile = self.current_start_profile()
@@ -1036,11 +1055,15 @@ class WorkbenchWindow(StatusWindow):
         self.timer.stop();super().closeEvent(event)
 
 
-def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None,autostart=False):
+def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None,autostart=False,
+        update_root=None, notification=None):
     app=QApplication.instance() or QApplication([])
     window=WorkbenchWindow(pipe_name,store=store,account_id=account_id,paired_launcher=paired_launcher,
-                           dsv_config=dsv_config,use_desktop_dsv=True,autostart=autostart)
+                           dsv_config=dsv_config,use_desktop_dsv=True,autostart=autostart, notification=notification)
     window.setAttribute(Qt.WA_DeleteOnClose)
     window.destroyed.connect(app.quit)
     window.show();QTimer.singleShot(0,window.refresh)
+    if update_root is not None:
+        from online_trader.desktop.update_ui import install_update_menu
+        install_update_menu(window, update_root)
     return app.exec()

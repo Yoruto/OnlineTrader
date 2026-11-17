@@ -63,7 +63,7 @@ class SymbolEditorDialog(QDialog):
         field('name', '品种名称 *', source['name'], identity, '自动补全后也可以自行修改')
         content.addLayout(identity)
         parameters = QGroupBox('交易参数'); form = QFormLayout(parameters); form.setVerticalSpacing(9)
-        for key, label in (('open_offset', '开仓偏移（点）'), ('stop_offset', '止损偏移（点）'), ('profit_offset', '止盈偏移（点）')):
+        for key, label in (('open_offset', '开仓（点）'), ('stop_offset', '止损（点）'), ('profit_offset', '止盈（点）')):
             field(key, label, source[key], form)
         defaults = QLabel('偏移填 0 时沿用策略启动值：开仓 100、止损 15、止盈 60。')
         defaults.setWordWrap(True); defaults.setStyleSheet('color: #63738a;'); form.addRow(defaults)
@@ -163,8 +163,8 @@ class SymbolEditorDialog(QDialog):
         try: candidate = profile_from_form(self.base_profile, values)
         except EditError as error:
             key = error.path.rsplit('.', 1)[-1]
-            messages = {'open_offset': '开仓偏移请填写大于等于 0 的数字。', 'stop_offset': '止损偏移请填写大于等于 0 的数字。',
-                        'profit_offset': '止盈偏移请填写大于等于 0 的数字。', 'order_volume': '固定手数请填写正整数。',
+            messages = {'open_offset': '开仓请填写大于等于 0 的数字。', 'stop_offset': '止损请填写大于等于 0 的数字。',
+                        'profit_offset': '止盈请填写大于等于 0 的数字。', 'order_volume': '固定手数请填写正整数。',
                         'hysteresis_points': '滞回点请填写大于等于 0 的数字。', 'code_new': '候选换月合约需要填写具体月份，或留空。'}
             return self._failure(key, messages.get(key, '名称或参数格式不正确，请检查填写内容。'))
         self.result_profile = candidate; self.result_symbol = candidate.to_settings()['symbols'][index]

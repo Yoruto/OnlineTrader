@@ -1,5 +1,7 @@
 """Start the selected simulation directly and report progress in the workbench."""
+from datetime import datetime, timezone
 from pathlib import Path
+import time
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
@@ -14,7 +16,7 @@ START_ERRORS = {
     'E_DEPENDENCY': '交易连接组件不可用，请检查本机已配置的交易环境。',
     'E_CREDENTIALS': '账号或密码未保存完整，请到「账号信息 → 账户管理」核对。',
     'E_GATEWAY_CONNECT': '模拟盘连接失败，请核对账号、密码及网络后重试。',
-    'E_CLOCK': 'Windows 时间证据不可用，请核对本机时间。',
+    'E_CLOCK': '无法取得应用授时，请检查授时网络连接。',
     'E_ACCOUNT_LOCKED': '该账号已有运行程序，请先查看原来的运行状态。',
     'E_INSTANCE_EXISTS': '该账号已有运行程序，请先查看原来的运行状态。',
     'E_INSTANCE_LOCK': '账号状态暂时无法锁定，请稍后重试。',
@@ -45,8 +47,25 @@ class _StartWorker(QThread):
         try:
             from online_trader.runtime.desktop_bootstrap import build_start_request
             from online_trader.runtime.startup_environment import launch_bootstrap
-            options = {} if self.timed_trigger is None else {'timed_trigger':self.timed_trigger, 'now':self.now}
-            request = build_start_request(self.store, self.account_id, self.profile, arm=True, **options)
+            from online_trader.scheduling.holdover import ProtectionClockAnchor
+            from online_trader.scheduling.reference import CalibratedClock
+            options = {} if self.timed_trigger is None else {'timed_trigger': self.timed_trigger}
+            recovering = False
+            try:
+                options['now'] = self.now if self.now is not None else CalibratedClock().now()
+            except TraderError as error:
+                if error.code != 'E_CLOCK' or self.timed_trigger is not None:
+                    raise
+                row = self.store.get(self.account_id)
+                anchor = ProtectionClockAnchor(self.store.ledger_path(row), row['account_key']).load()
+                if anchor is None:
+                    raise
+                utc, monotonic = anchor
+                options['now'] = datetime.fromtimestamp(utc + (time.monotonic() - monotonic), timezone.utc)
+                recovering = True
+            request = build_start_request(self.store, self.account_id, self.profile, arm=not recovering, **options)
+            if recovering:
+                request['recover_original'] = True
             directory = self.store.directory / 'desktop-starts' / request['request_id']
             request_path = publish_new_bytes(canonical_bytes(request), directory / 'request.json')
             output = directory / 'run'

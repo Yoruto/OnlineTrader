@@ -29,7 +29,7 @@ class ParameterEditorDialog(QDialog):
             for key, value in sorted(values[section].items()):
                 path = section + "." + key
                 label = (_TRADE_LABELS if section == "trade" else _OTHER_LABELS).get(key, key)
-                if section == "auto_offset": label = {"formula": "偏移候选公式", "ceiling": "当日振幅上限比例（非负）", "floor": "开仓偏移下限比例（非负）", "coef": "品种系数表（按品种名）"}[key]
+                if section == "auto_offset": label = {"formula": "偏移候选公式", "ceiling": "当日振幅上限比例（非负）", "floor": "开仓下限比例（非负）", "coef": "品种系数表（按品种名）"}[key]
                 if section == "trade" and (key.endswith("_ratio") or key == "total_margin_cap"): label += "（0–1）"
                 if type(value) is bool:
                     widget = QCheckBox("开启"); widget.setChecked(value)
@@ -49,7 +49,9 @@ class ParameterEditorDialog(QDialog):
                 form.addRow(label, widget); self._form_rows.append((form, form.rowCount() - 1, label + " " + key))
             scroll.setWidget(body); self.tabs.addTab(scroll, title)
         symbols_body = QWidget(); symbols_layout = QVBoxLayout(symbols_body)
-        self.symbols_table = _table(HEADERS)
+        offset_labels = {"open_offset": "开仓", "stop_offset": "止损", "profit_offset": "止盈"}
+        symbol_headers = tuple(offset_labels.get(field, title) for field, title in zip(FIELDS, HEADERS))
+        self.symbols_table = _table(symbol_headers)
         self.symbols_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed | QAbstractItemView.AnyKeyPressed)
         self.symbols_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.symbols_table.setRowCount(len(values["symbols"]))
@@ -59,7 +61,7 @@ class ParameterEditorDialog(QDialog):
         controls = QHBoxLayout()
         self.add_button = QPushButton("新增品种"); self.edit_symbol_button = QPushButton("编辑选中品种"); self.remove_button = QPushButton("删除选中行")
         self.batch_field = QComboBox()
-        for field, title in zip(FIELDS[2:8], HEADERS[2:8]): self.batch_field.addItem(title, field)
+        for field, title in zip(FIELDS[2:8], symbol_headers[2:8]): self.batch_field.addItem(title, field)
         self.batch_value = QLineEdit(); self.batch_value.setPlaceholderText("批量值")
         self.batch_button = QPushButton("设置所选行")
         for widget in (self.add_button, self.edit_symbol_button, self.remove_button): controls.addWidget(widget)

@@ -56,8 +56,8 @@ class DesktopStartupTests(unittest.TestCase):
 
     def window(self, **options):
         settings = QSettings(str(self.root / 'view.ini'), QSettings.IniFormat)
-        with (patch('online_trader.desktop.workbench.QSettings', return_value=settings),
-              patch('online_trader.desktop.workbench_layout.QSettings', return_value=settings)):
+        with (patch('online_trader.desktop.workbench.workbench_preferences', return_value=settings),
+              patch('online_trader.desktop.workbench_layout.workbench_preferences', return_value=settings)):
             window = WorkbenchWindow(None, store=self.store, account_id=self.account_id, **options)
         self.addCleanup(self.close_window, window)
         window.timer.stop()

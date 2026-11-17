@@ -230,7 +230,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
             local = QSettings(str(run/'ui.ini'), QSettings.IniFormat)
-            with patch('online_trader.desktop.workbench_layout.QSettings', return_value=local):
+            with patch('online_trader.desktop.workbench_layout.workbench_preferences', return_value=local):
                 window = WorkbenchWindow(None)
             self.addCleanup(dispose_widget, window)
             window.timer.stop()
@@ -250,7 +250,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory)
             local = QSettings(str(run/'ui.ini'), QSettings.IniFormat)
-            with patch('online_trader.desktop.workbench_layout.QSettings', return_value=local):
+            with patch('online_trader.desktop.workbench_layout.workbench_preferences', return_value=local):
                 window = WorkbenchWindow(None)
             window.timer.stop()
             self.addCleanup(dispose_widget, window)
@@ -286,7 +286,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             run = parent / 'run'
             run.mkdir()
             local = QSettings(str(parent/'ui.ini'), QSettings.IniFormat)
-            with patch('online_trader.desktop.workbench_layout.QSettings', return_value=local):
+            with patch('online_trader.desktop.workbench_layout.workbench_preferences', return_value=local):
                 window = WorkbenchWindow(None)
             window.timer.stop()
             self.addCleanup(dispose_widget, window)
@@ -469,7 +469,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
     def test_toolbar_template_updates_preview_without_changing_binding(self):
         with tempfile.TemporaryDirectory() as directory:
             local = QSettings(str(Path(directory)/'ui.ini'),QSettings.IniFormat)
-            with patch('online_trader.desktop.workbench_layout.QSettings',return_value=local):
+            with patch('online_trader.desktop.workbench_layout.workbench_preferences',return_value=local):
                 window = WorkbenchWindow(None)
             try:
                 window.timer.stop()

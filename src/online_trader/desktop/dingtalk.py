@@ -100,14 +100,14 @@ class WorkbenchDingTalk(QObject):
     status_changed = Signal(str)
     delivered = Signal(bool, str, bool)
 
-    def __init__(self, settings, *, vault=None, sender=send_dingtalk, monotonic=time.monotonic, log=None):
+    def __init__(self, settings, *, vault=None, sender=send_dingtalk, monotonic=time.monotonic, log=None, initial_config=None):
         super().__init__()
         self.settings = settings
         self.vault = vault
         self.sender = sender
         self.monotonic = monotonic
         self.log = log
-        self._config = None
+        self._config = initial_config
         self._last_sent = {}
         self._slots = BoundedSemaphore(8)
         self._test_pending = False

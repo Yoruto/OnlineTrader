@@ -5,6 +5,7 @@ import copy,time,uuid
 
 from online_trader.contracts.codec import canonical_bytes,content_hash,strict_loads
 from online_trader.domain.values import decimal_text
+from online_trader.scheduling.reference import CalibratedClock
 from online_trader.errors import TraderError
 from online_trader.protection import ProtectionState,reduce_event
 
@@ -132,7 +133,11 @@ class OnlineSimulation:
         if previous and previous['source_epoch']==snapshot['source_epoch']:
             self._account_revision=max(self._account_revision,previous['revision'])
         self._account_revision+=1
-        fact.update(revision=self._account_revision, observed_at_utc=snapshot.get('observed_at_utc') or utc_now())
+        clock = getattr(self.port, 'clock', None)
+        observed = snapshot.get('observed_at_utc')
+        if observed is None and isinstance(clock, CalibratedClock):
+            observed = clock.now().isoformat().replace('+00:00', 'Z')
+        fact.update(revision=self._account_revision, observed_at_utc=observed or utc_now())
         return validate_account(fact,self.kernel.account_key)
 
     def day_permitted(self,day):
@@ -152,10 +157,14 @@ class OnlineSimulation:
 
     def consumed(self):return any(c['plan'].get('approval_record_id')==self.grant.value['grant_id'] for c in self.kernel._staged.values())
 
+    def _clock_ready(self):
+        clock = getattr(self.port, 'clock', None)
+        return not isinstance(clock, CalibratedClock) or clock.entry_ready()
+
     def arm(self):
         k=self.kernel;k._writable();k.wait_idle()
         if (not self._configured or self.consumed() or k.recovery_required or k._has_unknown() or self.port.fault
-                or not self.port.complete() or not self.grant.in_window(self.port.clock.now())):
+                or not self._clock_ready() or not self.port.complete() or not self.grant.in_window(self.port.clock.now())):
             raise TraderError('E_NOT_READY','Simulation scope, time, quota or recovery gate blocks opening')
         k._state_revision+=1;k._authority_revision+=1
         authority=k._authority()|{'armed':True};generation=k._authority_revision
@@ -168,7 +177,7 @@ class OnlineSimulation:
         if (not self._configured or plan.get('execution_scope')!='ONLINE_SIMULATION' or plan.get('schema_version')!='1.0'
                 or plan.get('approval_record_id')!=value['grant_id'] or plan.get('contract_id') not in value['contracts']
                 or plan.get('trading_day')!=value['trading_day'] or plan.get('initial_open_quantity')!=1 or plan.get('direction')!='LONG'
-                or self.consumed() or not self.grant.in_window(self.port.clock.now()) or self.port.fault):
+                or not self._clock_ready() or self.consumed() or not self.grant.in_window(self.port.clock.now()) or self.port.fault):
             raise TraderError('E_ONLINE_SCOPE','Manual one-lot simulation plan is outside its exact grant')
         if any(plan[field].get('enabled') for field in ('profit_protection','trailing_stop','partial_reduction','close_session','slippage_exit','data_gap_exit','emergency_exit')):
             raise TraderError('E_UNSUPPORTED','This online stage permits G0 fixed protection and the durable timed exit only')

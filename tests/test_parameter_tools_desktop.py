@@ -205,7 +205,7 @@ class ParameterToolsDesktopTests(unittest.TestCase):
         from online_trader.desktop.workbench import WorkbenchWindow
 
         local = QSettings(str(self.root / "workbench.ini"), QSettings.IniFormat)
-        with patch("online_trader.desktop.workbench_layout.QSettings", return_value=local):
+        with patch("online_trader.desktop.workbench_layout.workbench_preferences", return_value=local):
             window = WorkbenchWindow(None)
         self.windows.append(window)
         window.timer.stop()

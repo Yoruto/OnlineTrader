@@ -1,3 +1,4 @@
+import time
 """Native daily facts and the real owner chain; no SDK import or connection."""
 import copy
 import csv
@@ -19,6 +20,7 @@ from online_trader.kernel import Kernel
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.auto_offsets import compile_preparation,prepare_connected,cache_path,load_preparation,verify_preparation
 from online_trader.runtime.comparison import verify_dsv_profile,read_records
+from online_trader.scheduling.reference import ReferenceClock
 from online_trader.runtime.dsv_simulation import DsvSimulationSession,prepare,run
 from online_trader.scheduling.calendar import TradingCalendar
 from qa.dsv_native_facts import FactClock,NativeFactApi,NativeRows
@@ -246,7 +248,8 @@ class AutoOffsetRuntimeTests(unittest.TestCase):
         class Server:
             def __init__(self,kernel,pipe):captured.append(kernel)
             def serve(self,stop,**kwargs):stop.set()
-        with (patch('online_trader.runtime.dsv_simulation.Thread'),
+        with (patch('online_trader.scheduling.reference.measure_reference', return_value=ReferenceClock(
+                  self.port.clock.now().timestamp(), time.monotonic(), 0, ())),
               patch.object(SimNowDsvPort,'connect',return_value=self.port) as connect,
               patch('online_trader.kernel.server.ControlServer',Server)):
             run(self.root/'scope.json','NEVER_READ',self.root/'profile.json',self.root/'calendar.json',self.root/'run',pipe='offline-auto')

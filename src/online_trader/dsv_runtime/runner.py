@@ -462,7 +462,7 @@ class DsvSession:
             if frame.get('market_clock') and tick is not None:
                 native_time = _utc(tick['native_time'])
                 silence_ms = int(frame['monotonic_ms']) - int(row['quote_clock']['anchor']['mono'])
-                quote_age = max(silence_ms / 1000, (_utc(frame['wall_time']) - native_time).total_seconds())
+                quote_age = max(silence_ms / 1000, (_utc(frame.get('authorization_time', frame['wall_time'])) - native_time).total_seconds())
                 observed['quote_age_seconds'] = quote_age
             values = self._evaluate_symbol(state, row, observed, symbol_frame, spec)
             self._update_stops(row, contract, day, spec, frame.get('trading_days', []))

@@ -11,6 +11,7 @@ from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.rollover import expiry_date
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
 from online_trader.dsv_runtime.controller import SendNotAttempted, legal_price, terminal
+from online_trader.scheduling.reference import CalibratedClock
 from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.dsv_facts import native_integer, utc
 from online_trader.gateway.native_days import native_day
@@ -94,13 +95,19 @@ class DsvSdkAdapter:
 
     def check_start(self, state):
         now, _ = self.clock()
+        if not self.entry_clock_ready():
+            raise TraderError('E_CLOCK', '无法校准应用时间，已暂停新开仓。')
         if not self.synchronized or not state['synchronized'] or not self.grant.in_window(now):
             raise TraderError('E_DSV_SDK_SYNC', 'Start needs a current synchronized account within the reviewed window')
         if not self.grant.permits_day(state['trading_day']):
             raise TraderError('E_DSV_SDK_SCOPE', 'Start needs the authorized cabinet day')
 
+    def entry_clock_ready(self):
+        clock_ready = getattr(self.connection, 'entry_clock_ready', None)
+        return clock_ready is None or clock_ready()
+
     def opening_window(self, day, now):
-        return self.grant.permits_day(day) and self.grant.in_window(now)
+        return self.entry_clock_ready() and self.grant.permits_day(day) and self.grant.in_window(now)
 
     @staticmethod
     def order_id(child):
@@ -147,6 +154,9 @@ class DsvSdkAdapter:
             if self.connection is None:
                 self.api.wait_update(deadline=time.time() + 0.5)
             else:
+                clock = getattr(self.connection, 'clock', None)
+                if isinstance(clock, CalibratedClock):
+                    clock.poll()
                 epoch = self.connection.source_epoch
                 self.connection.poll_updates(0.5)
                 if self.connection.source_epoch != epoch:
@@ -217,6 +227,10 @@ class DsvSdkAdapter:
         markets = [self._market(code, day, now, funds, state['symbols'][code],
                                 code in foreign_orders or code in foreign_trades, state['orders'], quote_time=quotes.get(code))
                    for code in self.contracts]
+        if isinstance(getattr(self.connection, 'clock', None), CalibratedClock):
+            observation_time = utc(authorization_time)
+            for market in markets:
+                market['wall_reads'] = {name: observation_time for name in ('close', 'pending', 'position_sync')}
         if any(row.get('native_coverage') is False for row in markets):
             raise TraderError('E_DSV_SDK_SCOPE', 'Market time is outside the complete calendar coverage')
         sequence = state['sequence'] + 1
@@ -496,9 +510,17 @@ class DsvSdkAdapter:
                 now, _ = self.clock()
                 if (effect['contract_id'] not in self.grant.value['contracts'] or
                         not self.grant.permits_day(effect['trading_day']) or
-                        effect['native_offset'] == 'OPEN' and not self.grant.in_window(now)):
+                        effect['native_offset'] == 'OPEN' and not self.opening_window(effect['trading_day'], now)):
                     rejection_reason = 'ACCOUNT_SCOPE_OR_WINDOW'
                     raise TraderError('E_DSV_SDK_SCOPE', 'The SDK request exceeded its explicit account scope')
+                if effect['native_offset'] == 'OPEN' and isinstance(
+                        getattr(self.connection, 'clock', None), CalibratedClock):
+                    source_time = self._quote_time(self.quotes[effect['contract_id']])
+                    max_age = float(self.profile.to_record()['settings']['trade']['max_quote_age_seconds'])
+                    age = (now - source_time).total_seconds() if source_time is not None else float('inf')
+                    if source_time is None or age < -1 or (max_age > 0 and age > max_age):
+                        rejection_reason = 'QUOTE_OR_PRICE_SCOPE'
+                        raise TraderError('E_DSV_SDK_SCOPE', 'Opening requires a current native quote')
             request = dict(symbol=effect['contract_id'], direction=effect['direction'],
                            offset=effect['native_offset'], volume=quantity(effect['quantity'], positive=True),
                            limit_price=float(Decimal(effect['limit_price'])), order_id=native, account=self.account)

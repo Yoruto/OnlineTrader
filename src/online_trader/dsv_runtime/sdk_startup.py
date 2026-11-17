@@ -25,7 +25,8 @@ from online_trader.gateway.simnow import strategy_port
 from online_trader.runtime.dsv_simulation import _claim_run_output, load_inputs
 from online_trader.runtime.instance import AccountLock
 from online_trader.runtime.startup_metadata import SDK_VERSION
-from online_trader.scheduling.reference import LocalWallClock
+from online_trader.scheduling.holdover import ProtectionClockAnchor
+from online_trader.scheduling.reference import CalibratedClock
 from online_trader.transport.named_pipe import PipeListener
 
 
@@ -129,19 +130,19 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
     validate_sqlite_runtime(grant.provider)
     output = Path(output).resolve()
     date_resolver = _date_resolver(grant, calendar)
-    wall = LocalWallClock()
     with ExitStack() as stack:
         lock = stack.enter_context(AccountLock(grant.account_key))
         imported = _validate_source(grant, profile, legacy, database)
         installed = sdk_version()
-        now = wall.now()
-        if now < datetime.fromisoformat(grant.value['not_before_utc']):
-            raise TraderError('E_ONLINE_SCOPE', 'The replacement scope has not started')
         with _readonly(database) as db:
             saved = strict_loads(db.execute('SELECT payload FROM checkpoint WHERE id=1').fetchone()[0])
             recovering = any(row['position'] or row.get('detached_positions') or row.get('native_conflicts')
                              for row in saved['symbols'].values())
             recovering |= any(not terminal(order) for order in saved['orders'].values())
+        wall = CalibratedClock(recovery_anchor=ProtectionClockAnchor(database, grant.account_key), recovering=recovering)
+        now = wall.now()
+        if now < datetime.fromisoformat(grant.value['not_before_utc']):
+            raise TraderError('E_ONLINE_SCOPE', 'The replacement scope has not started')
         if not grant.in_window(now) and not recovering:
             raise TraderError('E_ONLINE_SCOPE', 'The replacement scope has expired without pending responsibilities')
         _claim_run_output(output, grant)
@@ -222,6 +223,10 @@ def _serve(session, adapter, listener, day, status_path, complete, *, diagnostic
         state = session.snapshot()
         if error_code is None and state['synchronized']:
             diagnostics.recovered()
+        connection = getattr(adapter, 'connection', None)
+        clock = getattr(connection, 'clock', None)
+        if isinstance(clock, CalibratedClock) and not clock.entry_ready():
+            error_code = error_code or 'E_CLOCK'
         payload = {'phase': 'READY' if state['synchronized'] else 'WAITING_FOR_NATIVE_SYNC',
                    'account_key': state['scope']['account_key'], 'trading_day': state['trading_day'],
                    'entry_authority': 'RUNNING' if state['running'] else 'DISARMED', 'error_code': error_code,

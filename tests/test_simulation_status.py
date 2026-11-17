@@ -7,80 +7,57 @@ import unittest
 from unittest.mock import patch
 
 from online_trader.errors import TraderError
-from online_trader.runtime.simulation import SimulationSession, run_session
-from online_trader.scheduling.reference import ReferenceClock
+from online_trader.runtime.simulation import run_session
+from online_trader.scheduling.reference import CalibratedClock, ReferenceClock
 from tests.test_online_simulation import OnlineSimulationFixture
 from tests import test_server as server_tests
 
 
 class ClockRefreshTests(OnlineSimulationFixture, unittest.TestCase):
-    def setUp(self):
-        super().setUp()
-        self.port.clock.monotonic_anchor = time.monotonic()-121
-        self.port.poll_updates = lambda seconds: None
-        self.session = SimulationSession(self.kernel, Path(self.temp.name)/'session', emit=lambda value: None)
-        self.release = threading.Event()
-
-    def tearDown(self):
-        self.session.close(); self.release.set()
-        worker = self.session._reference_worker
-        if worker is not None: worker.join(timeout=2)
-        super().tearDown()
-
-    def test_slow_sampling_is_single_flight_and_does_not_own_kernel_or_renew_old_clock(self):
-        threads = []; entered = threading.Event(); old = self.port.clock
+    def test_slow_sampling_leaves_protection_time_available_and_failure_blocks_entry(self):
+        initial = ReferenceClock(self.port.clock.now().timestamp() - 121, time.monotonic() - 121, 0, ())
+        with patch('online_trader.scheduling.reference.measure_reference', return_value=initial):
+            clock = CalibratedClock()
+        entered, release = threading.Event(), threading.Event()
+        calls = []
         def sample():
-            threads.append(threading.get_ident()); entered.set(); self.release.wait(2)
-            raise TraderError('E_CLOCK', 'Injected timeout')
-        with patch('online_trader.runtime.simulation.measure_reference', sample):
-            self.session._refresh_reference(); self.assertTrue(entered.wait(1))
-            for _ in range(10): self.session._refresh_reference()
-            self.assertEqual(len(threads), 1); self.assertNotEqual(threads[0], self.kernel._owner)
-            self.assertIs(self.port.clock, old)
-            self.release.set(); self.session._reference_worker.join(timeout=1)
-            self.session._refresh_reference()
-            self.assertIs(self.port.clock, old)
+            calls.append(threading.get_ident())
+            entered.set()
+            release.wait(2)
+            raise TraderError('E_CLOCK', 'Offline time servers')
 
-    def test_owner_commits_reference_evidence_before_installing_result(self):
-        old = self.port.clock
-        new = ReferenceClock(old.now().timestamp(), time.monotonic(), 0, ())
-        with patch('online_trader.runtime.simulation.measure_reference', return_value=new):
-            self.session._refresh_reference(); self.session._reference_worker.join(timeout=1)
-        self.assertIs(self.port.clock, old)
-        original = self.session.owner.capture; owners = []
-        def capture(event, data):
-            owners.append(threading.get_ident()); self.assertIs(self.port.clock, old)
-            return original(event, data)
-        with patch.object(self.session.owner, 'capture', side_effect=capture): self.session._refresh_reference()
-        self.assertEqual(owners, [self.kernel._owner]); self.assertIs(self.port.clock, new)
-        self.assertEqual(len(self.kernel.ledger.query("SELECT * FROM event_journal WHERE event_type='ONLINE_CLOCK_REFERENCE_REFRESH'")), 1)
+        with patch('online_trader.scheduling.reference.measure_reference', side_effect=sample):
+            clock.poll()
+            try:
+                self.assertTrue(entered.wait(1))
+                before = clock.now()
+                for _ in range(10):
+                    clock.poll()
+                self.assertEqual(len(calls), 1)
+                self.assertNotEqual(calls[0], threading.get_ident())
+                self.assertTrue(clock.entry_ready())
+            finally:
+                release.set()
+                clock._worker.join(timeout=2)
+            clock.poll()
+        self.assertFalse(clock.entry_ready())
+        self.assertGreaterEqual(clock.now(), before)
 
-    def test_failed_reference_commit_does_not_install_uncommitted_clock(self):
-        old = self.port.clock
-        self.session._reference_results.put(ReferenceClock(old.now().timestamp(), time.monotonic(), 0, ()))
-        with patch.object(self.session.owner, 'capture', side_effect=TraderError('E_STORAGE', 'Injected write failure')):
-            with self.assertRaises(TraderError): self.session._refresh_reference()
-        self.assertIs(self.port.clock, old)
-
-    def test_expired_sample_never_replaces_existing_reference(self):
-        old = self.port.clock
-        self.session._reference_results.put(ReferenceClock(old.now().timestamp(), time.monotonic()-301, 0, ()))
-        with self.assertRaises(TraderError): self.session._refresh_reference()
-        self.assertIs(self.port.clock, old)
-
-    def test_closed_session_cannot_accept_late_reference_result_or_write_again(self):
-        old = self.port.clock; before = self.kernel._durable_seq
-        self.session.close()
-        self.session._reference_results.put(ReferenceClock(old.now().timestamp(), time.monotonic(), 0, ()))
-        self.session._refresh_reference()
-        self.assertIs(self.port.clock, old); self.assertEqual(self.kernel._durable_seq, before)
-
-    def test_reference_failure_cannot_extend_expired_clock_or_rearm_owner(self):
-        self.port.clock = ReferenceClock(1000, time.monotonic()-301, 0, ())
-        self.session._reference_results.put(None)
-        self.session.step()
-        self.assertEqual(self.session.phase, 'BLOCKED_E_CLOCK'); self.assertFalse(self.kernel.snapshot()['armed'])
-        self.assertEqual(self.port.sent, [])
+    def test_refresh_is_not_installed_if_evidence_write_fails(self):
+        initial = ReferenceClock(self.port.clock.now().timestamp() - 121, time.monotonic() - 121, 0, ())
+        with patch('online_trader.scheduling.reference.measure_reference', return_value=initial):
+            clock = CalibratedClock()
+        refreshed = ReferenceClock(clock.now().timestamp(), time.monotonic(), 0, ())
+        with patch('online_trader.scheduling.reference.measure_reference', return_value=refreshed):
+            clock.poll()
+            clock._worker.join(timeout=2)
+        def fail(reference):
+            raise TraderError('E_STORAGE', 'Injected write failure')
+        before = clock.now()
+        with self.assertRaises(TraderError):
+            clock.poll(before_install=fail)
+        self.assertFalse(clock.entry_ready())
+        self.assertGreaterEqual(clock.now(), before)
 
     def test_gateway_closes_even_when_kernel_shutdown_raises(self):
         closed = []
@@ -88,7 +65,8 @@ class ClockRefreshTests(OnlineSimulationFixture, unittest.TestCase):
         fake_kernel = SimpleNamespace(simulation=SimpleNamespace(initialize=fail), close=fail)
         port = SimpleNamespace(close=lambda: closed.append(True))
         with patch('online_trader.runtime.simulation.SimulationGrant.load', return_value=self.grant), \
-             patch('online_trader.runtime.simulation.measure_reference', return_value=self.port.clock), \
+             patch('online_trader.runtime.simulation.AccountLock'), \
+             patch('online_trader.runtime.simulation.CalibratedClock', return_value=self.port.clock), \
              patch('online_trader.runtime.simulation.TqKqPort.connect', return_value=port), \
              patch('online_trader.runtime.simulation.Kernel', return_value=fake_kernel):
             with self.assertRaises(TraderError):

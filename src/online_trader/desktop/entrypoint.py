@@ -1,13 +1,16 @@
 """Windows workbench entry point. Opening the window is an offline action."""
 import argparse
+import json
 from contextlib import nullcontext
 from pathlib import Path
 import os
+import sys
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from online_trader import __version__
 from online_trader.accounts import AccountStore
+from online_trader.desktop.dingtalk import DingTalkSettings
 from online_trader.desktop.workbench import run
 from online_trader.errors import TraderError
 from online_trader.runtime.instance import AccountLock
@@ -19,6 +22,24 @@ def license_status_text():
              '机器码：—', '状态：本地模拟功能可用', '到期：—', '功能：快期模拟、SimNow 模拟',
              '实盘开新仓：未启用')
     return '\n'.join(lines) + '\n'
+
+
+def bundled_defaults():
+    if not getattr(sys, 'frozen', False):
+        return None, None, None
+    directory = Path(sys.executable).parent
+    profile = directory / 'OnlineTrader-parameters.json'
+    config = directory / 'OnlineTrader-defaults.json'
+    if not config.is_file():
+        return profile if profile.is_file() else None, None, None
+    try:
+        data = json.loads(config.read_text(encoding='utf-8-sig'))
+        accounts = data.get('simulation')
+        ding = data.get('dingtalk')
+        notification = DingTalkSettings.parse(**ding) if ding is not None else None
+    except (ValueError, AttributeError, TypeError, TraderError):
+        raise TraderError('E_CONFIG_FILE', '请检查程序目录中的 OnlineTrader-defaults.json。') from None
+    return profile if profile.is_file() else None, accounts, notification
 
 
 def main(argv=None):
@@ -34,7 +55,6 @@ def main(argv=None):
                         help='打开本地成交对照，或预填指定 CSV')
     args = parser.parse_args(argv)
     if args.license:
-        import sys
         directory = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path.cwd()
         try:
             (directory/'授权状态.txt').write_text(license_status_text(), encoding='utf-8')
@@ -53,6 +73,9 @@ def main(argv=None):
             with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):
                 return run(launcher.review()['pipe'], paired_launcher=launcher)
         store = AccountStore(args.account_store or Path(os.environ['LOCALAPPDATA']) / 'OnlineTrader' / 'accounts')
+        profile, accounts, notification = (None, None, None)
+        if args.compare_fills is None and args.account_store is None:
+            profile, accounts, notification = bundled_defaults()
         account_id = store.read()['selected_id']
         account = store.get(account_id) if account_id is not None else None
         if args.compare_fills is not None:
@@ -62,7 +85,19 @@ def main(argv=None):
                                   statement_path=Path(args.compare_fills) if args.compare_fills else None)
         pipe = store.pipe_name(account) if account else None
         with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):
-            return run(pipe, store=store, account_id=account_id, dsv_config=args.dsv_config, autostart=args.autostart)
+            if accounts is not None and not store.read()['accounts']:
+                account_id = store.initialize_simulation_accounts(accounts)['selected_id']
+                pipe = store.pipe_name(store.get(account_id))
+            if (getattr(sys, 'frozen', False) and not args.allow_multi
+                    and args.account_store is None and args.dsv_config is None):
+                from online_trader.update_install import managed_root
+                root = managed_root(sys.executable)
+                if root is not None:
+                    return run(pipe, store=store, account_id=account_id,
+                               dsv_config=profile, autostart=args.autostart, update_root=root,
+                               notification=notification)
+            return run(pipe, store=store, account_id=account_id, dsv_config=args.dsv_config or profile,
+                       autostart=args.autostart, notification=notification)
     except (TraderError, OSError) as error:
         if isinstance(error, TraderError) and error.code == 'E_INSTANCE_EXISTS' and args.autostart:
             return 0

@@ -95,9 +95,13 @@ class TqKqPort(OnlineSimulationPort):
                     'effect':order['effect'],'original_qty':order['original_qty'],'limit_price':order['limit_price']}
                 if order.get('native_offset'):self._bindings[order['child_order_id']]['native_offset']=order['native_offset']
 
+    def entry_clock_ready(self):
+        ready = getattr(self.clock, 'entry_ready', None)
+        return ready is None or ready()
+
     def poll_updates(self,seconds=0.1):
         self.api.wait_update(deadline=time.time()+seconds)
-        received = datetime.now(timezone.utc), time.monotonic_ns()
+        received = self.clock.now(), time.monotonic_ns()
         for key,item in self.api._data.get('notify',{}).items():
             if key in self._known_notifications:continue
             self._known_notifications.add(key);code=item.get('code')
@@ -108,27 +112,61 @@ class TqKqPort(OnlineSimulationPort):
     def complete(self):return self._transport_up and not self.api._account._get_trade_more_data(self.api._data)
 
     def fresh(self, code, *, check_age=True, now=None):
-        try:
-            q=self.quotes[code];at=datetime.fromisoformat(q.datetime).replace(tzinfo=timezone(timedelta(hours=8)))
-            age=((self.clock.now() if now is None else now)-at).total_seconds()
-            values=(q.bid_price1,q.ask_price1,q.last_price,q.price_tick,q.lower_limit,q.upper_limit)
-            return not q.expired and -1 <= age and (not check_age or age <= 5) and all(math.isfinite(v) and v>0 for v in values) and q.lower_limit<=q.bid_price1<=q.ask_price1<=q.upper_limit and q.bid_volume1>0 and q.ask_volume1>0
-        except (KeyError,AttributeError,TypeError,ValueError,TraderError):return False
+        return self.quote_block(code, check_age=check_age, now=now) is None
 
     def fresh_manual_reduction(self,code):
         """Validate a current native quote for a frozen manual reduction limit."""
         return self._fresh_last(code)
 
     def _fresh_last(self, code, *, check_age=True):
+        return self.quote_block(code, check_age=check_age, book=False) is None
+
+    @staticmethod
+    def quote_issue(field, reason, actual, expected):
+        return {'source': '行情', 'field': field, 'reason': reason,
+                'actual': str(actual), 'expected': str(expected)}
+
+    def quote_block(self, code, *, check_age=True, now=None, book=True):
+        issue = self.quote_issue
+        field, value = 'quote', None
         try:
             q = self.quotes[code]
-            stamp = datetime.fromisoformat(q.datetime).replace(tzinfo=timezone(timedelta(hours=8)))
-            age = (self.clock.now()-stamp).total_seconds()
-            values = (q.last_price,q.price_tick,q.lower_limit,q.upper_limit)
-            return (not q.expired and -1 <= age and (not check_age or age <= 5) and all(math.isfinite(v) and v>0 for v in values)
-                    and q.lower_limit<=q.last_price<=q.upper_limit)
-        except (KeyError,AttributeError,TypeError,ValueError,TraderError):
-            return False
+            field, value = 'datetime', getattr(q, 'datetime', None)
+            stamp = datetime.fromisoformat(value).replace(tzinfo=timezone(timedelta(hours=8)))
+            field, value = 'clock', None
+            age = ((self.clock.now() if now is None else now)-stamp).total_seconds()
+            field, value = 'expired', None
+            value = q.expired
+            if value:
+                return issue(field, '合约已到期', value, False)
+            if age < -1:
+                return issue('datetime', '行情时间超前', q.datetime, '最多超前 1 秒')
+            if check_age and age > 5:
+                return issue('datetime', '行情超时', f'{age:.3f} 秒', '不超过 5 秒')
+            prices = ('last_price', 'price_tick', 'lower_limit', 'upper_limit')
+            if book:
+                prices += ('bid_price1', 'ask_price1')
+            for field in prices:
+                value = getattr(q, field, None)
+                if not math.isfinite(value) or value <= 0:
+                    return issue(field, '价格无效', value, '有限正数')
+            if not book:
+                if not q.lower_limit <= q.last_price <= q.upper_limit:
+                    return issue('last_price', '超出涨跌停范围', q.last_price, f'{q.lower_limit}–{q.upper_limit}')
+                return None
+            if q.bid_price1 < q.lower_limit:
+                return issue('bid_price1', '低于跌停价', q.bid_price1, q.lower_limit)
+            if q.bid_price1 > q.ask_price1:
+                return issue('bid_price1', '买一价高于卖一价', q.bid_price1, q.ask_price1)
+            if q.ask_price1 > q.upper_limit:
+                return issue('ask_price1', '高于涨停价', q.ask_price1, q.upper_limit)
+            for field in ('bid_volume1', 'ask_volume1'):
+                value = getattr(q, field, None)
+                if not value > 0:
+                    return issue(field, '盘口数量无效', value, '大于 0')
+            return None
+        except (KeyError, AttributeError, TypeError, ValueError):
+            return issue(field, '字段缺失或无效', value, '有效行情字段')
 
     def position(self,code):
         p=self.api.get_position(code,account=self.account)
@@ -167,6 +205,8 @@ class TqKqPort(OnlineSimulationPort):
                 or request['effect'] not in {'OPEN','REDUCE'} or request['trading_day']!=self.grant.value['trading_day'] or type(request['original_qty']) is not int or request['original_qty']!=1 or not self.fresh(request['contract_id'])):
             raise TraderError('E_GATEWAY_SCOPE','Fresh, complete matching simulated scope is required')
         if request['effect']=='OPEN':
+            if not self.entry_clock_ready():
+                raise TraderError('E_CLOCK', '无法校准应用时间，已暂停新开仓。')
             if self._opening_consumed or request['direction']!='BUY' or not self.grant.in_window(self.clock.now()) or self.position(request['contract_id'])!={'long':0,'short':0} or self.active_orders(request['contract_id']):
                 raise TraderError('E_GATEWAY_SCOPE','Opening window or selected contract is occupied')
         else:

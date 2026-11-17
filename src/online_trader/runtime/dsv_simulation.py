@@ -21,7 +21,8 @@ from online_trader.runtime.simulation import SimulationSession
 from online_trader.runtime.instance import AccountLock
 from online_trader.runtime.market_monitor import DsvMarketMonitor, append_latency
 from online_trader.scheduling.calendar import TradingCalendar
-from online_trader.scheduling.reference import LocalWallClock, check_wall_clock
+from online_trader.scheduling.holdover import ProtectionClockAnchor, legacy_protection_pending
+from online_trader.scheduling.reference import CalibratedClock, LocalWallClock, check_wall_clock
 from online_trader.runtime.comparison import ComparisonRecorder, verify_dsv_profile
 from online_trader.runtime.strategy_log import DsvEntryLog
 
@@ -64,7 +65,7 @@ class DsvSimulationSession(SimulationSession):
             kernel._dsv_diagnostics['run_identity'] = 'E_RUN_IDENTITY_WRITE'
         source_clock = self.port.clock
         self.driver = ScheduledRuntime(kernel, calendar, profile=profile,
-                                       clock=clock or (source_clock if isinstance(source_clock, LocalWallClock)
+                                       clock=clock or (source_clock if isinstance(source_clock, (CalibratedClock, LocalWallClock))
                                                        else NativeReferenceClock(self.port)))
         self.driver.activate();kernel.wait_idle()
         self.feed=DsvFactFeed(self.port,profile,calendar);self.last_decisions={};self._primed=False
@@ -150,7 +151,19 @@ class DsvSimulationSession(SimulationSession):
             self.entry_log.failed(method, error, self.emit)
 
     def _poll_clock_diagnostic(self):
-        if not isinstance(self.port.clock, LocalWallClock):
+        clock = self.port.clock
+        if isinstance(clock, CalibratedClock):
+            clock.poll()
+            ready = clock.entry_ready()
+            self.kernel._dsv_diagnostics['ntp'] = 'NTP_ALIGNED' if ready else 'NTP_UNAVAILABLE'
+            if not ready:
+                self._entry_resume = None
+                self._arm_request_revision = None
+                if self.kernel._armed:
+                    self.kernel.pause()
+                    self.kernel.wait_idle()
+            return
+        if not isinstance(clock, LocalWallClock):
             return
         try:
             result = self._ntp_results.get_nowait()
@@ -179,7 +192,6 @@ class DsvSimulationSession(SimulationSession):
                 self.kernel._dsv_diagnostics['ntp'] = 'NTP_UNAVAILABLE'
 
     def close(self):
-        super().close()
         self._operation_log('poll')
         self._operation_log('close')
         self._comparison('poll')
@@ -573,10 +585,11 @@ class DsvSimulationSession(SimulationSession):
         try:
             update_start = time.monotonic_ns()
             received = self.port.poll_updates(.05)
+            self._poll_clock_diagnostic()
             if isinstance(clock, LocalWallClock):
                 clock.begin_turn()
             clock_received_ns = time.monotonic_ns()
-            wall, sdk_return = received or (datetime.now(timezone.utc), time.monotonic_ns())
+            wall, sdk_return = received or (clock.now(), time.monotonic_ns())
             timings['SDK 更新'] = sdk_return - update_start
             try:
                 self.monitor.observe(self.port, returned_ns=sdk_return, wall=wall)
@@ -707,7 +720,7 @@ class DsvSimulationSession(SimulationSession):
             else:self.status('DSV_MANAGING_OWNED' if any(c['lifecycle']!='CLOSED' for c in k._staged.values())
                              else 'DSV_OBSERVING',armed=k._armed)
         except Exception as error:
-            self.monitor.invalidate(datetime.now(timezone.utc))
+            self.monitor.invalidate(clock.now())
             self._monitor_at_ns = 0
             self._entry_resume = None
             self._arm_request_revision = None
@@ -735,7 +748,7 @@ class DsvSimulationSession(SimulationSession):
                             exception={key: val for key, val in self._runtime_error.items() if key != 'count'},
                             repeat_count=repeat)
                 self._operation_log('auxiliary', [{
-                    'observed_at_utc': utc(datetime.now(timezone.utc)), 'kind': 'DSV_RUNTIME_ERROR', 'tag': '警告',
+                    'observed_at_utc': utc(clock.now()), 'kind': 'DSV_RUNTIME_ERROR', 'tag': '警告',
                     'message': f"{error_code} · {self._runtime_error['exception_id']} · 累计 {repeat} 次",
                     'contract_id': code, 'decision_id': decision_id,
                     'exception_id': self._runtime_error['exception_id'],
@@ -748,7 +761,6 @@ class DsvSimulationSession(SimulationSession):
                 k._dsv_monitor_error = 'E_MARKET_DIAGNOSTIC'
                 self._latency_at_ns = time.monotonic_ns()
             try:
-                self._poll_clock_diagnostic()
                 self._operation_log('monitor', self.monitor, loop_start, timings)
                 self._operation_log('poll')
                 self._comparison('poll')
@@ -758,7 +770,7 @@ class DsvSimulationSession(SimulationSession):
 
 
 def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=False,dsv_config=None,dsv_log_dir=None,
-        _execution_lock=None):
+        _execution_lock=None, _reference=None):
     """Future explicitly scoped connection path. Offline tests never call it."""
     grant,profile,calendar=load_inputs(scope,profile_path,calendar_path)
     if grant.replacement:
@@ -781,7 +793,12 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
             from online_trader.runtime.auto_offsets import load_preparation,prepare_connected
             restored=load_preparation(source_grant,source_profile)
             if restored is not None:preparation,grant,profile=restored
-        reference=LocalWallClock()
+        anchor = ProtectionClockAnchor(grant.value['ledger_path'], grant.account_key)
+        if _reference is None:
+            reference = CalibratedClock(recovery_anchor=anchor, recovering=lambda: legacy_protection_pending(grant))
+        else:
+            reference = _reference
+            reference.bind_recovery_anchor(anchor)
         port=strategy_port(grant).connect(credentials,grant,reference)
         port.configure_calendar(calendar)
         if automatic and preparation is None:
@@ -807,9 +824,8 @@ def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=Fals
         session=DsvSimulationSession(kernel,output,profile=profile,calendar=calendar,dsv_config=dsv_config,dsv_log_dir=dsv_log_dir)
         session._poll_clock_diagnostic()
         session.prime()
-        reference.end_turn()
         # Restart is original exits only, regardless of a repeated --arm flag.
-        if arm and not restoring:session.request_initial_arm()
+        if arm and not restoring and port.entry_clock_ready():session.request_initial_arm()
         if pipe:
             from online_trader.kernel.server import ControlServer
             ControlServer(kernel,pipe).serve(session.stop,owner_tick=session.step)
@@ -976,7 +992,7 @@ def prepare(scope,profile_path,calendar_path,output,*,dsv_config=None,dsv_log_di
             'scope_hash':grant.content_hash,'profile_hash':profile.content_hash,'calendar_hash':calendar.content_hash,
             'account_key':grant.account_key,'contracts':grant.value['contracts'],
             'provider':grant.provider,'dsv_settings_verified':dsv_config is not None,
-            'dsv_log_directory_attached':dsv_log_dir is not None,'clock_policy':'SYSTEM_WALL_CLOCK_NTP_DIAGNOSTIC_ONLY',
+            'dsv_log_directory_attached':dsv_log_dir is not None,'clock_policy':'APPLICATION_UTC_NTP_MONOTONIC',
             'scope_schema':grant.value['schema_version'],'trading_days':grant.trading_days,
             'manual_workbench':grant.manual_workbench,
             'external_allocation_allowed':grant.external_allocation_allowed,

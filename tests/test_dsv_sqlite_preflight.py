@@ -76,7 +76,7 @@ class SqliteStartupPreflightTests(unittest.TestCase):
         self.status = self.enterContext(patch.object(sdk_startup, '_status'))
         self.enterContext(patch.object(sdk_startup, 'sdk_version', return_value='3.10.4'))
         self.enterContext(patch.object(sdk_startup, '_date_resolver', return_value=lambda *args: '2026-11-16'))
-        wall = self.enterContext(patch.object(sdk_startup, 'LocalWallClock'))
+        wall = self.enterContext(patch.object(sdk_startup, 'CalibratedClock'))
         wall.return_value.now.return_value = datetime(2026, 11, 16, 1, tzinfo=timezone.utc)
         self.db = Mock()
         self.db.execute.return_value.fetchone.return_value = (canonical_bytes({'symbols': {}, 'orders': {}}),)

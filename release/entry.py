@@ -1,6 +1,7 @@
 """Entry shared by the two Windows bootloaders in the portable distribution."""
 
 from importlib.metadata import PackageNotFoundError, version
+from contextlib import nullcontext
 from pathlib import Path
 import sys
 
@@ -21,10 +22,29 @@ def console_main(argv):
 
 
 if __name__ == '__main__':
+    from online_trader.update_install import managed_bootstrap, managed_root, runtime_lease
+    from online_trader.updates import UpdateError
+
+    arguments = sys.argv[1:]
+    root = managed_root(sys.executable)
     if Path(sys.executable).stem.casefold() == 'onlinetradercli':
         for stream in (sys.stdout, sys.stderr):
             if stream is not None:
                 stream.reconfigure(encoding='utf-8')
-        raise SystemExit(console_main(sys.argv[1:]))
+        if arguments[:1] == ['--managed-launch']:
+            raise SystemExit(managed_bootstrap(arguments[1:]))
+        try:
+            with runtime_lease(root) if root else nullcontext():
+                raise SystemExit(console_main(arguments))
+        except UpdateError as error:
+            print(error, file=sys.stderr)
+            raise SystemExit(2)
     from online_trader.desktop.entrypoint import main
-    raise SystemExit(main())
+    if arguments == ['--update-smoke', __version__] and root is None:
+        from online_trader.desktop.update_ui import offline_smoke
+        raise SystemExit(offline_smoke())
+    try:
+        with runtime_lease(root) if root else nullcontext():
+            raise SystemExit(main())
+    except UpdateError:
+        raise SystemExit(2)
