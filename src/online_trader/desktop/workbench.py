@@ -17,16 +17,24 @@ from online_trader.desktop.workbench_layout import ACTIVATION_MESSAGES,Workbench
 from online_trader.errors import TraderError
 from online_trader.runtime.market_monitor import append_latency
 from online_trader.transport.status_client import StatusClient
+from online_trader.transport.workbench_snapshot import MAX_AGE_NS, read_workbench_publication
 
 
 class _WorkbenchRequest(QThread):
     result=Signal(object);failed=Signal(object)
-    def __init__(self,pipe,factory,action,args,account_key,boot):
+    def __init__(self,pipe,factory,action,args,account_key,boot,*,publication_after_ns=0):
         super().__init__();self.pipe=pipe;self.factory=factory;self.action=action;self.args=args
         self.account_key=account_key;self.boot=boot
+        self.publication_after_ns = publication_after_ns
     def run(self):
         client=None
         try:
+            if self.action == 'refresh' and self.factory is StatusClient:
+                value = read_workbench_publication(self.pipe, self.account_key)
+                if value is not None and value['published_ns'] >= self.publication_after_ns:
+                    if not self.isInterruptionRequested():
+                        self.result.emit({'action': self.action, 'value': value})
+                    return
             client=self.factory(self.pipe,expected_account_key=self.account_key,expected_kernel_boot_id=self.boot)
             if self.action=='refresh':
                 base=client.snapshot();metadata=client.last_metadata
@@ -94,6 +102,8 @@ class WorkbenchWindow(StatusWindow):
         if paired_launcher is not None:
             self.paired_account_key=paired_launcher.review()['account_key']
         self.view=None;self.receipt_identity=None;self._boot=None
+        self.snapshot_published_ns = None
+        self._publication_after_ns = 0
         self._finished_run = None
         self._startup_in_progress = False
         self._guard_launch = autostart
@@ -222,6 +232,11 @@ class WorkbenchWindow(StatusWindow):
 
     def _start_job(self,action,args=None):
         if self._closing:return
+        if action == 'command' and self.published_snapshot_expired():
+            self._stale = True
+            self._enable_commands(False)
+            self.show_home_feedback('上次确认的快照已过期，请等待更新。')
+            return
         if self._worker is not None:
             if action!='refresh':
                 if self._worker.action=='refresh' and self._deferred_request is None and self.view is not None:
@@ -236,10 +251,19 @@ class WorkbenchWindow(StatusWindow):
         if action!='refresh':
             self.refresh_button.setEnabled(False);self._enable_commands(False)
         account=self.paired_account_key or (self.selected_account['account_key'] if self.selected_account is not None else self.view['account_key'] if self.view is not None else None)
-        worker=_WorkbenchRequest(self.pipe_name,self._factory,action,args,account,None if action=='refresh' else self._boot)
+        worker=_WorkbenchRequest(self.pipe_name,self._factory,action,args,account,None if action=='refresh' else self._boot,
+                                 publication_after_ns=self._publication_after_ns)
         self._worker=worker;worker.result.connect(self._job_result);worker.failed.connect(self._job_failed);worker.finished.connect(self._finished);worker.start()
 
     def refresh(self):self._start_job('refresh')
+
+    def published_snapshot_expired(self):
+        return (self.snapshot_published_ns is not None
+                and time.monotonic_ns() - self.snapshot_published_ns >= MAX_AGE_NS)
+
+    def published_snapshot_age(self):
+        if self.snapshot_published_ns is not None:
+            return (time.monotonic_ns() - self.snapshot_published_ns) // 1_000_000_000
 
     def refresh_monitor(self):
         view = self.view
@@ -297,7 +321,7 @@ class WorkbenchWindow(StatusWindow):
         worker = self.sender()
         if (not self._closing and worker is self.monitor_worker and self.view is not None
                 and worker.pipe == self.pipe_name and worker.boot == self._boot
-                and worker.account_key == self.view['account_key']):
+                and worker.account_key == self.view['account_key'] and self.snapshot_published_ns is None):
             self.dashboard.render_strategy_monitor(None)
 
     def _monitor_finished(self):
@@ -382,6 +406,8 @@ class WorkbenchWindow(StatusWindow):
             super()._result({'action':'snapshot','value':value['base'],'metadata':value['metadata']})
             self._base_cycle_ids=[r['record_id'] for r in value['base']['records'] if r['record_type']=='CYCLE']
             self.view=value['view'];self._boot=self.view['kernel_boot_id']
+            self.snapshot_published_ns = value.get('published_ns')
+            self._stale = self.published_snapshot_expired()
             if self.receipt_identity:
                 receipt=next((row for row in self.view['commands'] if all(
                     row.get(key)==expected for key,expected in self.receipt_identity.items())),None)
@@ -390,6 +416,7 @@ class WorkbenchWindow(StatusWindow):
             self._restore_selection(selected)
         else:
             receipt=result['value'];self.receipt_identity={k:receipt[k] for k in ('command_id','payload_hash')}
+            self._publication_after_ns = time.monotonic_ns()
             self._stale=True
             self._show_receipt(receipt)
             self.dashboard.render_home()
@@ -437,6 +464,8 @@ class WorkbenchWindow(StatusWindow):
                     and result.get('status') in {'DSV_STOPPED','DSV_SCOPE_FINISHED'}):
                 self._finished_run = (self.view['account_key'], self._boot, run)
                 self.view = None
+                self.snapshot_published_ns = None
+                self._publication_after_ns = 0
                 self._boot = None
                 self.receipt_identity = None
                 self._control_notice = None
@@ -454,7 +483,9 @@ class WorkbenchWindow(StatusWindow):
         if self.view is not None or error['identity'] is not None:
             self._sounds.observe_request_error()
         if self.view is not None:self._tray.set_status('error')
-        if error['identity'] is not None:self.receipt_identity=error['identity']
+        if error['identity'] is not None:
+            self.receipt_identity=error['identity']
+            self._publication_after_ns = time.monotonic_ns()
         self._failed(error['code'])
         if self.view is not None:self.dashboard.add_activity('状态刷新失败 · '+error['code'],category='error')
         if self.view is not None:
@@ -503,7 +534,7 @@ class WorkbenchWindow(StatusWindow):
 
     def render_view(self):
         v=self.view;c=v['connection']
-        self._tray.set_status('error' if c['fault'] or c['recovery_required'] or c['clock_fault'] else
+        self._tray.set_status('error' if self._stale or c['fault'] or c['recovery_required'] or c['clock_fault'] else
                               'running' if v['entry_authority']=='ARMED' else 'idle')
         authority_label='人工开仓权限' if v['configuration'].get('manual_workbench') else '自动开仓权限'
         diagnostics = v['configuration'].get('strategy_diagnostics', {})
@@ -532,7 +563,8 @@ class WorkbenchWindow(StatusWindow):
         self.command_buttons['arm'].setToolTip(v['configuration'].get('strategy_stop_wait') or
             ('等待原停止指令的撤单结果' if v['configuration'].get('stop_cancel_pending') else ''))
         self.dashboard.render(v)
-        self._sounds.observe(v)
+        if not self._stale:
+            self._sounds.observe(v)
         self.notice_label.setText('视图超过容量，已截断；批量操作关闭。' if v['truncated'] else
             self._control_notice or '状态来自原内核；行情来源时间与新鲜度单独显示。关闭工作台保留原持仓保护。')
 
@@ -872,6 +904,8 @@ class WorkbenchWindow(StatusWindow):
             self._session_dialog = None
         self._account_login = self._read_account_login()
         self._boot=None;self.view=None;self.receipt_identity=None;self._stale=True;self._account_key=None
+        self.snapshot_published_ns = None
+        self._publication_after_ns = 0
         self._finished_run = None
         self._control_notice=None
         self.home_feedback = self.home_issue = ''

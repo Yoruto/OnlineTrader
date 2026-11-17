@@ -106,6 +106,7 @@ class DsvSimulationSession(SimulationSession):
             record=strict_loads(row['payload_json']);data=record.get('data',record)
             self._day_barriers.add(data['conflict']['transition_hash'])
         self._status_signature = None
+        self._path_rebuild_ns = 0
         self._runtime_error = None
         self._ntp_results = SimpleQueue()
         self._next_clock_check = 0
@@ -344,15 +345,19 @@ class DsvSimulationSession(SimulationSession):
         self.status('DSV_PRIMED_DISARMED',strategy=self.driver.strategy.status())
 
     def _prime_path(self,code,events,*,extend=False,preserve_authority=False):
-        enriched=[self.driver._event(event) for event in events]
-        anchor_key=(code,events[0]['source_epoch'])
-        evidence='native-path-'+self.kernel.boot_id+'-'+str(events[0]['source_epoch'])+'-'+code+'-'+content_hash(enriched)[:16]
-        future=self.driver.strategy.rebuild_observation(enriched,evidence_id=evidence,extend=extend,
-            _preserve_authority=preserve_authority,_resume_anchor=self.feed.resume_anchors.get(anchor_key))
-        self.kernel.wait_idle();future.result()
-        self.feed.resume_anchors.pop(anchor_key,None)
-        self.feed.accept(events[-1])
-        return events[-1]
+        started = time.monotonic_ns()
+        try:
+            enriched=[self.driver._event(event) for event in events]
+            anchor_key=(code,events[0]['source_epoch'])
+            evidence='native-path-'+self.kernel.boot_id+'-'+str(events[0]['source_epoch'])+'-'+code+'-'+content_hash(enriched)[:16]
+            future=self.driver.strategy.rebuild_observation(enriched,evidence_id=evidence,extend=extend,
+                _preserve_authority=preserve_authority,_resume_anchor=self.feed.resume_anchors.get(anchor_key))
+            self.kernel.wait_idle();future.result()
+            self.feed.resume_anchors.pop(anchor_key,None)
+            self.feed.accept(events[-1])
+            return events[-1]
+        finally:
+            self._path_rebuild_ns += time.monotonic_ns() - started
 
     def _extend_late_path(self,code,events):
         first=events[0];state=self.driver.strategy._states.get((code,first['trading_day']))
@@ -578,6 +583,8 @@ class DsvSimulationSession(SimulationSession):
         k=self.kernel
         clock = self.port.clock
         loop_start = time.monotonic_ns()
+        commit_wait_start = k.commit_wait_ns
+        path_rebuild_start = self._path_rebuild_ns
         timings = {}
         code, event = None, None
         try:
@@ -651,9 +658,11 @@ class DsvSimulationSession(SimulationSession):
                 self.prime(manage_owned=True)
                 return
             path_start = time.monotonic_ns()
-            batches=self._market_batches()
+            try:
+                batches=self._market_batches()
+            finally:
+                timings['Tick 批次'] = time.monotonic_ns() - path_start
             rebuilt=self._rebuild_session_paths(batches)
-            timings['行情与路径'] = time.monotonic_ns() - path_start
             if self._arm_request_revision is not None:
                 if k._authority_revision!=self._arm_request_revision:
                     self._arm_request_revision=None
@@ -759,6 +768,8 @@ class DsvSimulationSession(SimulationSession):
                 self._latency_at_ns = time.monotonic_ns()
             try:
                 self._poll_clock_diagnostic()
+                timings['会话路径重建'] = self._path_rebuild_ns - path_rebuild_start
+                timings['提交等待（含各阶段内等待）'] = k.commit_wait_ns - commit_wait_start
                 self._operation_log('monitor', self.monitor, loop_start, timings)
                 self._operation_log('poll')
                 self._comparison('poll')
@@ -829,7 +840,7 @@ def _run(scope,credentials,profile_path,calendar_path,output,*,pipe,arm,dsv_conf
         if arm and not restoring:session.request_initial_arm()
         if pipe:
             from online_trader.kernel.server import ControlServer
-            ControlServer(kernel,pipe).serve(session.stop,owner_tick=session.step)
+            ControlServer(kernel,pipe).serve(session.stop,owner_tick=session.step,publish_workbench=True)
         else:
             while not session.stop.is_set():session.step();time.sleep(.01)
         return 0 if session.result and (session.result['status']=='DSV_STOPPED' or final_relogin(kernel,session,credentials)) else 2

@@ -283,13 +283,24 @@ class ControlServer:
                 except Exception:peer.close()
         self._waiting=remaining
 
-    def serve(self,stop_event=None,*,owner_tick=None):
+    def serve(self,stop_event=None,*,owner_tick=None,publish_workbench=False):
         acceptor=threading.Thread(target=self._acceptor,daemon=True);acceptor.start()
+        publication = None
         try:
+            if publish_workbench:
+                from online_trader.kernel.workbench import workbench_publication
+                from online_trader.transport.workbench_snapshot import WorkbenchPublication
+                try:
+                    publication = WorkbenchPublication(self.listener.name)
+                except (OSError, TraderError):
+                    # The original control endpoint remains available.
+                    pass
             while not self._stop.is_set() and not (stop_event and stop_event.is_set()):
                 self.kernel.poll()
                 self._sync_streams()
                 self._service_inbound();self._flush_receipts()
+                if publication is not None:
+                    publication.publish(lambda: workbench_publication(self.kernel))
                 if owner_tick is not None:owner_tick()
                 self._sync_streams()
                 self._service_inbound(closing=bool(self._stop.is_set() or (stop_event and stop_event.is_set())))
@@ -308,6 +319,8 @@ class ControlServer:
                 with self._peers_lock:self._workers=[worker for worker in self._workers if worker.is_alive()]
                 self._stop.wait(.01)
         finally:
+            if publication is not None:
+                publication.close()
             self._drain_outgoing()
             self._stop.set();self.listener.close()
             for peer in self._peer_snapshot():peer.close()

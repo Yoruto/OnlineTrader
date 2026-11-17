@@ -109,9 +109,11 @@ def workbench_monitor_view(kernel):
             'symbols': kernel._dsv_monitor_rows, 'diagnostics': monitor.diagnostics(time.monotonic_ns())}
 
 
-def workbench_view(kernel):
+def workbench_view(kernel, *, snapshot=None):
     kernel._check_owner()
-    snapshot=kernel._make_snapshot();port=kernel.port
+    if snapshot is None:
+        snapshot = kernel._make_snapshot()
+    port=kernel.port
     records=projection_batch(snapshot)['records'];scheduler=getattr(kernel,'_scheduled_runtime',None)
     runtime=getattr(kernel,'_dsv_runtime',None)
     markets=[];decisions={}
@@ -469,3 +471,10 @@ def workbench_view(kernel):
         key=max(('trades','commands','orders','cycles','blocks','markets','external_positions'),key=lambda k:len(canonical_bytes(result.get(k,[]))))
         result[key]=result[key][len(result[key])//2+1:];result['truncated']=True
     return result
+
+
+def workbench_publication(kernel):
+    snapshot = kernel._make_snapshot()
+    base = projection_batch(snapshot)
+    base['records'] = [row for row in base['records'] if row['record_type'] in {'ACCOUNT', 'CYCLE'}]
+    return base, workbench_view(kernel, snapshot=snapshot)

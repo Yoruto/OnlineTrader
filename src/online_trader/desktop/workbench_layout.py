@@ -1062,6 +1062,8 @@ class WorkbenchLayout:
         monitor = config.get('strategy_monitor') or {}
         owner_states = {item['contract_id']: item for item in monitor.get('symbols', ())}
         resting = monitor.get('quote_status') == '休市'
+        previous_snapshot = bool(view and not view['truncated'] and self.window._stale
+                                 and self.window.snapshot_published_ns is not None)
         self.dashboard_market_rows = {}
         rows = []
         for code in codes:
@@ -1070,7 +1072,8 @@ class WorkbenchLayout:
             owned = [cycle for cycle in cycles if cycle['contract_id'] == code]
             quantities = {side: sum(cycle['remaining_quantity'] for cycle in owned if cycle['direction'] == direction)
                           for side, direction in (('多', 'LONG'), ('空', 'SHORT'))}
-            position = ' / '.join(f'{side} {qty}' for side, qty in quantities.items() if qty) or ('0' if available else '—')
+            position = ' / '.join(f'{side} {qty}' for side, qty in quantities.items() if qty) or (
+                '0' if available or previous_snapshot else '—')
             reasons = quote.get('entry_reasons', ())
             explanation = [self.entry_reason_text(reason) for reason in reasons
                            if reason != 'DUPLICATE_MARKET_EVENT']
@@ -1090,7 +1093,7 @@ class WorkbenchLayout:
             lines = (quote.get('trigger_prices') or {}) if quote_current else {}
             decision = quote.get('decision_time_utc')
             if not self.market_view_current(view):
-                status = '状态待同步'
+                status = '上次快照已过期' if previous_snapshot else '状态待同步'
             elif any(cycle.get('exit_pending') for cycle in owned) or report.get('state') == 'PENDING':
                 status = '平仓待确认'
             elif quote.get('enabled') is False:
@@ -1118,7 +1121,8 @@ class WorkbenchLayout:
                 nearby = min(lines, key=lambda side: abs(Decimal(lines[side]) - Decimal(last)))
             focus = f'{("多头" if nearby == "LONG" else "空头")}触发 {lines[nearby]}' if nearby else '—'
             rows.append((f'{code}  {names[code]}' if code in names else code,
-                         display_value(last if self.market_view_current(view) else None), focus, position, status))
+                         display_value(last if self.market_view_current(view) or previous_snapshot else None),
+                         focus, position, status))
             self.dashboard_market_rows[code] = (status, quote, lines, decision, explanation, nearby)
         self.fill_selectable(self.dashboard_markets, rows, codes)
         self.dashboard_markets.setFixedHeight(
@@ -1486,7 +1490,10 @@ class WorkbenchLayout:
         quotes = (view or {}).get('markets', ())
         monitor_state = (config.get('strategy_monitor') or {}).get('quote_status')
         lagging = sum(not item.get('fresh') and bool(item.get('source_time_utc')) for item in quotes)
-        if not available or not quotes:
+        snapshot_age = w.published_snapshot_age() if view else None
+        if stale and snapshot_age is not None:
+            market_health = f'上次确认 {snapshot_age} 秒前'
+        elif not available or not quotes:
             market_health = '待同步'
         elif monitor_state == '休市' and not any(item.get('fresh') for item in quotes):
             market_health = '休市'
@@ -1507,7 +1514,8 @@ class WorkbenchLayout:
             color = '#14a163' if good else '#eea124' if alert else '#a1afc1'
             dot.setStyleSheet(f'background:{color}; border-radius:4px;')
         self.home_state.setText(state)
-        self.home_connection.setText(description)
+        self.home_connection.setText(description if snapshot_age is None else
+                                     f'{description} · 快照 {snapshot_age} 秒前')
         identity = config.get('runtime_identity') or {}
         engine = {'DSV_LEGACY_KERNEL': '原 DSV 执行链', 'DSV_REPLACEMENT': 'DSV 替代执行链'}.get(identity.get('engine_kind'))
         self.home_connection.setToolTip(f"{engine} · {identity['entry_point']}" if engine else '')
@@ -1544,7 +1552,8 @@ class WorkbenchLayout:
         self.render_position_detail()
         self.home_positions.setVisible(bool(positions))
         self.home_empty_positions.setVisible(not positions)
-        self.home_empty_positions.setText('当前无策略持仓' if available else '持仓待同步')
+        self.home_empty_positions.setText('当前无策略持仓' if available else
+                                         '上次确认无策略持仓' if stale and snapshot_age is not None else '持仓待同步')
         for index, position in enumerate(positions):
             direction = self.home_positions.item(index, 1)
             direction.setForeground(QColor('#bd263e' if position[1] == '多' else '#08764d'))

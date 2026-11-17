@@ -120,6 +120,7 @@ class Kernel:
         self._armed = False
         self._failed = False
         self._pending = deque()
+        self.commit_wait_ns = 0
         self._staged: dict[str, dict] = {}
         self._committed: dict[str, dict] = {}
         self._facts: dict[str, str] = {}
@@ -284,12 +285,17 @@ class Kernel:
         return overflow,result
 
     def wait_idle(self, timeout: float = 5) -> None:
-        end = time.monotonic() + timeout
-        while self._pending:
-            self.poll()
-            if time.monotonic() >= end:
-                raise TraderError("E_TIMEOUT", "Commit queue did not drain")
-            time.sleep(0.001)
+        if self._pending:
+            started = time.monotonic_ns()
+            end = time.monotonic() + timeout
+            try:
+                while self._pending:
+                    self.poll()
+                    if time.monotonic() >= end:
+                        raise TraderError("E_TIMEOUT", "Commit queue did not drain")
+                    time.sleep(0.001)
+            finally:
+                self.commit_wait_ns += time.monotonic_ns() - started
         if self._failed:
             raise TraderError("E_STORAGE", "A required transaction failed")
 
