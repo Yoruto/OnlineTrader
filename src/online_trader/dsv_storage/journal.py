@@ -8,6 +8,7 @@ from online_trader.errors import TraderError
 
 
 _APPLICATION_ID = 0x44535631
+TIME_SCHEMA = 3
 _SCHEMA = (
     'CREATE TABLE scope (id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL)',
     'CREATE TABLE checkpoint (id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL)',
@@ -56,7 +57,7 @@ class Journal:
                     self._db.execute('PRAGMA user_version=2')
                     self._db.execute('INSERT INTO scope VALUES(1,?)', (canonical_bytes(scope),))
                     self._db.execute('INSERT INTO checkpoint VALUES(1,?)', (canonical_bytes(initial),))
-                elif application != _APPLICATION_ID or version not in (1, 2):
+                elif application != _APPLICATION_ID or version not in (1, 2, TIME_SCHEMA):
                     raise TraderError('E_DSV_STORE_VERSION', 'Expected a new database or a supported DSV fact store')
                 if self._read('SELECT payload FROM scope WHERE id=1') != scope:
                     raise TraderError('E_DSV_SCOPE', 'Fact store belongs to a different account, provider, day or profile')
@@ -111,6 +112,18 @@ class Journal:
 
     def load(self):
         return self._read('SELECT payload FROM checkpoint WHERE id=1')
+
+    @property
+    def schema_version(self):
+        return self._db.execute('PRAGMA user_version').fetchone()[0]
+
+    def activate_time_schema(self, evidence):
+        """The version change commits with the first time-aware state or cold copy."""
+        if not self._db.in_transaction:
+            raise TraderError('E_DSV_STORE_VERSION', 'Clock schema activation requires the original writer transaction')
+        if self.schema_version < TIME_SCHEMA:
+            self._db.execute(f'PRAGMA user_version={TIME_SCHEMA}')
+            self.event('TIME_SCHEMA_MIGRATED', {'time_schema': TIME_SCHEMA, 'minimum_writer': TIME_SCHEMA, **evidence})
 
     def sdk_scope_grant(self):
         return self._read("SELECT payload FROM events WHERE kind='SDK_SCOPE_BOUND' ORDER BY seq LIMIT 1")

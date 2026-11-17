@@ -8,14 +8,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
 import time
+from uuid import uuid4
 
 from online_trader.errors import TraderError
 
 
 MAX_MONOTONIC_NS = 9_223_372_036_854_775_807
 MAX_WALL_DRIFT_MS = 2_147_483_647
+TIME_SEMANTICS = "OT_TIME/2"
+NS_PER_SECOND = 1_000_000_000
 _UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z\Z")
 _NS = re.compile(r"(?:0|[1-9][0-9]{0,18})\Z")
+_EPOCH = re.compile(r"[a-f0-9]{32}\Z")
+_FRACTION = re.compile(r"[T ][0-9]{2}:[0-9]{2}:[0-9]{2}[.,]([0-9]{1,9})(?![0-9])")
 
 
 def _error(message):
@@ -31,7 +36,13 @@ def _milliseconds_text(nanoseconds):
     return sign + str(whole) + "." + f"{remainder:06d}".rstrip("0")
 
 
-def _wall_delta_ns(later, earlier):
+def utc_text(at):
+    if not isinstance(at, datetime) or at.utcoffset() is None:
+        _error("Expected a timezone-aware wall clock")
+    return at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def delta_ns(later, earlier):
     delta = later - earlier
     microseconds = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
     return microseconds * 1000
@@ -41,6 +52,8 @@ def _wall_delta_ns(later, earlier):
 class ClockSample:
     now_utc: str
     monotonic_ns: str
+    clock_epoch: str | None = None
+    sample_span_ns: str = "0"
 
     def __post_init__(self):
         if type(self.now_utc) is not str or not _UTC.fullmatch(self.now_utc):
@@ -52,6 +65,12 @@ class ClockSample:
         if (type(self.monotonic_ns) is not str or not _NS.fullmatch(self.monotonic_ns)
                 or int(self.monotonic_ns) > MAX_MONOTONIC_NS):
             _error("Expected canonical nonnegative signed-64-bit monotonic nanoseconds")
+        if (self.clock_epoch is not None and
+                (type(self.clock_epoch) is not str or not _EPOCH.fullmatch(self.clock_epoch))):
+            _error("Expected a bounded owner clock epoch")
+        if (type(self.sample_span_ns) is not str or not _NS.fullmatch(self.sample_span_ns)
+                or int(self.sample_span_ns) > MAX_MONOTONIC_NS):
+            _error("Expected a bounded clock capture span")
 
     @classmethod
     def from_record(cls, record):
@@ -61,6 +80,16 @@ class ClockSample:
 
     def to_record(self):
         return {"now_utc": self.now_utc, "monotonic_ns": self.monotonic_ns}
+
+    @classmethod
+    def from_paired_record(cls, record):
+        if (type(record) is not dict or set(record) != {
+                "now_utc", "monotonic_ns", "clock_epoch", "sample_span_ns"} or record["clock_epoch"] is None):
+            _error("Missing or unsupported paired clock sample fields")
+        return cls(**record)
+
+    def paired_record(self):
+        return self.to_record() | {"clock_epoch": self.clock_epoch, "sample_span_ns": self.sample_span_ns}
 
     @property
     def utc(self):
@@ -74,9 +103,79 @@ class ClockSample:
 class SystemClock:
     """Read local clocks only; there is no timer, network or clock adjustment."""
 
+    def __init__(self):
+        self.epoch = uuid4().hex
+
+    @staticmethod
+    def utc_now():
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def monotonic_ns():
+        return time.monotonic_ns()
+
+    def capture(self):
+        before = self.monotonic_ns()
+        utc = self.utc_now()
+        after = self.monotonic_ns()
+        return ClockSample(utc_text(utc), str((before + after) // 2), self.epoch,
+                           str(after - before))
+
     def sample(self):
-        utc = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-        return ClockSample(utc, str(time.monotonic_ns())).to_record()
+        return self.capture().to_record()
+
+
+def sdk_deadline(seconds):
+    """Convert only a relative wait slice at the TqSdk boundary."""
+    return time.time() + seconds
+
+
+def source_fraction_tail(raw):
+    """Return nanoseconds below datetime's microsecond precision."""
+    match = _FRACTION.search(raw)
+    return int(match[1].ljust(9, "0")[6:]) if match else 0
+
+
+def source_age_ns(now, source, raw):
+    return delta_ns(now, source) - source_fraction_tail(raw)
+
+
+class ClockContinuity:
+    """Observe per-owner jumps and stalls without substituting a different UTC."""
+
+    def __init__(self, *, drift_ns=2 * NS_PER_SECOND, gap_ns=15 * NS_PER_SECOND):
+        if type(drift_ns) is not int or type(gap_ns) is not int or not 0 < drift_ns < gap_ns:
+            _error("Expected positive, ordered clock continuity thresholds")
+        self.drift_ns, self.gap_ns = drift_ns, gap_ns
+        self.previous = None
+        self.continuous_samples = 0
+
+    def compare(self, sample):
+        previous = self.previous
+        if previous is None:
+            return {"reason": None, "wall_delta_ns": None, "mono_delta_ns": None, "drift_ns": None}
+        wall = delta_ns(sample.utc, previous.utc)
+        elapsed = sample.monotonic - previous.monotonic
+        drift = wall - elapsed
+        tolerance = self.drift_ns + int(sample.sample_span_ns) + int(previous.sample_span_ns)
+        reason = None
+        if elapsed < 0 or sample.clock_epoch != previous.clock_epoch:
+            reason = "MONOTONIC_DISCONTINUITY"
+        elif abs(drift) > tolerance:
+            reason = "WALL_CLOCK_DISCONTINUITY"
+        elif elapsed > self.gap_ns:
+            reason = "OWNER_SCHEDULING_GAP"
+        return {"reason": reason, "wall_delta_ns": str(wall),
+                "mono_delta_ns": str(elapsed), "drift_ns": str(drift)}
+
+    def observe(self, sample):
+        result = self.compare(sample)
+        if result["reason"] or self.previous is None:
+            self.continuous_samples = 0
+        elif sample.monotonic > self.previous.monotonic:
+            self.continuous_samples = min(2, self.continuous_samples + 1)
+        self.previous = sample
+        return result | {"continuous_samples": self.continuous_samples}
 
 
 class ClockGuard:
@@ -102,7 +201,7 @@ class ClockGuard:
         if self._accepted is None:
             self._accepted = sample
             return self._result(sample, valid=True, elapsed_ms=0)
-        wall_ns = _wall_delta_ns(sample.utc, self._accepted.utc)
+        wall_ns = delta_ns(sample.utc, self._accepted.utc)
         monotonic_ns = sample.monotonic - self._accepted.monotonic
         drift_ns = wall_ns - monotonic_ns
         if self._fault_reasons:

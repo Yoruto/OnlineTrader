@@ -242,7 +242,8 @@ def _ordinary_target(state, frame, market, spec, settings, active_symbols, open_
     previous_stop = state.get('last_stop')
     if previous_stop and previous_stop['direction'] == direction:
         if settings['stop_cooldown_enabled'] and previous_stop.get('until') is not None:
-            if _clock(frame, market, 'cooldown').timestamp() < float(previous_stop['until']):
+            active = market.get('stop_cooldown_active')
+            if active if active is not None else _clock(frame, market, 'cooldown').timestamp() < float(previous_stop['until']):
                 return {'reason': 'STOP_COOLDOWN', 'consume': bar}
         if settings['require_trigger_update'] and abs(float(previous_stop['theory']) - theory) < 1e-6:
             return {'reason': 'STOP_TRIGGER_UNCHANGED', 'consume': bar}
@@ -266,8 +267,10 @@ def _ordinary_target(state, frame, market, spec, settings, active_symbols, open_
         return {'reason': 'QUOTE_NEAR_LIMIT', 'consume': bar}
     order_time = _clock(frame, market, 'submit').timestamp()
     previous = state.get('last_order_ms')
-    if state.get('last_order_direction') == direction and previous is not None and int(order_time * 1000) - int(previous) < 1000:
-        return {'reason': 'ENTRY_THROTTLED', 'consume': bar}
+    if state.get('last_order_direction') == direction and previous is not None:
+        active = market.get('entry_throttle_active')
+        if active if active is not None else int(order_time * 1000) - int(previous) < 1000:
+            return {'reason': 'ENTRY_THROTTLED', 'consume': bar}
     lots = _lots(market, settings, spec, active_symbols)
     if not lots:
         return {'reason': 'FUNDS_UNAVAILABLE' if lots is None else 'INSUFFICIENT_MARGIN', 'consume': bar}

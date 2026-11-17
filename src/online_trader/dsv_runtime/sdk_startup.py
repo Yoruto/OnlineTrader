@@ -99,13 +99,12 @@ def prepare(scope, profile_path, calendar_path, database, output):
 
 
 def _date_resolver(grant, calendar):
-    def cabinet_day(previous, now):
-        windows = [calendar.query(code, utc(now)) for code in grant.value['contracts']]
-        days = {item['trading_day'] for item in windows if item['is_trading']}
-        if (not all(item['complete'] for item in windows) or len(days) > 1 or
-                any(not grant.permits_day(day) for day in days)):
-            raise TraderError('E_DSV_SDK_SYNC', 'Current cabinet day is outside the approved calendar')
-        return next(iter(days), previous)
+    # The locked SDK snapshot labels the day with the bound calendar. It is
+    # useful for showing the civil session but is not independent cabinet proof.
+    def cabinet_day(previous, _now):
+        if not grant.permits_day(previous):
+            raise TraderError('E_DSV_SDK_SYNC', 'Retained cabinet day is outside the approved scope')
+        return previous
     return cabinet_day
 
 
@@ -163,7 +162,7 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
                     raise TraderError('E_DSV_SDK_SCOPE', 'Initial SDK snapshot differs from the approved account or day')
                 adapter = DsvSdkAdapter(connection.api, connection.account, account_key=grant.account_key, profile=profile,
                                         calendar=calendar, sdk_version=installed,
-                                        clock=lambda: (wall.now(), time.monotonic_ns() // 1_000_000), _connection=connection,
+                                        _connection=connection,
                                         _legacy_native_orders=imported.get('legacy_native_orders'))
                 session = owner.enter_context(DsvSession(
                     database, profile=profile, port=adapter, _execution_lock=lock, account_key=grant.account_key,
