@@ -26,7 +26,7 @@ class TqKqDsvPort(TqKqPort):
             if error.code != 'E_CLOCK':
                 raise
             return False
-        return True
+        return super().entry_clock_ready()
 
     def strategy_wall_time(self):
         return self.clock.now()
@@ -322,6 +322,7 @@ class TqKqDsvPort(TqKqPort):
         return observations
 
     def validate_send(self,request):
+        self.check_dispatch_clock(request['effect'])
         value=self.grant.value;kernel=getattr(self,'kernel',None)
         if (self.read_only or self.fault or not self.complete() or kernel is None
                 or request.get('account_key')!=self.grant.account_key or request.get('contract_id') not in self.quotes

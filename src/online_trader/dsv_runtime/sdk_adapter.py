@@ -106,6 +106,8 @@ class DsvSdkAdapter:
 
     def check_start(self, state):
         sample = self._clock_sample()
+        if not self._entry_clock_ready():
+            raise TraderError('E_DSV_SDK_CLOCK', 'Application UTC calibration is unavailable for opening')
         if (not self.synchronized or not state['synchronized'] or state.get('scope_expired_at')
                 or not self.grant.in_window(sample.utc)):
             raise TraderError('E_DSV_SDK_SYNC', 'Start needs a current synchronized account within the reviewed window')
@@ -133,7 +135,15 @@ class DsvSdkAdapter:
         return ClockSample(utc_text(now), str(mono * 1_000_000), getattr(self, '_clock_epoch', None))
 
     def opening_window(self, day, now):
-        return self.grant.permits_day(day) and self.grant.in_window(now)
+        return self._entry_clock_ready() and self.grant.permits_day(day) and self.grant.in_window(now)
+
+    def _entry_clock_ready(self):
+        ready = getattr(getattr(self, 'clock', None), 'entry_ready', None)
+        return ready is None or ready()
+
+    def _protection_clock_ready(self):
+        ready = getattr(getattr(self, 'clock', None), 'protection_ready', None)
+        return ready is None or ready()
 
     def expired(self, now):
         return now > datetime.fromisoformat(self.grant.value['not_after_utc'])
@@ -180,6 +190,12 @@ class DsvSdkAdapter:
         state = self._bind(session)
         self.enabled = False
         try:
+            poll_clock = getattr(self.clock, 'poll', None)
+            if poll_clock is not None:
+                poll_clock()
+                if state['running'] and not self._entry_clock_ready():
+                    session.disable_entries_for_clock()
+                    state = session.snapshot()
             timers = session.active_timers()
             wait = poll_slice(timers, self._clock_sample()) if timers else 0.5
             started = time.monotonic_ns()
@@ -203,7 +219,10 @@ class DsvSdkAdapter:
             self._health = self._continuity.observe(sample)
             if self._health['reason'] and prior_sample is not None:
                 self._health['previous_sample'] = prior_sample.paired_record()
-            if self._reference is not None:
+            clock_health = getattr(self.clock, 'health', None)
+            if clock_health is not None:
+                self._health.update(clock_health(sample))
+            elif self._reference is not None:
                 self._health.update(self._reference.poll(sample, invalidate=bool(self._health['reason'])))
             else:
                 self._health['reference_status'] = 'UNOBSERVED'
@@ -413,7 +432,10 @@ class DsvSdkAdapter:
             session = self.calendar.query(code, utc(source))['session']
         raw_age = None if source is None else source_age_ns(sample.utc, source, raw)
         quality, reason = 'UNKNOWN', 'QUOTE_UNAVAILABLE'
-        if malformed:
+        if not self._protection_clock_ready():
+            quality, reason = 'CLOCK_UNVERIFIED', 'CLOCK_PROTECTION_WINDOW_EXPIRED'
+            source = None
+        elif malformed:
             quality, reason = 'SOURCE_ANOMALY', 'QUOTE_TIMESTAMP_INVALID'
         elif source is not None:
             precise_time = source, source_fraction_tail(raw)
@@ -578,6 +600,9 @@ class DsvSdkAdapter:
         # _authorized remains outside the proof boundary: a reused/ambiguous
         # effect must never be downgraded to definitely unsent.
         try:
+            if not self._protection_clock_ready():
+                rejection_reason = 'CLOCK_PROTECTION_WINDOW_EXPIRED'
+                raise TraderError('E_DSV_SDK_CLOCK', 'Application UTC protection window expired')
             market = self.dispatch_market[effect['contract_id']]
             tick = market['ticks'][-1] if market['ticks'] else None
             if (tick is None or market['external_orders'] or
@@ -597,7 +622,8 @@ class DsvSdkAdapter:
                 if (effect['contract_id'] not in self.grant.value['contracts'] or
                         not self.grant.permits_day(effect['trading_day']) or
                         effect['native_offset'] == 'OPEN' and (
-                            getattr(self.session, '_state', {}).get('scope_expired_at') or not self.grant.in_window(clock.utc))):
+                            getattr(self.session, '_state', {}).get('scope_expired_at')
+                            or not self.opening_window(effect['trading_day'], clock.utc))):
                     rejection_reason = 'ACCOUNT_SCOPE_OR_WINDOW'
                     raise TraderError('E_DSV_SDK_SCOPE', 'The SDK request exceeded its explicit account scope')
             request = dict(symbol=effect['contract_id'], direction=effect['direction'],

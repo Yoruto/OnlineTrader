@@ -23,6 +23,8 @@ from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime import dsv_simulation
 from online_trader.runtime.instance import AccountLock, ClockActivity
 from online_trader.scheduling.calendar import TradingCalendar, _utc
+from online_trader.scheduling.holdover import ProtectionClockAnchor
+from online_trader.scheduling.reference import CalibratedClock
 
 
 REQUEST_SCHEMA = 'DESKTOP_START/1'
@@ -35,6 +37,7 @@ _PHASE_MESSAGES = {
     'STARTUP_CHECKING': '正在核对账号与本次启动请求',
     'STARTUP_READING_MARKET': '正在连接行情并核对交易日、交易时段和合约信息',
     'STARTUP_PREPARED': '交易时段已核对，正在启动所选模拟盘策略',
+    'STARTUP_RECOVERING': '正在连接柜台并恢复原持仓保护，开仓权限保持关闭',
 }
 ERROR_MESSAGES = {
     'E_DESKTOP_START_REQUEST': '启动请求已过期或内容发生变化，请重新点击启动策略。',
@@ -51,7 +54,7 @@ ERROR_MESSAGES = {
     'E_STARTUP_METADATA_TIMEOUT': '读取交易日历或合约资料超时，请检查行情网络后重新启动。',
     'E_STARTUP_METADATA_CLOSE': '行情资料连接未正常关闭，策略启动已停止。',
     'E_DEPENDENCY': '模拟运行组件不可用，请检查已安装的程序环境。',
-    'E_CLOCK': 'Windows 时间证据不可用，请核对本机时间。',
+    'E_CLOCK': '无法取得应用授时，请检查授时网络连接。',
 }
 
 
@@ -129,19 +132,22 @@ def build_start_request(store, account_id, profile, *, arm=True, now=None, timed
     return request
 
 
-def _request(path, instant):
+def _request(path, instant=None):
     try:
         with Path(path).open('rb') as stream:
             raw = stream.read(MAX_REQUEST_BYTES + 1)
         value = strict_loads(raw)
         if (len(raw) > MAX_REQUEST_BYTES or type(value) is not dict
-                or set(value) - {'timed_trigger'} != _REQUEST_KEYS):
+                or set(value) - {'timed_trigger', 'recover_original'} != _REQUEST_KEYS):
             raise ValueError()
         if value['schema_version'] != REQUEST_SCHEMA or value['confirmed'] is not True or type(value['arm']) is not bool:
             raise ValueError()
         identifier(value['request_id'])
         created, expiry = _utc(value['created_at_utc']), _utc(value['expires_at_utc'])
-        if not created <= instant < expiry or expiry - created != REQUEST_LIFETIME:
+        if expiry - created != REQUEST_LIFETIME or (instant is not None and not created <= instant < expiry):
+            raise ValueError()
+        if 'recover_original' in value and (value['recover_original'] is not True or value['arm']
+                                             or 'timed_trigger' in value):
             raise ValueError()
         directory = Path(value['account_store'])
         if not directory.is_absolute():
@@ -185,6 +191,36 @@ def _check_existing_ledger(store, row):
     except TraderError as error:
         if error.code != 'E_FACT_BARRIER':
             raise
+        raise TraderError('E_DESKTOP_START_RECOVERY', ERROR_MESSAGES['E_DESKTOP_START_RECOVERY']) from None
+
+
+def _original_scope(store, row):
+    ledger = store.ledger_path(row).resolve()
+    try:
+        with closing(sqlite3.connect(ledger.as_uri() + '?mode=ro', uri=True, timeout=1)) as connection:
+            approvals = connection.execute("""
+                SELECT DISTINCT approval.approval_record_id, approval.manifest_hash
+                FROM position_cycles AS cycle
+                JOIN protection_plans AS plan USING (position_cycle_id)
+                JOIN approval_manifests AS approval
+                  ON approval.approval_record_id = json_extract(plan.plan_json, '$.approval_record_id')
+                WHERE cycle.lifecycle != 'CLOSED'
+            """).fetchall()
+        if len(approvals) != 1:
+            raise ValueError()
+        grant_id, manifest_hash = approvals[0]
+        identifier(grant_id)
+        if not grant_id.startswith('desktop-'):
+            raise ValueError()
+        original = store.directory / 'desktop-starts' / grant_id / 'run'
+        paths = tuple(original / name for name in ('scope.json', 'profile.json', 'calendar.json'))
+        grant, profile, calendar = dsv_simulation.load_inputs(*paths)
+        if (grant.content_hash != manifest_hash or grant.value['grant_id'] != grant_id
+                or grant.account_key != row['account_key'] or grant.provider != row['provider']
+                or Path(grant.value['ledger_path']).resolve() != ledger or grant.replacement):
+            raise ValueError()
+        return grant, profile, calendar
+    except (OSError, sqlite3.Error, ValueError, TraderError):
         raise TraderError('E_DESKTOP_START_RECOVERY', ERROR_MESSAGES['E_DESKTOP_START_RECOVERY']) from None
 
 
@@ -267,9 +303,8 @@ def run_desktop_start(request_path, output, *, now=None):
     """Explicit child entry; called only after desktop confirmation, never by preview."""
     directory = Path(output).resolve()
     directory.mkdir(parents=True, exist_ok=False)
-    instant = _now(now)
     try:
-        request, source_profile = _request(request_path, instant)
+        request, source_profile = _request(request_path, now)
         store = AccountStore(request['account_store'])
         row = _selected(store, request['account_id'])
         if row['account_key'] != request['account_key'] or row['provider'] != request['provider']:
@@ -279,19 +314,44 @@ def run_desktop_start(request_path, output, *, now=None):
                 'entry_authority': 'DISARMED', **extra}), directory / f'phase-{index:03}-bootstrap.json')
         phase(0, 'STARTUP_CHECKING')
         with ClockActivity(), AccountLock(row['account_key']) as lease:
-            _check_existing_ledger(store, row)
+            recovering = request.get('recover_original', False)
+            if not recovering:
+                try:
+                    _check_existing_ledger(store, row)
+                except TraderError as error:
+                    if error.code != 'E_DESKTOP_START_RECOVERY' or 'timed_trigger' in request:
+                        raise
+                    recovering = True
+            if recovering:
+                grant, effective, calendar = _original_scope(store, row)
+                anchor = ProtectionClockAnchor(grant.value['ledger_path'], row['account_key'])
+                clock = CalibratedClock(recovery_anchor=anchor, recovering=True)
+            else:
+                clock = CalibratedClock() if now is None else None
+            instant = clock.now() if clock is not None else _now(now)
+            if not _utc(request['created_at_utc']) <= instant < _utc(request['expires_at_utc']):
+                raise TraderError('E_DESKTOP_START_REQUEST', ERROR_MESSAGES['E_DESKTOP_START_REQUEST'])
             claim = store.directory / 'desktop-start-claims' / (request['request_id'] + '.json')
             if claim.exists():
                 raise TraderError('E_DESKTOP_START_REPLAY', ERROR_MESSAGES['E_DESKTOP_START_REPLAY'])
             publish_new_bytes(canonical_bytes({'request_hash': content_hash(request),
                 'output': str(directory), 'created_at_utc': _stamp(instant)}), claim)
             publish_new_bytes(canonical_bytes(request), directory / 'confirmed-request.json')
+            if recovering:
+                for name, record in (('scope.json', grant.value), ('profile.json', effective.to_record()),
+                                     ('calendar.json', calendar.to_record())):
+                    publish_new_bytes(canonical_bytes(record), directory / name)
+                phase(1, 'STARTUP_RECOVERING', account_key=row['account_key'],
+                      trading_day=grant.value['trading_day'], pipe=store.pipe_name(row))
+                return dsv_simulation.run(directory / 'scope.json', store.credential_reference(row['account_id']),
+                    directory / 'profile.json', directory / 'calendar.json', directory, pipe=store.pipe_name(row), arm=False,
+                    _execution_lock=lease, _reference=clock)
             phase(1, 'STARTUP_READING_MARKET')
             from online_trader.runtime.startup_metadata import read_metadata
             codes = [symbol['code'] for symbol in source_profile.to_record()['settings']['symbols']]
             reference = store.credential_reference(row['account_id'])
             metadata = read_metadata(reference, codes, now=instant)
-            current = _now(now)
+            current = clock.now() if clock is not None else _now(now)
             if current >= _utc(request['expires_at_utc']):
                 raise TraderError('E_DESKTOP_START_REQUEST', ERROR_MESSAGES['E_DESKTOP_START_REQUEST'])
             trigger = request.get('timed_trigger')
@@ -310,7 +370,7 @@ def run_desktop_start(request_path, output, *, now=None):
             row = _selected(store, request['account_id'])
             return dsv_simulation.run(directory / 'scope.json', reference, directory / 'profile.json',
                 directory / 'calendar.json', directory, pipe=store.pipe_name(row), arm=request['arm'],
-                _execution_lock=lease)
+                _execution_lock=lease, **({'_reference': clock} if clock is not None else {}))
     except Exception as error:
         code = error.code if isinstance(error, TraderError) else 'E_DESKTOP_START'
         failure = {'status': 'STARTUP_FAILED', 'error_code': code, 'entry_authority': 'DISARMED',

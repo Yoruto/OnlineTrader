@@ -25,7 +25,8 @@ from online_trader.runtime.dsv_simulation import _claim_run_output, load_inputs
 from online_trader.runtime.identity import runtime_identity
 from online_trader.runtime.instance import AccountLock, ClockActivity
 from online_trader.runtime.startup_metadata import SDK_VERSION
-from online_trader.scheduling.reference import LocalWallClock, ReferenceMonitor
+from online_trader.scheduling.holdover import ProtectionClockAnchor
+from online_trader.scheduling.reference import CalibratedClock
 from online_trader.transport.named_pipe import PipeListener
 
 
@@ -130,20 +131,20 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
     validate_sqlite_runtime(grant.provider)
     output = Path(output).resolve()
     date_resolver = _date_resolver(grant, calendar)
-    wall = LocalWallClock()
     with ExitStack() as stack:
         stack.enter_context(ClockActivity())
         lock = stack.enter_context(AccountLock(grant.account_key))
         imported = _validate_source(grant, profile, legacy, database)
         installed = sdk_version()
-        now = wall.now()
-        if now < datetime.fromisoformat(grant.value['not_before_utc']):
-            raise TraderError('E_ONLINE_SCOPE', 'The replacement scope has not started')
         with _readonly(database) as db:
             saved = strict_loads(db.execute('SELECT payload FROM checkpoint WHERE id=1').fetchone()[0])
             recovering = any(row['position'] or row.get('detached_positions') or row.get('native_conflicts')
                              for row in saved['symbols'].values())
             recovering |= any(not terminal(order) for order in saved['orders'].values())
+        wall = CalibratedClock(recovery_anchor=ProtectionClockAnchor(database, grant.account_key), recovering=recovering)
+        now = wall.now()
+        if now < datetime.fromisoformat(grant.value['not_before_utc']):
+            raise TraderError('E_ONLINE_SCOPE', 'The replacement scope has not started')
         if (saved.get('scope_expired_at') or not grant.in_window(now)) and not recovering:
             raise TraderError('E_ONLINE_SCOPE', 'The replacement scope has expired without pending responsibilities')
         _claim_run_output(output, grant)
@@ -165,7 +166,7 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
                     raise TraderError('E_DSV_SDK_SCOPE', 'Initial SDK snapshot differs from the approved account or day')
                 adapter = DsvSdkAdapter(connection.api, connection.account, account_key=grant.account_key, profile=profile,
                                         calendar=calendar, sdk_version=installed,
-                                        _connection=connection, clock=wall, reference=ReferenceMonitor(wall),
+                                        _connection=connection, clock=wall,
                                         _legacy_native_orders=imported.get('legacy_native_orders'))
                 session = owner.enter_context(DsvSession(
                     database, profile=profile, port=adapter, _execution_lock=lock, account_key=grant.account_key,

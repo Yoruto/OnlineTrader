@@ -154,6 +154,9 @@ class OnlineSimulation:
 
     def arm(self):
         k=self.kernel;k._writable();k.wait_idle()
+        ready = getattr(self.port.clock, 'entry_ready', None)
+        if ready is not None and not ready():
+            raise TraderError('E_CLOCK', 'Application UTC calibration is unavailable for opening')
         if (not self._configured or self.consumed() or k.recovery_required or k._has_unknown() or self.port.fault
                 or not self.port.complete() or not self.grant.in_window(self.port.clock.now())):
             raise TraderError('E_NOT_READY','Simulation scope, time, quota or recovery gate blocks opening')
@@ -165,6 +168,9 @@ class OnlineSimulation:
 
     def validate_entry(self,plan):
         value=self.grant.value
+        ready = getattr(self.port.clock, 'entry_ready', None)
+        if ready is not None and not ready():
+            raise TraderError('E_CLOCK', 'Application UTC calibration is unavailable for opening')
         if (not self._configured or plan.get('execution_scope')!='ONLINE_SIMULATION' or plan.get('schema_version')!='1.0'
                 or plan.get('approval_record_id')!=value['grant_id'] or plan.get('contract_id') not in value['contracts']
                 or plan.get('trading_day')!=value['trading_day'] or plan.get('initial_open_quantity')!=1 or plan.get('direction')!='LONG'

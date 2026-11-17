@@ -86,14 +86,17 @@ class ClockRefreshTests(OnlineSimulationFixture, unittest.TestCase):
         closed = []
         def fail(): raise TraderError('E_STORAGE', 'Injected shutdown failure')
         fake_kernel = SimpleNamespace(simulation=SimpleNamespace(initialize=fail), close=fail)
-        port = SimpleNamespace(close=lambda: closed.append(True))
+        port = SimpleNamespace(close=lambda: closed.append('gateway'))
+        lease = SimpleNamespace(close=lambda: closed.append('account'))
         with patch('online_trader.runtime.simulation.SimulationGrant.load', return_value=self.grant), \
-             patch('online_trader.runtime.simulation.measure_reference', return_value=self.port.clock), \
+             patch('online_trader.scheduling.reference.measure_utc_anchor',
+                   return_value=ReferenceClock(1000, time.monotonic(), 0, ())), \
+             patch('online_trader.runtime.simulation.AccountLock', return_value=lease), \
              patch('online_trader.runtime.simulation.TqKqPort.connect', return_value=port), \
              patch('online_trader.runtime.simulation.Kernel', return_value=fake_kernel):
             with self.assertRaises(TraderError):
                 run_session('unused-offline-scope', 'unused-offline-credentials', Path(self.temp.name)/'shutdown', prepare=True)
-        self.assertEqual(closed, [True])
+        self.assertEqual(closed, ['gateway', 'account'])
 
 
 class ClosingDispatchTests(unittest.TestCase):

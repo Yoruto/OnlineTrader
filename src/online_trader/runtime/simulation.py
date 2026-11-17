@@ -11,7 +11,9 @@ from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import TqKqPort
 from online_trader.kernel import Kernel
 from online_trader.online_scope import SimulationGrant
-from online_trader.scheduling.reference import measure_reference
+from online_trader.scheduling.holdover import ProtectionClockAnchor, legacy_protection_pending
+from online_trader.scheduling.reference import CalibratedClock, measure_reference
+from online_trader.runtime.instance import AccountLock
 
 
 class SimulationSession:
@@ -73,7 +75,13 @@ class SimulationSession:
     def step(self):
         k=self.kernel;p=self.port
         try:
-            self._refresh_reference()
+            if isinstance(p.clock, CalibratedClock):
+                p.clock.poll(before_install=lambda sample: self.owner.capture(
+                    'ONLINE_CLOCK_REFERENCE_REFRESH', {'clock': sample.record()}))
+                if not p.clock.entry_ready() and k._armed:
+                    k.pause();k.wait_idle()
+            else:
+                self._refresh_reference()
             p.poll_updates(0.1);self.owner.tick()
             now=p.clock.now();value=self.grant.value
             if time.monotonic()-self._last_money>=10:
@@ -110,6 +118,8 @@ class SimulationSession:
                 self.result={'status':'NO_ENTRY_WITHIN_WINDOW','source':'PRODUCT_KERNEL_ORIGINAL_LEDGER'};self.write('result.json',self.result)
                 self.status('NO_ENTRY_WITHIN_WINDOW');self.stop.set();return
             if self._entered:return
+            if isinstance(p.clock, CalibratedClock) and not p.clock.entry_ready():
+                self.status('CLOCK_UNAVAILABLE_NEW_ENTRIES_PAUSED');return
             for code in value['contracts']:
                 if not p.fresh(code) or p.position(code)!={'long':0,'short':0} or p.active_orders(code):continue
                 market=p.market(code);seen=self._quotes.setdefault(code,set());seen.add(market['source_time'])
@@ -148,9 +158,14 @@ def run_session(scope,credential_file,output,*,pipe=None,prepare=False):
 
 def _run_session(scope,credential_file,output,*,pipe,prepare):
     grant=SimulationGrant.load(scope);output=Path(output);output.mkdir(parents=True,exist_ok=True)
-    clock=measure_reference();port=TqKqPort.connect(credential_file,grant,clock,read_only=prepare);kernel=None;session=None
+    lease = AccountLock(grant.account_key)
+    port = kernel = session = None
     try:
-        kernel=Kernel(grant.value['ledger_path'],grant.account_key,port=port,simulation_grant=grant,risk_budget='1000',max_quote_age_ms=5000)
+        anchor = ProtectionClockAnchor(grant.value['ledger_path'], grant.account_key) if not prepare else None
+        clock = CalibratedClock(recovery_anchor=anchor, recovering=lambda: legacy_protection_pending(grant))
+        port = TqKqPort.connect(credential_file,grant,clock,read_only=prepare)
+        kernel=Kernel(grant.value['ledger_path'],grant.account_key,port=port,simulation_grant=grant,
+                      risk_budget='1000',max_quote_age_ms=5000,_execution_lock=lease)
         baseline=kernel.simulation.initialize()
         start={'scope_hash':grant.content_hash,'execution_scope':'ONLINE_SIMULATION','kernel_boot_id':kernel.boot_id,'ledger_path':grant.value['ledger_path'],
             'clock':clock.record(),'baseline':baseline,'prepare_only':prepare}
@@ -212,4 +227,9 @@ def _run_session(scope,credential_file,output,*,pipe,prepare):
         if session is not None:session.close()
         try:
             if kernel is not None:kernel.close()
-        finally:port.close()
+        finally:
+            try:
+                if port is not None:
+                    port.close()
+            finally:
+                lease.close()

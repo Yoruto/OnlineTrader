@@ -112,7 +112,23 @@ class TqKqPort(OnlineSimulationPort):
 
     def complete(self):return self._transport_up and not self.api._account._get_trade_more_data(self.api._data)
 
+    def entry_clock_ready(self):
+        ready = getattr(self.clock, 'entry_ready', None)
+        return ready is None or ready()
+
+    def check_dispatch_clock(self, effect):
+        if not self.protection_clock_ready():
+            raise TraderError('E_CLOCK','Application UTC protection window expired')
+        if effect == 'OPEN' and not self.entry_clock_ready():
+            raise TraderError('E_CLOCK','Application UTC calibration is unavailable for opening')
+
+    def protection_clock_ready(self):
+        ready = getattr(self.clock, 'protection_ready', None)
+        return ready is None or ready()
+
     def fresh(self, code, *, check_age=True, now=None):
+        if not self.protection_clock_ready():
+            return False
         try:
             q=self.quotes[code];at=quote_timestamp(q.datetime, timezone(timedelta(hours=8)))
             now = self.clock.now() if now is None else now
@@ -176,6 +192,7 @@ class TqKqPort(OnlineSimulationPort):
             'positions':positions,'orders':orders,'trades':trades}
 
     def validate_send(self,request):
+        self.check_dispatch_clock(request['effect'])
         if (self.read_only or self.fault or not self.complete() or request['account_key']!=self.grant.account_key or request['contract_id'] not in self.quotes
                 or request['effect'] not in {'OPEN','REDUCE'} or request['trading_day']!=self.grant.value['trading_day'] or type(request['original_qty']) is not int or request['original_qty']!=1 or not self.fresh(request['contract_id'])):
             raise TraderError('E_GATEWAY_SCOPE','Fresh, complete matching simulated scope is required')

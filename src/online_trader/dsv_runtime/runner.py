@@ -229,6 +229,10 @@ class DsvSession:
         self._check_owner()
         self.command({'id': 'sdk-startup-stop-' + uuid4().hex, 'action': 'STOP'})
 
+    def disable_entries_for_clock(self):
+        self._check_owner()
+        self.command({'id': 'sdk-clock-stop-' + uuid4().hex, 'action': 'STOP'})
+
     @staticmethod
     def _mark_unsynchronized(state):
         state['synchronized'] = False

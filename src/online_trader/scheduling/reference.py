@@ -3,10 +3,12 @@ from dataclasses import dataclass
 from datetime import datetime,timezone
 from decimal import Decimal
 from queue import Empty, SimpleQueue
+import secrets
 import socket,statistics,struct,time
 from threading import Thread
 from online_trader.errors import TraderError
 from online_trader.scheduling.clock import NS_PER_SECOND, SystemClock
+from online_trader.scheduling.holdover import within_holdover_budget
 
 @dataclass(frozen=True,slots=True)
 class ReferenceClock:
@@ -14,6 +16,7 @@ class ReferenceClock:
     monotonic_anchor:float
     offset_seconds:float
     samples:tuple
+    error_seconds:float=0.0
     def now(self):
         elapsed=time.monotonic()-self.monotonic_anchor
         if not 0<=elapsed<300:raise TraderError('E_CLOCK','Simulation clock reference expired or regressed')
@@ -97,6 +100,190 @@ def measure_reference():
         raise TraderError('E_CLOCK','Insufficient consistent NTP samples; no opening permitted')
     offset=statistics.median(row[1] for row in valid)
     return ReferenceClock(time.time()+offset,time.monotonic(),offset,tuple(samples))
+
+
+def measure_utc_anchor():
+    samples, estimates = [], []
+    for host in ('ntp.aliyun.com', 'ntp.tencent.com', 'time.cloudflare.com'):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+                client.settimeout(1.5)
+                client.connect((host, 123))
+                packet = bytearray(48)
+                packet[0] = 0x23
+                packet[40:48] = nonce = secrets.token_bytes(8)
+                sent = time.monotonic()
+                client.send(packet)
+                raw = client.recv(1024)
+                received = time.monotonic()
+            if (len(raw) < 48 or raw[0] >> 6 == 3 or raw[0] & 7 != 4
+                    or not 1 <= raw[1] <= 15 or raw[24:32] != nonce):
+                raise ValueError('Invalid NTP reply')
+            t2, f2, t3, f3 = struct.unpack_from('!4I', raw, 32)
+            if not (t2 or f2) or not (t3 or f3):
+                raise ValueError('Missing NTP timestamp')
+            # Unfold around 2026, independent of the system date, including
+            # server timestamps after the 2036 NTP era rollover.
+            pivot = 3_976_214_400
+            receive_utc = pivot + (t2 - pivot + 2**31) % 2**32 - 2**31 + f2 / 2**32
+            transmit_utc = pivot + (t3 - pivot + 2**31) % 2**32 - 2**31 + f3 / 2**32
+            delay = (received - sent) - (transmit_utc - receive_utc)
+            if transmit_utc < receive_utc or not 0 <= delay <= 0.5:
+                raise ValueError('Invalid NTP round trip')
+            utc_at_receive = transmit_utc - 2_208_988_800 + delay / 2
+            estimates.append(utc_at_receive - received)
+            samples.append({'host': host, 'valid': True, 'rtt_seconds': str(delay)})
+        except (OSError, ValueError):
+            samples.append({'host': host, 'valid': False})
+    if len(estimates) < 2 or max(estimates) - min(estimates) > 0.25:
+        raise TraderError('E_CLOCK', 'Insufficient consistent NTP samples; no opening permitted')
+    monotonic = time.monotonic()
+    anchor = monotonic + statistics.median(estimates)
+    error = max(float(row['rtt_seconds']) for row in samples if row['valid']) / 2 + max(estimates) - min(estimates)
+    return ReferenceClock(anchor, monotonic, None, tuple(samples), error)
+
+
+class CalibratedClock(LocalWallClock):
+    """Advance externally calibrated UTC without consulting the system wall clock."""
+
+    def __init__(self, *, recovery_anchor=None, recovering=False, lazy=False):
+        super().__init__()
+        self._recovery_anchor = recovery_anchor
+        self._checkpoint_saved = None
+        self._trusted_reference_mono = None
+        self._trusted_error = None
+        self._holding = False
+        self._correction = 0.0
+        self._last_poll = time.monotonic()
+        self._results = SimpleQueue()
+        self._worker = None
+        if lazy:
+            self._reference = self._utc = None
+            self._valid = False
+            self._anchor = self._next_refresh = self._last_poll
+            return
+        try:
+            self._reference = measure_utc_anchor()
+            self._anchor = self._reference.monotonic_anchor
+            self._trusted_reference_mono = self._anchor
+            self._trusted_error = self._reference.error_seconds
+            self._utc = self._reference.wall_anchor
+        except TraderError as error:
+            pending = recovering() if callable(recovering) else recovering
+            saved = recovery_anchor.load() if error.code == 'E_CLOCK' and pending and recovery_anchor else None
+            if saved is None:
+                raise
+            (self._utc, self._anchor, self._trusted_reference_mono, self._correction,
+             self._trusted_error) = saved
+            self._reference = None
+            self._holding = True
+        self._valid = not self._holding
+        self._last_poll = time.monotonic()
+        self._next_refresh = self._anchor + 120 if self._valid else self._last_poll
+        if self._valid:
+            self._checkpoint(self._anchor)
+
+    def _applied_correction(self, now):
+        applied = min(abs(self._correction), max(0, now - self._anchor) * .01)
+        return applied if self._correction >= 0 else -applied
+
+    def _timestamp(self, now):
+        if self._utc is None:
+            raise TraderError('E_CLOCK', 'Initial application UTC calibration is unavailable')
+        return self._utc + now - self._anchor + self._applied_correction(now)
+
+    def utc_now(self):
+        return datetime.fromtimestamp(self._timestamp(time.monotonic()), timezone.utc)
+
+    def _checkpoint(self, now):
+        if self._recovery_anchor is not None:
+            self._checkpoint_saved = self._recovery_anchor.save(
+                self._timestamp(now), now, self._trusted_reference_mono,
+                self._correction - self._applied_correction(now), self._trusted_error)
+
+    def bind_recovery_anchor(self, anchor):
+        self._recovery_anchor = anchor
+        if self._valid:
+            self._checkpoint(time.monotonic())
+
+    def entry_ready(self):
+        now = time.monotonic()
+        if not self._valid or not 0 <= now - self._last_poll <= 30:
+            return False
+        reference = self._reference
+        elapsed = now - reference.monotonic_anchor
+        return (0 <= elapsed < 300
+                and abs(self._timestamp(now) - (reference.wall_anchor + elapsed)) <= .25)
+
+    def protection_ready(self):
+        anchor = self._trusted_reference_mono
+        return anchor is not None and within_holdover_budget(time.monotonic() - anchor, self._trusted_error)
+
+    def record(self):
+        return {'mode': 'PERSISTED_NTP_HOLDOVER' if self._holding else 'APPLICATION_UTC',
+                'entry_ready': self.entry_ready(), 'protection_ready': self.protection_ready(),
+                'recovery_anchor_saved': self._checkpoint_saved,
+                'os_clock_changed': False}
+
+    def health(self, sample):
+        if not self.entry_ready():
+            return {'reference_status': 'REFERENCE_UNAVAILABLE', 'utc_error_ns': None}
+        reference = self._reference
+        age = sample.monotonic / NS_PER_SECOND - reference.monotonic_anchor
+        uncertainty = reference.error_seconds + max(0, age) / 1000
+        offset = reference.wall_anchor + age - sample.utc.timestamp()
+        return {'reference_status': 'OBSERVED_OK',
+                'reference': {'source': 'APPLICATION_UTC_NTP', 'offset_ns': str(round(offset * NS_PER_SECOND)),
+                              'estimated_error_ns': str(round(uncertainty * NS_PER_SECOND))},
+                'utc_error_ns': str(round((uncertainty + abs(offset)) * NS_PER_SECOND))}
+
+    def poll(self, *, before_install=None):
+        now = time.monotonic()
+        if not 0 <= now - self._last_poll <= 30:
+            self._valid = False
+            self._next_refresh = now
+        self._last_poll = now
+        try:
+            reference = self._results.get_nowait()
+        except Empty:
+            pass
+        else:
+            self._worker = None
+            self._valid = reference is not None and 0 <= now - reference.monotonic_anchor < 30
+            if self._valid:
+                candidate = reference.wall_anchor + now - reference.monotonic_anchor
+                current = candidate if self._utc is None else self._timestamp(now)
+                self._valid = abs(candidate - current) <= .25
+                if self._valid:
+                    if before_install is not None:
+                        self._valid = False
+                        self._next_refresh = now + 10
+                        before_install(reference)
+                        self._valid = True
+                    self._anchor, self._utc = now, current
+                    self._correction = candidate - current
+                    self._reference = reference
+            self._next_refresh = now + (120 if self.entry_ready() else 10)
+        if self.entry_ready() and self._reference.monotonic_anchor != self._trusted_reference_mono:
+            self._trusted_reference_mono = self._reference.monotonic_anchor
+            self._trusted_error = self._reference.error_seconds + abs(self._correction)
+            self._holding = False
+            self._checkpoint(now)
+        if self._worker is None and now >= self._next_refresh:
+            self._worker = Thread(target=self._refresh, name='OnlineTrader-UTC', daemon=True)
+            try:
+                self._worker.start()
+            except RuntimeError:
+                self._valid = False
+                self._worker = None
+                self._next_refresh = now + 10
+
+    def _refresh(self):
+        try:
+            reference = measure_utc_anchor()
+        except Exception:
+            reference = None
+        self._results.put(reference)
 
 
 class ReferenceMonitor:

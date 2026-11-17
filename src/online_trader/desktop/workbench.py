@@ -139,6 +139,7 @@ class WorkbenchWindow(StatusWindow):
         self._session_dialog=None
         self._strategy_starter=None
         self._scheduled_start=None
+        self._schedule_clock = None
         self.command_buttons={}
         for name,text,callback in (
             ('arm','启动策略 (F5)',self.start_strategy),('close','平选定自有仓',self.close_selected),
@@ -946,7 +947,7 @@ class WorkbenchWindow(StatusWindow):
             self.show_home_feedback('请先选择要定时启动的模拟账户。')
             return
         def arrange():
-            from online_trader.strategy.entry import CHINA_TIME
+            from online_trader.scheduling.reference import CalibratedClock
             profile = self.current_start_profile()
             settings = profile.to_record()['settings']
             schedule = settings['schedule']
@@ -954,16 +955,15 @@ class WorkbenchWindow(StatusWindow):
             if not (schedule['enabled'] or on_launch):
                 self.show_home_feedback('当前参数未启用定时启动或软件启动时自动启动。')
                 return
-            local = datetime.now(CHINA_TIME)
-            ends = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             message = (f"模拟账户 {self.selected_account['masked_login']}，{len(settings['symbols'])} 个品种。\n"
                        f"北京时间日盘 {schedule['day_start_time']}、夜盘 {schedule['night_start_time']}，"
                        f"补启动 {schedule['catch_up_minutes']} 分钟。\n"
-                       f"确认后仅启动一次，有效至 {ends:%m-%d %H:%M}。")
+                       "确认后仅启动一次，有效至授时当日北京时间 24:00。")
             if QMessageBox.question(self, '安排定时启动', message) != QMessageBox.Yes:
                 return
             self._scheduled_start = {'account_id':self.selected_account['account_id'],
-                                     'profile_hash':profile.content_hash, 'ends':ends}
+                                     'profile_hash':profile.content_hash, 'ends':None, 'on_launch':on_launch}
+            self._schedule_clock = CalibratedClock(lazy=True)
             self.dashboard.timed_start_button.setText('取消定时启动')
             self.pause_button.setEnabled(True)
             self.show_home_feedback('已安排本次定时启动。')
@@ -974,6 +974,7 @@ class WorkbenchWindow(StatusWindow):
     def cancel_timed_start(self, *, message='已取消本次定时启动。'):
         if self._scheduled_start is not None:
             self._scheduled_start = None
+            self._schedule_clock = None
             self.schedule_timer.stop()
             self.dashboard.timed_start_button.setText('安排定时启动')
             self.show_home_feedback(message)
@@ -987,8 +988,7 @@ class WorkbenchWindow(StatusWindow):
                 self.show_home_feedback('守护已打开工作台，请安排本次策略启动。')
                 self._guard_launch = False
             return
-        now = now or datetime.now(timezone.utc)
-        if now >= scheduled['ends'] or self._closing or self.selected_account is None or (
+        if self._closing or self.selected_account is None or (
                 self.selected_account['account_id'] != scheduled['account_id']):
             self.cancel_timed_start()
             return
@@ -998,6 +998,23 @@ class WorkbenchWindow(StatusWindow):
             return
         if self._startup_in_progress or self._worker is not None:
             return
+        if now is None:
+            clock = self._schedule_clock
+            if clock is None:
+                return
+            clock.poll()
+            if not clock.entry_ready():
+                self.show_home_feedback('等待应用授时后开始核对定时启动。')
+                return
+            now = clock.now()
+        if scheduled['ends'] is None:
+            from online_trader.strategy.entry import CHINA_TIME
+            local = now.astimezone(CHINA_TIME)
+            scheduled['ends'] = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if now >= scheduled['ends']:
+            self.cancel_timed_start()
+            return
+        on_launch = scheduled.pop('on_launch', on_launch)
         from online_trader.runtime.desktop_bootstrap import timed_start_trigger
         try:
             profile = self.current_start_profile()

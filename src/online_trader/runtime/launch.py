@@ -125,9 +125,19 @@ class SessionLauncher:
     def launch(self,python,output,*,expected_review_hash,arm=False,now=None):
         review=self.review()
         if review['review_hash']!=expected_review_hash:raise TraderError('E_REVISION_CONFLICT','Scope or inputs changed after review')
-        instant=now or datetime.now(timezone.utc)
-        if instant.tzinfo is None or not datetime.fromisoformat(review['login_from_utc'])<=instant<datetime.fromisoformat(review['not_after_utc']):
+        from online_trader.scheduling.holdover import ProtectionClockAnchor, legacy_protection_pending
+        from online_trader.scheduling.reference import CalibratedClock
+
+        grant, _, _ = load_inputs(*self.paths)
+        recovering = legacy_protection_pending(grant)
+        if now is None:
+            anchor = ProtectionClockAnchor(grant.value['ledger_path'], grant.account_key)
+            now = CalibratedClock(recovery_anchor=anchor, recovering=recovering).now()
+        if now.tzinfo is None or now < datetime.fromisoformat(review['login_from_utc']) or (
+                not recovering and now >= datetime.fromisoformat(review['not_after_utc'])):
             raise TraderError('E_ONLINE_SCOPE','This finite scope is outside its explicit startup window')
+        if recovering:
+            arm = False
         if type(arm) is not bool:raise TraderError('E_SCHEMA','Initial entry authority must be explicit')
         if arm and review['manual_workbench']:raise TraderError('E_ONLINE_SCOPE','Arm manual entry explicitly from the attached workbench')
         executable=Path(python).resolve()

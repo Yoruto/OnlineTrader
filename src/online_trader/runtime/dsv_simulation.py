@@ -22,7 +22,8 @@ from online_trader.runtime.instance import AccountLock, ClockActivity
 from online_trader.runtime.identity import runtime_identity
 from online_trader.runtime.market_monitor import DsvMarketMonitor, append_latency
 from online_trader.scheduling.calendar import TradingCalendar
-from online_trader.scheduling.reference import LocalWallClock, check_wall_clock
+from online_trader.scheduling.holdover import ProtectionClockAnchor, legacy_protection_pending
+from online_trader.scheduling.reference import CalibratedClock, LocalWallClock, check_wall_clock
 from online_trader.runtime.comparison import ComparisonRecorder, verify_dsv_profile
 from online_trader.runtime.strategy_log import DsvEntryLog
 
@@ -161,6 +162,18 @@ class DsvSimulationSession(SimulationSession):
             self.entry_log.failed(method, error, self.emit)
 
     def _poll_clock_diagnostic(self):
+        clock = self.port.clock
+        if isinstance(clock, CalibratedClock):
+            clock.poll()
+            ready = clock.entry_ready()
+            self.kernel._dsv_diagnostics['ntp'] = 'NTP_ALIGNED' if ready else 'NTP_UNAVAILABLE'
+            if not ready:
+                self._entry_resume = None
+                self._arm_request_revision = None
+                if self.kernel._armed:
+                    self.kernel.pause()
+                    self.kernel.wait_idle()
+            return
         if not isinstance(self.port.clock, LocalWallClock):
             return
         try:
@@ -779,14 +792,15 @@ class DsvSimulationSession(SimulationSession):
 
 
 def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=False,dsv_config=None,dsv_log_dir=None,
-        _execution_lock=None):
+        _execution_lock=None,_reference=None):
     """Future explicitly scoped connection path. Offline tests never call it."""
     with ClockActivity():
         return _run(scope, credentials, profile_path, calendar_path, output, pipe=pipe, arm=arm,
-                    dsv_config=dsv_config, dsv_log_dir=dsv_log_dir, _execution_lock=_execution_lock)
+                    dsv_config=dsv_config, dsv_log_dir=dsv_log_dir, _execution_lock=_execution_lock,
+                    _reference=_reference)
 
 
-def _run(scope,credentials,profile_path,calendar_path,output,*,pipe,arm,dsv_config,dsv_log_dir,_execution_lock):
+def _run(scope,credentials,profile_path,calendar_path,output,*,pipe,arm,dsv_config,dsv_log_dir,_execution_lock,_reference):
     grant,profile,calendar=load_inputs(scope,profile_path,calendar_path)
     if grant.replacement:
         raise TraderError('E_ONLINE_SCOPE','A replacement grant requires the replacement SDK startup')
@@ -808,7 +822,12 @@ def _run(scope,credentials,profile_path,calendar_path,output,*,pipe,arm,dsv_conf
             from online_trader.runtime.auto_offsets import load_preparation,prepare_connected
             restored=load_preparation(source_grant,source_profile)
             if restored is not None:preparation,grant,profile=restored
-        reference=LocalWallClock()
+        anchor = ProtectionClockAnchor(grant.value['ledger_path'], grant.account_key)
+        reference = _reference
+        if reference is None:
+            reference = CalibratedClock(recovery_anchor=anchor, recovering=lambda: legacy_protection_pending(grant))
+        else:
+            reference.bind_recovery_anchor(anchor)
         port=strategy_port(grant).connect(credentials,grant,reference)
         port.configure_calendar(calendar)
         if automatic and preparation is None:
@@ -837,7 +856,7 @@ def _run(scope,credentials,profile_path,calendar_path,output,*,pipe,arm,dsv_conf
         session.prime()
         reference.end_turn()
         # Restart is original exits only, regardless of a repeated --arm flag.
-        if arm and not restoring:session.request_initial_arm()
+        if arm and not restoring and reference.entry_ready():session.request_initial_arm()
         if pipe:
             from online_trader.kernel.server import ControlServer
             ControlServer(kernel,pipe).serve(session.stop,owner_tick=session.step,publish_workbench=True)
