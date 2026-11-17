@@ -770,6 +770,15 @@ class DsvSession:
         if row.get('detached_positions') or row.get('native_conflicts'):
             return [{'reason': 'LATE_FILL_OWNERSHIP_REVIEW', 'rule_ids': ['I01', 'I02']}]
         if position is not None:
+            if (timing and tick is not None and position['owned'] and (row.get('last_stop') or {}).get('until') is not None
+                    and (position.get('rollback_exit') or {}).get('reason') == 'STOP_LOSS'
+                    and self._in_session(frame, market)
+                    and self._controller.proves_position(state, position, market)):
+                # Recheck the stop while the original exit is still working, even on a cached quote.
+                # Only the cooldown is renewed. The exit target and its synchronization timer are separate.
+                _, triggers = protect(position | {'exit_target': None}, tick, self._trade, spec)
+                if any(trigger['reason'] == 'STOP_LOSS' for trigger in triggers):
+                    self._record_stop_cooldown(row, position, market, frame, timing)
             if 'close_request_at' in position:
                 wait = self._synchronize_protection_exit(state, position, market, frame, spec, timing=timing)
                 if wait is not None:
@@ -893,6 +902,16 @@ class DsvSession:
             return {'reason': 'PROTECTION_EXIT_AWAITING_SYNC', 'rule_ids': ['D08', 'I02']}
         return None
 
+    def _record_stop_cooldown(self, row, position, market, frame, timing):
+        cooldown = float(self._trade['stop_cooldown_minutes']) * 60
+        stop_at = market.get('wall_reads', {}).get('protection', frame['wall_time'])
+        until = None
+        if self._trade['stop_cooldown_enabled'] and cooldown > 0:
+            until = str(_utc(stop_at).timestamp() + cooldown)
+            if timing:
+                timing.arm(row, 'stop_cooldown', market['contract_id'], cooldown)
+        row['last_stop'] = {'direction': position['direction'], 'theory': position['theory'], 'until': until}
+
     def _maintain_position(self, row, position, market, frame, spec, *, timing=None):
         if timing and position['owned']:
             close = self._timed_close(row, position, market, frame, timing)
@@ -964,14 +983,7 @@ class DsvSession:
                 row['stop_streak'] = row.get('stop_streak', 0) + 1
                 if position.get('entry_kind') == 'CONTINUATION_ENTRY' and self._trade['cont_stop_day_stop']:
                     row.update(continuation_stopped=True, day_stop=True)
-                cooldown = float(self._trade['stop_cooldown_minutes']) * 60
-                stop_at = market.get('wall_reads', {}).get('protection', frame['wall_time'])
-                protection_now = _utc(stop_at).timestamp()
-                row['last_stop'] = {'direction': position['direction'], 'theory': position['theory'],
-                                    'until': str(protection_now + cooldown)
-                                    if self._trade['stop_cooldown_enabled'] and cooldown > 0 else None}
-                if timing and row['last_stop']['until'] is not None:
-                    timing.arm(row, 'stop_cooldown', market['contract_id'], cooldown)
+                self._record_stop_cooldown(row, position, market, frame, timing)
             if result.get('remaining') == 0:
                 reference, nominal_move = market['tick']['last'], result['move']
                 if reason == 'PROTECTED_FLOOR':
