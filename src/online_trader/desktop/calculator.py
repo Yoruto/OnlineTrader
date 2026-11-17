@@ -90,7 +90,7 @@ class OffsetCalculatorDialog(QDialog):
         self.table.resizeColumnsToContents(); self._rendering = False
 
     def invalidate(self, *_):
-        self.calculation = None
+        self.calculation = self.result_profile = None
         for button in (self.select_button, self.copy_button, self.export_button, self.apply_button): button.setEnabled(False)
         self._rendering = True
         for row in range(self.table.rowCount()):
@@ -133,6 +133,7 @@ class OffsetCalculatorDialog(QDialog):
 
     def calculate_with_market(self, inputs):
         from online_trader.runtime.auto_offsets import dataset_from_rows
+        self.invalidate()
         if inputs.get('status') == 'QUOTE_TIME_REJECTED':
             reasons = {'QUOTE_SESSION_MISMATCH': '报价属于其他交易时段', 'QUOTE_TOO_OLD': '报价已超过 15 秒'}
             details = [f"{code} {reasons[item['reason']]}，本机减源时间 {int(item['source_age_raw_ns'])/1_000_000:+.3f} ms"
