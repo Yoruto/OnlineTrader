@@ -133,6 +133,12 @@ class OffsetCalculatorDialog(QDialog):
 
     def calculate_with_market(self, inputs):
         from online_trader.runtime.auto_offsets import dataset_from_rows
+        if inputs.get('status') == 'QUOTE_TIME_REJECTED':
+            reasons = {'QUOTE_SESSION_MISMATCH': '报价属于其他交易时段', 'QUOTE_TOO_OLD': '报价已超过 15 秒'}
+            details = [f"{code} {reasons[item['reason']]}，本机减源时间 {int(item['source_age_raw_ns'])/1_000_000:+.3f} ms"
+                       for code, item in inputs['quote_time_quality'].items() if item['reason'] in reasons]
+            self.error_label.setText('；'.join(details) or '振幅报价时间待核对。')
+            return False
         symbols = self.base_profile.to_record()['settings']['symbols']
         try:
             dataset = dataset_from_rows(inputs['daily_rows'])

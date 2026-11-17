@@ -221,10 +221,15 @@ def main(argv=None):
             from online_trader.accounts import AccountStore
             from online_trader.configuration.files import load_profile, publish_new_bytes
             from online_trader.contracts.codec import canonical_bytes
-            from online_trader.runtime.startup_metadata import read_offset_inputs
+            from online_trader.runtime.startup_metadata import OffsetQuoteTimeError, read_offset_inputs
             reference = AccountStore(args.store).credential_reference(args.account_id)
-            result = read_offset_inputs(reference, load_profile(args.profile), args.formula,
-                                        as_of_date=args.as_of_date)
+            try:
+                result = read_offset_inputs(reference, load_profile(args.profile), args.formula,
+                                            as_of_date=args.as_of_date)
+            except OffsetQuoteTimeError as error:
+                publish_new_bytes(canonical_bytes({'status': 'QUOTE_TIME_REJECTED', 'code': error.code,
+                                                  'quote_time_quality': error.quality}), args.output)
+                raise
             publish_new_bytes(canonical_bytes(result), args.output)
             return 0
         elif args.action=='data':

@@ -129,6 +129,10 @@ def _merge_stats(profile, account, code, day, base, cycles, grouped, blockers):
         exit_event.update(flat_confirmed=True, orders_terminal=True, exit_reason=exit_info['reason'],
                           closed_at_utc=last['accepted_at_utc'], exit_triggered_at_utc=exit_info['at'],
                           nominal_exit_price=price, adverse_slippage_points=exit_info['slip'])
+        calendar_exit = position.get('calendar_exit') or {}
+        if (exit_info['reason'] == 'SESSION_CLOSE' and price is None
+                and calendar_exit.get('nominal_price_status') == 'UNDETERMINED'):
+            exit_event['unpriced_calendar_exit_id'] = calendar_exit['id']
         chronology.extend([(int(first['source_event_seq']), 0, entry), (int(last['source_event_seq']), 1, exit_event)])
     for _, _, event in sorted(chronology, key=lambda x: x[:2]):
         try:

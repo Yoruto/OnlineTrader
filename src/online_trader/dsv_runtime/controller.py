@@ -459,7 +459,7 @@ class ExplicitOrderController:
             reference = position['theory'] if mode == 'PASSIVE' else position['cap']
         else:
             direction = 'SHORT' if direction == 'LONG' else 'LONG'
-            mode = position.get('close_mode')
+            mode = market.get('close_price_mode', position.get('close_mode'))
             if mode in {'AGGR1', 'MARKET'}:
                 buy = direction == 'LONG'
                 quote = tick.get('ask1' if buy else 'bid1')

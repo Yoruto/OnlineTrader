@@ -122,7 +122,7 @@ def _event(profile, state, event):
     if not _COMMON <= event.keys() or event["type"] not in _KINDS:_invalid("Incomplete statistics event")
     fields={"requested_quantity","confirmed_quantity"} if event['type']=='ENTRY_CONFIRMED' else {
         "flat_confirmed","orders_terminal","exit_reason","closed_at_utc","exit_triggered_at_utc",
-        "nominal_exit_price","adverse_slippage_points"}
+        "nominal_exit_price","adverse_slippage_points","unpriced_calendar_exit_id"}
     if not event.keys()<=_COMMON|fields:_invalid('Unsupported statistics event fields')
     for key in ("account_key", "contract_id", "trading_day"):
         if event[key] != state[key]:raise TraderError("E_SCOPE", "Statistics event belongs to another aggregate scope")
@@ -149,7 +149,11 @@ def _event(profile, state, event):
         _utc(event.get("closed_at_utc"))
         if event.get("exit_triggered_at_utc") is not None and _utc(event["exit_triggered_at_utc"])>_utc(event['closed_at_utc']):
             raise TraderError('E_FACT_BARRIER','An exit trigger cannot follow its confirmed close evidence')
-        if event["exit_reason"] in _NORMAL_REASONS | {"SESSION_CLOSE", "MANUAL_EXIT"}:
+        if "unpriced_calendar_exit_id" in event:
+            _hash(event["unpriced_calendar_exit_id"])
+            if event["exit_reason"] != "SESSION_CLOSE" or event.get("nominal_exit_price") is not None:
+                _invalid("Only a scheduled exit without a quote can omit nominal points")
+        elif event["exit_reason"] in _NORMAL_REASONS | {"SESSION_CLOSE", "MANUAL_EXIT"}:
             _decimal(event.get("nominal_exit_price"), positive=True)
         if event["exit_reason"] == "ADVERSE_SLIPPAGE":
             slip=_decimal(event.get("adverse_slippage_points"))
@@ -188,6 +192,7 @@ def apply_event(profile, state, event):
                 if entry['receipt'][name]!=event[name]:raise TraderError('E_SCOPE','Close statistics differ from their original confirmed cycle')
     result=copy.deepcopy(state);daily=Decimal(state["daily_pnl_points"]);loss=Decimal(state["net_loss_points"])
     notes=[];daily_delta=Decimal(0);loss_delta=Decimal(0)
+    unpriced = "unpriced_calendar_exit_id" in event
     with localcontext() as context:
         context.prec=80
         if event["type"] == "ENTRY_CONFIRMED":
@@ -195,7 +200,7 @@ def apply_event(profile, state, event):
             notes.append("SOURCE_TOTAL_VOLUME_IS_REQUESTED_TARGET_NOT_CONFIRMED_FILL_VOLUME")
         else:
             reason=event["exit_reason"]
-            if reason in _NORMAL_REASONS | {"SESSION_CLOSE", "MANUAL_EXIT"}:
+            if not unpriced and reason in _NORMAL_REASONS | {"SESSION_CLOSE", "MANUAL_EXIT"}:
                 sign=Decimal(1) if event["direction"]=="LONG" else Decimal(-1)
                 pf=sign*(Decimal(event["nominal_exit_price"])-Decimal(event["theoretical_entry_price"]))
             if reason in _NORMAL_REASONS:
@@ -222,7 +227,11 @@ def apply_event(profile, state, event):
                 else:
                     loss_delta=-Decimal(event["take_profit_distance"]) if reason=="TAKE_PROFIT" else -pf
                     result["profit_count"]+=1;result["stop_streak"]=0
-            elif reason=="SESSION_CLOSE":daily_delta=pf;loss_delta=-pf
+            elif reason=="SESSION_CLOSE":
+                if unpriced:
+                    notes.append("SESSION_CLOSE_REFERENCE_UNAVAILABLE")
+                else:
+                    daily_delta=pf;loss_delta=-pf
             elif reason=="ADVERSE_SLIPPAGE":loss_delta=Decimal(event["adverse_slippage_points"])
             elif reason=="MANUAL_EXIT":
                 daily_delta=pf;loss_delta=-pf;result['stop_count']+=1;result['trade_count']+=1
@@ -235,8 +244,8 @@ def apply_event(profile, state, event):
     # Computed results must still fit the registered point domain exactly.
     _decimal(result["daily_pnl_points"]);_decimal(result["net_loss_points"])
     receipt=copy.deepcopy(event)
-    receipt.update(event_hash=digest,daily_pnl_delta_points=decimal_text(daily_delta),
-                   net_loss_delta_points=decimal_text(loss_delta),source_notes=notes)
+    receipt.update(event_hash=digest,daily_pnl_delta_points=None if unpriced else decimal_text(daily_delta),
+                   net_loss_delta_points=None if unpriced else decimal_text(loss_delta),source_notes=notes)
     if event["type"]=="CYCLE_CLOSED":receipt["exit_reason"]=event["exit_reason"]
     result["receipts"][key]={"event_hash":digest,"receipt":receipt}
     canonical_bytes(result);canonical_bytes(receipt)

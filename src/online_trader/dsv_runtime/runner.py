@@ -610,6 +610,10 @@ class DsvSession:
             if timing.due(position, 'price_context', position['id'], consume=True):
                 position['price_context_expired'] = True
             market['price_context_expired'] = position.get('price_context_expired', False)
+            mode = position.get('close_mode')
+            if seconds := {'AGGR1': 60, 'MARKET': 120}.get(mode):
+                age = timing.elapsed(position, 'close_refresh')
+                market['close_price_mode'] = mode if age is not None and age <= seconds * NS_PER_SECOND else 'ACTIVE'
         effects.extend(self._controller.plan(state, row, market, timing.sample.utc.timestamp()))
         active_exit = position and position['exit_target'] is not None and position['owned'] > position['exit_target']
         reason = None

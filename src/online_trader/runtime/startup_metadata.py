@@ -29,6 +29,12 @@ def _error(message, code='E_STARTUP_METADATA'):
     raise TraderError(code, message) from None
 
 
+class OffsetQuoteTimeError(TraderError):
+    def __init__(self, quality):
+        self.quality = quality
+        super().__init__('E_OFFSET_QUOTE_TIME', '振幅报价超过有效时间或属于其他交易时段。')
+
+
 def _utc(value):
     return value.astimezone(timezone.utc).isoformat(timespec='seconds').replace('+00:00', 'Z')
 
@@ -385,11 +391,10 @@ def read_offset_inputs(credential_reference, profile, formula, *, as_of_date=Non
                             'daily_rows': [row for row in daily if row['date'] < cutoff],
                             'realized_ranges': ranges, 'quote_time_quality': quality}
             api.wait_update(deadline=sdk_deadline(min(.3, max(0, deadline-time.monotonic()))))
-        if any(item['reason'] in {'QUOTE_SESSION_MISMATCH', 'QUOTE_TOO_OLD'} for item in quality.values()):
-            details = '，'.join(f"{code} {item['reason']} {item['source_age_raw_ns']} ns"
-                               for code, item in quality.items()
-                               if item['reason'] in {'QUOTE_SESSION_MISMATCH', 'QUOTE_TOO_OLD'})
-            _error(f'振幅报价时点不合格（{details}）。', 'E_OFFSET_QUOTE_TIME')
+        rejected = {code: item for code, item in quality.items()
+                    if item['reason'] in {'QUOTE_SESSION_MISMATCH', 'QUOTE_TOO_OLD'}}
+        if rejected:
+            raise OffsetQuoteTimeError(rejected)
         _error('完整日线或当前振幅未同步，请检查行情后重试。', 'E_OFFSET_INPUTS')
 
     return _read_market(credential_reference, read, timeout_seconds=timeout_seconds, sdk_factory=sdk_factory)

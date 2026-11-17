@@ -1073,6 +1073,16 @@ class WorkbenchLayout:
             reasons = quote.get('entry_reasons', ())
             explanation = [self.entry_reason_text(reason) for reason in reasons
                            if reason != 'DUPLICATE_MARKET_EVENT']
+            if self.market_view_current(view):
+                time_reason = {
+                    'CALENDAR_COVERAGE_UNKNOWN': '当前时段无完整日历',
+                    'QUOTE_OUTSIDE_CURRENT_SESSION': '当前休市',
+                    'QUOTE_UNAVAILABLE': '尚无当前报价',
+                    'QUOTE_LEADS_LOCAL_UTC': '源报价时间领先本机',
+                    'QUOTE_STALE': '当前报价已过时',
+                }.get(quote.get('quote_time_reason'))
+                if time_reason:
+                    explanation.append(time_reason)
             quote_current = self.market_view_current(view) and quote.get('fresh')
             lines = (quote.get('trigger_prices') or {}) if quote_current else {}
             decision = quote.get('decision_time_utc')
@@ -1647,7 +1657,9 @@ class WorkbenchLayout:
                 messages = by_cycle.get(cid, [])
                 status = '平仓待成交' if messages and all('待成交' in item for item in messages) else '平仓待确认'
                 if not messages:
-                    pending.append(f'{code} {status}')
+                    wait_label = {'EXIT_WAITING_FOR_SESSION': '退出已登记，等待交易时段',
+                                  'EXIT_WAITING_FOR_PRICE': '退出已登记，等待有效报价'}.get(cycle.get('exit_wait_reason'))
+                    pending.append(f'{code} {wait_label or status}')
             elif (cycle.get('quality') != 'CONTIGUOUS' or connection.get('recovery_required')
                   or (cycle.get('close_route_review') or {}).get('status') == 'BLOCKED'):
                 status = '保护待核对'

@@ -114,6 +114,10 @@ def fetch_offset_inputs(store, account_id, profile, formula, as_of_date):
             raise TraderError('E_OFFSET_INPUTS', '联网取数未完成。') from None
         if result.returncode:
             code = re.findall(rb'^([A-Z][A-Z0-9_]{1,49}): ', result.stderr, re.MULTILINE)
+            if code and code[-1] == b'E_OFFSET_QUOTE_TIME' and response.is_file():
+                quality = bounded_json(response)
+                if quality.get('status') == 'QUOTE_TIME_REJECTED':
+                    return quality
             raise TraderError(code[-1].decode() if code else 'E_OFFSET_INPUTS', '联网取数未完成。')
         return bounded_json(response)
 

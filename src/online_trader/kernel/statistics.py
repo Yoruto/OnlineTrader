@@ -182,7 +182,7 @@ class StatisticsOwner:
         ClockSample(observed,sample['monotonic_ns'])
         cycle['statistics_observed_at_utc']=observed
 
-    def freeze_exit(self,cycle,reason=None,*,reference_price=_UNSET):
+    def freeze_exit(self,cycle,reason=None,*,reference_price=_UNSET,unpriced_calendar_exit_id=None):
         if cycle.get('statistics_profile') is None or cycle.get('nominal_exit') is not None:return
         if cycle['protection'].get('target_remaining_qty')!=0:return
         state=cycle['protection'];plan=cycle['plan']
@@ -204,6 +204,8 @@ class StatisticsOwner:
                 slip=_point(max(Decimal(0),sign*(Decimal(state['entry_value'])/state['entry_filled_qty']-Decimal(plan['theoretical_entry_price']))))
         cycle['nominal_exit']={'exit_reason':reason,'nominal_exit_price':price,'adverse_slippage_points':slip,
             'trigger_clock':self._sample(cycle),'plan_hash':content_hash(plan)}
+        if reason == 'SESSION_CLOSE' and price is None and unpriced_calendar_exit_id is not None:
+            cycle['nominal_exit']['unpriced_calendar_exit_id'] = unpriced_calendar_exit_id
 
     def _event(self,cycle,profile,kind,evidence):
         plan=cycle['plan'];candidate=(cycle.get('strategy_metadata') or {}).get('candidate') or {}
@@ -262,6 +264,8 @@ class StatisticsOwner:
         event.update(flat_confirmed=True,orders_terminal=True,exit_reason=reason,closed_at_utc=at_utc or sample['now_utc'],
             exit_triggered_at_utc=(source.get('trigger_clock') or {}).get('now_utc'),nominal_exit_price=price,
             adverse_slippage_points=source.get('adverse_slippage_points'))
+        if reason == 'SESSION_CLOSE' and (identity := source.get('unpriced_calendar_exit_id')):
+            event['unpriced_calendar_exit_id'] = identity
         update=self._prepare(cycle,profile,event)
         if update is not None:cycle['statistics_close_id']=event['event_id']
         return update

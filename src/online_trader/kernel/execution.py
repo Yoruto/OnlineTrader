@@ -110,7 +110,8 @@ class ExecutionCoordinator:
             if calendar_event is not None:
                 ex['calendar_event'] = copy.deepcopy(calendar_event)
             reference = market.get('last') if not calendar_event or priced['allowed'] else None
-            k.statistics.freeze_exit(cycle,'SESSION_CLOSE',reference_price=reference)
+            k.statistics.freeze_exit(cycle, 'SESSION_CLOSE', reference_price=reference,
+                                     unpriced_calendar_exit_id=calendar_event['id'] if calendar_event and reference is None else None)
         if event.get('force_close'):
             if ex['force_start_ms'] is None:
                 ex['force_start_ms']=event['elapsed_ms']

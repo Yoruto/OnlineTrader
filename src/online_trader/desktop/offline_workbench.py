@@ -87,6 +87,8 @@ _QUOTE_REASONS = {
     'QUOTE_TIME_REGRESSION': '报价源时间发生倒退',
     'QUOTE_LEADS_LOCAL_UTC': '报价领先本机时间',
     'QUOTE_REFERENCE_CONFLICT': '报价时间与独立参考冲突',
+    'CALENDAR_COVERAGE_UNKNOWN': '当前时段无完整日历',
+    'CABINET_DAY_UNPROVED': '柜台交易日待核对',
 }
 
 
@@ -353,7 +355,8 @@ class OfflineWorkbench(QMainWindow):
         for code, row_state in state['symbols'].items():
             quote = row_state.get('quote_observation') or {}
             age, silence = (quote.get(name) for name in ('source_age_raw_ns', 'silence_ns'))
-            reason = _QUOTE_REASONS.get(quote.get('reason'), '已观测' if quote else '未知')
+            time_reason = row_state.get('calendar_reason') or quote.get('reason')
+            reason = _QUOTE_REASONS.get(time_reason, '已观测' if quote else '未知')
             wait = _STRATEGY_REASONS.get(row_state.get('exit_wait_reason'), '—')
             if row_state.get('timer_recovery_uncertain'):
                 wait = '计时起点待核对' if wait == '—' else wait + ' · 计时起点待核对'
