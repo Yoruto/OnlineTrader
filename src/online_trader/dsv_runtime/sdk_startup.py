@@ -135,7 +135,6 @@ def run(scope, credentials, profile_path, calendar_path, database, output, *, pi
         imported = _validate_source(grant, profile, legacy, database)
         installed = sdk_version()
         now = wall.now()
-        date_resolver(grant.value['trading_day'], now)
         if now < datetime.fromisoformat(grant.value['not_before_utc']):
             raise TraderError('E_ONLINE_SCOPE', 'The replacement scope has not started')
         with _readonly(database) as db:

@@ -81,6 +81,7 @@ class DsvSdkAdapter:
         self.synchronized = False
         self.flat_confirmed = False
         self.dispatch_market = {}
+        self.quote_times = {}
         self._seen_effects = set()
         self._local_returns = set()
         self._foreign_trades = None
@@ -125,6 +126,7 @@ class DsvSdkAdapter:
         self.synchronized = False
         self.flat_confirmed = False
         self.dispatch_market = {}
+        self.quote_times = {}
         self._local_returns.clear()
         self.epoch = uuid4().hex
         session.disconnect('SDK_DISCONNECTED')
@@ -156,13 +158,25 @@ class DsvSdkAdapter:
             now, mono = self.clock()
             if not isinstance(now, datetime) or now.utcoffset() is None or type(mono) is not int or mono < 0:
                 raise TraderError('E_DSV_SDK_CLOCK', 'Expected an explicit wall and monotonic clock sample')
-            now = now.astimezone(timezone.utc)
-            if callable(trading_day):
-                trading_day = trading_day(state['trading_day'], now)
             if not synchronized:
                 self.disconnect(session)
                 return {'type': 'DISCONNECTED', 'synchronized': False}
-            frame, market = self._frame(state, now, mono, trading_day)
+            quotes = {}
+            for code, quote in self.quotes.items():
+                moment = self._quote_time(quote)
+                if moment is None:
+                    continue
+                window = self.calendar.query(code, utc(moment))
+                if not window['complete'] or window['is_trading'] and window['trading_day'] < state['trading_day']:
+                    continue
+                if moment >= self.quote_times.get(code, moment):
+                    self.quote_times[code] = moment
+                    quotes[code] = moment
+            market_time = max(self.quote_times.values(), default=None)
+            if callable(trading_day):
+                trading_day = (state['trading_day'] if market_time is None else
+                               trading_day(state['trading_day'], market_time))
+            frame, market = self._frame(state, market_time, mono, trading_day, quotes, now)
             self.enabled = True
             self.dispatch_market = market
             receipt = session.apply_round(frame)
@@ -174,6 +188,7 @@ class DsvSdkAdapter:
             self.synchronized = False
             self.flat_confirmed = False
             self.dispatch_market = {}
+            self.quote_times = {}
             self._local_returns.clear()
             self.epoch = uuid4().hex
             if not session._failed:
@@ -182,11 +197,11 @@ class DsvSdkAdapter:
         finally:
             self.enabled = False
 
-    def _frame(self, state, now, mono, day):
+    def _frame(self, state, now, mono, day, quotes, authorization_time):
         if day not in self.trading_days or day < state['trading_day']:
             raise TraderError('E_DSV_SDK_SCOPE', 'Cabinet day is outside of the selected calendar')
         active_days = {window['trading_day'] for code in self.contracts
-                       if (window := self.calendar.query(code, utc(now)))['is_trading']}
+                       if now is not None and (window := self.calendar.query(code, utc(now)))['is_trading']}
         if active_days and active_days != {day} or day != state['trading_day'] and not active_days:
             raise TraderError('E_DSV_SDK_SCOPE', 'A cabinet-day change requires a matching active calendar session')
         bindings = {self.order_id(child): order for child, order in state['orders'].items()}
@@ -200,13 +215,16 @@ class DsvSdkAdapter:
         details, foreign_trades = self._trade_facts(trades, bindings, day, accepted, needs_recovery=bool(state['orders']))
         funds = self.api.get_account(account=self.account)
         markets = [self._market(code, day, now, funds, state['symbols'][code],
-                                code in foreign_orders or code in foreign_trades, state['orders'])
+                                code in foreign_orders or code in foreign_trades, state['orders'], quote_time=quotes.get(code))
                    for code in self.contracts]
         if any(row.get('native_coverage') is False for row in markets):
-            raise TraderError('E_DSV_SDK_SCOPE', 'Wall time is outside the complete calendar coverage')
+            raise TraderError('E_DSV_SDK_SCOPE', 'Market time is outside the complete calendar coverage')
         sequence = state['sequence'] + 1
+        # A quote-less startup can reconcile account facts without advancing strategy time.
+        stamp = utc(now) if now is not None else min(row['session_open'] for row in markets)
         frame = {'id': f'sdk-{self.epoch}-{sequence}', 'sequence': sequence, 'session_id': self.epoch,
-                 'wall_time': utc(now), 'monotonic_ms': str(mono), 'trading_day': day,
+                 'wall_time': stamp, 'authorization_time': utc(authorization_time.astimezone(timezone.utc)),
+                 'market_clock': True, 'monotonic_ms': str(mono), 'trading_day': day,
                  'trading_days': self.trading_days, 'calendar_hash': self.calendar.content_hash,
                  'synchronized': True, 'market': markets,
                  'sync_orders': [fact['child_order_id'] for fact in native if fact['kind'] == 'ORDER'],
@@ -337,17 +355,19 @@ class DsvSdkAdapter:
     def _contract(item):
         return item.exchange_id + '.' + item.instrument_id
 
-    def _market(self, code, day, now, funds, previous, external, orders):
-        window = self.calendar.query(code, utc(now))
+    def _market(self, code, day, now, funds, previous, external, orders, *, quote_time=None):
+        window = (self.calendar.query(code, utc(now)) if now is not None else
+                  {'is_trading': False, 'complete': True})
         periods = [period for period in self.periods[code] if period['trading_day'] == day]
         session = window['session'] if window['is_trading'] else next(
-            (period for period in periods if datetime.fromisoformat(period['open_utc']) > now), periods[-1])
+            (period for period in periods if now is None or datetime.fromisoformat(period['open_utc']) > now), periods[-1])
         position = self.api.get_position(code, account=self.account)
         quote = self.quotes[code]
-        tick = self._tick(code, quote, session, now) if window['is_trading'] else None
+        tick = self._tick(code, quote, session, quote_time) if window['is_trading'] else None
         result = {'contract_id': code, 'session_open': session['open_utc'], 'session_close': session['close_utc'],
                   'opening_session': session['is_opening_session'], 'ticks': [] if tick is None else [tick],
-                  'external_orders': external, 'native_coverage': window['complete']}
+                  'external_orders': external, 'native_coverage': window['complete'],
+                  'market_session_active': window['is_trading']}
         for field, native in _POSITION.items():
             result[field] = native_integer(getattr(position, native))
         if window['is_trading']:
@@ -381,12 +401,12 @@ class DsvSdkAdapter:
                 break
         result['pending_margin'] = pending
         expiry = expiry_date(getattr(quote, 'expire_datetime', None))
-        if expiry is not None:
-            # DSV subtracts the full local wall time from expiry-day midnight,
+        if expiry is not None and now is not None:
+            # DSV subtracts the full Beijing timestamp from expiry-day midnight,
             # then floors through timedelta.days; a date-only subtraction is one
             # day too large after midnight. Keep the decision independent of host TZ.
             midnight = datetime.combine(expiry, datetime.min.time(), tzinfo=_BEIJING)
-            result['days_to_expiry'] = str((midnight - now.astimezone(_BEIJING)).days)
+            result['days_to_expiry'] = str((midnight - (quote_time or now).astimezone(_BEIJING)).days)
         for field, native in (('min_order_qty', 'min_limit_order_volume'), ('max_order_qty', 'max_limit_order_volume')):
             value = getattr(quote, native, None)
             if value is not None and window['is_trading']:
@@ -394,7 +414,8 @@ class DsvSdkAdapter:
                 result[field] = min(actual, result.get(field, actual))
         return result
 
-    def _tick(self, code, quote, session, now):
+    @staticmethod
+    def _quote_time(quote):
         stamp = getattr(quote, 'datetime', None)
         if not stamp or getattr(quote, 'expired', False):
             return None
@@ -404,9 +425,14 @@ class DsvSdkAdapter:
             raise TraderError('E_DSV_SDK_FACT', 'Invalid SDK quote time') from error
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=_BEIJING)
+        return moment.astimezone(timezone.utc)
+
+    def _tick(self, code, quote, session, moment):
         start, end = map(datetime.fromisoformat, (session['open_utc'], session['close_utc']))
-        if moment > now or not start <= moment < end:
+        if moment is None or not start <= moment < end:
             return None
+        native_time = utc(moment)
+        stamp = quote.datetime
         serial = self.minutes[code]
         try:
             tail = serial.iloc[-1]['datetime']
@@ -418,7 +444,7 @@ class DsvSdkAdapter:
             # The legacy owner derives its opaque ID from the UTC minute.
             kline_stamp = datetime.fromtimestamp((minute // 1_000_000_000), timezone.utc)
             candle = code + ':' + kline_stamp.strftime('%Y%m%dT%H%M')
-        return {'native_time': utc(moment.astimezone(timezone.utc)), 'candle_id': candle,
+        return {'native_time': native_time, 'candle_id': candle,
                 'native_candle_ns': str(minute) if candle is not None else None, 'native_quote_stamp': stamp,
                 **{name: _amount(getattr(quote, field, None)) for name, field in _PRICE_FIELDS.items()}}
 

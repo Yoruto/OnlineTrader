@@ -580,7 +580,7 @@ class WorkbenchLayout:
         self.home_state.setStyleSheet('font-weight: bold; color: #1746a1;')
         self.home_connection = QLabel()
         self.home_connection.setWordWrap(True)
-        self.home_quote_delay = QLabel('行情延迟   --（需启动策略）')
+        self.home_quote_delay = QLabel('整体行情延迟（抽样）   —')
         status_line = QHBoxLayout()
         status_line.addWidget(self.home_state)
         status_line.addWidget(self.home_connection, 1)
@@ -709,7 +709,7 @@ class WorkbenchLayout:
         self.render_strategy_monitor(None)
         for label in self.status_labels:
             label.setText('等待同步')
-        self.quote_status.setText('行情 · 等待所选账号同步')
+        self.quote_status.setText('合约行情 · 等待所选账号同步')
         self.instrument_grid.setRowCount(0)
         self.instrument_rules.set_markets(self.names, {})
         self.render_session_hours({})
@@ -1310,7 +1310,7 @@ class WorkbenchLayout:
         fields = (
             ('equity','账户权益'), ('available','可用资金'), ('margin','当前保证金'),
             ('margin_ratio','资金使用率'), ('risk_ratio','风险度'), ('local_time','本机时间'),
-            ('quote_delay','行情延迟'), ('close_profit','平仓盈亏'), ('position_profit','持仓盈亏'),
+            ('close_profit','平仓盈亏'), ('position_profit','持仓盈亏'),
             ('today_pnl','当日累计'), ('fees','手续费'), ('today_ratio','盈亏比例'),
             ('opening_orders','开仓委托'),
         )
@@ -1320,11 +1320,14 @@ class WorkbenchLayout:
             metrics.addWidget(metric,index//7,index%7)
             self.fund_metrics[key] = (metric,title)
         account.addLayout(metrics)
-        self.quote_status = QLabel('行情 · 等待首份快照')
+        self.monitor_quote_delay = QLabel('整体行情延迟（抽样）   —')
+        account.addWidget(self.monitor_quote_delay)
+        self.quote_status = QLabel('合约行情 · 等待首份快照')
+        self.quote_status.setWordWrap(True)
         account.addWidget(self.quote_status)
         states = group('品种状态', layout, horizontal=True)
         self.status_labels = []
-        for name, title in (('waiting','尚可开仓'),('blocked','当日已停止开仓'),('pending','平仓待确认')):
+        for name, title in (('waiting','未触发当日停开'),('blocked','当日已停止开仓'),('pending','平仓待确认')):
             box = group(title, states, stretch=1)
             label = QLabel('等待同步')
             label.setObjectName(name)
@@ -1332,7 +1335,7 @@ class WorkbenchLayout:
             label.setMinimumHeight(62)
             label.setAlignment(Qt.AlignTop)
             if name == 'waiting':
-                label.setToolTip('品种尚未触发当日停开。每笔开仓仍需满足当前信号和风控。')
+                label.setToolTip('品种尚未触发当日停开。开仓仍需全局授权，并满足当前信号和风控。')
             box.addWidget(label)
             self.status_labels.append(label)
         details = QTabWidget()
@@ -2306,22 +2309,27 @@ class WorkbenchLayout:
             metric.setText(f'{title}   {value if value is not None else "—"}')
 
     def render_strategy_monitor(self, monitor):
-        value = display_quote_delay(monitor.get('quote_delay_seconds') if monitor else None)
-        self.home_quote_delay.setText(f'行情延迟   {value}')
-        metric, title = self.fund_metrics['quote_delay']
-        metric.setText(f'{title}   {value}')
+        delay = monitor.get('quote_delay_seconds') if monitor else None
+        if delay is None and monitor:
+            status = monitor['quote_status']
+            value = '—（休市）' if status == '休市' else '—（等待延迟样本）'
+        else:
+            value = display_quote_delay(delay) if monitor else '—'
+        self.home_quote_delay.setText(f'整体行情延迟（抽样）   {value}')
+        self.home_quote_delay.setToolTip('最近一笔有效行情的抽样延迟。各合约的新鲜度见下方合约行情。')
+        self.monitor_quote_delay.setText(self.home_quote_delay.text())
+        self.monitor_quote_delay.setToolTip(self.home_quote_delay.toolTip())
         if not monitor:
-            self.home_quote_delay.setToolTip('')
             return
-        status = monitor['quote_status']
-        self.home_quote_delay.setToolTip(f'行情 · {status}')
-        self.quote_status.setText(f'行情 · {status}')
+        armed = (self.rendered_view or {}).get('entry_authority') == 'ARMED'
         groups = {'ACTIVE': [], 'STOPPED': [], 'PENDING': []}
         for symbol in monitor['symbols']:
             state = symbol['state']
             code = symbol['contract_id']
             status = symbol.get('status') or '等待行情'
             position = symbol.get('position_quantity', 0)
+            if state == 'ACTIVE' and status == '可开仓' and not armed:
+                status = '已停止新开仓'
             if state == 'ACTIVE' and position:
                 status = '📌持仓中' if status == '持仓中' else '📌持仓中 · ' + status
             marker = {'ACTIVE':'●','STOPPED':'⛔','PENDING':'⏳'}[state]
@@ -2430,8 +2438,20 @@ class WorkbenchLayout:
                 pending.append(f"● {cycle['contract_id']}  剩余 {cycle['remaining_quantity']} 手{status}")
         for label, lines in zip(self.status_labels,(waiting,blocked,pending)):
             label.setText('\n'.join(lines) or '（无）')
-        self.quote_status.setText(f"行情 · {sum(bool(item.get('fresh')) for item in markets.values())} / {len(codes)} 合约有新鲜报价")
-        self.render_strategy_monitor(view['configuration'].get('strategy_monitor'))
+        monitor = view['configuration'].get('strategy_monitor')
+        fresh = sum(status == '新鲜' for status in quote_states.values())
+        lagging = [code for code, status in quote_states.items() if status == '行情已滞后']
+        if monitor and monitor['quote_status'] == '休市' and not fresh:
+            self.quote_status.setText('合约行情 · 休市')
+        else:
+            details = [f'{fresh} / {len(codes)} 个合约有新鲜报价']
+            if lagging:
+                details.append(f'滞后 ({len(lagging)})：{"、".join(lagging)}')
+            waiting_count = len(codes) - fresh - len(lagging)
+            if waiting_count:
+                details.append(f'{waiting_count} 个合约等待行情')
+            self.quote_status.setText('合约行情 · ' + ' · '.join(details))
+        self.render_strategy_monitor(monitor)
         populate(self.instrument_grid,[[self.names.get(code,code),code,markets.get(code,{}).get('trading_day','—'),
              display_value(markets.get(code,{}).get('last')),quote_states[code]] for code in codes])
         rule_markets = self.quote_reference | {code:market for code,market in markets.items() if market.get('fresh') or code not in self.quote_reference}

@@ -445,7 +445,7 @@ class WorkbenchWindow(StatusWindow):
         self._failed(error['code'])
         if self.view is not None:self.dashboard.add_activity('状态刷新失败 · '+error['code'],category='error')
         if self.view is not None:
-            self.dashboard.quote_status.setText('行情 · 上次快照已过期')
+            self.dashboard.quote_status.setText('合约行情 · 上次快照已过期')
             self.dashboard.render_strategy_monitor(None)
             self.dashboard.manual_status.setText('连接或请求失败 · 等待重新同步')
         if self.paired_launcher is not None and self.view is None and error['code']=='E_TIMEOUT':

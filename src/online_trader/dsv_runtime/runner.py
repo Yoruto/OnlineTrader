@@ -434,7 +434,7 @@ class DsvSession:
         if needs_sync and frame.get('synchronized') is True:
             self._synchronize(state, frame, pending)
         state.update(sequence=frame['sequence'], monotonic_ms=mono, session_id=frame['session_id'])
-        if self._sdk_port is not None and not self._sdk_port.opening_window(day, _utc(frame['wall_time'])):
+        if self._sdk_port is not None and not self._sdk_port.opening_window(day, _utc(frame.get('authorization_time', frame['wall_time']))):
             state['running'] = False
             for row in state['symbols'].values():
                 if position := row['position']:
@@ -448,18 +448,28 @@ class DsvSession:
                 decisions.append({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:0",
                                   'reason': 'AWAITING_NATIVE_SYNC', 'rule_ids': ['I01', 'I02']})
                 continue
-            self._observe_market(row, market, frame)
+            symbol_frame = frame
+            if frame.get('market_clock') and market['ticks']:
+                symbol_frame = frame | {'wall_time': market['ticks'][-1]['native_time']}
+            self._observe_market(row, market, symbol_frame)
             tick = row['tick'] if row['tick_session'] == frame['session_id'] else None
+            if frame.get('market_clock') and not market['ticks']:
+                tick = None
             if (tick is not None and market.get('native_coverage') is True and
                     not _utc(market['session_open']) <= _utc(tick['native_time']) < _utc(market['session_close'])):
                 tick = None
             observed = market | {'tick': tick}
-            values = self._evaluate_symbol(state, row, observed, frame, spec)
+            if frame.get('market_clock') and tick is not None:
+                native_time = _utc(tick['native_time'])
+                silence_ms = int(frame['monotonic_ms']) - int(row['quote_clock']['anchor']['mono'])
+                quote_age = max(silence_ms / 1000, (_utc(frame['wall_time']) - native_time).total_seconds())
+                observed['quote_age_seconds'] = quote_age
+            values = self._evaluate_symbol(state, row, observed, symbol_frame, spec)
             self._update_stops(row, contract, day, spec, frame.get('trading_days', []))
             decisions.extend({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:{i}",
                               **value} for i, value in enumerate(values))
-            if self._in_session(frame, observed):
-                now = _utc(observed.get('wall_reads', {}).get('pending', frame['wall_time'])).timestamp()
+            if self._in_session(symbol_frame, observed):
+                now = _utc(observed.get('wall_reads', {}).get('pending', symbol_frame['wall_time'])).timestamp()
                 if tick is None:
                     self._controller.settle(state, row)
                 else:
@@ -527,7 +537,7 @@ class DsvSession:
             if market.get('native_coverage') is True:
                 row.update(tick=None, tick_session=None)
         previous = clock.get('previous')
-        if previous is not None:
+        if previous is not None and not frame.get('market_clock'):
             wall_gap = (wall - datetime.fromisoformat(previous['wall'])).total_seconds()
             mono_gap = (int(sample['mono']) - int(previous['mono'])) / 1000
             if wall_gap < 0 or wall_gap > 300 and 0 < mono_gap < wall_gap * 0.5:
@@ -586,6 +596,8 @@ class DsvSession:
 
     @staticmethod
     def _in_session(frame, market):
+        if market.get('market_session_active') is False:
+            return False
         now = _utc(market.get('wall_reads', {}).get('session', frame['wall_time']))
         return _utc(market['session_open']) <= now < _utc(market['session_close'])
 
@@ -607,8 +619,13 @@ class DsvSession:
             return [{'reason': 'QUOTE_UNAVAILABLE', 'rule_ids': ['D01']}]
         if market['long_qty'] or market['short_qty'] or market.get('external_orders'):
             return [{'reason': 'UNOWNED_POSITION', 'rule_ids': ['I01', 'I02']}]
+        if 'quote_age_seconds' in market:
+            age_limit = float(self._trade['max_quote_age_seconds'])
+            if age_limit > 0 and market['quote_age_seconds'] > age_limit:
+                return [{'reason': 'QUOTE_AGE', 'rule_ids': ['D01']}]
         if self._sdk_port is not None:
-            reason = self._sdk_port.opening_limit(state, market, spec, _utc(frame['wall_time']))
+            reason = self._sdk_port.opening_limit(state, market, spec,
+                                                  _utc(frame.get('authorization_time', frame['wall_time'])))
             if reason:
                 return [{'reason': reason, 'rule_ids': ['I02']}]
         rows = tuple(state['symbols'].values())
@@ -777,10 +794,16 @@ class DsvSession:
             return False
         clock = row['quote_clock']
         anchor = clock['anchor']
-        wall = datetime.fromisoformat(clock['previous']['wall'])
         start = _utc(market['session_open'])
-        quiet = (wall - max(start, datetime.fromisoformat(anchor['wall']))).total_seconds()
+        anchor_time = datetime.fromisoformat(anchor['wall'])
         elapsed = Decimal(int(frame['monotonic_ms']) - int(anchor['mono'])) / 1000
+        if frame.get('market_clock'):
+            # A frozen feed cannot advance exchange time. Measure silence since
+            # the last distinct quote using the local monotonic counter.
+            warmup_left = (start + timedelta(seconds=60) - anchor_time).total_seconds()
+            return elapsed > warmup_left and elapsed > limit
+        wall = datetime.fromisoformat(clock['previous']['wall'])
+        quiet = (wall - max(start, anchor_time)).total_seconds()
         return (wall - start).total_seconds() > 60 and quiet > limit and elapsed > limit
 
     def _scheduled_close(self, row, position, market, frame):
