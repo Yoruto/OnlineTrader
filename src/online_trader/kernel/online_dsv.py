@@ -121,7 +121,7 @@ class OnlineDsvSimulation(OnlineSimulation):
             return False
         return self.opening_attempt_count() >= self.grant.value['opening_attempts']
 
-    def can_resume_entries(self, snapshot):
+    def can_resume_entries(self, snapshot, *, clock_recovery=False):
         k = self.kernel
         try:
             self._validate_snapshot(snapshot)
@@ -129,6 +129,19 @@ class OnlineDsvSimulation(OnlineSimulation):
                     or k._has_unknown() or k.recovery_required or not k.control.can_increase()
                     or snapshot['funds'].get('available') is None):
                 return False
+            if clock_recovery:
+                contracts = self.grant.value['contracts']
+                if any(order['contract_id'] in contracts and order['status'] != 'FINISHED'
+                       for order in snapshot['orders']):
+                    return False
+                for code in contracts:
+                    self.verify_owned_position(code, snapshot)
+                for cycle in k._staged.values():
+                    if cycle['lifecycle'] != 'CLOSED' and (cycle.get('statistics_review_required')
+                            or cycle['protection'].get('reconciliation_required')
+                            or any(not order['terminal_confirmed'] or order['reported_fill_qty'] != order['filled_qty']
+                                   for order in cycle['orders'])):
+                        return False
             return not any(
                 OrderState.from_dict(order).potential_remaining and
                 (order['effect'] == 'OPEN' or order.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'})

@@ -1471,6 +1471,8 @@ class WorkbenchLayout:
         elif armed:
             count = len(config.get('scoped_contracts') or view['markets'])
             state, description = '策略运行中', f'账户已连接 · 正在监控 {count} 个合约'
+        elif config.get('strategy_diagnostics', {}).get('utc_resume_pending'):
+            state, description = '授时恢复待续开', '等待授时和行情恢复 · 停止策略可取消续开'
         else:
             state = '已停止新开仓'
             description = f'仍有 {quantity} 手策略持仓 · 保护状态见「策略持仓」' if quantity else '账户已连接 · 等待启动'

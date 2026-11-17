@@ -54,6 +54,8 @@ def handle_control(session, request, *, sdk=None):
             result.update(session.workbench_evidence())
         if sdk is not None:
             result['sdk_connection'] = True
+            if getattr(sdk, 'clock_resume_pending', False):
+                result['clock_resume_pending'] = True
         return result
     if op == 'receipt':
         session.verify_scope(body.get('expected_scope'))

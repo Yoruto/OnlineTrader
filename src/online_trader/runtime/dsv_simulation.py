@@ -95,6 +95,7 @@ class DsvSimulationSession(SimulationSession):
         self._source_epoch=self.port.source_epoch
         self._arm_request_revision=None
         self._entry_resume = None
+        self._utc_resume = None
         self._calendar_anchor=utc(self.port.clock.now())
         self._clock_reset_seen = None
         self._day_barriers=set()
@@ -161,18 +162,41 @@ class DsvSimulationSession(SimulationSession):
         except Exception as error:
             self.entry_log.failed(method, error, self.emit)
 
+    def _utc_resume_binding(self):
+        k = self.kernel
+        return (k.control.entry_stop_generation, self._managed_day, k._authority_revision,
+                k._config_revision, k.active_epoch, self.port.source_epoch)
+
     def _poll_clock_diagnostic(self):
         clock = self.port.clock
         if isinstance(clock, CalibratedClock):
             clock.poll()
             ready = clock.entry_ready()
-            self.kernel._dsv_diagnostics['ntp'] = 'NTP_ALIGNED' if ready else 'NTP_UNAVAILABLE'
+            k = self.kernel
+            k._dsv_diagnostics['ntp'] = 'NTP_ALIGNED' if ready else 'NTP_UNAVAILABLE'
+            if self._utc_resume is not None and (
+                    self._utc_resume != self._utc_resume_binding()
+                    or k.control.strategy_stop_requested() or not self.owner.entry_window(clock.now())):
+                self._utc_resume = None
             if not ready:
                 self._entry_resume = None
                 self._arm_request_revision = None
-                if self.kernel._armed:
-                    self.kernel.pause()
-                    self.kernel.wait_idle()
+                if k._armed:
+                    eligible = (not self.grant.manual_workbench and not k.recovery_required
+                                and not k._has_unknown() and not self.port.fault
+                                and not self.driver._fault and not self.driver.clock_rebuild_pending
+                                and not k.control.strategy_stop_requested() and self.owner.entry_window(clock.now()))
+                    k.pause()
+                    k.wait_idle()
+                    self._utc_resume = self._utc_resume_binding() if eligible else None
+                    if self._utc_resume is not None:
+                        self.owner.capture('ONLINE_DSV_ENTRY_RECOVERY_PENDING', {
+                            'trading_day': self._managed_day, 'source_epoch': self.port.source_epoch,
+                            'reason': 'APPLICATION_UTC_UNAVAILABLE'})
+            if self._utc_resume is not None:
+                k._dsv_diagnostics['utc_resume_pending'] = True
+            else:
+                k._dsv_diagnostics.pop('utc_resume_pending', None)
             return
         if not isinstance(self.port.clock, LocalWallClock):
             return
@@ -409,14 +433,21 @@ class DsvSimulationSession(SimulationSession):
                 'reason': 'WAITING_FOR_NATIVE_RECONCILIATION_AND_LIVE_QUOTE'})
 
     def _try_resume_entries(self, event, account):
-        if self._entry_resume is None:
+        clock_recovery = self._utc_resume is not None
+        pending = self._utc_resume if clock_recovery else self._entry_resume
+        if pending is None:
             return
         k = self.kernel
-        generation, original_day = self._entry_resume
+        generation, original_day = pending[:2]
         now = self.port.clock.now()
         if (generation != k.control.entry_stop_generation or event['trading_day'] != original_day
-                or not self.owner.entry_window(now) or k.control.strategy_stop_requested()):
+                or not self.owner.entry_window(now) or k.control.strategy_stop_requested()
+                or clock_recovery and pending != self._utc_resume_binding()):
             self._entry_resume = None
+            self._utc_resume = None
+            return
+        if clock_recovery and (not self.port.clock.entry_stable()
+                               or not 0 <= (now - datetime.fromisoformat(event['source_time_utc'])).total_seconds() <= 5):
             return
         key = event['contract_id'], event['trading_day']
         strategy = self.driver.strategy
@@ -428,12 +459,14 @@ class DsvSimulationSession(SimulationSession):
             return {'reason_code': 'ENTRY_RESUME_MARKET_PATH'}
         if not self.driver.scope_current(key[0], key[1], event['session_id']) or not self.port.current_strategy_quote(event):
             return {'reason_code': 'ENTRY_RESUME_NATIVE_QUOTE'}
-        if not self.owner.can_resume_entries(self.port.snapshot()):
+        snapshot = self.port.snapshot()
+        if (clock_recovery and snapshot['trading_day'] != original_day
+                or not self.owner.can_resume_entries(snapshot, clock_recovery=clock_recovery)):
             return {'reason_code': 'ENTRY_RESUME_ACCOUNT_SYNC'}
         # Preview the same continuation the armed strategy would evaluate.
         # Its native freshness gate is independent of the ordinary age limit.
         if strategy.ordinary_quote_stale(event, now=now) and (
-                self._quote_expired(event) or not strategy.continuation_ready_on_resume(
+                clock_recovery or self._quote_expired(event) or not strategy.continuation_ready_on_resume(
                     state, self.driver._event(event), account, now=now)):
             return {'reason_code': 'ENTRY_RESUME_QUOTE_AGE_POLICY',
                     'age_seconds': str(strategy.ordinary_quote_age(event, now=now)),
@@ -447,9 +480,11 @@ class DsvSimulationSession(SimulationSession):
         k.wait_idle()
         if k._armed:
             self._entry_resume = None
+            self._utc_resume = None
             self.owner.capture('ONLINE_DSV_ENTRIES_RESUMED', {
                 'trading_day': event['trading_day'], 'source_epoch': event['source_epoch'],
-                'quote_id': event.get('native_tick_id', event['sequence'])})
+                'quote_id': event.get('native_tick_id', event['sequence']),
+                **({'reason': 'APPLICATION_UTC_RECOVERED'} if clock_recovery else {})})
             return
         return {'reason_code': 'ENTRY_RESUME_ACCOUNT_SYNC'}
 
@@ -601,6 +636,8 @@ class DsvSimulationSession(SimulationSession):
         timings = {}
         code, event = None, None
         try:
+            if isinstance(clock, CalibratedClock):
+                self._poll_clock_diagnostic()
             update_start = time.monotonic_ns()
             received = self.port.poll_updates(.05)
             if isinstance(clock, LocalWallClock):
@@ -615,9 +652,11 @@ class DsvSimulationSession(SimulationSession):
             if self._entry_resume and self._entry_resume[0] != k.control.entry_stop_generation:
                 self._entry_resume = None
             if self.port.fault or self.port.source_epoch != self._source_epoch:
+                self._utc_resume = None
                 self._suspend_for_recovery()
             self.driver.preflight()
             if self.driver._fault:
+                self._utc_resume = None
                 protection_sample = self.driver.clock_protection_sample()
                 self.owner.observe_native_orders()
                 k.wait_idle()
@@ -645,6 +684,7 @@ class DsvSimulationSession(SimulationSession):
                 self._calendar_anchor = reset.now_utc
                 self._clock_reset_seen = reset
             if self.check_day_transition():
+                self._utc_resume = None
                 self.owner.observe_native_orders()
                 k.wait_idle()
                 if self._entry_resume and self.port.complete():
@@ -668,6 +708,7 @@ class DsvSimulationSession(SimulationSession):
                 self._source_epoch = self.port.source_epoch
             self.owner.tick();k.wait_idle()
             if self.driver.clock_rebuild_pending:
+                self._utc_resume = None
                 self.prime(manage_owned=True)
                 return
             path_start = time.monotonic_ns()
@@ -721,6 +762,7 @@ class DsvSimulationSession(SimulationSession):
                 self._last_funds_capture=time.monotonic()
             if expired:
                 self._entry_resume = None
+                self._utc_resume = None
                 if k._armed:
                     k.pause()
                     k.wait_idle()
@@ -734,7 +776,7 @@ class DsvSimulationSession(SimulationSession):
                 except (OSError, TraderError) as error:
                     self.kernel._dsv_diagnostics['status'] = getattr(error, 'code', 'E_SESSION_STATUS_WRITE')
                 self.stop.set()
-            elif self._entry_resume is not None:
+            elif self._entry_resume is not None or self._utc_resume is not None:
                 self.status('DSV_ENTRY_RECOVERY_PENDING', armed=False)
             else:self.status('DSV_MANAGING_OWNED' if any(c['lifecycle']!='CLOSED' for c in k._staged.values())
                              else 'DSV_OBSERVING',armed=k._armed)
@@ -742,6 +784,7 @@ class DsvSimulationSession(SimulationSession):
             self.monitor.invalidate(datetime.now(timezone.utc))
             self._monitor_at_ns = 0
             self._entry_resume = None
+            self._utc_resume = None
             self._arm_request_revision = None
             error_code = getattr(error, 'code', 'E_GATEWAY_RUNTIME')
             record = exception_record(error)

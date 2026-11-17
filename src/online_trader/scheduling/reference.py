@@ -155,6 +155,7 @@ class CalibratedClock(LocalWallClock):
         self._holding = False
         self._correction = 0.0
         self._last_poll = time.monotonic()
+        self._entry_ready_since = None
         self._results = SimpleQueue()
         self._worker = None
         if lazy:
@@ -219,6 +220,10 @@ class CalibratedClock(LocalWallClock):
         anchor = self._trusted_reference_mono
         return anchor is not None and within_holdover_budget(time.monotonic() - anchor, self._trusted_error)
 
+    def entry_stable(self):
+        since = self._entry_ready_since
+        return since is not None and self.entry_ready() and time.monotonic() - since >= 2
+
     def record(self):
         return {'mode': 'PERSISTED_NTP_HOLDOVER' if self._holding else 'APPLICATION_UTC',
                 'entry_ready': self.entry_ready(), 'protection_ready': self.protection_ready(),
@@ -239,6 +244,8 @@ class CalibratedClock(LocalWallClock):
 
     def poll(self, *, before_install=None):
         now = time.monotonic()
+        if not self.entry_ready():
+            self._entry_ready_since = None
         if not 0 <= now - self._last_poll <= 30:
             self._valid = False
             self._next_refresh = now
@@ -269,6 +276,10 @@ class CalibratedClock(LocalWallClock):
             self._trusted_error = self._reference.error_seconds + abs(self._correction)
             self._holding = False
             self._checkpoint(now)
+        if not self.entry_ready():
+            self._entry_ready_since = None
+        elif self._entry_ready_since is None:
+            self._entry_ready_since = now
         if self._worker is None and now >= self._next_refresh:
             self._worker = Thread(target=self._refresh, name='OnlineTrader-UTC', daemon=True)
             try:

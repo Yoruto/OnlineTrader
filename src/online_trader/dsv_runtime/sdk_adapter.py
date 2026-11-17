@@ -19,7 +19,7 @@ from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.scheduling.calendar import TradingCalendar
 from online_trader.scheduling.clock import (
-    ClockContinuity, ClockSample, SystemClock, TIME_SEMANTICS, quote_age_quality, quote_timestamp, sdk_deadline,
+    ClockContinuity, ClockSample, NS_PER_SECOND, SystemClock, TIME_SEMANTICS, quote_age_quality, quote_timestamp, sdk_deadline,
     source_age_ns, source_fraction_tail, utc_text,
 )
 from online_trader.scheduling.timers import poll_slice
@@ -94,6 +94,7 @@ class DsvSdkAdapter:
         self.flat_confirmed = False
         self.dispatch_market = {}
         self.quote_observations = {}
+        self._clock_resume_day = None
         self._seen_effects = set()
         self._local_returns = set()
         self._foreign_trades = None
@@ -145,6 +146,10 @@ class DsvSdkAdapter:
         ready = getattr(getattr(self, 'clock', None), 'protection_ready', None)
         return ready is None or ready()
 
+    @property
+    def clock_resume_pending(self):
+        return self._clock_resume_day is not None
+
     def expired(self, now):
         return now > datetime.fromisoformat(self.grant.value['not_after_utc'])
 
@@ -180,6 +185,8 @@ class DsvSdkAdapter:
     def command(self, session, command):
         """Run a user command through the same owner and committed effect path."""
         state = self._bind(session)
+        if command.get('action') in {'START', 'STOP', 'CLOCK_RECOVER'}:
+            self._clock_resume_day = None
         self.enabled = self.synchronized and state['synchronized']
         try:
             return session.command(command)
@@ -195,6 +202,10 @@ class DsvSdkAdapter:
                 poll_clock()
                 if state['running'] and not self._entry_clock_ready():
                     session.disable_entries_for_clock()
+                    self._clock_resume_day = (state['trading_day'] if self.grant is not None and state['synchronized']
+                                              and not state.get('clock_recovery_required')
+                                              and not state.get('scope_expired_at')
+                                              and self.grant.in_window(self._clock_sample().utc) else None)
                     state = session.snapshot()
             timers = session.active_timers()
             wait = poll_slice(timers, self._clock_sample()) if timers else 0.5
@@ -206,6 +217,7 @@ class DsvSdkAdapter:
                 self.connection.poll_updates(wait)
                 updated = getattr(self.connection, 'last_poll_updated', None)
                 if self.connection.source_epoch != epoch:
+                    self._clock_resume_day = None
                     self.disconnect(session)
                     state = session.snapshot()
             after_pump = time.monotonic_ns()
@@ -217,6 +229,8 @@ class DsvSdkAdapter:
             sample = self._clock_sample()
             prior_sample = self._continuity.previous
             self._health = self._continuity.observe(sample)
+            if self._health['reason']:
+                self._clock_resume_day = None
             if self._health['reason'] and prior_sample is not None:
                 self._health['previous_sample'] = prior_sample.paired_record()
             clock_health = getattr(self.clock, 'health', None)
@@ -241,11 +255,14 @@ class DsvSdkAdapter:
             self.dispatch_market = market
             receipt = session.apply_round(frame)
             self.metrics.update(session.round_timing)
-            self.synchronized = session.snapshot()['synchronized']
+            state = session.snapshot()
+            self.synchronized = state['synchronized']
             self.flat_confirmed = self.synchronized and all(
                 row['long_qty'] == row['short_qty'] == 0 and not row['external_orders'] for row in market.values())
+            self._try_resume_clock_entries(session, state, market)
             return receipt
         except BaseException:
+            self._clock_resume_day = None
             self.synchronized = False
             self.flat_confirmed = False
             self.dispatch_market = {}
@@ -257,6 +274,36 @@ class DsvSdkAdapter:
             raise
         finally:
             self.enabled = False
+
+    def _try_resume_clock_entries(self, session, state, market):
+        day = self._clock_resume_day
+        if day is None:
+            return
+        sample = self._clock_sample()
+        if (state['trading_day'] != day or state['running'] or state.get('scope_expired_at')
+                or state.get('clock_recovery_required') or not self.grant.in_window(sample.utc)):
+            self._clock_resume_day = None
+            return
+        if not self.synchronized or not self.clock.entry_stable() or not session.clock_resume_native_safe(state, market):
+            return
+        limit = Decimal(self.profile.to_record()['settings']['trade']['max_quote_age_seconds'])
+        limit = min(limit, Decimal(5)) if limit > 0 else Decimal(5)
+        for code, row in market.items():
+            observed = row['quote_observation']
+            if (not row['ticks'] or observed['age_quality'] != 'VALID'
+                    or not row['native_coverage'] or not row['market_session_active']):
+                continue
+            window = self.calendar.query(code, sample.now_utc)
+            if (not window['is_trading'] or window['trading_day'] != day
+                    or window['session']['session_id'] != row['calendar_session_id']):
+                continue
+            stamp = observed['source_time_raw']
+            age = source_age_ns(sample.utc, quote_timestamp(stamp, _BEIJING), stamp)
+            if not 0 <= age <= limit * NS_PER_SECOND:
+                continue
+            session.resume_entries_for_clock()
+            self._clock_resume_day = None
+            return
 
     def _frame(self, state, sample, day):
         if day not in self.trading_days or day < state['trading_day']:

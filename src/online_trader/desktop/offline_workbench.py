@@ -292,7 +292,9 @@ class OfflineWorkbench(QMainWindow):
 
     def _show_state(self, state):
         self._state = state
-        if not state['synchronized']:
+        if state.get('clock_resume_pending'):
+            status = '已暂停新增 · 等待授时和柜台行情恢复'
+        elif not state['synchronized']:
             status = '等待行情与订单核对'
         elif state.get('clock_recovery_required'):
             status = '时钟或长间隔待核对 · 已停止新增'
@@ -426,7 +428,7 @@ class OfflineWorkbench(QMainWindow):
         self.recover_clock.setVisible(bool(fault))
         self.recover_clock.setEnabled(bool(idle and connected and fault and state.get('clock_native_reconciled')
                                            and (state.get('clock_health') or {}).get('continuous_samples', 0) >= 2))
-        self.stop.setEnabled(idle and connected and state.get('running', False))
+        self.stop.setEnabled(idle and connected and (state.get('running', False) or state.get('clock_resume_pending', False)))
         selection = self._selected(self.positions, 0)
         contract = selection[0] if isinstance(selection, tuple) else selection
         row_state = state.get('symbols', {}).get(contract, {})

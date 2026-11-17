@@ -233,6 +233,31 @@ class DsvSession:
         self._check_owner()
         self.command({'id': 'sdk-clock-stop-' + uuid4().hex, 'action': 'STOP'})
 
+    def clock_resume_native_safe(self, state, markets):
+        if any(not terminal(order) or order.get('terminal_conflict') for order in state['orders'].values()):
+            return False
+        for code, row in state['symbols'].items():
+            market = markets[code]
+            if row.get('native_conflicts') or row.get('detached_positions') or market['external_orders']:
+                return False
+            if row['position'] is not None:
+                if not self._controller.proves_position(state, row['position'], market):
+                    return False
+            elif market['long_qty'] or market['short_qty']:
+                return False
+        return True
+
+    def resume_entries_for_clock(self):
+        self._check_owner()
+
+        def resume(state, command):
+            decisions, effects = self._operate(state, command)
+            self._journal.event('CLOCK_ENTRIES_RESUMED', {'trading_day': state['trading_day'],
+                                                          'sample': state['time_sample']})
+            return decisions, effects
+
+        return self._run('COMMAND', {'id': 'sdk-clock-resume-' + uuid4().hex, 'action': 'START'}, resume)
+
     @staticmethod
     def _mark_unsynchronized(state):
         state['synchronized'] = False
