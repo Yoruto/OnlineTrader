@@ -28,6 +28,10 @@ def bundled_defaults():
     if not getattr(sys, 'frozen', False):
         return None, None, None
     directory = Path(sys.executable).parent
+    from online_trader.update_install import managed_root
+    root = managed_root(sys.executable)
+    if root is not None and (root / 'OnlineTrader.exe').is_file():
+        directory = root
     profile = directory / 'OnlineTrader-parameters.json'
     config = directory / 'OnlineTrader-defaults.json'
     if not config.is_file():

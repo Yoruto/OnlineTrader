@@ -67,6 +67,8 @@ if ($DeliveryConfigDirectory) {
 $cli = Join-Path $bundle 'OnlineTraderCLI.exe'
 $version = & $interpreter -I -c "import sys,tomllib; print(tomllib.load(open(sys.argv[1],'rb'))['project']['version'])" (Join-Path $project 'pyproject.toml')
 if ($LASTEXITCODE -ne 0) { throw 'Cannot determine the product version.' }
+@{project_id = 89047383; channel = 'preview'; portable_version = $version} | ConvertTo-Json -Compress |
+    Set-Content -Encoding ASCII -LiteralPath (Join-Path $bundle 'update-source.json')
 & $cli --verify-runtime $version
 if ($LASTEXITCODE -ne 0) { throw "Bundled runtime identity check failed. Inspect $staging" }
 & $cli --help

@@ -1279,7 +1279,21 @@ def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=N
     window.setAttribute(Qt.WA_DeleteOnClose)
     window.destroyed.connect(app.quit)
     window.show();QTimer.singleShot(0,window.refresh)
+    restart_for_update = False
     if update_root is not None:
         from online_trader.desktop.update_ui import install_update_menu
-        install_update_menu(window, update_root)
-    return app.exec()
+        from online_trader.update_install import RESTART_FOR_UPDATE
+
+        def request_restart():
+            nonlocal restart_for_update
+            if (window._startup_in_progress or window._worker is not None
+                    or (window._strategy_starter is not None and window._strategy_starter.is_preparing())
+                    or (window._session_dialog is not None
+                        and getattr(window._session_dialog, 'is_preparing', lambda: False)())):
+                raise TraderError('E_ACCOUNT_BUSY', '请等待当前账户操作结束后再更新')
+            restart_for_update = True
+            window._tray.close_window()
+
+        install_update_menu(window, update_root, request_restart)
+    result = app.exec()
+    return RESTART_FOR_UPDATE if restart_for_update else result

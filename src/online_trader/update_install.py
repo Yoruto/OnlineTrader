@@ -20,13 +20,27 @@ from online_trader.updates import (Candidate, MAX_BUNDLE, SHA256, UpdateError, a
                                    extract_bundle, version_key)
 
 
+RESTART_FOR_UPDATE = 36
+
+
 def managed_root(executable):
     directory = Path(executable).resolve().parent
     if directory.parent.name == 'versions':
         root = directory.parent.parent
         if (root / 'update-source.json').is_file():
             return root
+    if (directory / 'update-source.json').is_file() and (directory / 'OnlineTrader.exe').is_file():
+        return directory
     return None
+
+
+def program_directory(root, version):
+    version_key(version)
+    if (root / 'OnlineTrader.exe').is_file():
+        source = json.loads((root / 'update-source.json').read_text(encoding='utf-8-sig'))
+        if source.get('portable_version') == version:
+            return root
+    return root / 'versions' / version
 
 
 @contextmanager
@@ -97,18 +111,26 @@ def _tree_hashes(directory):
     return files
 
 
-def apply_pending(root, current):
+def pending_candidate(root, current):
     cache = root / 'updates'
     pending = cache / 'pending.json'
     if not pending.exists():
-        return current
+        return None
     candidate = Candidate(**json.loads(pending.read_text(encoding='utf-8')))
     if (version_key(candidate.version) <= version_key(current)
             or (cache / f'{candidate.version}.failed').exists()):
-        return current
+        return None
     if (type(candidate.size) is not int or not 0 < candidate.size <= MAX_BUNDLE
             or not isinstance(candidate.sha256, str) or not SHA256.fullmatch(candidate.sha256)):
         raise UpdateError('待安装更新信息无效')
+    return candidate
+
+
+def apply_pending(root, current):
+    candidate = pending_candidate(root, current)
+    if candidate is None:
+        return current
+    cache = root / 'updates'
     archive = cache / f'{candidate.version}-{candidate.sha256}.zip'
     with runtime_lease(root, exclusive=True), settled_accounts():
         try:
@@ -117,6 +139,7 @@ def apply_pending(root, current):
                         or hashlib.file_digest(stream, 'sha256').hexdigest() != candidate.sha256):
                     raise UpdateError('安装前的更新文件校验失败')
             versions = root / 'versions'
+            versions.mkdir(exist_ok=True)
             target = versions / candidate.version
             with tempfile.TemporaryDirectory(dir=versions, prefix='.staging-') as scratch:
                 staged = Path(scratch) / 'bundle'
@@ -135,10 +158,31 @@ def apply_pending(root, current):
     return candidate.version
 
 
-def launch_managed(root, arguments):
+@contextmanager
+def launcher_lock(root, *, wait=False):
+    deadline = time.monotonic() + (15 if wait else 0)
+    with ExitStack() as locks:
+        while True:
+            try:
+                locks.enter_context(AccountLock('UPDATE-LAUNCHER:' + str(root).casefold()))
+            except TraderError as error:
+                if error.code != 'E_INSTANCE_EXISTS' or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.2)
+            else:
+                break
+        yield
+
+
+def launch_managed(root, arguments, *, wait_for_previous=False, portable_version=None):
     if arguments not in ([], ['--autostart']):
         return 2
-    with AccountLock('UPDATE-LAUNCHER:' + str(root).casefold()):
+    with launcher_lock(root, wait=wait_for_previous):
+        if portable_version is not None:
+            if program_directory(root, portable_version) != root:
+                raise UpdateError('便携版程序与更新配置版本不符')
+            if not (root / 'active.json').exists():
+                atomic_json(root / 'active.json', {'version': portable_version})
         current = active_version(root)
         deferred = False
         try:
@@ -149,7 +193,7 @@ def launch_managed(root, arguments):
             deferred = True
         state = json.loads((root / 'active.json').read_text(encoding='utf-8-sig'))
         previous = state.get('previous')
-        executable = root / 'versions' / selected / 'OnlineTrader.exe'
+        executable = program_directory(root, selected) / 'OnlineTrader.exe'
         # Only early startup failures before the workbench becomes usable trigger rollback.
         with tempfile.TemporaryDirectory(dir=root, prefix='.launch-') as session:
             ready = Path(session) / 'ready'
@@ -179,19 +223,20 @@ def launch_managed(root, arguments):
                 with runtime_lease(root, exclusive=True):
                     atomic_json(root / 'active.json', {'version': previous})
                     (root / 'updates' / f'{selected}.failed').touch()
-                fallback = root / 'versions' / previous / 'OnlineTrader.exe'
-                environment.pop('ONLINETRADER_UPDATE_READY')
+                fallback = program_directory(root, previous) / 'OnlineTrader.exe'
                 return subprocess.call([str(fallback), *arguments], cwd=fallback.parent,
                                        env=environment)
             return result
 
 
-def managed_bootstrap(arguments):
+def managed_bootstrap(arguments, *, restarting=False):
     directory = Path(sys.executable).resolve().parent
-    if directory.name != 'bootstrap' or not (directory.parent / 'update-source.json').is_file():
+    root = managed_root(sys.executable) if restarting else directory.parent
+    if root is None or (not restarting and (directory.name != 'bootstrap'
+                                            or not (root / 'update-source.json').is_file())):
         return 2
     try:
-        return launch_managed(directory.parent, arguments)
+        return launch_managed(root, arguments, wait_for_previous=restarting)
     except TraderError as error:
         if error.code == 'E_INSTANCE_EXISTS':
             return 0
