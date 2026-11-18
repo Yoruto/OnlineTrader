@@ -30,6 +30,12 @@ def view():
         'blocks':[],'commands':[],'policies':[],'truncated':False}
 
 
+def workbench_status(account_key='account-test'):
+    status = desktop_fixtures.projection()
+    status['records'][0].update(record_id=account_key, record_revision=view()['checkpoint_event_seq'])
+    return status
+
+
 class WorkbenchPipe(desktop_fixtures.FakePipe):
     def send(self,message,*,timeout):
         if message['type']=='WorkbenchRequest':
@@ -211,10 +217,9 @@ class WorkbenchDesktopTests(unittest.TestCase):
         class Client:
             last_command=None;last_metadata={'kernel_boot_id':'boot-test'};revision='1'
             def __init__(self,*args,**kwargs):pass
-            def snapshot(self):
-                release.wait(3)
-                return desktop_fixtures.projection()
+            def snapshot(self):return workbench_status()
             def workbench(self):
+                release.wait(3)
                 value=view()
                 value['configuration']['config_revision']=self.revision
                 value['policies']=[{'policy_id':'authority-policy','policy_kind':'AUTHORITY'}]
@@ -248,7 +253,7 @@ class WorkbenchDesktopTests(unittest.TestCase):
         class Client:
             last_command=None;last_metadata={'kernel_boot_id':'boot-test'}
             def __init__(self,*args,**kwargs):pass
-            def snapshot(self):return desktop_fixtures.projection()
+            def snapshot(self):return workbench_status()
             def workbench(self):
                 value=view();value['markets']=[{'contract_id':'DCE.p2701','name':'棕榈油','fresh':False}];return value
         window=WorkbenchWindow('pipe',client_factory=Client)
@@ -336,7 +341,7 @@ class WorkbenchDesktopTests(unittest.TestCase):
                 pass
 
             def snapshot(self):
-                return desktop_fixtures.projection()
+                return workbench_status()
 
             def workbench(self):
                 return copy.deepcopy(snapshot)
@@ -402,7 +407,7 @@ class WorkbenchDesktopTests(unittest.TestCase):
                 def __init__(self, *_args, **_kwargs): pass
                 def snapshot(self):
                     if self.fail: raise TraderError('E_PIPE', 'Offline test: selected account unavailable')
-                    return desktop_fixtures.projection()
+                    return workbench_status(snapshot['account_key'])
                 def workbench(self): return copy.deepcopy(snapshot)
 
             window = WorkbenchWindow('pipe', store=store, account_id=state['selected_id'], client_factory=Client)
@@ -434,7 +439,7 @@ class WorkbenchDesktopTests(unittest.TestCase):
         class Client:
             last_command=None;last_metadata={'kernel_boot_id':'boot-test'};reverse=False
             def __init__(self,*args,**kwargs):pass
-            def snapshot(self):return desktop_fixtures.projection()
+            def snapshot(self):return workbench_status()
             def workbench(self):
                 result=view()
                 result['orders']=[{'child_order_id':name,'contract_id':code,'effect':'OPEN'} for name,code in
@@ -454,7 +459,7 @@ class WorkbenchDesktopTests(unittest.TestCase):
         class Client:
             last_command=None;last_metadata={'kernel_boot_id':'boot-test'}
             def __init__(self,*args,**kwargs):pass
-            def snapshot(self):return desktop_fixtures.projection()
+            def snapshot(self):return workbench_status()
             def workbench(self):
                 value=view();value['markets']=[{'contract_id':'DCE.p2701','name':'棕榈油','enabled':False}]
                 value['policies']=[{'policy_id':'authority-policy','policy_kind':'AUTHORITY'}];return value
@@ -475,7 +480,7 @@ class WorkbenchDesktopTests(unittest.TestCase):
             def __init__(self,*args,**kwargs):pass
             def snapshot(self):
                 if self.fail:raise TraderError('E_TIMEOUT','Offline')
-                return desktop_fixtures.projection()
+                return workbench_status()
             def workbench(self):return view()
         window=WorkbenchWindow('pipe',client_factory=Client)
         try:
@@ -489,7 +494,7 @@ class WorkbenchDesktopTests(unittest.TestCase):
             def __init__(self,*args,**kwargs):calls.append(kwargs)
             def snapshot(self):
                 release.wait(3)
-                return desktop_fixtures.projection()
+                return workbench_status()
             def workbench(self):return view()|{'entry_authority':self.authority}
             def command(self,*args):
                 calls.append(args);Client.authority='DISARMED'
@@ -522,7 +527,7 @@ class WorkbenchDesktopTests(unittest.TestCase):
             receipt={'command_id':'stop-test','payload_hash':'0'*64,'status':'EXECUTING',
                      'error_code':'NONE','reason':'等待柜台确认','receipt_revision':'1'}
             def __init__(self,*args,**kwargs):pass
-            def snapshot(self):return desktop_fixtures.projection()
+            def snapshot(self):return workbench_status()
             def workbench(self):
                 current=view()
                 current['configuration'].update(cancel_on_stop=True,stop_cancel_pending=self.pending)

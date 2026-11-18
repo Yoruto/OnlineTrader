@@ -10,7 +10,9 @@
         "WorkbenchRequest",
         "WorkbenchSnapshot",
         "WorkbenchMonitorRequest",
-        "WorkbenchMonitorSnapshot"
+        "WorkbenchMonitorSnapshot",
+        "WorkbenchPositionsRequest",
+        "WorkbenchPositionsSnapshot"
       ]
     },
     "message_id": {
@@ -78,6 +80,58 @@
   "allOf": [
     {
       "oneOf": [
+        {
+          "properties": {
+            "type": {"const": "WorkbenchPositionsRequest"},
+            "body": {
+              "type": "object",
+              "required": ["after"],
+              "additionalProperties": false,
+              "properties": {
+                "after": {"anyOf": [{"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"}, {"type": "null"}]}
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "type": {"const": "WorkbenchPositionsSnapshot"},
+            "body": {
+              "type": "object",
+              "required": ["payload", "content_hash"],
+              "additionalProperties": false,
+              "properties": {
+                "content_hash": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/hash"},
+                "payload": {
+                  "type": "object",
+                  "required": ["account_key", "kernel_boot_id", "checkpoint_event_seq", "positions", "has_more"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "account_key": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"},
+                    "kernel_boot_id": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"},
+                    "checkpoint_event_seq": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/seq"},
+                    "has_more": {"type": "boolean"},
+                    "positions": {
+                      "type": "array",
+                      "maxItems": 64,
+                      "items": {
+                        "type": "object",
+                        "required": ["position_cycle_id", "contract_id", "direction", "remaining_quantity"],
+                        "additionalProperties": false,
+                        "properties": {
+                          "position_cycle_id": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"},
+                          "contract_id": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"},
+                          "direction": {"enum": ["LONG", "SHORT"]},
+                          "remaining_quantity": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/positiveQuantity"}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         {
           "properties": {
             "type": {"const": "WorkbenchMonitorRequest"},
@@ -219,12 +273,10 @@
                     },
                     "external_positions": {
                       "type": "array",
-                      "maxItems": 512,
                       "items": {"type": "object", "maxProperties": 64}
                     },
                     "cycles": {
                       "type": "array",
-                      "maxItems": 512,
                       "items": {
                         "type": "object",
                         "maxProperties": 64
@@ -232,7 +284,6 @@
                     },
                     "orders": {
                       "type": "array",
-                      "maxItems": 512,
                       "items": {
                         "type": "object",
                         "maxProperties": 64
@@ -248,7 +299,6 @@
                     },
                     "blocks": {
                       "type": "array",
-                      "maxItems": 512,
                       "items": {
                         "type": "object",
                         "maxProperties": 64
@@ -256,7 +306,6 @@
                     },
                     "commands": {
                       "type": "array",
-                      "maxItems": 512,
                       "items": {
                         "type": "object",
                         "maxProperties": 64
@@ -264,7 +313,6 @@
                     },
                     "policies": {
                       "type": "array",
-                      "maxItems": 512,
                       "items": {
                         "type": "object",
                         "maxProperties": 64
@@ -272,6 +320,31 @@
                     },
                     "truncated": {
                       "type": "boolean"
+                    },
+                    "history_truncated": {"type": "boolean"},
+                    "history_omitted": {
+                      "type": "object",
+                      "propertyNames": {"enum": ["cycles", "orders", "trades", "commands", "minute_bars"]},
+                      "additionalProperties": {"type": "integer", "minimum": 0}
+                    },
+                    "status_projection": {
+                      "$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/projectionBatch"
+                    },
+                    "detail_unavailable": {"const": "CURRENT_STATE_OVERSIZE"},
+                    "detail_omitted": {
+                      "type": "object",
+                      "propertyNames": {"enum": ["cycles", "orders", "trades", "markets", "blocks", "commands", "external_positions"]},
+                      "additionalProperties": {"type": "integer", "minimum": 0}
+                    },
+                    "current_responsibility": {
+                      "type": "object",
+                      "required": ["cycles", "owned_quantity", "active_orders"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "cycles": {"type": "integer", "minimum": 0},
+                        "owned_quantity": {"type": "integer", "minimum": 0},
+                        "active_orders": {"type": "integer", "minimum": 0}
+                      }
                     }
                   },
                   "required": [

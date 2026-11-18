@@ -21,7 +21,8 @@ from online_trader.gateway.ports import UnavailablePort
 FINAL = frozenset({"SUCCEEDED", "REJECTED", "FAILED", "SUPERSEDED"})
 OPERATIONS = frozenset({"PAUSE_NEW_ENTRIES", "STOP_DSV_STRATEGY", "ARM_ENTRIES", "FLATTEN_THEN_STOP", "BEGIN_TAKEOVER", "CONFIRM_TAKEOVER",
     "ENTER_MAINTENANCE", "MANUAL_OPEN", "MANUAL_CLOSE", "MANUAL_CLOSE_ALL", "CANCEL_SELECTED", "CANCEL_OWNED", "CANCEL_ACCOUNT_CONFIRMED",
-    "REQUEST_RECONCILIATION", "RESUME_ORIGINAL_EXITS", "ADOPT_EXTERNAL_POSITION", "CANCEL_NATIVE_ACCOUNT"})
+    "REQUEST_RECONCILIATION", "RESUME_ORIGINAL_EXITS", "ADOPT_EXTERNAL_POSITION", "CANCEL_NATIVE_ACCOUNT",
+    "SAVE_DSV_PARAMETERS"})
 
 
 def _new(prefix): return prefix + "-" + uuid.uuid4().hex
@@ -227,7 +228,11 @@ class ControlProtocol:
             scope_id = self._context_scope(body)
             self.kernel.contexts.validate(body["context_id"],peer_id,"OPERATOR_COMMAND",operation,scope_id,
                 kernel_boot_id=self.kernel.boot_id,kernel_epoch=body["kernel_epoch"],revisions=body["expected_revisions"])
-            if body["expected_revisions"] != self.kernel.revisions: raise TraderError("E_REVISION_CONFLICT", "Relevant state changed")
+            current = self.kernel.revisions
+            expected = body["expected_revisions"]
+            keys = ('config_revision', 'authority_revision') if operation == 'SAVE_DSV_PARAMETERS' else current
+            if any(expected[key] != current[key] for key in keys):
+                raise TraderError("E_REVISION_CONFLICT", "Relevant state changed")
             if operation in {"PAUSE_NEW_ENTRIES", "STOP_DSV_STRATEGY", "ENTER_MAINTENANCE",
                              "FLATTEN_THEN_STOP", "BEGIN_TAKEOVER"} and scope["scope_type"] == "ACCOUNT":
                 self.entry_stop_generation += 1
@@ -325,7 +330,13 @@ class ControlProtocol:
             return self._symbol_entry_command(binding)
         if op in {"PAUSE_NEW_ENTRIES", "STOP_DSV_STRATEGY", "ARM_ENTRIES", "FLATTEN_THEN_STOP", "MANUAL_CLOSE_ALL", "ENTER_MAINTENANCE", "CANCEL_ACCOUNT_CONFIRMED", "CANCEL_NATIVE_ACCOUNT"} and scope["scope_type"] != "ACCOUNT":
             raise TraderError("E_SCOPE", "This command requires the whole account scope")
-        if op == "STOP_DSV_STRATEGY":
+        if op == 'SAVE_DSV_PARAMETERS':
+            runtime = getattr(k, '_dsv_runtime', None)
+            if scope["scope_type"] != "ACCOUNT" or runtime is None or not runtime.online:
+                raise TraderError('E_SCOPE', '运行中保存参数需要当前模拟策略账户。')
+            binding.update(initial_status='SUCCEEDED', reason='参数已保存。下一笔新鲜行情使用新参数判断开仓。')
+            runtime.save_parameters(p['profile'])
+        elif op == "STOP_DSV_STRATEGY":
             from online_trader.kernel.native_control import prepare_strategy_stop
             prepare_strategy_stop(self,binding)
         elif op == "PAUSE_NEW_ENTRIES":

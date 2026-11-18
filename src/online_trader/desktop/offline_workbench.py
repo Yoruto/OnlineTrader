@@ -276,7 +276,8 @@ class OfflineWorkbench(QMainWindow):
             messages = {'START': '已请求启动', 'STOP': '已停止新增', 'USER_REDUCE': '已登记减仓目标',
                         'CLOCK_RECOVERED': '时钟已核对，策略仍停止新增',
                         'USER_REDUCE_DETACHED': '已登记原周期减仓目标',
-                        'USER_CANCEL': '已请求撤单', 'CANCEL_UNAVAILABLE': '该委托当前不可撤'}
+                        'USER_CANCEL': '已请求撤单', 'CANCEL_UNAVAILABLE': '该委托当前不可撤',
+                        'CANCEL_AWAITING_NATIVE_RESULT': '原撤单结果待核对，继续接收原委托及成交回报'}
             self.receipt.setText(f'{messages.get(reason, reason)} · {result["input_id"]}')
             self.pending = None
             self._confirmed_absent = False

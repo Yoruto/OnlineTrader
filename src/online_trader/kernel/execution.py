@@ -259,15 +259,16 @@ class ExecutionCoordinator:
             plan = cycle['plan']
             facts = runtime._latest.get((plan['contract_id'], plan['trading_day']))
             market['fresh'] = bool(ex['ordinary_entry_fresh'] and facts and
-                                   k.port.fresh_strategy_entry(plan['contract_id'], self.side(cycle, effect), facts['event']))
+                                   k.port.fresh_strategy_entry(plan['contract_id'], self.side(cycle, effect), facts['event'],
+                                                               profile=runtime.profile_for_plan(plan)))
         elif not quote or quote['kernel_boot_id']!=k.boot_id or k._quote_age_ns(quote['received_ns'])>k.max_quote_age_ms*1_000_000:
             market['fresh']=False
         else:market.update(last=quote['price'],bid1=quote.get('bid1'),ask1=quote.get('ask1'))
         side=self.side(cycle,effect)
         if manual_mode is not None:
             runtime = getattr(k,'_dsv_runtime',None)
-            ratio = (runtime.profile.to_record()['settings']['trade']['limit_fallback_ratio']
-                     if runtime is not None else '0.01')
+            profile = runtime.profile_for_plan(cycle['plan']) if runtime is not None else None
+            ratio = profile.to_record()['settings']['trade']['limit_fallback_ratio'] if profile is not None else '0.01'
             return select_manual_price(manual_mode,side,market,elapsed_ms=elapsed_ms,limit_fallback_ratio=ratio)
         manual=self.manual_reduction(cycle) if effect=='REDUCE' else None
         if manual:

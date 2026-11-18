@@ -124,6 +124,8 @@ def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_
 
 def owned_lot_facts(kernel,contract_id,direction,cycles):
     mapping={c['position_cycle_id']:c for c in cycles if c['plan']['contract_id']==contract_id and c['plan']['direction']==direction}
+    if not mapping:
+        return [], mapping
     facts=kernel.ledger.query('SELECT f.trade_key,f.contract_id,f.trading_day,f.offset_kind,f.recorded_event_seq AS event_seq,a.effect,a.quantity,a.position_cycle_id '
         'FROM fill_facts f JOIN fill_allocations a ON a.fill_id=f.fill_id WHERE f.contract_id=? AND f.recorded_event_seq<=? ORDER BY f.recorded_event_seq',
         (contract_id,kernel._durable_seq))

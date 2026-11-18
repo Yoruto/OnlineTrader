@@ -6,6 +6,7 @@ Business rows come exclusively from accepted commits at the stated watermark.
 import copy
 from datetime import datetime, timezone
 from decimal import Decimal
+from heapq import nsmallest
 import time
 
 from online_trader.contracts.codec import canonical_bytes, strict_loads
@@ -16,6 +17,24 @@ from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import number
 from online_trader.scheduling.clock import delta_ns, quote_timestamp, source_age_ns, utc_text
 from online_trader.strategy.entry import CHINA_TIME
+
+
+def workbench_positions(kernel, after):
+    """Read a page of owned, reducible cycles at the owner's committed boundary."""
+    page_size = 64
+    candidates = (
+        cycle_id for cycle_id, cycle in kernel._committed.items()
+        if (after is None or cycle_id > after) and cycle['protection']['owned_qty']
+        and cycle.get('management_state') not in {'TAKEOVER_PENDING', 'TAKEN_OVER'}
+    )
+    ids = nsmallest(page_size + 1, candidates)
+    rows = []
+    for cycle_id in ids[:page_size]:
+        cycle = kernel._committed[cycle_id]
+        rows.append({'position_cycle_id': cycle_id, 'contract_id': cycle['plan']['contract_id'],
+                     'direction': cycle['plan']['direction'], 'remaining_quantity': cycle['protection']['owned_qty']})
+    return {'account_key': kernel.account_key, 'kernel_boot_id': kernel.boot_id,
+            'checkpoint_event_seq': str(kernel._durable_seq), 'positions': rows, 'has_more': len(ids) > page_size}
 
 
 def monitor_symbols(kernel, decisions):
@@ -114,7 +133,7 @@ def workbench_view(kernel, *, snapshot=None):
     if snapshot is None:
         snapshot = kernel._make_snapshot()
     port=kernel.port
-    records=projection_batch(snapshot)['records'];scheduler=getattr(kernel,'_scheduled_runtime',None)
+    records=projection_batch(snapshot, include_orders=False)['records'];scheduler=getattr(kernel,'_scheduled_runtime',None)
     runtime=getattr(kernel,'_dsv_runtime',None)
     markets=[];decisions={}
     scoped=bool(getattr(kernel.simulation,'strategy_enabled',False))
@@ -125,7 +144,7 @@ def workbench_view(kernel, *, snapshot=None):
         try:
             native,external_positions=review_positions(kernel.simulation)
             if kernel.simulation.grant.manual_workbench:
-                _,_,native_cancel_review=cancel_review(kernel.simulation)
+                _,_,native_cancel_review=cancel_review(kernel.simulation, snapshot=native)
         except TraderError as error:
             native_error=error.code
     day=native['trading_day'] if native and native['complete'] else None
@@ -431,6 +450,7 @@ def workbench_view(kernel, *, snapshot=None):
         contracts = kernel.simulation.grant.value['contracts']
         result['configuration']['scoped_contracts'] = contracts
         if runtime is not None:
+            result['configuration']['live_parameter_save'] = not kernel.simulation.grant.manual_workbench
             fields = ('name', 'code', 'open_offset', 'stop_offset', 'profit_offset',
                       'order_volume', 'half_close_ratio', 'hysteresis_points')
             result['configuration']['strategy_symbols'] = [
@@ -493,12 +513,11 @@ def workbench_view(kernel, *, snapshot=None):
     for key, rows in historical.items():
         if len(rows) > 512:
             omit_history(key, len(rows) - 512)
+    account_record = records[0]
+    cycle_records = [row for row in records if row['record_type'] == 'CYCLE']
     while True:
         visible_cycles = {row['position_cycle_id'] for row in result['cycles']}
-        projection = projection_batch(snapshot | {
-            'cycles': [cycle for cycle in snapshot['cycles'] if cycle['position_cycle_id'] in visible_cycles],
-        }, include_orders=False)
-        base = {'records': [row for row in projection['records'] if row['record_type'] in {'ACCOUNT', 'CYCLE'}]}
+        base = {'records': [account_record, *(row for row in cycle_records if row['position_cycle_id'] in visible_cycles)]}
         result['status_projection'] = base
         # Include the duplicated base and leave room for both IPC envelopes.
         if len(canonical_bytes({'base': base, 'view': result})) <= 950_000:

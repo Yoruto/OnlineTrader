@@ -117,7 +117,11 @@ class StatusClient:
     def workbench_monitor(self):
         return self._workbench('WorkbenchMonitorRequest', 'WorkbenchMonitorSnapshot', 'READ_DIAGNOSTIC')
 
-    def _workbench(self, request_type, response_type, capability):
+    def workbench_positions(self, after=None):
+        return self._workbench('WorkbenchPositionsRequest', 'WorkbenchPositionsSnapshot', 'READ_STATUS',
+                               body={'after': after})
+
+    def _workbench(self, request_type, response_type, capability, *, body=None):
         deadline=time.monotonic()+self.timeout
         timings = {'request_started_monotonic_ns':str(time.monotonic_ns())}
         with connect(self.pipe_name,timeout=self._remaining(deadline),expected_server_pid=self.expected_server_pid) as connection:
@@ -126,7 +130,7 @@ class StatusClient:
                 if capability == 'READ_DIAGNOSTIC':
                     return None
                 raise TraderError('E_AUTH','Read capability was not granted')
-            request=self._message(request_type,{},welcome)
+            request=self._message(request_type,{} if body is None else body,welcome)
             connection.send(request,timeout=self._remaining(deadline))
             response=self._receive(connection,deadline,request=request,welcome=welcome,expected_type=response_type,timings=timings)
             body=response['body']

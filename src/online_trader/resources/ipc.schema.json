@@ -1044,6 +1044,12 @@
       "properties": {"evidence_hash": {"$ref": "#/$defs/hash"}},
       "additionalProperties": false
     },
+    "Params_SAVE_DSV_PARAMETERS": {
+      "type": "object",
+      "properties": {"profile": {"type": "object"}},
+      "required": ["profile"],
+      "additionalProperties": false
+    },
     "Params_CANCEL_NATIVE_ACCOUNT": {
       "type": "object",
       "properties": {"evidence_hash": {"$ref": "#/$defs/hash"}},
@@ -1272,6 +1278,7 @@
           "enum": [
             "PAUSE_NEW_ENTRIES",
             "STOP_DSV_STRATEGY",
+            "SAVE_DSV_PARAMETERS",
             "ARM_ENTRIES",
             "FLATTEN_THEN_STOP",
             "BEGIN_TAKEOVER",
@@ -1325,6 +1332,12 @@
               "properties": {
                 "operation": {"const": "STOP_DSV_STRATEGY"},
                 "parameters": {"$ref": "#/$defs/Params_STOP_DSV_STRATEGY"}
+              }
+            },
+            {
+              "properties": {
+                "operation": {"const": "SAVE_DSV_PARAMETERS"},
+                "parameters": {"$ref": "#/$defs/Params_SAVE_DSV_PARAMETERS"}
               }
             },
             {

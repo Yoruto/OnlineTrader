@@ -21,19 +21,30 @@ def review_positions(owner):
     owner._validate_snapshot(snapshot)
     rows=[]
     positions={p['contract_id']:p for p in snapshot['positions']}
-    order_ids={port.order_id(o['child_order_id']) for c in k._committed.values() for o in c['orders']}
-    codes=set(positions)|{c['plan']['contract_id'] for c in k._committed.values() if c['lifecycle']!='CLOSED'}
+    native_positions=port.api.get_position(account=port.account)
+    cycles_by_code={};orders_by_code={};trades_by_code={}
+    order_ids=set()
+    codes=set(positions)
+    for cycle in k._committed.values():
+        code=cycle['plan']['contract_id']
+        cycles_by_code.setdefault(code,[]).append(cycle)
+        if cycle['lifecycle']!='CLOSED':
+            codes.add(code)
+        order_ids.update(port.order_id(order['child_order_id']) for order in cycle['orders'])
+    for rows_by_code, facts in ((orders_by_code,snapshot['orders']),(trades_by_code,snapshot['trades'])):
+        for fact in facts:
+            rows_by_code.setdefault(fact['contract_id'],[]).append(fact)
     for code in sorted(codes):
         position=positions.get(code,{'contract_id':code,'long':0,'short':0})
-        cycles=[c for c in k._committed.values() if c['plan']['contract_id']==code]
+        cycles=cycles_by_code.get(code,[])
         active=[c for c in cycles if c['lifecycle']!='CLOSED']
         owned={side:sum(c['protection']['owned_qty'] for c in cycles if c['plan']['direction']==side.upper())
                for side in ('long','short')}
         difference={side:position[side]-owned[side] for side in owned}
         scoped=code in owner.grant.value['contracts']
-        native=port.api.get_position(account=port.account).get(code)
-        orders=sorted((o for o in snapshot['orders'] if o['contract_id']==code),key=lambda o:o['order_id'])
-        trades=sorted((t for t in snapshot['trades'] if t['contract_id']==code),key=lambda t:t['trade_id'])
+        native=native_positions.get(code)
+        orders=sorted(orders_by_code.get(code,[]),key=lambda o:o['order_id'])
+        trades=sorted(trades_by_code.get(code,[]),key=lambda t:t['trade_id'])
         occupied=any(c.get('management_state') in {'TAKEN_OVER','TAKEOVER_PENDING'} or
             any(OrderState.from_dict(o).potential_remaining or o['send_state'] in {'UNKNOWN','SEND_POSSIBLE'}
                 for o in c['orders']) for c in active)

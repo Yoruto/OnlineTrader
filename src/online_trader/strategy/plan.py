@@ -209,15 +209,15 @@ def build_development_plan(profile, candidate, *, account_key, trading_day,
     return plan
 
 
-def build_simulation_plan(profile,candidate,*,grant,**values):
+def build_simulation_plan(profile,candidate,*,grant,_active_profile_hash=None,**values):
     """Reuse the DSV compiler, then bind a distinct ONLINE_SIMULATION version."""
     from online_trader.online_scope import DsvSimulationGrant
-    if type(grant) is not DsvSimulationGrant or profile.content_hash!=grant.value['profile_hash']:
+    if type(grant) is not DsvSimulationGrant or profile.content_hash!=(_active_profile_hash or grant.value['profile_hash']):
         raise TraderError('E_ONLINE_SCOPE','Strategy plan must match its independently scoped profile')
     values.pop('execution_version',None)
     plan=build_development_plan(profile,candidate,execution_version='1.2',**values)
     plan.update(schema_version='1.3',execution_scope='ONLINE_SIMULATION',approval_record_id=grant.value['grant_id'],
-                online_binding={'grant_hash':grant.content_hash,'profile_hash':profile.content_hash,'calendar_hash':grant.value['calendar_hash']})
+                online_binding={'grant_hash':grant.content_hash,'profile_hash':grant.value['profile_hash'],'calendar_hash':grant.value['calendar_hash']})
     from online_trader.protection.reducer import DsvSimulationPlanPermit
     DsvSimulationPlanPermit.issue(plan,grant);validate_plan(plan)
     return plan

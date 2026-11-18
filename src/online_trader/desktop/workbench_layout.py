@@ -1743,7 +1743,7 @@ class WorkbenchLayout:
             schedule.addWidget(self.timed_start_button)
 
         fields.addLayout(row(button('参数中心', self.open_parameters),
-                             button('保存预览参数', self.export_parameters_preview)))
+                             button('保存参数', self.export_parameters_preview)))
         layout.addStretch()
 
     def symbols_page(self, layout):
@@ -1772,7 +1772,7 @@ class WorkbenchLayout:
                       button('清空列表',lambda:self.remove_selected_symbols(all_symbols=True)),
                       button('参数中心',self.open_parameters),
                       button('换月预览',self.stage_selected_rollover))
-        actions.addWidget(button('保存预览参数',self.export_parameters_preview))
+        actions.addWidget(button('保存参数',self.export_parameters_preview))
         contracts.addLayout(actions)
 
     def render_parameters(self, profile):
@@ -1785,11 +1785,12 @@ class WorkbenchLayout:
             self.offset_preview.setText('参数预览已更新，请重新计算偏移。')
         self.parameter_state.setText(self.profile_source)
         if profile.content_hash!=self.profile.content_hash:
-            self.parameter_state.setText('本地参数预览 · 用于下次启动')
+            live = (self.window.view or {}).get('configuration', {}).get('live_parameter_save')
+            self.parameter_state.setText('本地参数草稿 · 保存后应用到当前策略' if live else '本地参数草稿 · 用于下次启动')
         if self.dsv_config is not None:
             self.parameter_state.setToolTip(str(self.dsv_config))
             self.symbol_preview_state.setToolTip(str(self.dsv_config))
-        self.symbol_preview_state.setText(self.parameter_state.text() + ' · 编辑预览不改变当前运行')
+        self.symbol_preview_state.setText(self.parameter_state.text())
         for key,field in self.parameter_fields.items():
             field.setText(str(settings['trade'][key]))
         for key,check in self.parameter_switches.items():
@@ -2058,7 +2059,7 @@ class WorkbenchLayout:
         if self.parameter_dialog().edit_preview(add_symbol=True):
             self.symbol_grid.selectRow(self.symbol_grid.rowCount() - 1)
             self.symbol_grid.scrollToBottom()
-            self.window.show_home_feedback('品种已添加到列表。点击“保存预览参数”可保存到文件。')
+            self.window.show_home_feedback('品种已添加到列表。点击“保存参数”可保存到文件。')
 
     def edit_selected_symbol(self):
         selected = self.symbol_grid.selectionModel().selectedRows()
@@ -2066,7 +2067,7 @@ class WorkbenchLayout:
             index = selected[0].row()
             if self.parameter_dialog().edit_preview(symbol_row=index):
                 self.symbol_grid.selectRow(index)
-                self.window.show_home_feedback('品种修改已保存到列表。点击“保存预览参数”可保存到文件。')
+                self.window.show_home_feedback('品种修改已保存到列表。点击“保存参数”可保存到文件。')
         else:
             self.window.show_home_feedback('请先选中一个品种，再点击“编辑选中”；也可以双击品种。')
 
@@ -2096,12 +2097,19 @@ class WorkbenchLayout:
 
     def export_parameters_preview(self):
         dialog = self.parameter_dialog()
-        path,_ = QFileDialog.getSaveFileName(self.window,'保存业务参数预览','dsv-business-settings.json','JSON (*.json)')
+        window = self.window
+        view = window.view or {}
+        live = view.get('configuration', {}).get('live_parameter_save')
+        if live:
+            window.send('SAVE_DSV_PARAMETERS', {'scope_type':'ACCOUNT','scope_ids':[]},
+                        {'profile':dialog.profile.to_record()})
+            return
+        path,_ = QFileDialog.getSaveFileName(window,'保存业务参数','dsv-business-settings.json','JSON (*.json)')
         if path:
             if not dialog.export_file(path):
-                QMessageBox.warning(self.window,'保存业务参数预览',dialog.error_label.text())
+                QMessageBox.warning(window,'保存业务参数',dialog.error_label.text())
             else:
-                self.window.show_home_feedback('参数已保存：' + Path(path).name)
+                window.show_home_feedback('参数已保存到文件：' + Path(path).name)
 
     @staticmethod
     def read_value(value):
@@ -2458,6 +2466,7 @@ class WorkbenchLayout:
             self.manual_tables[key] = grid
             manual_tabs.addTab(grid,title)
         self.manual_controls_enabled = False
+        self.manual_owner_controls = False
         self.manual_cancel = button('撤单',self.cancel_manual_order)
         self.manual_cancel_account = button('撤全部挂单',self.window.cancel_account)
         for key in ('cycles','orders'):
@@ -2465,8 +2474,9 @@ class WorkbenchLayout:
         summary.addWidget(manual_tabs)
         summary.addLayout(row(self.manual_cancel,self.manual_cancel_account))
 
-    def update_manual_controls(self, enabled):
+    def update_manual_controls(self, enabled, *, owner_controls=False):
         self.manual_controls_enabled = enabled
+        self.manual_owner_controls = owner_controls
         self.update_manual_open_controls()
         self.refresh_manual_selection()
 
@@ -2542,13 +2552,18 @@ class WorkbenchLayout:
         selected = self.selected_manual_ids('cycles')
         position = next((item for item in owned if len(selected)==1 and item['position_cycle_id']==selected[0]),None)
         available = position['remaining_quantity'] if position else 0
-        self.manual_position.setText(f"选中持仓：{position['contract_id']} {available} 手" if position else '选中持仓：无')
+        detail_unavailable = bool(view.get('detail_unavailable'))
+        owner_close = detail_unavailable and self.manual_owner_controls
+        self.manual_position.setText('当前持仓明细已省略，可向执行器查询。' if detail_unavailable else
+                                     f"选中持仓：{position['contract_id']} {available} 手" if position else '选中持仓：无')
+        self.manual_close_buttons[None].setText('选择持仓平仓' if detail_unavailable else '全部平仓')
         for qty,control in self.manual_close_buttons.items():
-            control.setEnabled(self.manual_controls_enabled and available>0 and (qty is None or qty<=available))
+            control.setEnabled((owner_close and qty is None) or
+                               (self.manual_controls_enabled and available>0 and (qty is None or qty<=available)))
         configuration = view.get('configuration',{})
         mode = configuration.get('manual_close_price_mode')
-        self.manual_close_all.setEnabled(self.manual_controls_enabled and mode is not None and bool(owned))
-        self.manual_close_price_mode.setEnabled(self.manual_controls_enabled and mode is not None)
+        self.manual_close_all.setEnabled(mode is not None and (owner_close or (self.manual_controls_enabled and bool(owned))))
+        self.manual_close_price_mode.setEnabled(mode is not None and (owner_close or self.manual_controls_enabled))
         selected = self.selected_manual_ids('orders')
         active = {item['child_order_id'] for item in view.get('orders',[]) if item.get('potential_remaining')}
         self.manual_cancel.setEnabled(self.manual_controls_enabled and bool(selected) and set(selected)<=active)
@@ -2556,6 +2571,9 @@ class WorkbenchLayout:
         self.manual_cancel_account.setEnabled(self.manual_controls_enabled and bool(cancel_review.get('active_count')))
 
     def close_manual_position(self, quantity):
+        if (self.rendered_view or {}).get('detail_unavailable'):
+            self.window.close_selected()
+            return
         selected = self.selected_manual_ids('cycles')
         if len(selected)==1:
             self.window.close_manual_cycle(selected[0],quantity)

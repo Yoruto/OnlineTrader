@@ -483,10 +483,12 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                 self.assertTrue(dialog.save_template('DSV样本'))
                 dialog.reset_to_baseline()
                 self.assertEqual(dashboard.template_picker.currentText(),'DSV样本')
-                dashboard.apply_selected_template()
+                with patch.object(window, 'send') as command:
+                    dashboard.apply_selected_template()
+                command.assert_not_called()
                 self.assertEqual(dashboard.parameter_fields['max_volume'].text(),'17')
                 self.assertEqual(dashboard.profile.content_hash,binding)
-                self.assertIn('预览',dashboard.parameter_state.text())
+                self.assertEqual(dashboard.parameter_state.text(),'本地参数草稿 · 用于下次启动')
             finally:
                 dispose_widget(window)
 

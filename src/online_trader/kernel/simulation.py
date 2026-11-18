@@ -82,7 +82,10 @@ class OnlineSimulation:
             rule='simnow-dsv-'+self.grant.content_hash[:32]
             descriptor['kind']='SIMNOW_DSV_ONLINE_SIMULATION'
         previous=k.ledger.query('SELECT payload_json FROM config_revisions WHERE config_revision=?',(k._config_revision,))
-        if previous and strict_loads(previous[0]['payload_json'])==descriptor:
+        current = strict_loads(previous[0]['payload_json']) if previous else {}
+        saved_strategy = (self.strategy_enabled and current.get('online_grant_hash') == self.grant.content_hash
+                          and current.get('parameters_saved_at_utc'))
+        if current == descriptor or saved_strategy:
             self._configured=True
         else:
             revision=k.ledger.query('SELECT MAX(config_revision) AS n FROM config_revisions')[0]['n']+1

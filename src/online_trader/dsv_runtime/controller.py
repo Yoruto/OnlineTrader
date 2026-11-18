@@ -325,13 +325,16 @@ class ExplicitOrderController:
         position['children'].append(child_id)
         return self._prepare(order, 'SEND', quantity=qty, limit_price=price, native_offset=offset, direction=side)
 
-    def cancel(self, order, reason):
+    def cancel(self, order, reason, *, retry_risk_refusal=False):
         identity = None
         if order['send_state'] == 'NATIVE_SEEN':
             identity = order['native_id']
         elif order['send_state'] == 'CALL_RETURNED':
             identity = order.get('local_order_id')
         if order['terminal_confirmed'] or order['cancel_status'] or identity is None:
+            return None
+        if (not retry_risk_refusal
+                and order.get('local_cancel_rejection', {}).get('error_code') == 'E_DSV_SDK_CANCEL_RISK'):
             return None
         order['cancel_attempt'] = order.get('cancel_attempt', 0) + 1
         order.update(cancel_status='SEND_POSSIBLE', cancel_reason=reason)
@@ -345,6 +348,9 @@ class ExplicitOrderController:
                   'child_order_id': order['child_order_id'], 'contract_id': order['contract_id'],
                   'account_key': self.scope['account_key'], 'provider': self.scope['provider'],
                   'trading_day': order['native_trading_day'], **parameters}
+        if kind == 'CANCEL':
+            effect['cancel_attempt'] = order['cancel_attempt']
+            order['cancel_effect_id'] = effect_id
         self.journal.prepare(effect)
         return effect
 

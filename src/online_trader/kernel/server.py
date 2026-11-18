@@ -169,6 +169,11 @@ class ControlServer:
             from online_trader.kernel.workbench import workbench_view
             value=workbench_view(self.kernel)
             peer.enqueue(self._reply(peer,message,'WorkbenchSnapshot',{'payload':value,'content_hash':content_hash(value)}))
+        elif kind == 'WorkbenchPositionsRequest':
+            from online_trader.kernel.workbench import workbench_positions
+            value = workbench_positions(self.kernel, body['after'])
+            peer.enqueue(self._reply(peer, message, 'WorkbenchPositionsSnapshot',
+                                    {'payload': value, 'content_hash': content_hash(value)}))
         elif kind == 'WorkbenchMonitorRequest':
             if peer.role != 'DESKTOP' or getattr(self.kernel, '_dsv_market_monitor', None) is None:
                 raise TraderError('E_AUTH', 'Read diagnostics capability was not granted')

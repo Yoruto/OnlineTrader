@@ -58,6 +58,8 @@ class _WorkbenchRequest(QThread):
             elif self.action=='status':value=client.command_status(self.args)
             elif self.action=='monitor':
                 value = {'monitor': client.workbench_monitor(), 'metadata': client.last_metadata}
+            elif self.action=='close_positions':
+                value = client.workbench_positions(self.args[1])
             else:value=client.command(*self.args)
             if not self.isInterruptionRequested():self.result.emit({'action':self.action,'value':value})
         except Exception as error:
@@ -123,6 +125,7 @@ class WorkbenchWindow(StatusWindow):
         self._startup_in_progress = False
         self._guard_launch = autostart
         self._deferred_request=None;self._control_notice=None
+        self._close_positions_result = None
         self.home_feedback = ''
         self.home_issue = ''
         self._account_login = self._read_account_login()
@@ -246,7 +249,7 @@ class WorkbenchWindow(StatusWindow):
         self.pause_button.setEnabled(self._scheduled_start is not None or (owner_controls and (
             self.view['entry_authority']=='ARMED' or ('cancel_on_stop' in self.view['configuration']
             and not self.view['configuration'].get('strategy_stop_requested')))))
-        self.dashboard.update_manual_controls(enabled)
+        self.dashboard.update_manual_controls(enabled, owner_controls=owner_controls)
         self.command_buttons['receipt'].setEnabled(enabled and self.receipt_identity is not None)
 
     def _start_job(self,action,args=None):
@@ -435,6 +438,8 @@ class WorkbenchWindow(StatusWindow):
                 if receipt:self._show_receipt(receipt)
             self.render_view()
             self._restore_selection(selected)
+        elif result['action'] == 'close_positions':
+            self._close_positions_result = (self._worker.args, result['value'])
         else:
             receipt=result['value'];self.receipt_identity={k:receipt[k] for k in ('command_id','payload_hash')}
             self._publication_after_ns = time.monotonic_ns()
@@ -468,6 +473,11 @@ class WorkbenchWindow(StatusWindow):
                     if name in {'cycles','external_positions'}:break
 
     def _job_failed(self,error):
+        if self._worker is not None and self._worker.action == 'close_positions':
+            message = f"未能从执行器查询可平持仓 · {error['code']}"
+            self.notice_label.setText(message)
+            self.show_home_feedback(message)
+            return
         if self.view is not None and error['code'] in {'E_TIMEOUT','E_PIPE'}:
             from online_trader.desktop.runtime_logs import read_record, supplied_run_directory
             run = self.dashboard.latest_run() or supplied_run_directory(self.view)
@@ -537,8 +547,11 @@ class WorkbenchWindow(StatusWindow):
         super()._finished()
         self._enable_commands(not self._closing and not self._stale and self.view is not None and not self.view['truncated'])
         self.command_buttons['receipt'].setEnabled(not self._closing and self._worker is None and self.receipt_identity is not None)
+        positions_result, self._close_positions_result = self._close_positions_result, None
         deferred,self._deferred_request=self._deferred_request,None
         if self._closing:return
+        if positions_result is not None:
+            self._action(lambda: self._review_close_positions(*positions_result))
         if deferred is None:
             if action in ('command','status') and self.timer.isActive():self.refresh()
             return
@@ -590,7 +603,7 @@ class WorkbenchWindow(StatusWindow):
         history_notice = ('历史列表已限量显示，省略 ' +
                           str(sum(v.get('history_omitted', {}).values())) + ' 条。' if v.get('history_truncated') else '')
         capacity_notice = ('当前明细超过容量，省略 ' + str(sum(v.get('detail_omitted', {}).values())) +
-                           ' 条。可停止策略、撤自有开仓单或平仓后停开；具体持仓请查询执行器完整快照。')
+                           ' 条。可停止策略、撤自有开仓单或平仓。平仓时向执行器查询可操作持仓。')
         self.notice_label.setText(capacity_notice if v.get('detail_unavailable') else
             '当前摘要不完整，请通过执行器核对控制请求。' if v['truncated'] else
             history_notice or
@@ -656,6 +669,10 @@ class WorkbenchWindow(StatusWindow):
         self._action(action)
 
     def close_selected(self):
+        if self.view is not None and self.view.get('detail_unavailable'):
+            self._request_close_positions()
+            return
+
         def action():
             selected=self.cycles.selectionModel().selectedRows()
             if len(selected)!=1:raise TraderError('E_SCOPE','请选择一个自有持仓周期')
@@ -690,23 +707,74 @@ class WorkbenchWindow(StatusWindow):
         def action():
             if self.view is None or 'manual_close_price_mode' not in self.view['configuration']:
                 raise TraderError('E_NOT_READY','请先连接支持批量平仓的执行器')
+            if self.view.get('detail_unavailable'):
+                self._request_close_positions(bulk=True)
+                return
             cycles = [row for row in self.view['cycles'] if row['remaining_quantity'] > 0
                       and row.get('management_state') not in {'TAKEOVER_PENDING', 'TAKEN_OVER'}]
-            if not cycles:
-                raise TraderError('E_SCOPE','没有可平的自有持仓')
-            positions = {row['position_cycle_id']: row['remaining_quantity'] for row in cycles}
-            identity = self._command_binding()
-            mode = self.dashboard.manual_close_price_mode.currentText()
-            policy = self.policy('EXECUTION')
-            message = f"按{mode}平掉 {len(positions)} 个自有持仓周期，共 {sum(positions.values())} 手？"
-            if QMessageBox.question(self, '平所有自有持仓', message) != QMessageBox.Yes:
-                return
-            if self.view is None or identity != self._command_binding():
-                self.notice_label.setText('批量平仓未发送。请核对当前账户和持仓。')
-                return
-            self.send('MANUAL_CLOSE_ALL', {'scope_type': 'ACCOUNT', 'scope_ids': []},
-                      {'positions': positions, 'price_mode': mode, 'execution_policy_id': policy})
+            self._confirm_manual_close_all(cycles)
         self._action(action)
+
+    def _request_close_positions(self, *, after=None, bulk=False):
+        self.show_home_feedback('正在向执行器查询可平持仓。')
+        self._start_job('close_positions', (self._command_binding(), after, bulk))
+
+    def _review_close_positions(self, request, page):
+        binding, after, bulk = request
+        if self.view is None or binding != self._command_binding():
+            raise TraderError('E_SCOPE', '账户、执行器或参数已变化，请重新查询持仓。')
+        rows = page['positions']
+        if bulk:
+            if page['has_more']:
+                raise TraderError('E_WORKBENCH_CAPACITY', '可平持仓超过单次批量平仓上限，请按持仓周期操作。')
+            self._confirm_manual_close_all(rows)
+            return
+        if not rows and after is None:
+            raise TraderError('E_SCOPE', '没有可平的自有持仓')
+        choices = [f"{row['contract_id']} · {display_cell('direction', row['direction'])} · "
+                   f"{row['remaining_quantity']} 手 · {row['position_cycle_id']}" for row in rows]
+        if page['has_more']:
+            choices.append('下一页')
+        if after is not None:
+            choices.append('返回第一页')
+        choice, ok = QInputDialog.getItem(self, '选择自有持仓', '持仓周期', choices, editable=False)
+        if not ok:
+            return
+        if self.view is None or binding != self._command_binding():
+            raise TraderError('E_SCOPE', '账户、执行器或参数已变化，请重新查询持仓。')
+        if choice in {'下一页', '返回第一页'}:
+            self._request_close_positions(after=rows[-1]['position_cycle_id'] if choice == '下一页' else None)
+            return
+        cycle = rows[choices.index(choice)]
+        maximum = cycle['remaining_quantity']
+        qty, ok = QInputDialog.getInt(self, '平选定自有仓', cycle['contract_id'] + ' · 平仓手数', 1, 1, maximum)
+        if not ok:
+            return
+        if self.view is None or binding != self._command_binding():
+            raise TraderError('E_SCOPE', '账户、执行器或参数已变化，请重新查询持仓。')
+        cycle_id = cycle['position_cycle_id']
+        parameters = {'position_cycle_id': cycle_id, 'quantity': qty,
+                      'execution_policy_id': self.policy('EXECUTION'), 'external_takeover_id': None}
+        if 'manual_close_price_mode' in self.view['configuration']:
+            parameters['price_mode'] = self.dashboard.manual_close_price_mode.currentText()
+        self.send('MANUAL_CLOSE', {'scope_type': 'CYCLE', 'scope_ids': [cycle_id]}, parameters)
+
+    def _confirm_manual_close_all(self, cycles):
+        if not cycles:
+            raise TraderError('E_SCOPE', '没有可平的自有持仓')
+        if len(cycles) > 64:
+            raise TraderError('E_WORKBENCH_CAPACITY', '可平持仓超过单次批量平仓上限，请按持仓周期操作。')
+        positions = {row['position_cycle_id']: row['remaining_quantity'] for row in cycles}
+        identity = self._command_binding()
+        mode = self.dashboard.manual_close_price_mode.currentText()
+        policy = self.policy('EXECUTION')
+        message = f"按{mode}平掉 {len(positions)} 个自有持仓周期，共 {sum(positions.values())} 手？"
+        if QMessageBox.question(self, '平所有自有持仓', message) != QMessageBox.Yes:
+            return
+        if self.view is None or identity != self._command_binding():
+            raise TraderError('E_SCOPE', '账户、执行器或参数已变化，请重新查询持仓。')
+        self.send('MANUAL_CLOSE_ALL', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                  {'positions': positions, 'price_mode': mode, 'execution_policy_id': policy})
 
     def set_symbol_entries(self,enabled):
         def action():

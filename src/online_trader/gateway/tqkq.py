@@ -1,6 +1,6 @@
 """Optional TqKq ONLINE_SIM adapter. SDK imports occur only on explicit connect."""
 from datetime import datetime,timezone,timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_EVEN, localcontext
 import hashlib,math,re,time,uuid
 from pathlib import Path
 
@@ -14,6 +14,15 @@ from online_trader.gateway.ports import OnlineSimulationPort
 def number(value):
     if type(value) not in {int,float} or not math.isfinite(value):return None
     return decimal_text(Decimal(str(value)))
+
+
+def account_number(value):
+    text = number(value)
+    if text is None:
+        return None
+    with localcontext() as context:
+        context.prec = 40
+        return decimal_text(Decimal(text).quantize(Decimal('0.000000000001'), rounding=ROUND_HALF_EVEN))
 
 def credentials(path):
     from online_trader.accounts import StoredCredential,StoredSimNowCredential
@@ -187,9 +196,14 @@ class TqKqPort(OnlineSimulationPort):
         for tid,t in self.api.get_trade(account=self.account).items():
             trades.append({'trade_id':tid,'order_id':t.order_id,'contract_id':t.exchange_id+'.'+t.instrument_id,'direction':t.direction,'offset':t.offset,
                 'quantity':t.volume,'price':number(t.price),'source_time_ns':str(t.trade_date_time)})
+        amounts = ('balance', 'pre_balance', 'available', 'margin', 'frozen_margin', 'close_profit',
+                   'position_profit', 'float_profit', 'commission')
+        account_funds = {key: account_number(getattr(funds, key, None)) for key in amounts}
+        # Preserve the broker value until the strategy applies its risk-ratio precision.
+        account_funds['risk_ratio'] = number(getattr(funds, 'risk_ratio', None))
         return {'snapshot_id':'kq-snapshot-'+uuid.uuid4().hex,'gateway_identity':self.gateway_identity,'source_epoch':self.source_epoch,
             'account_key':self.grant.account_key,'trading_day':self.grant.value['trading_day'],'complete':self.complete(),
-            'funds':{key:number(getattr(funds,key,None)) for key in ('balance','pre_balance','available','margin','frozen_margin','close_profit','position_profit','float_profit','commission','risk_ratio')},
+            'funds':account_funds,
             'positions':positions,'orders':orders,'trades':trades}
 
     def validate_send(self,request):

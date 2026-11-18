@@ -362,7 +362,8 @@ class ScheduledRuntime:
                    and (same_session or not self.strategy.online))
         ordinary = bool(not price_only and self.strategy.online and cycle.get('entry_origin') == 'STRATEGY'
                         and ((cycle.get('strategy_metadata') or {}).get('candidate') or {}).get('entry_kind') == 'NORMAL')
-        ordinary_fresh = ordinary and cached and same_session and not self.strategy.ordinary_quote_stale(event, now=sample.utc)
+        ordinary_fresh = ordinary and cached and same_session and not self.strategy.ordinary_quote_stale(
+            event, now=sample.utc, profile=self.strategy.profile_for_plan(cycle['plan']))
         if self.strategy.online and not price_only and (cycle.get('execution') or {}).get('close_start_ms') is not None:
             close_due = False
         time_only = not cached or self.strategy.online and not (fresh or ordinary_fresh)

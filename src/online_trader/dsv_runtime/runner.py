@@ -3,13 +3,14 @@
 import copy
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from hashlib import sha256
 import sqlite3
 from threading import get_ident
 import time
 from uuid import uuid4
 
 from online_trader.configuration.dsv import DsvProfile
-from online_trader.contracts.codec import content_hash
+from online_trader.contracts.codec import canonical_bytes, content_hash
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
 from online_trader.dsv_core.business_statistics import reduce_stops
 from online_trader.dsv_core.month_stop import observe_month_stop
@@ -360,8 +361,9 @@ class DsvSession:
                 elif kind == 'ROUND' and state.get('time_semantics_version') == TIME_SEMANTICS:
                     raise TraderError('E_DSV_TIME_VERSION', 'A paired-clock owner cannot apply an unversioned round')
                 decisions, effects = apply(state, source, timing=timing) if timing else apply(state, source)
+                checkpoint = canonical_bytes(state)
                 receipt = {'type': kind, 'input_id': identity, 'configuration_id': self._scope['configuration_id'],
-                           'state_before_digest': before, 'state_after_digest': content_hash(state),
+                           'state_before_digest': before, 'state_after_digest': sha256(checkpoint).hexdigest(),
                            'decisions': decisions, 'effects': effects}
                 if kind == 'ROUND':
                     receipt['evaluated_at'] = source['wall_time']
@@ -372,7 +374,7 @@ class DsvSession:
                         if timing.events:
                             receipt['time_events'] = timing.events
                 self._journal.event(kind, {'input': source, 'receipt': receipt})
-                self._journal.save(state)
+                self._journal.save_checkpoint(checkpoint)
                 self._journal.record_receipt(kind, identity, digest, receipt)
         except sqlite3.Error as error:
             self._failed = True
@@ -1222,7 +1224,7 @@ class DsvSession:
                         row['position']['preserve_open_on_stop'] = not self._trade['cancel_on_stop']
                         if not defer_cancels and state['synchronized'] and not row['position']['preserve_open_on_stop']:
                             for order in self._controller.child_orders(state, row['position'], 'OPEN'):
-                                request = self._controller.cancel(order, 'USER_STOP')
+                                request = self._controller.cancel(order, 'USER_STOP', retry_risk_refusal=True)
                                 if request:
                                     effects.append(request)
             return [{'reason': action, 'rule_ids': ['D14']}], effects
@@ -1232,8 +1234,12 @@ class DsvSession:
             order = state['orders'].get(command['child_order_id'])
             if order is None:
                 raise TraderError('E_DSV_NATIVE_ID', 'Manual cancellation requires an owned child')
-            request = self._controller.cancel(order, 'USER_CANCEL')
-            return [{'reason': 'USER_CANCEL' if request else 'CANCEL_UNAVAILABLE', 'rule_ids': ['I01', 'I02']}], [request] if request else []
+            request = self._controller.cancel(order, 'USER_CANCEL', retry_risk_refusal=True)
+            reason = 'USER_CANCEL' if request else 'CANCEL_UNAVAILABLE'
+            if request is None and order['cancel_status'] in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'} and not terminal(order):
+                reason = 'CANCEL_AWAITING_NATIVE_RESULT'
+            return [{'reason': reason, 'cancel_status': order['cancel_status'],
+                     'cancel_effect_id': order.get('cancel_effect_id'), 'rule_ids': ['I01', 'I02']}], [request] if request else []
         if action == 'REDUCE':
             row = state['symbols'].get(command['contract_id'])
             position = row['position'] if row else None

@@ -64,7 +64,7 @@ class OnlineDsvTests(unittest.TestCase):
         self.temp.cleanup()
 
     def start(self,*,trade=None,quantity=5,grant_changes=None,history=True,code='DCE.p2701',max_quote_age_ms=30_000,
-              calendar=None,overnight=None):
+              calendar=None,overnight=None,initial_price=1040):
         self.code=code;self.calendar=calendar or day_calendar(code)
         settings=load_confirmed_baseline()[0].to_settings()
         settings['trade'].update(protect_80_enabled=False,half_close_enabled=True,half_stage2=True,half_breakeven=True,
@@ -82,7 +82,7 @@ class OnlineDsvTests(unittest.TestCase):
                                            calendar=self.calendar,clock=self.clock,emit=lambda event:None)
         if overnight:self.api.tick(code,**overnight)
         if history:self.api.tick(code,at='2026-11-10T01:00:00Z',last=1040)
-        self.api.tick(code,last=1040)
+        self.api.tick(code,last=initial_price)
         self.session.prime();self.kernel.simulation.arm();self.kernel.wait_idle()
 
     def quote(self,price=1055,*,milliseconds=1000,**values):
@@ -152,16 +152,24 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertEqual(len(self.api.inserted),1)
 
     def test_risk_ratio_comes_from_the_broker_and_preserves_the_cap_boundary(self):
-        self.start(quantity=0)
-        self.api.funds.margin = 1_000.
-        self.api.funds.risk_ratio = 0.6999999999999998
-        self.quote(price=1040)
-        facts = self.session.driver.strategy._latest[(self.code, '2026-11-10')]
-        self.assertEqual(facts['account']['risk_ratio'], '0.699999999999')
-        self.api.funds.risk_ratio = 0.7
-        self.quote(price=1055)
-        self.assertIn('EFFECTIVE_RISK_CAP', self.session.last_decisions[self.code]['reasons'])
-        self.assertEqual(self.api.inserted, [])
+        cases = ((0.6999999999999998, '0.699999999999', False),
+                 (0.7, '0.7', True),
+                 (0.7000000000000001, '0.7', True))
+        for native_ratio, strategy_ratio, blocked in cases:
+            with self.subTest(native_risk_ratio=native_ratio):
+                case = OnlineDsvTests()
+                case.setUp()
+                try:
+                    case.start(quantity=0, grant_changes={'max_order_quantity': 30})
+                    case.api.funds.margin = 1_000.
+                    case.api.funds.risk_ratio = native_ratio
+                    case.quote(price=1055)
+                    facts = case.session.driver.strategy._latest[(case.code, '2026-11-10')]
+                    self.assertEqual(facts['account']['risk_ratio'], strategy_ratio)
+                    self.assertEqual('EFFECTIVE_RISK_CAP' in case.session.last_decisions[case.code]['reasons'], blocked)
+                    self.assertEqual(len(case.api.inserted), 0 if blocked else 1)
+                finally:
+                    case.tearDown()
 
     def test_positive_dsv_quote_age_refuses_ordinary_entry_without_consuming_the_bar(self):
         self.start(trade={'max_quote_age_seconds': 2}, max_quote_age_ms=5000)
@@ -748,7 +756,7 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertEqual(len(attempts),2)
         self.assertEqual(self.kernel.active_epoch,attempts[-1])
 
-    def test_sdk_padding_with_positive_id_does_not_hide_a_real_path_gap(self):
+    def test_sdk_padding_with_positive_id_is_not_an_observed_tick(self):
         tick=NativeFactApi.tick
 
         def tick_with_padding(api,code,**values):
@@ -761,8 +769,9 @@ class OnlineDsvTests(unittest.TestCase):
         rows=self.api.serials[self.code].rows
         rows.append({'id':rows[-1]['id']+1,'datetime':0.0})
         self.quote()
-        self.assertIn('MARKET_PATH_INCOMPLETE',self.session.last_decisions[self.code]['reasons'])
-        self.assertEqual(self.api.inserted,[])
+        next_state = self.session.driver.strategy._states[(self.code,'2026-11-10')]
+        self.assertEqual(next_state['last_sequence'], state['last_sequence'] + 1)
+        self.assertEqual(len(self.api.inserted), 1)
 
     def cycle(self):return next(iter(self.kernel._staged.values()))
 
@@ -959,29 +968,29 @@ class OnlineDsvTests(unittest.TestCase):
         self.quote(price=1040)
         self.assertNotIn('MARKET_PATH_INCOMPLETE', self.session.last_decisions[self.code]['reasons'])
 
-    def test_missing_open_tick_stays_blocked_until_native_boundary_is_backfilled(self):
-        self.start(history=False, max_quote_age_ms=5000)
+    def test_late_backfill_does_not_replay_an_already_skipped_tick(self):
+        self.start(max_quote_age_ms=5000)
         self.kernel.pause()
         self.kernel.wait_idle()
-        self.api.serials[self.code].rows[0]['id'] = 1
-        self.quote(price=1040)
-        self.assertIn('MARKET_PATH_INCOMPLETE', self.session.last_decisions[self.code]['reasons'])
         serial = self.api.serials[self.code]
-        ticks = serial.rows[:]
-        serial.rows.clear()
-        self.api.tick(self.code, at='2026-11-10T01:00:00Z', index=0, last=1040)
-        serial.rows.extend(ticks)
-        self.session.step()
-        self.assertTrue(self.session.driver.strategy._states[(self.code, '2026-11-10')]['coverage_lost'])
-        self.quote(price=1040)
+        missing_id = serial.rows[-1]['id'] + 1
+        missing_at = self.clock.now() + timedelta(milliseconds=500)
+        self.quote(price=1040, index=missing_id + 1)
         key = (self.code, '2026-11-10')
+        accepted_sequence = self.session.driver.strategy._states[key]['last_sequence']
+        latest = serial.rows.pop()
+        self.api.tick(self.code, at=missing_at.isoformat(), index=missing_id, last=1040)
+        serial.rows.append(latest)
+        self.session.step()
+        self.assertEqual(self.session.driver.strategy._states[key]['last_sequence'], accepted_sequence)
+        self.quote(price=1040)
         self.assertFalse(self.session.driver.strategy._states[key]['coverage_lost'])
         self.assertFalse(self.kernel.snapshot()['armed'])
         self.assertEqual(self.api.inserted, [])
         self.quote(price=1040)
         self.assertNotIn('MARKET_PATH_INCOMPLETE', self.session.last_decisions[self.code]['reasons'])
 
-    def test_native_id_gap_requests_backfill_and_keeps_opening_blocked(self):
+    def test_native_id_gap_requests_backfill_and_allows_a_fresh_signal(self):
         self.start(max_quote_age_ms=5000)
         rows = self.api.serials[self.code].rows
         self.clock.advance(1000)
@@ -990,8 +999,8 @@ class OnlineDsvTests(unittest.TestCase):
         with patch.object(self.port, 'request_tick_backfill') as request:
             self.session.step()
         request.assert_called_once_with(self.code)
-        self.assertIn('MARKET_PATH_INCOMPLETE', self.session.last_decisions[self.code]['reasons'])
-        self.assertEqual(self.api.inserted, [])
+        self.assertEqual(len(self.api.inserted), 1)
+        self.assertEqual(self.api.inserted[0]['offset'], 'OPEN')
 
     def test_lunch_restart_keeps_entry_blocked_without_afternoon_boundary_proof(self):
         self.start(calendar=split_day_calendar())
@@ -1351,15 +1360,20 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertEqual(self.api.inserted,[])
         self.assertEqual(OrderState.from_dict(self.cycle()['orders'][0]).potential_remaining,5)
 
-    def test_late_join_without_a_complete_native_path_cannot_open(self):
-        self.start(history=False);self.quote()
+    def test_late_join_without_opening_ticks_only_opens_on_a_live_signal(self):
+        self.start(history=False, initial_price=1055)
         self.assertEqual(self.api.inserted,[])
-        self.assertIn('MARKET_PATH_INCOMPLETE',self.session.last_decisions['DCE.p2701']['reasons'])
+        self.quote()
+        self.assertEqual(len(self.api.inserted),1)
+        self.assertEqual(self.api.inserted[0]['offset'],'OPEN')
 
-    def test_native_tick_gap_blocks_entries_without_inventing_missing_ticks(self):
-        self.start();self.quote(index=100)
-        self.assertEqual(self.api.inserted,[])
-        self.assertIn('MARKET_PATH_INCOMPLETE',self.session.last_decisions['DCE.p2701']['reasons'])
+    def test_native_tick_gap_allows_entry_without_inventing_missing_ticks(self):
+        key = ('DCE.p2701', '2026-11-10')
+        self.start()
+        accepted_sequence = self.session.driver.strategy._states[key]['last_sequence']
+        self.quote(index=100)
+        self.assertEqual(self.session.driver.strategy._states[key]['last_sequence'], accepted_sequence + 1)
+        self.assertEqual(len(self.api.inserted), 1)
 
     def test_foreign_position_change_before_ack_prevents_native_send(self):
         self.start();self.clock.advance(1000);self.api.tick(last=1055)

@@ -142,7 +142,10 @@ class Journal:
         self._db.execute('PRAGMA user_version=2')
 
     def save(self, state):
-        self._db.execute('UPDATE checkpoint SET payload=? WHERE id=1', (canonical_bytes(state),))
+        self.save_checkpoint(canonical_bytes(state))
+
+    def save_checkpoint(self, checkpoint):
+        self._db.execute('UPDATE checkpoint SET payload=? WHERE id=1', (checkpoint,))
 
     def receipt(self, kind, identity, digest):
         row = self._db.execute('SELECT digest,payload FROM receipts WHERE kind=? AND id=?', (kind, identity)).fetchone()

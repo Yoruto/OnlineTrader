@@ -78,7 +78,7 @@ class TqKqDsvPort(TqKqPort):
         except (TraderError, KeyError, AttributeError, TypeError, ValueError):
             return False
 
-    def fresh_strategy_entry(self, code, side, event):
+    def fresh_strategy_entry(self, code, side, event, *, profile=None):
         """Use the strategy age rule and verify the exact legal native quote."""
         if event is None:
             return False
@@ -87,7 +87,7 @@ class TqKqDsvPort(TqKqPort):
             quote = self.quotes[code]
             now = self.clock.utc_now() if hasattr(self.clock, 'utc_now') else self.clock.now()
             if (not self._matches_strategy_quote(quote, event) or
-                    (runtime is not None and runtime.ordinary_quote_stale(event, now=now))):
+                    (runtime is not None and runtime.ordinary_quote_stale(event, now=now, profile=profile))):
                 return False
             field = 'ask1' if side == 'BUY' else 'bid1'
             opponent, other, volume = ((getattr(quote,'ask_price1',None), getattr(quote,'bid_price1',None),
@@ -122,6 +122,7 @@ class TqKqDsvPort(TqKqPort):
         self._tick_backfill_attempts={}
         self._tick_backfill_after={}
         self._tick_backfill_pending=set()
+        self._local_order_returns = set()
         self.minute_chart_serials={}
         self.minute_chart_requested=False
         self.minute_chart_sample_at = None
@@ -291,6 +292,7 @@ class TqKqDsvPort(TqKqPort):
         received = super().poll_updates(seconds)
         if self.source_epoch!=epoch:
             self.started_at=self.clock.now();self.subscription_ready_at.clear()
+            self._local_order_returns.clear()
             self.minute_chart_sample_at = None
             self.minute_chart_cache = {}
             if self._rollover_task is not None:
@@ -306,12 +308,24 @@ class TqKqDsvPort(TqKqPort):
         observations=super().observations()
         orders=self.api.get_order(account=self.account)
         owner = getattr(getattr(self, 'kernel', None), 'simulation', None)
+        proved_observations = []
         for observation in observations:
             item=orders[observation['order_id']]
             stamp=getattr(item,'insert_date_time',None)
             child, code = observation['child_order_id'], observation['contract_id']
             if getattr(item, 'is_error', None) is True:
                 observation['rejected'] = True
+            if (child in self._local_order_returns and not self.fault
+                    and observation['status'] == 'ALIVE' and observation['reported_fill_qty'] == 0
+                    and (stamp is None or type(stamp) is int and stamp == 0)
+                    and getattr(item, '_this_session', False) is True
+                    and not getattr(item, 'exchange_order_id', None)
+                    and not observation.get('rejected')):
+                # This is the SDK's local insert result. Keep the durable
+                # reservation and wait for the original broker order facts.
+                continue
+            self._local_order_returns.discard(child)
+            proved_observations.append(observation)
             try:
                 if type(stamp) is not int:raise TraderError('E_FACT_BARRIER','Missing native order time')
                 observation['order_day_evidence'] = (owner.native_day_proof(child, code, str(stamp)) if owner
@@ -324,7 +338,7 @@ class TqKqDsvPort(TqKqPort):
                              else native_day(self.calendar, code, stamp))
                     fill.update(trading_day=proof['trading_day'],native_day_evidence=proof)
                 except TraderError as error:fill['native_day_error']=error.code
-        return observations
+        return proved_observations
 
     def validate_send(self,request):
         self.check_dispatch_clock(request['effect'])
@@ -365,7 +379,8 @@ class TqKqDsvPort(TqKqPort):
             kernel.simulation.verify_clock_protection(cycle, snapshot, exclude_child=request['child_order_id'])
             fresh = True
         elif request['effect']=='OPEN' and candidate.get('entry_kind')=='NORMAL' and cycle['entry_origin']=='STRATEGY':
-            fresh = self.fresh_strategy_entry(code, request['direction'], facts['event'] if facts is not None else None)
+            fresh = self.fresh_strategy_entry(code, request['direction'], facts['event'] if facts is not None else None,
+                                              profile=runtime.profile_for_plan(cycle['plan']) if runtime else None)
         else:
             fresh = self.fresh(code) or (direct and self.fresh_manual_reduction(code))
         if not fresh:
@@ -431,9 +446,11 @@ class TqKqDsvPort(TqKqPort):
         if child in self._issued:raise TraderError('E_DUPLICATE_CONFLICT','A DSV native send cannot be replayed')
         self._issued.add(child)
         self._bindings[child]={key:request[key] for key in ('contract_id','direction','effect','original_qty','limit_price','native_offset')}
-        return self.api.insert_order(symbol=request['contract_id'],direction=request['direction'],
+        order = self.api.insert_order(symbol=request['contract_id'],direction=request['direction'],
             offset=request['native_offset'],volume=request['original_qty'],
             limit_price=float(Decimal(request['limit_price'])),order_id=self.order_id(child),account=self.account)
+        self._local_order_returns.add(child)
+        return order
 
     def tick_records(self,code,*,after_id=None):
         serial=self.tick_serials[code]

@@ -97,7 +97,7 @@ COMMITTED_EVENT_TYPES = frozenset(SESSION_EVENTS) | {
     'CANCEL_PREPARED', 'CANCEL_RESULT', 'CANCEL_UNSENT', 'ONLINE_SIMULATION_RECONCILED',
     'ONLINE_WORKING_ORDER_PROVED', 'REPLACEMENT_BLOCKED', 'NATIVE_ACCOUNT_CANCEL_RESULTS',
     'CONTROL_CANCEL_RESULT', 'CONTROL_CANCEL_ERRORS', 'SCHEDULER_FACT_BARRIER', 'CLOCK_RESET_REQUIRES_FRESH_FACTS',
-    'EXECUTION_OBSERVATION', 'PROTECTION_OBSERVATION', 'SCHEDULED_DATA_GAP',
+    'EXECUTION_OBSERVATION', 'PROTECTION_OBSERVATION', 'SCHEDULED_DATA_GAP', 'DSV_PARAMETERS_SAVED',
 }
 OPERATION_EVENT_TYPES = tuple(sorted(COMMITTED_EVENT_TYPES | {'DSV_STRATEGY_OBSERVED'}))
 
@@ -341,6 +341,11 @@ class DsvEntryLog:
         kind = row['event_type']
         data = strict_loads(row['payload_json'])
         data = data.get('data', data)
+        if kind == 'DSV_PARAMETERS_SAVED':
+            from online_trader.configuration.dsv import DsvProfile
+            settings = DsvProfile.from_record(data['dsv_execution']['profile']).to_record()['settings']
+            self.trade = settings['trade']
+            self.symbols = {item['code']: item for item in settings['symbols']}
         report = data.get('report', {})
         strategy = (data.get('cycle') or {}).get('strategy_metadata') or {}
         self._event = row['event_seq'], report.get('decision_id') or strategy.get('decision_id')
@@ -716,6 +721,9 @@ class DsvEntryLog:
         session = SESSION_EVENTS.get(kind)
         if session is not None:
             append(*session)
+        if kind == 'DSV_PARAMETERS_SAVED':
+            append('参数', '已保存运行参数，下一笔新鲜行情使用新版本判断开仓',
+                   profile_hash=data['dsv_execution']['profile_hash'])
         cycle = data.get('cycle')
         if isinstance(cycle, dict):
             self.cycle_event(kind, cycle, data.get('fill'), append)

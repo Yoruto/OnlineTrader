@@ -14,13 +14,36 @@ class FactClock:
     def advance(self,milliseconds):self.value+=timedelta(milliseconds=milliseconds);self.monotonic_ns+=milliseconds*1_000_000
 
 
+class _NativeColumn(list):
+    def __ge__(self, threshold):
+        return [value >= threshold for value in self]
+
+
+class _NativeRowSelection:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __getitem__(self, mask):
+        return NativeRows([row for row, selected in zip(self.rows, mask, strict=True) if selected])
+
+
 class NativeRows:
-    def __init__(self):self.rows=[]
+    def __init__(self, rows=None):self.rows=[] if rows is None else rows
+
+    def __getitem__(self, column):
+        return _NativeColumn(row[column] for row in self.rows)
+
+    @property
+    def loc(self):
+        return _NativeRowSelection(self.rows)
+
+    @property
+    def iloc(self):
+        return self.rows
+
     def to_dict(self,mode):assert mode=='records';return copy.deepcopy(self.rows)
     def tail(self, count):
-        selection = NativeRows()
-        selection.rows = self.rows[-count:]
-        return selection
+        return NativeRows(self.rows[-count:])
 
 
 class NativeFactApi:

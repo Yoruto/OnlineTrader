@@ -8,6 +8,7 @@ from online_trader.contracts.codec import content_hash
 from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import number
+from online_trader.scheduling.clock import delta_ns, quote_age_quality
 from online_trader.strategy.entry import is_night_session
 from online_trader.strategy.risk import calculate_daily_loss
 
@@ -36,6 +37,7 @@ class DsvFactFeed:
         if profile.content_hash!=port.grant.value['profile_hash'] or calendar.content_hash!=port.grant.value['calendar_hash']:
             raise TraderError('E_ONLINE_SCOPE','Native fact conversion requires the original profile and calendar')
         self.port,self.profile,self.calendar=port,profile,calendar
+        self._startup_epoch = port.source_epoch
         self._accepted={};self._sequences={};self._path={};self._revision=0;self._last_native={}
         self.resume_anchors={}
         self.rebuild_paths=set()
@@ -43,7 +45,8 @@ class DsvFactFeed:
         self._continuation_seconds = float(trade['chase_window_minutes']) * 60 if trade['continuation_entry'] else None
         self._night_references = {}
 
-    def batches(self, *, resume_states=None, calendar_event=None):
+    def batches(self, *, resume_states=None, calendar_event=None, allow_startup_observation=True,
+                reconnect_ready=None):
         result=[];now=self.port.clock.now()
         for code in self.port.grant.value['contracts']:
             at=self.calendar.query(code,utc(now))
@@ -92,10 +95,9 @@ class DsvFactFeed:
             session_contiguous=all(b[0]==a[0]+1 for a,b in zip(boundary_rows,boundary_rows[1:]))
             accepted_key=(code,self.port.source_epoch)
             previous=self._accepted.get(accepted_key)
-            if previous is None and contiguous and resume_states is not None:
-                state=resume_states.get((code,at['trading_day']))
-                if state is not None:
-                    previous=self._resume_anchor(code,session,rows,state,calendar_event)
+            state=resume_states.get((code,at['trading_day'])) if resume_states is not None else None
+            if previous is None and contiguous and state is not None:
+                previous=self._resume_anchor(code,session,rows,state,calendar_event)
             prior=next((row for row in rows if row[0]==previous),None)
             if prior is not None:
                 normalized={'native_time_ns':str(native_integer(prior[2]['datetime'],minimum=1))}
@@ -108,15 +110,53 @@ class DsvFactFeed:
             ready=self.port.subscription_ready_at.get(code)
             boundary_proved=session_contiguous and (first_index>0 or session_rows[0][1]==start)
             subscribed_at_open=session_contiguous and ready is not None and ready<=start
-            if key in self.rebuild_paths and not boundary_proved:
+            # A cold intraday start may observe the contiguous native window
+            # available now.
+            observed_from_startup = (
+                allow_startup_observation and not boundary_proved and session_contiguous and previous is None
+                and self.port.source_epoch == self._startup_epoch
+                and start < self.port.started_at <= now
+                and first_index == 0
+                and (state is None or state['session_id'] != session['session_id'] or state['coverage_lost'])
+            )
+            if observed_from_startup and session_rows[-1][1] > now:
+                clock = self.port.clock
+                health = None
+                if hasattr(clock, 'health') and hasattr(clock, 'capture'):
+                    sample = clock.capture_live() if hasattr(clock, 'capture_live') else clock.capture()
+                    health = clock.health(sample)
+                latest = session_rows[-1]
+                age = delta_ns(now, latest[1]) - native_integer(latest[2]['datetime'], minimum=1) % 1000
+                if quote_age_quality(age, health)[0] != 'VALID':
+                    continue
+            # After account reconciliation, a fresh quote can start a new
+            # observation path in this epoch if the old checkpoint did not join.
+            observed_after_reconnect = (
+                reconnect_ready is not None and self.port.source_epoch != self._startup_epoch
+                and not boundary_proved and not subscribed_at_open and not self._path.get(key)
+                and bool(pending) and start <= self.port.started_at <= pending[-1][1]
+                and self.port.fresh(code) and reconnect_ready()
+            )
+            if observed_after_reconnect:
+                self._path[key] = True
+                self.rebuild_paths.add(key)
+                pending = pending[-1:]
+            elif key in self.rebuild_paths and not (boundary_proved or observed_from_startup):
                 self.rebuild_paths.remove(key)
                 self._path[key]=False
             gap=bool(same_session and pending and pending[0][0]!=previous+1)
             pending_contiguous=all(b[0]==a[0]+1 for a,b in zip(pending,pending[1:]))
             if not session_contiguous or gap:
                 self.port.request_tick_backfill(code)
-            if gap or not pending_contiguous:self._path[key]=False
-            elif key not in self._path:self._path[key]=boundary_proved or subscribed_at_open
+            # On an established, connected stream, keep observing actual
+            # quotes in order even if the SDK skips a native tick ID.
+            live_path = same_session and self._path.get(key) and not self.port.fault
+            if (gap or not pending_contiguous) and not (live_path or observed_after_reconnect):
+                self._path[key] = False
+            elif key not in self._path:
+                self._path[key] = boundary_proved or subscribed_at_open or observed_from_startup
+                if observed_from_startup:
+                    self.rebuild_paths.add(key)
             if not pending:continue
             if not self._path[key] and boundary_proved:
                 if same_session:
@@ -124,7 +164,13 @@ class DsvFactFeed:
                     # quote. An accepted incomplete tick cannot supply the proof.
                     self.rebuild_paths.add(key)
                 self._path[key]=True
-            if key in self.rebuild_paths:pending=session_rows
+            if observed_from_startup:
+                # The last native quote already carries the current day range.
+                # Establish the cold-start observation without replaying the
+                # whole rolling buffer on the owner thread.
+                pending = pending[-1:]
+            elif key in self.rebuild_paths and not observed_after_reconnect:
+                pending = session_rows
             events=[]
             night_reference = None
             if (contiguous and self._path[key] and self._continuation_seconds is not None

@@ -38,7 +38,6 @@ class WorkbenchPublication:
         now = time.monotonic_ns()
         if now < self._next_publication:
             return
-        self._next_publication = now + PUBLICATION_INTERVAL_NS
         stamp = datetime.now(timezone.utc).isoformat()
         try:
             base, view = project()
@@ -58,6 +57,8 @@ class WorkbenchPublication:
             self.status = self.status | {'error_code': code}
             # Keep serving the previous complete frame with its original age.
             return
+        finally:
+            self._next_publication = time.monotonic_ns() + PUBLICATION_INTERVAL_NS
 
     def _serve(self):
         while not self._stop.is_set():

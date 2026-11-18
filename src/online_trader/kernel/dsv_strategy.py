@@ -50,6 +50,22 @@ class DsvStrategyRuntime:
             self.profile=profile
         if self.online and self.profile.content_hash!=kernel.simulation.grant.value['profile_hash']:
             raise TraderError('E_ONLINE_SCOPE','The selected DSV profile differs from the explicit strategy grant')
+        self._profile_effective_after = None
+        self._plan_profiles = {}
+        self.on_parameters_saved = None
+        compatible_profiles = set()
+        if self.online:
+            saved = strict_loads(kernel.ledger.query(
+                "SELECT payload_json FROM config_revisions WHERE config_revision=?", (kernel._config_revision,)
+            )[0]["payload_json"])
+            if (saved.get("online_grant_hash") == kernel.simulation.grant.content_hash
+                    and saved.get("parameters_saved_at_utc")):
+                self.profile = DsvProfile.from_record(saved["profile"])
+                self._profile_effective_after = datetime.fromisoformat(saved["parameters_saved_at_utc"])
+                compatible_profiles = {row['profile_hash'] for row in kernel.ledger.query(
+                    "SELECT json_extract(payload_json,'$.profile_hash') AS profile_hash FROM config_revisions "
+                    "WHERE json_extract(payload_json,'$.online_grant_hash')=? AND config_revision<=?",
+                    (kernel.simulation.grant.content_hash, kernel._config_revision))}
         self.strategy=DsvEntryStrategy(self.profile)
         trade=self.profile.to_record()['settings']['trade']
         self._continuation_seconds=float(trade['chase_window_minutes'])*60 if trade['continuation_entry'] else None
@@ -78,8 +94,9 @@ class DsvStrategyRuntime:
             if state.get("profile_hash")!=self.profile.content_hash:
                 # A new development profile cannot erase an already consumed
                 # bar or turn the former parameter path into complete evidence.
+                if state["profile_hash"] not in compatible_profiles:
+                    state["coverage_lost"]=True
                 state["profile_hash"]=self.profile.content_hash
-                state["coverage_lost"]=True
             self._states[(state["contract_id"],state["trading_day"])]=state
         for row in kernel.ledger.query("SELECT event_seq,event_type,payload_json FROM event_journal ORDER BY event_seq"):
             material=strict_loads(row["payload_json"]);data=material.get("data",material)
@@ -164,7 +181,7 @@ class DsvStrategyRuntime:
             descriptor['profile_source']='EXPLICIT_SCOPED_DSV_PROFILE'
             descriptor['code_hashes']['protection-plan-v1.3.schema.json']=hashlib.sha256(files('online_trader').joinpath('resources','protection-plan-v1.3.schema.json').read_bytes()).hexdigest()
         digest=content_hash(descriptor)
-        if k._configuration["payload_hash"]!=digest:
+        if self._profile_effective_after is None and k._configuration["payload_hash"]!=digest:
             revision=k.ledger.query("SELECT COALESCE(MAX(config_revision),0)+1 AS n FROM config_revisions")[0]["n"]
             k._armed=False;k.contexts.revoke_all();k._state_revision+=1;k._risk_revision+=1;k._authority_revision+=1
             authority=k._authority()|{"config_revision":revision,"armed":False}
@@ -191,6 +208,72 @@ class DsvStrategyRuntime:
         k.wait_idle();self.epoch=epoch
         return self.status()
 
+    def save_parameters(self, record):
+        """Publish a new next-cycle configuration without changing run authority."""
+        k = self.kernel
+        grant = k.simulation.grant
+        if (grant.manual_workbench or not k.control.can_increase() or self.epoch != k.active_epoch
+                or k._pending or self._pending is not None):
+            raise TraderError('E_NOT_READY', '当前执行器无法保存运行参数，请刷新后重试。')
+        from online_trader.configuration.offsets import dsv_startup_profile
+        candidate = dsv_startup_profile(DsvProfile.from_record(record))
+        previous = self.profile.to_record()['settings']
+        settings = candidate.to_record()['settings']
+        if {row['code'] for row in settings['symbols']} != set(grant.value['contracts']):
+            raise TraderError('E_SCOPE', '运行中只能调整当前已授权合约的参数。')
+        if settings['schedule'] != previous['schedule'] or any(
+            settings['trade'][field] != previous['trade'][field] for field in ('holidays', 'night_session_close')
+        ):
+            raise TraderError('E_SCOPE', '交易日历和定时设置需在下次启动时生效。')
+        if candidate.content_hash == self.profile.content_hash:
+            return
+
+        row = k.ledger.query("SELECT payload_json FROM config_revisions WHERE config_revision=?",
+                             (k._config_revision,))[0]
+        effective_after = k.port.strategy_wall_time()
+        descriptor = strict_loads(row['payload_json']) | {
+            'profile': candidate.to_record(), 'profile_hash': candidate.content_hash,
+            'parameters_saved_at_utc': effective_after.isoformat(),
+        }
+        digest = content_hash(descriptor)
+        revision = k.ledger.query("SELECT COALESCE(MAX(config_revision),0)+1 AS n FROM config_revisions")[0]['n']
+        rule_set = k._configuration['rule_set_id']
+        authority = k._authority() | {'config_revision': revision}
+
+        def mutate(conn, seq):
+            conn.execute("INSERT INTO config_revisions VALUES(?,?,?,?,'NEXT_CYCLE',?)",
+                         (revision, rule_set, canonical_bytes(descriptor).decode(), digest, seq))
+            k._write_authority(conn, seq, authority)
+
+        def accepted():
+            k._config_revision = revision
+            k._configuration = {'payload_hash': digest, 'rule_set_id': rule_set}
+            self.profile = candidate
+            self.strategy = DsvEntryStrategy(candidate)
+            self._profile_effective_after = effective_after
+            trade = settings['trade']
+            self._quote_age_limit = Decimal(trade['max_quote_age_seconds'])
+            self._continuation_seconds = float(trade['chase_window_minutes']) * 60 if trade['continuation_entry'] else None
+            for state in self._states.values():
+                state.update(profile_hash=candidate.content_hash, open_half_reached=False, need_hyst=False,
+                             hysteresis_armed={'LONG': False, 'SHORT': False})
+            if self.on_parameters_saved is not None:
+                self.on_parameters_saved(candidate)
+
+        k._submit('TX_CONFIG', 'DSV_PARAMETERS_SAVED', {'authority': authority, 'dsv_execution': descriptor},
+                  mutate, after=accepted)
+
+    def profile_for_plan(self, plan):
+        k = self.kernel
+        if (plan['config_revision'], plan['config_hash']) == (str(k._config_revision), k._configuration['payload_hash']):
+            return self.profile
+        key = plan['config_revision'], plan['config_hash']
+        if key not in self._plan_profiles:
+            rows = k.ledger.query("SELECT payload_json FROM config_revisions WHERE config_revision=? AND payload_hash=?", key)
+            record = strict_loads(rows[0]['payload_json']) if rows else {}
+            self._plan_profiles[key] = DsvProfile.from_record(record['profile']) if 'profile' in record else None
+        return self._plan_profiles[key]
+
     def status(self):
         self.kernel._check_owner()
         return {"profile_hash":self.profile.content_hash,"config_revision":str(self.kernel._config_revision),
@@ -216,7 +299,7 @@ class DsvStrategyRuntime:
             if not self._pending.done():self._pending.set_exception(TraderError("E_STORAGE","Strategy state could not be accepted"))
             self._pending=None
 
-    def _stop_decision(self,event,account):
+    def _stop_decision(self,event,account,*,profile=None):
         if account.get("strategy_stop_facts") is None:return None
         from online_trader.strategy.stops import evaluate_stops
         stop_facts=copy.deepcopy(account["strategy_stop_facts"])
@@ -224,7 +307,7 @@ class DsvStrategyRuntime:
         old=self._stop_states.get((event["contract_id"],event["trading_day"]))
         if old is not None and old["state"]["day_stopped"]:
             stop_facts["day_stopped"]=True;stop_facts["day_stopped_reason"]=old["state"]["day_stopped_reason"]
-        try:return evaluate_stops(self.profile,event["contract_id"],event["trading_day"],**stop_facts)
+        try:return evaluate_stops(profile or self.profile,event["contract_id"],event["trading_day"],**stop_facts)
         except TypeError as error:raise TraderError("E_RISK_INPUT","Incomplete strategy stop fact structure") from error
 
     def update_facts(self,event,account,instrument):
@@ -279,7 +362,9 @@ class DsvStrategyRuntime:
         self._latest[key]={"event":copy.deepcopy(event),"account":copy.deepcopy(account),
                            "instrument":copy.deepcopy(instrument),"received_ns":arrival,"stop_result":self._stop_decision(event,account)}
 
-    def _risk(self,candidate,facts,*,exclude_decision=None,exclude_attempt=None,counted_target=None,previous_attempt=None):
+    def _risk(self,candidate,facts,*,exclude_decision=None,exclude_attempt=None,counted_target=None,previous_attempt=None,
+              profile=None):
+        profile = profile or self.profile
         account=copy.deepcopy(facts["account"])
         instrument=facts["instrument"]
         pending=Decimal(0);symbol_extra=Decimal(0);active=set(account["active_symbols"])
@@ -307,9 +392,9 @@ class DsvStrategyRuntime:
                                     exclude_decision=counted_target or exclude_decision)
         account["orders_today"]=counts.get(candidate['contract_id'],0) if candidate.get('entry_kind')!='MANUAL' else 0
         account["active_symbols"]=sorted(active)
-        result=evaluate_entry(self.profile,direction=candidate["direction"],contract_id=candidate["contract_id"],
+        result=evaluate_entry(profile,direction=candidate["direction"],contract_id=candidate["contract_id"],
             stop_distance=candidate["stop_distance"],limit_price=candidate["limit_price"],market_price=facts["event"]["last"],
-            requested_qty=next(row["order_volume"] for row in self.profile.to_record()["settings"]["symbols"] if row["code"]==candidate["contract_id"]),
+            requested_qty=next(row["order_volume"] for row in profile.to_record()["settings"]["symbols"] if row["code"]==candidate["contract_id"]),
             account=account,instrument=instrument)
         if exclude_attempt is None and candidate.get('entry_kind','NORMAL')=='NORMAL':
             reason=self._ordinary_limit_reason(candidate,facts['event']['last'],instrument)
@@ -338,9 +423,9 @@ class DsvStrategyRuntime:
             return 'LAST_NEAR_PRICE_LIMIT'
         return None
 
-    def _blocked(self,event,*,exclude_decision=None,resuming=False):
+    def _blocked(self,event,*,exclude_decision=None,resuming=False,profile=None):
         k=self.kernel;reasons=[]
-        reasons+=k.statistics.entry_reasons(event['contract_id'],event['trading_day'],profile=self.profile,
+        reasons+=k.statistics.entry_reasons(event['contract_id'],event['trading_day'],profile=profile or self.profile,
             now_utc=event['source_time_utc'])
         scheduler=getattr(k,'_scheduled_runtime',None)
         if scheduler is not None and not scheduler.scope_current(event['contract_id'],event['trading_day'],event['session_id']):
@@ -364,8 +449,10 @@ class DsvStrategyRuntime:
     def ordinary_quote_age(self, event, *, now=None):
         return ordinary_quote_age(now or self.kernel.port.strategy_wall_time(), event['source_time_utc'])
 
-    def ordinary_quote_stale(self, event, *, now=None):
-        return self._quote_age_limit > 0 and self.ordinary_quote_age(event, now=now) > self._quote_age_limit
+    def ordinary_quote_stale(self, event, *, now=None, profile=None):
+        limit = (self._quote_age_limit if profile is None else
+                 Decimal(profile.to_record()['settings']['trade']['max_quote_age_seconds']))
+        return limit > 0 and self.ordinary_quote_age(event, now=now) > limit
 
     def _entry_recheck(self, original, facts, *, cycle=None):
         k = self.kernel
@@ -381,35 +468,35 @@ class DsvStrategyRuntime:
 
         if facts is None:
             return fail(["ENTRY_RECHECK_QUOTE_MISSING"])
+        profile = self.profile if cycle is None else self.profile_for_plan(cycle['plan'])
+        if profile is None or (cycle is not None and (cycle["strategy_epoch"] != self.epoch
+                or profile.content_hash != original["profile_hash"])):
+            return fail(["ENTRY_RECHECK_CONFIGURATION_CHANGED"])
         if facts["account"]["revision"] < self._account_revision:
             return fail(["ENTRY_RECHECK_ACCOUNT_CHANGED"], expected=str(self._account_revision),
                         observed=str(facts["account"]["revision"]))
         age = k._quote_age_ns(facts["received_ns"])
         if self.online and original.get("entry_kind") == "NORMAL":
-            limit = self._quote_age_limit
+            limit = Decimal(profile.to_record()['settings']['trade']['max_quote_age_seconds'])
             source_age = self.ordinary_quote_age(event)
             if limit > 0 and source_age > limit:
                 return fail(["DSV_QUOTE_AGE_EXCEEDED"], expected=str(limit), observed=str(source_age))
         elif age > k.max_quote_age_ms * 1_000_000:
             return fail(["ENTRY_RECHECK_QUOTE_STALE"], expected=k.max_quote_age_ms, observed=age // 1_000_000)
         if cycle is not None:
-            expected = (self.epoch, str(k._config_revision), k._configuration["payload_hash"])
-            observed = (cycle["strategy_epoch"], cycle["plan"]["config_revision"], cycle["plan"]["config_hash"])
-            if observed != expected:
-                return fail(["ENTRY_RECHECK_CONFIGURATION_CHANGED"], expected=list(expected), observed=list(observed))
             moment = datetime.fromisoformat(event["source_time_utc"])
             if (not datetime.fromisoformat(event["session_open_utc"]) <= moment < datetime.fromisoformat(event["session_close_utc"])
                     or event["session_id"] != original["session_id"] or not event["is_trading"]):
                 return fail(["ENTRY_RECHECK_SESSION_CHANGED"], expected=original["session_id"], observed=event["session_id"])
             if event["quality"] != "CONTIGUOUS" or not event["path_complete"] or not event["calendar_complete"]:
                 return fail(["ENTRY_RECHECK_PATH_INCOMPLETE"], observed=event["quality"])
-        stops = facts.get("stop_result")
+        stops = facts.get("stop_result") if profile is self.profile else self._stop_decision(event, facts["account"], profile=profile)
         if stops is not None and (not stops["allow_new_entries"] or
                 (original.get("entry_kind") == "CONTINUATION" and not stops["allow_continuation"])):
             return fail(stops["reasons"] or ["ENTRY_RECHECK_STOP_ACTIVE"])
         decision_key = cycle["decision_key"] if cycle else original["decision_key"]
-        reasons = self._blocked(event, exclude_decision=decision_key)
-        reasons += k.statistics.entry_reasons(event["contract_id"], event["trading_day"], profile=self.profile,
+        reasons = self._blocked(event, exclude_decision=decision_key, profile=profile)
+        reasons += k.statistics.entry_reasons(event["contract_id"], event["trading_day"], profile=profile,
             direction=original["direction"], entry_kind=original.get("entry_kind", "NORMAL"), now_utc=event["source_time_utc"])
         if reasons:
             return fail(dict.fromkeys(reasons))
@@ -524,7 +611,8 @@ class DsvStrategyRuntime:
             if not result["allowed"]:
                 return result
             risk = self._risk(candidate | {"limit_price": order.limit_price}, facts,
-                              exclude_attempt=order.attempt_id, counted_target=cycle["decision_key"])
+                              exclude_attempt=order.attempt_id, counted_target=cycle["decision_key"],
+                              profile=self.profile_for_plan(cycle['plan']))
             return self._quantity_recheck(result, risk, order.original_qty)
 
         review = ready()
@@ -536,18 +624,39 @@ class DsvStrategyRuntime:
         return {'authorization':{'context_id':context['context_id'],'peer_id':peer,'authority_revision':k._authority_revision,
                                 'purpose':'ENTRY_PROPOSAL','operation':'DSV_ENTRY'},'gate':ready}
 
-    def rebuild_observation(self,events,*,evidence_id,extend=False,_preserve_authority=False,_resume_anchor=None,
-                            _progress=None):
+    def rebuild_observation(self,events,*,evidence_id=None,extend=False,_preserve_authority=False,_resume_anchor=None,
+                            _progress=None,_enrich=None,_evidence_prefix=None):
         """Commit a complete path or its contiguous suffix without executing signals."""
         from online_trader.domain.values import identifier
-        identifier(evidence_id);self._development();k=self.kernel
+        if _evidence_prefix is None:
+            identifier(evidence_id)
+        self._development();k=self.kernel
         if _preserve_authority and not (extend and self.online):
             raise TraderError('E_FACT_BARRIER','Only a continuous native suffix can retain current authority')
         if self.epoch is None or self.epoch!=k.active_epoch:raise TraderError("E_EPOCH_REVOKED","Observation rebuild requires the active owner")
         if self._pending is not None or k._pending:raise TraderError("E_FACT_BARRIER","Observation rebuild requires an accepted boundary")
         if type(events) is not list or not 1<=len(events)<=10000:raise TraderError("E_SCHEMA","Expected a bounded explicit source path")
-        if len(canonical_bytes(events))>16*1024*1024:raise TraderError("E_QUEUE_OVERFLOW","Observation replay exceeds its bounded capacity")
-        events=copy.deepcopy(events);path_hash=content_hash(events)
+        digest = hashlib.sha256(b'[')
+        size = 2  # Include the brackets of the canonical array.
+        prepared = []
+        for index, event in enumerate(events):
+            if _progress is not None and index and index % 256 == 0:
+                _progress()
+            row = copy.deepcopy(event) if _enrich is None else _enrich(event)
+            # Encoding an array of one preserves the original nesting limit.
+            encoded = canonical_bytes([row])[1:-1]
+            size += len(encoded) + bool(index)
+            if size > 16 * 1024 * 1024:
+                raise TraderError('E_QUEUE_OVERFLOW', 'Observation replay exceeds its bounded capacity')
+            if index:
+                digest.update(b',')
+            digest.update(encoded)
+            prepared.append(row)
+        digest.update(b']')
+        path_hash = digest.hexdigest()
+        if _evidence_prefix is not None:
+            evidence_id = identifier(_evidence_prefix + path_hash[:16])
+        events = prepared
         if evidence_id in self._rebuilds:
             if (self._rebuilds[evidence_id]["path_hash"]!=path_hash
                     or self._rebuilds[evidence_id]["profile_hash"]!=self.profile.content_hash
@@ -644,6 +753,9 @@ class DsvStrategyRuntime:
         previous=copy.deepcopy(self._states.get(key) or self.strategy.initial_state(k.account_key,*key))
         stop_result = self._latest[key].get("stop_result")
         ambiguous = previous.get("unproved_consumed_bar")
+        if (self._profile_effective_after is not None
+                and datetime.fromisoformat(event['source_time_utc']) <= self._profile_effective_after):
+            _allow_entry = False
         wait_next = _allow_entry and ambiguous == event["candle_id"]
         decision_time = self.kernel.port.strategy_wall_time() if self.online else None
         if _allow_entry and not wait_next and _entry_recovery is None:
@@ -792,7 +904,8 @@ class DsvStrategyRuntime:
                     compiler=build_development_plan;online_values={}
                     if self.online:
                         from online_trader.strategy.plan import build_simulation_plan
-                        compiler=build_simulation_plan;online_values={'grant':k.simulation.grant}
+                        compiler=build_simulation_plan
+                        online_values={'grant':k.simulation.grant, '_active_profile_hash':self.profile.content_hash}
                     plan=compiler(self.profile,candidate,account_key=k.account_key,trading_day=event["trading_day"],
                         config_revision=str(k._config_revision),config_hash=k._configuration["payload_hash"],
                         rule_set_id=k._configuration["rule_set_id"],quantity=risk["quantity"],execution_version='1.2',

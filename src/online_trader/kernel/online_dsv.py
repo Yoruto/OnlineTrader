@@ -188,8 +188,10 @@ class OnlineDsvSimulation(OnlineSimulation):
             code = 'DAILY_ORDER_LIMIT' if self.grant.daily_targets_per_contract is not None else 'E_ENTRY_ATTEMPT_LIMIT'
             raise TraderError(code, '本次授权允许的开仓额度已用完。')
         runtime=getattr(self.kernel,'_dsv_runtime',None)
-        if runtime is None or runtime.profile.content_hash!=self.grant.value['profile_hash']:
-            raise TraderError('E_ONLINE_SCOPE','The active strategy profile differs from its original scope')
+        if runtime is None or (not manual and
+                (plan['config_revision'], plan['config_hash']) !=
+                (str(self.kernel._config_revision), self.kernel._configuration['payload_hash'])):
+            raise TraderError('E_ONLINE_SCOPE','The plan differs from the active strategy parameters')
         code = plan['contract_id']
         if not manual and entry_kind == 'NORMAL':
             facts = runtime._latest.get((code, plan['trading_day']))

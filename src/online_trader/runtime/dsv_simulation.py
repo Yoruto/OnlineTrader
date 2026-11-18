@@ -80,6 +80,9 @@ class DsvSimulationSession(SimulationSession):
             kernel._dsv_diagnostics['run_identity'] = 'E_RUN_IDENTITY_WRITE'
         self.driver.activate();kernel.wait_idle()
         self.feed=DsvFactFeed(self.port,profile,calendar);self.last_decisions={};self._primed=False
+        self.driver.strategy.on_parameters_saved = self._update_feed_parameters
+        profile = self.driver.strategy.profile
+        self._update_feed_parameters(profile)
         scoped = set(self.grant.value['contracts'])
         monitor_settings = profile.to_record()['settings']
         monitor_contracts = [row['code'] for row in monitor_settings['symbols'] if row['code'] in scoped]
@@ -131,6 +134,10 @@ class DsvSimulationSession(SimulationSession):
                                                  dsv_config=dsv_config, dsv_log_dir=dsv_log_dir)
         except Exception as error:
             self._comparison_failed(error)
+
+    def _update_feed_parameters(self, profile):
+        self.feed.profile = profile
+        self.feed._continuation_seconds = self.driver.strategy._continuation_seconds
 
     def _register_operation_log(self):
         # This binding uses the original writer to locate the diagnostics
@@ -318,9 +325,14 @@ class DsvSimulationSession(SimulationSession):
         self._arm_request_revision=self.kernel._authority_revision
 
     def _market_batches(self):
-        if not self.driver.strategy._states or any(not self.owner.archived_cycle(cycle) for cycle in self.kernel._staged.values()):
-            return self.feed.batches()
-        return self.feed.batches(resume_states=self.driver.strategy._states,calendar_event=self.driver._event)
+        if any(not self.owner.archived_cycle(cycle) for cycle in self.kernel._staged.values()):
+            return self.feed.batches(allow_startup_observation=False, reconnect_ready=self._reconnect_observation_ready)
+        return self.feed.batches(resume_states=self.driver.strategy._states,calendar_event=self.driver._event,
+                                 reconnect_ready=self._reconnect_observation_ready)
+
+    def _reconnect_observation_ready(self):
+        return (not self.port.fault and self.port.complete()
+                and self.owner.can_resume_entries(self.port.snapshot()))
 
     def prime(self,*,manage_owned=False):
         """Rebuild available history with zero signal execution and no arming."""
@@ -352,7 +364,7 @@ class DsvSimulationSession(SimulationSession):
                 self.driver.clock_rebuild_pending = True
                 self._primed = True
                 return
-            pending=dict(self.feed.batches())
+            pending=dict(self._market_batches())
             for code,event in tuple(rebuilt.items()):
                 suffix=pending.get(code,[])
                 if (suffix and all(row['path_complete'] for row in suffix)
@@ -385,13 +397,19 @@ class DsvSimulationSession(SimulationSession):
 
     def _prime_path(self,code,events,*,extend=False,preserve_authority=False):
         started = time.monotonic_ns()
+        epoch = events[0]['source_epoch']
+
+        def progress():
+            self._pump_rebuild_responsibilities()
+            if self.port.source_epoch != epoch:
+                raise TraderError('E_DSV_REBUILD_INTERRUPTED', 'Native source changed during observation rebuild')
+
         try:
-            enriched=[self.driver._event(event) for event in events]
-            anchor_key=(code,events[0]['source_epoch'])
-            evidence='native-path-'+self.kernel.boot_id+'-'+str(events[0]['source_epoch'])+'-'+code+'-'+content_hash(enriched)[:16]
-            future=self.driver.strategy.rebuild_observation(enriched,evidence_id=evidence,extend=extend,
+            anchor_key=(code,epoch)
+            prefix='native-path-'+self.kernel.boot_id+'-'+str(epoch)+'-'+code+'-'
+            future=self.driver.strategy.rebuild_observation(events,extend=extend,
                 _preserve_authority=preserve_authority,_resume_anchor=self.feed.resume_anchors.get(anchor_key),
-                _progress=self._pump_rebuild_responsibilities)
+                _progress=progress,_enrich=self.driver._event,_evidence_prefix=prefix)
             self.kernel.wait_idle();future.result()
             self.feed.resume_anchors.pop(anchor_key,None)
             self.feed.accept(events[-1])

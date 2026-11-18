@@ -250,10 +250,13 @@ class DsvSdkAdapter:
             if not synchronized:
                 self.disconnect(session)
                 return {'type': 'DISCONNECTED', 'synchronized': False}
+            day_held = False
             if callable(trading_day):
-                trading_day = trading_day(state['trading_day'], sample.utc)
+                current_day = state['trading_day']
+                day_held = not self._protection_clock_ready() or bool(self._health.get('reason'))
+                trading_day = current_day if day_held else trading_day(current_day, sample.utc)
             facts_started = time.monotonic_ns()
-            frame, market = self._frame(state, sample, trading_day)
+            frame, market = self._frame(state, sample, trading_day, day_held=day_held)
             self.metrics['native_facts_ns'] = str(time.monotonic_ns() - facts_started)
             self.enabled = True
             self.dispatch_market = market
@@ -264,7 +267,7 @@ class DsvSdkAdapter:
             self.metrics.update(session.round_timing)
             state = session.snapshot()
             self.synchronized = state['synchronized']
-            self.flat_confirmed = self.synchronized and all(
+            self.flat_confirmed = self.synchronized and not self.metrics['native_fill_waiting_day_contracts'] and all(
                 row['long_qty'] == row['short_qty'] == 0 and not row['external_orders'] for row in market.values())
             self._try_resume_clock_entries(session, state, market)
             return receipt
@@ -314,7 +317,7 @@ class DsvSdkAdapter:
             self._clock_resume_day = None
             return
 
-    def _frame(self, state, sample, day):
+    def _frame(self, state, sample, day, *, day_held=False):
         if day not in self.trading_days or day < state['trading_day']:
             raise TraderError('E_DSV_SDK_SCOPE', 'Cabinet day is outside of the selected calendar')
         windows = {code: self.calendar.query(code, sample.now_utc) for code in self.contracts}
@@ -329,7 +332,9 @@ class DsvSdkAdapter:
         foreign_orders = self._foreign_orders(orders, bindings)
         accepted = {self.order_id(order['child_order_id']): order.get('native_order_time_ns') for order in state['orders'].values()}
         accepted.update({fact['native_order_id']: fact['source_time_ns'] for fact in native if 'source_time_ns' in fact})
-        details, foreign_trades = self._trade_facts(trades, bindings, day, accepted, needs_recovery=bool(state['orders']))
+        details, foreign_trades, deferred = self._trade_facts(
+            trades, bindings, day, accepted, needs_recovery=bool(state['orders']), day_held=day_held)
+        self.metrics['native_fill_waiting_day_contracts'] = len(deferred)
         reconcile = (not state['synchronized'] or day != state['trading_day']
                      or state.get('clock_recovery_required') or self._health.get('reason'))
         coverage = [fact['child_order_id'] for fact in native if fact['kind'] == 'ORDER']
@@ -346,9 +351,12 @@ class DsvSdkAdapter:
         markets = []
         for code in self.contracts:
             quote_time, observation = self._observe_quote(code, sample, windows[code], day)
-            markets.append(self._market(code, day, sample.utc, funds, state['symbols'][code],
-                                        code in foreign_orders or code in foreign_trades, state['orders'],
-                                        quote_time=quote_time, window=windows[code], observation=observation))
+            market = self._market(code, day, sample.utc, funds, state['symbols'][code],
+                                  code in foreign_orders or code in foreign_trades, state['orders'],
+                                  quote_time=quote_time, window=windows[code], observation=observation)
+            if code in deferred:
+                market.update(ticks=[], native_coverage=False, calendar_reason='CABINET_DAY_UNPROVED')
+            markets.append(market)
         sequence = state['sequence'] + 1
         frame = {'id': f'sdk-{self.epoch}-{sequence}', 'sequence': sequence, 'session_id': self.epoch,
                  'time_semantics_version': TIME_SEMANTICS, 'time_sample': sample.paired_record(),
@@ -398,8 +406,9 @@ class DsvSdkAdapter:
             result.append(self._fact('ORDER', binding, native_id) | {'status': status, 'filled_qty': filled} | temporal)
         return result
 
-    def _trade_facts(self, trades, bindings, day, accepted, *, needs_recovery):
+    def _trade_facts(self, trades, bindings, day, accepted, *, needs_recovery, day_held=False):
         facts, foreign = [], {}
+        deferred = set()
         for native_trade, trade in trades.items():
             binding = bindings.get(trade.order_id)
             if binding is None:
@@ -424,6 +433,9 @@ class DsvSdkAdapter:
                 continue
             proof = native_day(self.calendar, binding['contract_id'], str(stamp))
             if proof['trading_day'] > day:
+                if day_held:
+                    deferred.add(binding['contract_id'])
+                    continue
                 raise TraderError('E_DSV_SDK_FACT', 'SDK trade belongs to an unobserved future cabinet day')
             price = number(trade.price)
             decimal_value(price, positive=True)
@@ -444,7 +456,7 @@ class DsvSdkAdapter:
                                                for order in bindings.values()):
                         self._foreign_trades.add(identity)
         return [fact for _, fact in sorted(facts, key=lambda item: item[0])], {
-            code for native_trade, (code, _) in foreign.items() if native_trade not in self._foreign_trades}
+            code for native_trade, (code, _) in foreign.items() if native_trade not in self._foreign_trades}, deferred
 
     def _foreign_orders(self, orders, bindings):
         result = set()
@@ -454,6 +466,8 @@ class DsvSdkAdapter:
         return result
 
     def _check_legacy_orders(self, orders, trades):
+        if not self._legacy_native_orders:
+            return
         by_order = {}
         for trade_id, trade in trades.items():
             if trade.order_id in self._legacy_native_orders:
@@ -731,4 +745,29 @@ class DsvSdkAdapter:
             return CancelNotAttempted(effect['id'], effect['native_order_id'],
                                       getattr(error, 'code', 'E_DSV_PRE_CANCEL'), exception_record(error))
         self._seen_effects.add(effect['id'])
-        return self.api.cancel_order(native, account=self.account)
+        try:
+            return self.api.cancel_order(native, account=self.account)
+        except Exception as error:
+            if self._sdk_cancel_refused_before_queue(error):
+                return CancelNotAttempted(effect['id'], native, 'E_DSV_SDK_CANCEL_RISK', exception_record(error))
+            raise
+
+    def _sdk_cancel_refused_before_queue(self, error):
+        """Recognize the pinned SDK's rejection before its _send_pack call."""
+        try:
+            from tqsdk.api import TqApi
+            from tqsdk.exceptions import TqRiskRuleError
+            from tqsdk.risk_manager import TqRiskManager
+        except ImportError:
+            return False
+        if (type(error) is not TqRiskRuleError
+                or getattr(self.api.cancel_order, '__func__', None) is not TqApi.cancel_order):
+            return False
+        traceback = error.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code is TqApi.cancel_order.__code__:
+                refusal = traceback.tb_next
+                return (refusal is not None and refusal.tb_next is None
+                        and refusal.tb_frame.f_code is TqRiskManager._could_cancel_order.__code__)
+            traceback = traceback.tb_next
+        return False
