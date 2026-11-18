@@ -142,8 +142,9 @@ class DsvSimulationSession(SimulationSession):
         except Exception as error:
             self.entry_log.failed('discover', error, self.emit)
         try:
-            self.comparison = ComparisonRecorder(kernel, output, profile, calendar,
-                                                 dsv_config=dsv_config, dsv_log_dir=dsv_log_dir)
+            self.comparison = ComparisonRecorder(
+                kernel, output, profile, calendar, dsv_config=dsv_config, dsv_log_dir=dsv_log_dir,
+                desktop_archive=entry_point == 'desktop-start' and dsv_config is None and dsv_log_dir is None)
         except Exception as error:
             self._comparison_failed(error)
 
@@ -169,8 +170,10 @@ class DsvSimulationSession(SimulationSession):
             self._comparison_failed(error)
         else:
             if method == 'poll' and self.comparison_error in {
-                    None, 'E_COMPARISON_SETTINGS', 'E_COMPARISON_SETTINGS_UNAVAILABLE', 'E_COMPARISON_LOG_UNAVAILABLE'}:
-                self.comparison_error = self.comparison.profile_warning or self.comparison.log_warning
+                    None, 'E_COMPARISON_SETTINGS', 'E_COMPARISON_SETTINGS_UNAVAILABLE',
+                    'E_COMPARISON_LOG_UNAVAILABLE', 'E_COMPARISON_BACKPRESSURE'}:
+                self.comparison_error = (self.comparison.archive_warning or self.comparison.profile_warning
+                                         or self.comparison.log_warning)
                 if self.comparison_error:
                     self.kernel._dsv_diagnostics['comparison'] = self.comparison_error
                 else:
@@ -406,6 +409,7 @@ class DsvSimulationSession(SimulationSession):
         # Removing a ready contract here would leave its early quote aging
         # until the rest of startup finishes.
         waiting = set(rebuilt)
+        resting = set()
         catchup_deadline = time.monotonic() + 8
         while waiting:
             remaining = catchup_deadline - time.monotonic()
@@ -442,8 +446,17 @@ class DsvSimulationSession(SimulationSession):
                     waiting.remove(code)
             # Registration and protection for the other contracts take time.
             # A quote may need another distinct Tick before leaving catch-up.
+            reference_utc = utc(self.port.clock.now())
+            closed = {code for code in rebuilt
+                      if self.driver.calendar.query(code, reference_utc)['is_trading'] is False}
+            if trace is not None:
+                for code in sorted(closed - resting):
+                    self._trace_tick('PRIME_CONTRACT_RESTING', rebuilt[code], reference_utc=reference_utc,
+                                     reason='QUOTE_OUTSIDE_CURRENT_SESSION')
+            resting = closed
+            waiting.difference_update(resting)
             for code, event in rebuilt.items():
-                if code in waiting:
+                if code in waiting or code in resting:
                     continue
                 if not self._prime_quote_current(event):
                     waiting.add(code)
@@ -459,8 +472,10 @@ class DsvSimulationSession(SimulationSession):
         self._comparison('poll')
         self.status('DSV_PRIMED_DISARMED',strategy=self.driver.strategy.status())
         if trace is not None:
-            trace.record('PRIME_FINISHED', ready_contracts=[code for code in rebuilt if code not in waiting],
+            trace.record('PRIME_FINISHED',
+                         ready_contracts=[code for code in rebuilt if code not in waiting and code not in resting],
                          waiting_contracts=[code for code in rebuilt if code in waiting],
+                         resting_contracts=[code for code in rebuilt if code in resting],
                          unreconstructed_contracts=[code for code in self.grant.value['contracts'] if code not in rebuilt])
             trace.flush(phase=self.phase, force=True)
 
@@ -1020,7 +1035,9 @@ class DsvSimulationSession(SimulationSession):
                 timings['提交等待（含各阶段内等待）'] = k.commit_wait_ns - commit_wait_start
                 self._operation_log('monitor', self.monitor, loop_start, timings)
                 self._operation_log('poll')
+                archive_start = time.monotonic_ns()
                 self._comparison('poll')
+                timings['对照归档提交'] = time.monotonic_ns() - archive_start
             finally:
                 if self._quote_trace is not None:
                     self._quote_trace.live_poll = False
@@ -1146,8 +1163,8 @@ def _claim_run_output(output, grant):
     """Claim the output once, including when different accounts start concurrently."""
     records = ('comparison-*', 'run-identity.json', 'strategy-log.jsonl', 'phase-[0-9][0-9][0-9][0-9]*.json',
                'result.json', 'startup-failure.json', 'auto-offsets-starting.json',
-               'auto-offsets-completed.json', 'market-latency.jsonl*', 'workbench-latency-*', 'final-relogin.json',
-               'final-money-report.json')
+               'auto-offsets-completed.json', 'market-latency*.jsonl*', 'market-quote-trace*.jsonl',
+               'workbench-latency-*', 'final-relogin.json', 'final-money-report.json')
     try:
         recovery = output.with_name(output.name + '.operation-log-recovery.json')
         if recovery.exists() or any(next(output.glob(pattern), None) is not None for pattern in records):

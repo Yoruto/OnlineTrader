@@ -3,13 +3,18 @@
 This observer never calls a gateway, imports trades into the ledger, or changes
 prices/positions. A text exit decision is not evidence of a closing fill.
 """
+from contextlib import closing
+from copy import deepcopy
+import csv
 from datetime import datetime,timezone,timedelta,date
 from decimal import Decimal
-import csv
 import hashlib
 import json
 from pathlib import Path
+from queue import Empty, Full, Queue
 import re
+import sqlite3
+from threading import Event, Thread
 import time
 import uuid
 
@@ -187,7 +192,7 @@ class DsvLogTail:
 
 
 class ComparisonRecorder:
-    def __init__(self,kernel,output,profile,calendar,*,dsv_config=None,dsv_log_dir=None):
+    def __init__(self,kernel,output,profile,calendar,*,dsv_config=None,dsv_log_dir=None,desktop_archive=False):
         self.kernel=kernel;self.profile=profile;self.calendar=calendar
         self.source_profile=getattr(kernel,'_auto_source_profile',None)
         self._last_dsv_profile_hash=None
@@ -196,6 +201,10 @@ class ComparisonRecorder:
         self.dsv_config=None if dsv_config is None else Path(dsv_config)
         self.tail=None if dsv_log_dir is None else DsvLogTail(dsv_log_dir)
         self.last_seq=0;self.last_clock=0;self.last_profile_check=0
+        self._archive_thread = None
+        self._archive_error = None
+        self._archive_dropped = 0
+        self._archive_missed_watermarks = 0
         self.directory=Path(output)/('comparison-'+uuid.uuid4().hex[:12]);self.directory.mkdir(parents=True)
         self.path=self.directory/'events.jsonl';self.stream=self.path.open('xb');self.closed=False
         self.manifest={'schema_version':'DSV_COMPARISON/1','run_id':self.directory.name,
@@ -209,6 +218,8 @@ class ComparisonRecorder:
             'capture_from_utc':kernel.port.clock.now().isoformat().replace('+00:00','Z'),
             'capture_to_utc':kernel.simulation.grant.value['not_after_utc'],
             'same_host_clock_required':True,'dsv_log_precision_ms':1000,'comparison_is_read_only':True}
+        if desktop_archive:
+            self.manifest['archive_mode'] = 'DESKTOP_BACKGROUND'
         if self.source_profile is not None:
             self.manifest.update(source_profile_hash=self.source_profile.content_hash,
                 effective_profile_hash=profile.content_hash,automatic_offsets=True,
@@ -225,12 +236,108 @@ class ComparisonRecorder:
                 for row in profile.to_record()['settings']['symbols']:writer.writerow([row.get(k,'') for k in FIELDS[:8]])
                 publish_new_bytes(symbols.getvalue().encode('utf-8-sig'),self.directory/'dsv-calculated-symbols.csv')
                 publish_new_bytes(profile.to_json().encode('utf-8'),self.directory/'calculated-business-settings.json')
-            self.poll()
+            if desktop_archive:
+                self._archive_queue = Queue(maxsize=128)
+                self._archive_stop = Event()
+                self._archive_through = kernel._durable_seq
+                self._archive_queue.put_nowait((None, self._archive_through))
+                worker = Thread(target=self._archive, args=(kernel.ledger.path,), daemon=True,
+                                name='OnlineTrader-comparison-archive')
+                worker.start()
+                self._archive_thread = worker
+            else:
+                self.poll()
         except Exception:self.close();raise
 
+    def _append(self, kind, data):
+        row = {'kind': kind, 'data': data}
+        row['record_hash'] = content_hash(row)
+        self.stream.write(canonical_bytes(row) + b'\n')
+
     def write(self,kind,data):
-        row={'kind':kind,'data':data};row['record_hash']=content_hash(row)
-        self.stream.write(canonical_bytes(row)+b'\n');self.stream.flush()
+        if self._archive_thread is None:
+            self._append(kind, data)
+            self.stream.flush()
+        elif self._archive_error is None and not self.closed:
+            try:
+                self._archive_queue.put_nowait((kind, deepcopy(data)))
+            except Full:
+                self._archive_dropped += 1
+
+    @property
+    def archive_warning(self):
+        overrun = self._archive_dropped or self._archive_missed_watermarks
+        return self._archive_error or ('E_COMPARISON_BACKPRESSURE' if overrun else None)
+
+    def _record_committed(self, query, append, through, limit):
+        if self.last_seq >= through:
+            return
+        rows = query(
+            'SELECT event_seq,event_type,payload_json,kernel_boot_id FROM event_journal '
+            'WHERE event_seq>? AND event_seq<=? ORDER BY event_seq LIMIT ?',
+            (self.last_seq, through, limit))
+        for row in rows:
+            append('PRODUCT_COMMITTED_EVENT', {
+                'event_seq': str(row['event_seq']), 'event_type': row['event_type'],
+                'kernel_boot_id': row['kernel_boot_id'], 'payload': strict_loads(row['payload_json'])})
+            self.last_seq = row['event_seq']
+
+    def _archive(self, ledger_path):
+        try:
+            with self.stream, closing(sqlite3.connect(ledger_path.as_uri() + '?mode=ro',
+                                                       uri=True, timeout=.05)) as connection:
+                connection.row_factory = sqlite3.Row
+
+                def read(sql, params):
+                    with closing(connection.execute(sql, params)) as cursor:
+                        return cursor.fetchall()
+
+                while not self._archive_deadline_reached():
+                    try:
+                        kind, data = self._archive_queue.get(timeout=.025)
+                    except Empty:
+                        if not self._archive_stop.is_set():
+                            continue
+                        # Drain the last committed watermark at normal close,
+                        # including any watermark skipped under backpressure.
+                        self._archive_journal(read, self._archive_through)
+                        break
+                    if kind is None:
+                        self._archive_journal(read, data)
+                    else:
+                        self._append(kind, data)
+                        self.stream.flush()
+                pending = self._archive_queue.qsize()
+                caught_up = self.last_seq == self._archive_through and pending == 0
+                self._append('RUN_END', {
+                    'status': 'COMPLETE' if caught_up and not self.archive_warning else 'INCOMPLETE',
+                    'committed_through_event_seq': str(self._archive_through),
+                    'archived_through_event_seq': str(self.last_seq),
+                    'pending_items': str(pending),
+                    'dropped_records': str(self._archive_dropped),
+                    'missed_watermarks': str(self._archive_missed_watermarks)})
+        except Exception as error:
+            self._archive_error = getattr(error, 'code', 'E_COMPARISON_WRITE')
+
+    def _archive_deadline_reached(self):
+        return self._archive_stop.is_set() and time.monotonic() >= self._archive_end_at
+
+    def _archive_journal(self, read, through):
+        # A watermark is ordered with market samples in the same queue.
+        # Each short read releases its cursor before serialization or I/O.
+        while self.last_seq < through and not self._archive_deadline_reached():
+            before = self.last_seq
+            try:
+                self._record_committed(read, self._append, through, 32)
+            except sqlite3.OperationalError as error:
+                if (getattr(error, 'sqlite_errorcode', 0) & 0xff) not in {
+                        sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                    raise
+                time.sleep(.025)
+                continue
+            if self.last_seq == before:
+                raise TraderError('E_COMPARISON_JOURNAL_GAP', 'A committed archive watermark could not be read')
+            self.stream.flush()
 
     def market(self,event,account,instrument,decision):
         self.write('PRODUCT_MARKET_DECISION',{'event':event,'account':account,'instrument':instrument,
@@ -239,12 +346,14 @@ class ComparisonRecorder:
 
     def poll(self):
         k=self.kernel
-        for row in k.ledger.query('SELECT event_seq,event_type,payload_json,kernel_boot_id,observed_at_utc FROM event_journal WHERE event_seq>? AND event_seq<=? ORDER BY event_seq LIMIT 1000',
-                                  (self.last_seq,k._durable_seq)):
-            payload = strict_loads(row['payload_json'])
-            self.write('PRODUCT_COMMITTED_EVENT',{'event_seq':str(row['event_seq']),'event_type':row['event_type'],
-                'kernel_boot_id':row['kernel_boot_id'],'payload':payload})
-            self.last_seq = row['event_seq']
+        if self._archive_thread is None:
+            self._record_committed(k.ledger.query, self.write, k._durable_seq, 1000)
+        elif self._archive_error is None and self._archive_through < k._durable_seq:
+            self._archive_through = k._durable_seq
+            try:
+                self._archive_queue.put_nowait((None, self._archive_through))
+            except Full:
+                self._archive_missed_watermarks += 1
         now=time.monotonic()
         if now-self.last_clock>=1 and not isinstance(k.port.clock, LocalWallClock):
             self.write('CLOCK',clock_observation(k.port.clock)|{'source_epoch':k.port.source_epoch,
@@ -279,7 +388,21 @@ class ComparisonRecorder:
                 self._last_dsv_profile_hash=current.content_hash
 
     def close(self):
-        if not self.closed:self.stream.close();self.closed=True
+        if self.closed:
+            return
+        if self._archive_thread is None:
+            self.stream.close()
+            self.closed = True
+            return
+        self.closed = True
+        self._archive_through = self.kernel._durable_seq
+        self._archive_end_at = time.monotonic() + .5
+        self._archive_stop.set()
+        self._archive_thread.join(timeout=.6)
+        if self._archive_thread.is_alive():
+            raise TraderError('E_COMPARISON_CLOSE_PENDING', 'Comparison archive finalization is pending')
+        if self._archive_error:
+            raise TraderError(self._archive_error, 'Comparison archive could not be completed')
 
 
 def read_records(path):
@@ -494,6 +617,9 @@ def build_report(manifest_path,output,*,tolerance_ms=2000,dsv_trades=None,dsv_so
         'limits':['DSV text uses second precision; the last leading timestamp is used.',
                   'DSV exit-decision text does not prove closing fills; use the broker export for full close comparison.',
                   'Different-account quantities, funds and fills are reported as differences; no ledger is changed.']}
+    if manifest.get('archive_mode') == 'DESKTOP_BACKGROUND':
+        end = next((row['data'] for row in reversed(records) if row['kind'] == 'RUN_END'), None)
+        result['source_coverage']['desktop_archive'] = end or {'status': 'NOT_PROVED'}
     output=Path(output);output.mkdir(parents=True,exist_ok=True)
     publish_new_bytes(canonical_bytes(result),output/'comparison.json')
     keys=('status','kind','contract_id','trading_day','direction','dsv_time','product_time','dsv_quantity',
