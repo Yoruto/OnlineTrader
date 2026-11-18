@@ -12,6 +12,10 @@
 
 [运行记录和独立报告原件哈希](../refactor/dsv-parity-20261114/29-clock-stability-and-four-contract-retest.md)覆盖三轮 SimNow/TqKq 对照、SDK 行情时间复现和 30 分钟授时观察。
 
+## 2026-11-18 dev32 包与工作台重连
+
+[验收记录与证据身份](../refactor/dsv-parity-20261114/30-dev32-simnow-and-workbench-reconnect.md)登记 dev32 制品哈希、20 项 DSV 固定回放、SimNow 实际交易和午休暂停状态，以及重连修复的 12 项 Windows Qt 与 IPC 独立验收和 33 项回归。
+
 ## 不把证据来源和执行结果混写
 
 `reported_result` 记录原作者说测到了什么；`evidence_status` 记录本次审核是否实际取得相应原件。`REPORTED_PASS / NOT_INSPECTED` 不等于失败，也不等于本次独立通过。原件不可取得时，哈希、实际命令、完整环境及未知计数保留 `null`，禁止补造。

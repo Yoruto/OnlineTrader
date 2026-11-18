@@ -20,6 +20,10 @@ from online_trader.transport.status_client import StatusClient
 from online_trader.transport.workbench_snapshot import MAX_AGE_NS, read_workbench_publication
 
 
+RECONNECT_TIMEOUT_NS = 30_000_000_000
+CONNECTION_ERRORS = frozenset({'E_TIMEOUT', 'E_PIPE', 'E_PIPE_CLOSED'})
+
+
 OWNER_RECHECK_OPERATIONS = frozenset({
     'STOP_DSV_STRATEGY', 'PAUSE_NEW_ENTRIES', 'CANCEL_SELECTED', 'CANCEL_OWNED',
     'MANUAL_CLOSE', 'MANUAL_CLOSE_ALL', 'FLATTEN_THEN_STOP', 'REQUEST_RECONCILIATION',
@@ -28,14 +32,15 @@ OWNER_RECHECK_OPERATIONS = frozenset({
 
 class _WorkbenchRequest(QThread):
     result=Signal(object);failed=Signal(object)
-    def __init__(self,pipe,factory,action,args,account_key,boot,*,publication_after_ns=0):
+    def __init__(self,pipe,factory,action,args,account_key,boot,*,publication_after_ns=0,direct_refresh=False):
         super().__init__();self.pipe=pipe;self.factory=factory;self.action=action;self.args=args
         self.account_key=account_key;self.boot=boot
         self.publication_after_ns = publication_after_ns
+        self.direct_refresh = direct_refresh
     def run(self):
         client=None
         try:
-            if self.action == 'refresh' and self.factory is StatusClient:
+            if self.action == 'refresh' and self.factory is StatusClient and not self.direct_refresh:
                 value = read_workbench_publication(self.pipe, self.account_key)
                 if value is not None and value['published_ns'] >= self.publication_after_ns:
                     if not self.isInterruptionRequested():
@@ -121,6 +126,11 @@ class WorkbenchWindow(StatusWindow):
         self.view=None;self.receipt_identity=None;self._boot=None
         self.snapshot_published_ns = None
         self._publication_after_ns = 0
+        self.connection_recovery_source = None
+        self._connection_interrupted_ns = 0
+        self._connection_retry_deadline_ns = 0
+        self._connection_retry_pending = False
+        self._connection_retry_timed_out = False
         self._finished_run = None
         self._startup_in_progress = False
         self._guard_launch = autostart
@@ -195,6 +205,9 @@ class WorkbenchWindow(StatusWindow):
         self.monitor_timer.setInterval(1000)
         self.monitor_timer.timeout.connect(self.refresh_monitor)
         self.monitor_timer.start()
+        self.connection_retry_timer = QTimer(self)
+        self.connection_retry_timer.setInterval(1000)
+        self.connection_retry_timer.timeout.connect(self._update_connection_recovery)
         self.monitor_diagnostics = None
         self._diagnostic_instance = uuid.uuid4().hex[:12]
         self._diagnostic_write_failed = False
@@ -274,11 +287,56 @@ class WorkbenchWindow(StatusWindow):
         if action!='refresh':
             self.refresh_button.setEnabled(False);self._enable_commands(False)
         account=self.paired_account_key or (self.selected_account['account_key'] if self.selected_account is not None else self.view['account_key'] if self.view is not None else None)
+        direct_refresh = action == 'refresh' and self._connection_retry_pending
+        if direct_refresh:
+            self._connection_retry_pending = False
         worker=_WorkbenchRequest(self.pipe_name,self._factory,action,args,account,None if action=='refresh' else self._boot,
-                                 publication_after_ns=self._publication_after_ns)
+                                 publication_after_ns=self._publication_after_ns,direct_refresh=direct_refresh)
         self._worker=worker;worker.result.connect(self._job_result);worker.failed.connect(self._job_failed);worker.finished.connect(self._finished);worker.start()
 
     def refresh(self):self._start_job('refresh')
+
+    def _observe_connection_recovery(self, source):
+        if source is None:
+            self.connection_retry_timer.stop()
+            self.connection_recovery_source = None
+            self._connection_retry_pending = False
+            self._connection_retry_timed_out = False
+        else:
+            if self.connection_recovery_source is None:
+                now = time.monotonic_ns()
+                self._connection_interrupted_ns = now
+                self._connection_retry_deadline_ns = now + RECONNECT_TIMEOUT_NS
+                self.connection_retry_timer.start()
+            self.connection_recovery_source = source
+        self._update_connection_recovery()
+
+    def reconnect(self):
+        if self._closing or self.connection_recovery_source is None:
+            return
+        self._restart_connection_query(time.monotonic_ns(), timed_out=False)
+        self._update_connection_recovery()
+
+    def _restart_connection_query(self, now, *, timed_out):
+        self._connection_retry_timed_out = timed_out
+        self._connection_retry_deadline_ns = now + RECONNECT_TIMEOUT_NS
+        self._connection_retry_pending = True
+        self.refresh()
+
+    def _update_connection_recovery(self):
+        if self._closing or self.connection_recovery_source is None:
+            self.dashboard.show_connection_recovery('')
+            return
+        now = time.monotonic_ns()
+        if now >= self._connection_retry_deadline_ns:
+            self._restart_connection_query(now, timed_out=True)
+        remaining = (self._connection_retry_deadline_ns - now + 999_999_999) // 1_000_000_000
+        elapsed = (now - self._connection_interrupted_ns) // 1_000_000_000
+        source = ('等待执行器响应' if self.connection_recovery_source == 'owner'
+                  else '等待柜台恢复同步')
+        action = '上次等待超时 · ' if self._connection_retry_timed_out else ''
+        self.dashboard.show_connection_recovery(
+            f'{source} {elapsed} 秒 · {action}{remaining} 秒后重新发起连接查询')
 
     def published_snapshot_expired(self):
         return (self.snapshot_published_ns is not None
@@ -417,6 +475,9 @@ class WorkbenchWindow(StatusWindow):
         if self._closing:return
         if result['action']=='refresh':
             value=result['value']
+            if self._worker is not None and self._worker.direct_refresh:
+                # A cached view captured before this reply must not undo a direct refresh.
+                self._publication_after_ns = max(self._publication_after_ns, time.monotonic_ns())
             if self._stale and self.receipt_identity is None:
                 self.home_feedback = ''
             if self._boot is not None and self._boot!=value['view']['kernel_boot_id']:
@@ -432,6 +493,14 @@ class WorkbenchWindow(StatusWindow):
             self.view=value['view'];self._boot=self.view['kernel_boot_id']
             self.snapshot_published_ns = value.get('published_ns')
             self._stale = self.published_snapshot_expired()
+            connection = self.view['connection']
+            if self._stale or self.view['truncated']:
+                if self.connection_recovery_source is not None:
+                    self._observe_connection_recovery('owner')
+            elif not connection['broker_connected'] or not connection['synchronized']:
+                self._observe_connection_recovery('broker')
+            else:
+                self._observe_connection_recovery(None)
             if self.receipt_identity:
                 receipt=next((row for row in self.view['commands'] if all(
                     row.get(key)==expected for key,expected in self.receipt_identity.items())),None)
@@ -478,7 +547,7 @@ class WorkbenchWindow(StatusWindow):
             self.notice_label.setText(message)
             self.show_home_feedback(message)
             return
-        if self.view is not None and error['code'] in {'E_TIMEOUT','E_PIPE'}:
+        if self.view is not None and error['code'] in CONNECTION_ERRORS:
             from online_trader.desktop.runtime_logs import read_record, supplied_run_directory
             run = self.dashboard.latest_run() or supplied_run_directory(self.view)
             result = read_record(run/'result.json', limit=4 * 1024 * 1024) if run is not None else None
@@ -497,6 +566,7 @@ class WorkbenchWindow(StatusWindow):
                 self.view = None
                 self.snapshot_published_ns = None
                 self._publication_after_ns = 0
+                self._observe_connection_recovery(None)
                 self._boot = None
                 self.receipt_identity = None
                 self._control_notice = None
@@ -518,6 +588,9 @@ class WorkbenchWindow(StatusWindow):
             self.receipt_identity=error['identity']
             self._publication_after_ns = time.monotonic_ns()
         self._failed(error['code'])
+        if (self.view is not None and self._worker is not None and self._worker.action == 'refresh'
+                and error['code'] in CONNECTION_ERRORS):
+            self._observe_connection_recovery('owner')
         if self.view is not None:self.dashboard.add_activity('状态刷新失败 · '+error['code'],category='error')
         if self.view is not None:
             self.dashboard.quote_status.setText('合约行情 · 上次快照已过期')
@@ -530,7 +603,7 @@ class WorkbenchWindow(StatusWindow):
             self._control_notice='请求结果未知，已保留原命令身份。请查询上次回执。'
             self.notice_label.setText(self._control_notice)
             self.home_issue = '命令结果待核对，请查看交易详情中的命令回执'
-        if self.view is None and error['identity'] is None and error['code'] in {'E_TIMEOUT', 'E_PIPE'}:
+        if self.view is None and error['identity'] is None and error['code'] in CONNECTION_ERRORS:
             self.connection_label.setText('尚未连接模拟盘')
             self.notice_label.setText('点击「启动策略」后，程序会按所选账号和当前参数准备连接。')
             if self._strategy_starter is not None and self._strategy_starter.status_text:
@@ -553,7 +626,8 @@ class WorkbenchWindow(StatusWindow):
         if positions_result is not None:
             self._action(lambda: self._review_close_positions(*positions_result))
         if deferred is None:
-            if action in ('command','status') and self.timer.isActive():self.refresh()
+            if self._connection_retry_pending or (action in ('command','status') and self.timer.isActive()):
+                self.refresh()
             return
         identity,action,args=deferred
         if (self.view is None or identity!=self._command_binding() or
@@ -1002,6 +1076,7 @@ class WorkbenchWindow(StatusWindow):
         self._boot=None;self.view=None;self.receipt_identity=None;self._stale=True;self._account_key=None
         self.snapshot_published_ns = None
         self._publication_after_ns = 0
+        self._observe_connection_recovery(None)
         self._finished_run = None
         self._control_notice=None
         self.home_feedback = self.home_issue = ''
@@ -1191,6 +1266,7 @@ class WorkbenchWindow(StatusWindow):
             self._strategy_starter.status_timer.stop()
         self.cancel_timed_start()
         self.monitor_timer.stop()
+        self.connection_retry_timer.stop()
         self.dashboard.log_timer.stop()
         self.timer.stop();super().closeEvent(event)
 

@@ -243,6 +243,8 @@ Supervisor 不导入策略报单入口，不调用 SDK 下单/撤单，不改 Jo
 
 ## 7. 恢复、重连与监督
 
+当前桌面源码已实现工作台对原执行器的重连状态提示、手动直连查询和 30 秒超时重试。SDK 和后台持仓恢复继续由原执行器负责。服务监督和确认退出后的安全启动仍按本计划验收。 [工作台重连验收](refactor/dsv-parity-20261114/30-dev32-simnow-and-workbench-reconnect.md#工作台重连)
+
 ### 7.1 健康证明
 
 owner 完成一轮推进后发布 heartbeat sequence、owner_boot_id、engine/version、最近成功 SDK 驱动、最近事实同步、状态提交进度、未完成责任数量和实际阶段。休市无新报价不等于 owner 卡死；GUI 线程或独立心跳线程活着也不能代替 owner 推进证明。

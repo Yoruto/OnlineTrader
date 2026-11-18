@@ -1,5 +1,7 @@
 # G1 操作者控制协议与验收契约
 
+运行中工作台失联后，立即重连和 30 秒到期重试通过原执行器发起只读状态查询。回执未到达时保留已发送命令的身份，继续用原命令身份查询回执。直连结果生效后，早于该次回复的已发布快照不再覆盖它。 [工作台重连验收](refactor/dsv-parity-20261114/30-dev32-simnow-and-workbench-reconnect.md#工作台重连)
+
 dev20扩展原`PAUSE_NEW_ENTRIES`/`ARM_ENTRIES`的CONTRACT范围，用于工作台逐品种新增门禁；不增加发送者、不改原协议资源。停用可撤所选品种自有开仓余单，保留原保护；启用只解除品种限制，不武装全账户。原ACCOUNT语义及下方G1历史记录保留，当前流程见[dev20运行功能](dsv-runtime-completion-20261110.md)。
 
 本契约对应 G0 的 13 种 `OperatorCommand`。实现位于

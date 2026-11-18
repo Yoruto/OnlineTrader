@@ -10,6 +10,8 @@
 
 [2026-11-17 授时稳定性及四合约复测](29-clock-stability-and-four-contract-retest.md)记录早盘分钟缺口、原始报价复现、校时顺序与两轮拒开对照。
 
+[2026-11-18 dev32 四合约 SimNow 制品测试和工作台重连](30-dev32-simnow-and-workbench-reconnect.md)记录实际成交、午休暂停、同日恢复以及新源码的 Qt 验收。
+
 C01在上述基线仍为开放问题，代码修复候选见 [PR #2](https://github.com/Yoruto/OnlineTrader/pull/2)。本地验证、Windows复测、合并和部署分别核对；F04等其他差异不随本页更新而关闭。原作者89/1,564项通过记录与可取得原件的状态分列，缺失哈希不补造。
 
 **阶段记录**：[执行选型](05-offline-implementation.md) · [显式执行](06-round-replay-and-controller.md) · [离线工作台](07-offline-workbench-and-recovery.md) · [迁移与恢复](08-offline-migration-and-business-recovery.md) · [SDK 适配](09-sdk-opening-and-rollback-rehearsal.md) · [候选启动与回滚](10-sdk-startup-and-same-day-rollback.md) · [SimNow 只读核验](11-simnow-readonly-acceptance.md) · [F01–F03](12-review-fixes-f01-f03.md) · [原策略循环](13-original-loop-replay.md) · [SDK 子单及结清](14-sdk-round-and-close-sync.md)

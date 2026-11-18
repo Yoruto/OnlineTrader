@@ -4,6 +4,8 @@
 
 ## DSV 替代链开发与验收
 
+2026-11-18 的 dev32 Windows 便携版通过普通交易工作台和 SimNow 测试了棕榈油、塑料、沥青和菜油。前三笔各 1 手的试单完成开平。取消人为手数限制后，棕榈油自动算量并卖开成交 30 手。午休按用户要求暂停，原执行器继续管理这笔持仓。 [制品、四合约结果和重连验收](docs/refactor/dsv-parity-20261114/30-dev32-simnow-and-workbench-reconnect.md)
+
 2026-11-16 的[上午五合约迁移与模拟盘对照](docs/refactor/dsv-parity-20261114/23-simnow-migration-and-activation-parity.md)覆盖原账本副本恢复、同柜台日迁移和激活位修复。[下午四合约真实模拟盘复跑](docs/refactor/dsv-parity-20261114/24-afternoon-four-contract-acceptance.md)完成了几何拒绝、激活位与柜台空仓对照，记录了停开后的 SQLite 提交错误及读库修正。实际发单、成交保护和平仓仍待验证。
 
 2026-11-17 校时后的两轮四合约双跑共匹配 180 个同秒行情点和 20 条同分钟激活位拒开日志，塑料和沥青分钟缺口未复现。现有模拟柜台证据覆盖入场前判定，仍需有自然信号的开仓、成交后保护和退出闭环。 [现场复测记录](docs/refactor/dsv-parity-20261114/29-clock-stability-and-four-contract-retest.md)
@@ -67,6 +69,8 @@ $env:PYTHONPATH = 'src'
 即时校准前检查 W32Time 是否仍在渐进调速。已授权停机维护时，先停止服务并确认调速状态，再即时校准、恢复服务并重新同步。随后以独立样本跨自动同步周期复核偏差。 [实际操作与验证](docs/refactor/dsv-parity-20261114/29-clock-stability-and-four-contract-retest.md)
 
 ## 打开账户管理与交易工作台
+
+运行中失联时，包含重连修复的工作台会区分执行器未响应与柜台待同步。窗口底部显示已等待时间和 30 秒重试倒计时，可点「立即重连」直接向原执行器查询状态。收到完整同步状态后自动收起提示。 [重连行为与验收](docs/refactor/dsv-parity-20261114/30-dev32-simnow-and-workbench-reconnect.md#工作台重连)
 
 旧入口、参数编辑、报表、默认启动及维护命令完整保留在[原工作台说明](README.legacy-ddad472.md#打开账户管理与交易工作台)。使用前核对入口、所部署版本及当前授权，不能把旧制品操作记录当作替代链已切换的证明。
 

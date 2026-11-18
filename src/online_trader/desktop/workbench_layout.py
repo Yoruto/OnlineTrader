@@ -697,11 +697,17 @@ class WorkbenchLayout:
         self.diagnostic_sections.currentChanged.connect(self.update_logs)
         self.render_home()
         self.workspace_clock = QLabel()
+        self.connection_recovery_label = QLabel()
+        self.connection_recovery_button = button('立即重连', window.reconnect)
+        self.connection_recovery_button.setToolTip('重新查询原执行器与柜台同步状态')
         window.statusBar().setStyleSheet(
             'QStatusBar { background:#f5f8fc; border-top:1px solid #dbe5f2; }'
             'QStatusBar QLabel { color:#485b75; padding:2px 7px; }'
             'QStatusBar::item { border:0; }')
         window.statusBar().addWidget(self.workspace_clock)
+        window.statusBar().addWidget(self.connection_recovery_label, 1)
+        window.statusBar().addWidget(self.connection_recovery_button)
+        self.show_connection_recovery('')
         self.update_workspace_clock()
         self.log_timer = QTimer(window)
         self.log_timer.setInterval(400)
@@ -710,6 +716,11 @@ class WorkbenchLayout:
         self.log_timer.start()
         for grid in (*self.tables.values(), window.cycles):
             configure_table(grid)
+
+    def show_connection_recovery(self, text):
+        self.connection_recovery_label.setText(text)
+        self.connection_recovery_label.setVisible(bool(text))
+        self.connection_recovery_button.setVisible(bool(text))
 
     def section(self, title):
         page = QWidget()
@@ -1457,7 +1468,11 @@ class WorkbenchLayout:
 
         cycles = [cycle for cycle in (view or {}).get('cycles', []) if cycle['remaining_quantity'] > 0]
         quantity = sum(cycle['remaining_quantity'] for cycle in cycles)
-        if stale or fault or truncated:
+        if w.connection_recovery_source == 'owner':
+            state, description = '工作台重连中', '正在恢复原执行器的状态查询'
+        elif w.connection_recovery_source == 'broker':
+            state, description = '柜台重连中', '等待原执行器完成柜台同步'
+        elif stale or fault or truncated:
             state = '状态待核对'
             description = '上次状态已过期' if stale else '柜台或执行器状态待核对'
             if truncated:
@@ -1488,7 +1503,8 @@ class WorkbenchLayout:
         clock_diagnostic = config.get('strategy_diagnostics', {}).get('ntp')
         clock = ('异常' if connection.get('clock_fault') or clock_diagnostic == 'NTP_SKEW'
                  else '待核对' if not available or clock_diagnostic == 'NTP_UNAVAILABLE' else '无已知异常')
-        health = ('待核对' if stale or fault or truncated else '已连接' if connected else '未连接')
+        health = ('重连中' if w.connection_recovery_source else
+                  '待核对' if stale or fault or truncated else '已连接' if connected else '未连接')
         quotes = (view or {}).get('markets', ())
         monitor_state = (config.get('strategy_monitor') or {}).get('quote_status')
         lagging = sum(not item.get('fresh') and bool(item.get('source_time_utc')) for item in quotes)
@@ -1507,8 +1523,8 @@ class WorkbenchLayout:
             market_health = '已更新'
         for (dot, label), (title, value, good, alert) in zip(self.toolbar_status, (
             ('行情', market_health, market_health == '已更新', market_health.endswith('个合约滞后')),
-            ('交易', health, health == '已连接', stale or fault or truncated),
-            ('策略', state, armed and available, state in {'状态待核对', '正在核对'}),
+            ('交易', health, health == '已连接', health in {'重连中', '待核对'}),
+            ('策略', state, armed and available, state in {'状态待核对', '正在核对'} or bool(w.connection_recovery_source)),
             ('校时', clock, clock == '无已知异常', clock == '异常'),
         )):
             label.setText(f'{title} {value}')
