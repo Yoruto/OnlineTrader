@@ -16,6 +16,8 @@
 
 [验收记录与证据身份](../refactor/dsv-parity-20261114/30-dev32-simnow-and-workbench-reconnect.md)登记 dev32 制品哈希、20 项 DSV 固定回放、SimNow 实际交易和午休暂停状态，以及重连修复的 12 项 Windows Qt 与 IPC 独立验收和 33 项回归。
 
+[dev34 换机与收盘复核](../refactor/dsv-parity-20261114/31-dev34-simnow-handoff-and-closeout.md)登记两端原始事件、远端日志与 SQLite/WAL 副本的对应关系、独立尾盘禁开证据，以及未继承的日停和未完成的平仓。
+
 ## 不把证据来源和执行结果混写
 
 `reported_result` 记录原作者说测到了什么；`evidence_status` 记录本次审核是否实际取得相应原件。`REPORTED_PASS / NOT_INSPECTED` 不等于失败，也不等于本次独立通过。原件不可取得时，哈希、实际命令、完整环境及未知计数保留 `null`，禁止补造。
