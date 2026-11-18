@@ -51,4 +51,26 @@ SDK 驱动切片上界初始为 500 ms，严格截止点使用至少 1 ms 的调
 
 证据按 Windows 源码、实际 Qt/IPC、冻结 DSV、模拟柜台和制品记录。固定候选的计数和未执行项见对应独立测试报告。当前交易日缺少独立柜台证明时，替代链保留获准交易日及已有责任，自动换日范围仍须单独核实。
 
+### F5 候选诊断采集与证据口径
+
+范围为 [时钟准确性与行情稳定性方案](clock-market-data-stability-implementation-plan-20261118.md)的旧链首批候选。链路为普通工作台 F5 → `desktop-start` → 原 Kernel → `TqKqDsvPort`。SimNow 与 TqKq 的旧 DSV 入口共用这些测点。普通 `simulation run` 共用底层 SDK 等待适配。替代链使用自己的 SDK 泵、状态与回执。
+
+- 启动前在策略参数启用「逐行情诊断」`tick_diag`。以当前执行器的 `runtime-identity.json` 和 `SESSION_START` 核对入口、合约范围、日历和参数。工作台盘中源报价年龄取当前快照中已知活跃盘段、同盘有效的源戳。显示源时间领先、报价待核对和休市。积压提示表示存在原生 Tick 首见后至少等待 1 秒的本机样本。
+- `market-quote-trace.jsonl` 记录 SDK 返回的单调时刻和 SDK 等待模式、应用参考批次、原生 Tick 增量、真实策略入口 `STRATEGY_START`、接纳结果、工作台投影及派发关联。用合约、盘段、来源 epoch、原生 ID 和源时间配对。现有 `market-latency.jsonl` 延续兼容取样，策略前置准备起点仍在账户、合约资料整理之前。
+- `SDK_MONOTONIC_TIMEOUT` 表示固定 SDK 对该次等待使用事件循环的单调超时。出现兼容模式或未见超时回调时，以实际调用和跨度为证。SDK 同步合并、写账、启动隐式等待和其他入口分别核对。历史重建每 256 条或约 20 毫秒检查进度，单条同步操作和事务等待单列。
+- `market-latency-summary.jsonl` 保留整盘段与固定 15 分钟分组。入组用锁定 SDK 中新增的、同盘的可复核原生 Tick。汇总给出实际首末观察时点、原生槽位缺口、盘段外排除、M2 及时/迟到/未证计数和数值区间。发生断线、帧替换、时间改写或覆盖丢失时据实际范围记录。未被策略消费的 Tick 仍在原分母。分组样本小于 100 时标为未充分取证，整盘报告保留。
+- 原退出目标成立但自动减仓缺可用原生报价时，显示等待价格，允许的撤单与原生事实核对继续。子单真正派发前按原链复核。按尝试身份向后检查 `DISPATCH_PRECHECK`、`SDK_INSERT_ORDER`、`DISPATCH_RESULT`、账本提交与原生回报。SDK 本地返回只证明调用返回，原生终态以柜台可追溯事实为准。证实未发的网关拒绝可在账本 `last_dispatch_abort.details` 查询内层依据。
+- 诊断线程使用有界队列，每份活动文件和前一份轮转文件各保留 4 MiB。整盘验收应在现场按记录范围及时归档详细轮转段，保留批次号、摘要和结束标记。报告会列出原生缺口、写入丢样和从首批到末次可见批次的缺失。按实际操作时间核对范围与完成度。
+
+在候选源码目录使用项目 Python 离线读取已授权的诊断归档。
+
+```powershell
+$env:PYTHONPATH = 'src'
+python -X utf8 qa/f5_latency_report.py --run-dir 'E:\OnlineTrader-evidence\run'
+```
+
+重复传入 `--trace-file`、`--summary-file` 可合并已归档的轮转段。可选 `--time-proof` 文件使用 `F5_LATENCY_TIME_PROOF/1`。文件的 `kernel_boot_id` 对应同一个执行器运行，`application` 提供 `clock_epoch` 和 `from_monotonic_ns`、`until_monotonic_ns`，`sources` 提供 `contract_id`、`source_epoch` 和 `from_source_ns`、`until_source_ns`。源证据的 `meaning` 为 `SDK_NATIVE_TICK_EVENT`。每段还须提供独立获得的 `max_error_ns` 和可复查的 `evidence` 引用。只有同事件两端被证据覆盖时才估计 M1 的上下界。报告附证明文件哈希。缺失的启动、休市、重连和高流量窗口应按实际范围说明。
+
+当前候选状态为源码与编译检查。Windows 真入口的离线功能验收、整盘 UTC 与 M1/M2、SimNow 原生减仓终态及发布前验收为 `NOT_RUN`。现场源时间缺少独立证明时，M1 为 `NOT_PROVED`。
+
 按 E02 登记的无价收盘退出，在核实原生空仓和订单终态后可以结案。回执保存原日历退出身份及 `SESSION_CLOSE_REFERENCE_UNAVAILABLE`，该笔名义收益和净亏增量为未确定，已知值汇总保留。实际平仓价格、数量和由真实成交推导的点差继续在成交及资金侧记录。

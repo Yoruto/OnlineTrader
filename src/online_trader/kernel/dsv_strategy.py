@@ -636,12 +636,26 @@ class DsvStrategyRuntime:
         if self.epoch is None or self.epoch!=k.active_epoch:raise TraderError("E_EPOCH_REVOKED","Observation rebuild requires the active owner")
         if self._pending is not None or k._pending:raise TraderError("E_FACT_BARRIER","Observation rebuild requires an accepted boundary")
         if type(events) is not list or not 1<=len(events)<=10000:raise TraderError("E_SCHEMA","Expected a bounded explicit source path")
+        active_epoch, profile_hash = self.epoch, self.profile.content_hash
+        next_progress = time.monotonic_ns() + 20_000_000 if _progress is not None else None
+
+        def advance_owner(index):
+            nonlocal next_progress
+            if _progress is None:
+                return
+            if (index and index % 256 == 0) or time.monotonic_ns() >= next_progress:
+                _progress()
+                next_progress = time.monotonic_ns() + 20_000_000
+                if (active_epoch != self.epoch or active_epoch != k.active_epoch
+                        or profile_hash != self.profile.content_hash or self._pending or k._pending or k._failed):
+                    raise TraderError('E_DSV_REBUILD_INTERRUPTED',
+                                      'The owner, profile or commit boundary changed during observation rebuild')
+
         digest = hashlib.sha256(b'[')
         size = 2  # Include the brackets of the canonical array.
         prepared = []
         for index, event in enumerate(events):
-            if _progress is not None and index and index % 256 == 0:
-                _progress()
+            advance_owner(index)
             row = copy.deepcopy(event) if _enrich is None else _enrich(event)
             # Encoding an array of one preserves the original nesting limit.
             encoded = canonical_bytes([row])[1:-1]
@@ -693,8 +707,7 @@ class DsvStrategyRuntime:
                     datetime.fromisoformat(first['source_time_utc'])):
                 state['night_reference']=copy.deepcopy(night)
         for index, event in enumerate(events):
-            if _progress is not None and index and index % 256 == 0:
-                _progress()
+            advance_owner(index)
             if (type(event) is not dict or event.get("account_key")!=k.account_key
                     or (event.get("contract_id"),event.get("trading_day"))!=key
                     or event.get("source_epoch")!=first.get("source_epoch") or event.get("session_id")!=first.get("session_id")
@@ -706,6 +719,9 @@ class DsvStrategyRuntime:
             if new["coverage_lost"] or new["last_sequence"] != event["sequence"] or state["last_sequence"] == new["last_sequence"]:
                 raise TraderError("E_FACT_BARRIER","Replay is incomplete, repeated or out of order")
             state=new
+        advance_owner(len(events))
+        if self._states.get(key) is not old:
+            raise TraderError('E_DSV_REBUILD_INTERRUPTED', 'The accepted observation boundary changed during rebuild')
         if not extend:observed_from=first["source_time_utc"]
         if old is not None:
             if (state["source_epoch"]<old["source_epoch"] or
@@ -744,6 +760,9 @@ class DsvStrategyRuntime:
 
     def on_market(self,event,account,instrument,*,_allow_entry=True,_entry_recovery=None):
         self._development();k=self.kernel
+        trace = getattr(k, '_dsv_quote_trace', None)
+        if trace is not None:
+            trace.strategy_start(event, time.monotonic_ns(), k.port.clock)
         self.update_facts(event,account,instrument)
         if self.epoch is None or self.epoch!=k.active_epoch:
             raise TraderError("E_EPOCH_REVOKED","Activate the strategy for this boot before observing entry facts")

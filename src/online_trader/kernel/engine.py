@@ -754,8 +754,18 @@ class Kernel:
         request=copy.deepcopy(order) | {"position_cycle_id":cid,"account_key":self.account_key}
         if self.simulation is not None:
             request.update(contract_id=cycle['plan']['contract_id'],direction='BUY' if (cycle['plan']['direction']=='LONG')==(order['effect']=='OPEN') else 'SELL',trading_day=order.get('native_trading_day',cycle['plan']['trading_day']))
-            try:self.port.validate_send(request)
-            except TraderError as error:checks[error.code]=False
+            try:
+                self.port.validate_send(request)
+            except TraderError as error:
+                checks[error.code] = False
+                quote_evidence = getattr(error, 'quote_evidence', None)
+                if error.code == 'E_NATIVE_QUOTE_NOT_CURRENT' and quote_evidence:
+                    review_details[error.code] = quote_evidence
+        trace = getattr(self, '_dsv_quote_trace', None)
+        if trace is not None:
+            trace.record('DISPATCH_PRECHECK', contract_id=cycle['plan']['contract_id'],
+                         child_order_id=child_id, attempt_id=order['attempt_id'], effect=order['effect'],
+                         reasons=[check for check, passed in checks.items() if not passed])
         if not all(checks.values()):
             self._entry_gates.pop(order["attempt_id"],None)
             order["send_state"] = "DEFINITELY_NOT_SENT"
@@ -785,6 +795,13 @@ class Kernel:
             order["send_state"] = "UNKNOWN"
             self._armed = False
             evidence = {"exception": exception_record(error), "child_order_id": child_id}
+            if isinstance(error, TraderError) and error.code == 'E_NATIVE_QUOTE_NOT_CURRENT':
+                native_quote_review = getattr(error, 'quote_evidence', None)
+                if native_quote_review:
+                    evidence["native_quote_review"] = native_quote_review
+        if trace is not None:
+            trace.record('DISPATCH_RESULT', contract_id=cycle['plan']['contract_id'],
+                         child_order_id=child_id, attempt_id=order['attempt_id'], result=order['send_state'])
         cycle["revision"] += 1
         order["revision"] += 1
         self._stage_cycle(cycle,"TX_ORDER","SEND_RESULT", evidence=evidence)

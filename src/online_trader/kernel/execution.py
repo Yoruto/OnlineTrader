@@ -284,6 +284,12 @@ class ExecutionCoordinator:
             result.update(allowed=False,price=None,reasons=['OPEN_SESSION_CLOCK_UNKNOWN'])
         return result
 
+    def _automatic_reduction_ready(self, cycle, *, manual, price_only):
+        if manual or price_only or not getattr(self.kernel.simulation, 'strategy_enabled', False):
+            return True
+        ready = getattr(self.kernel.port, 'automatic_reduction_quote_ready', None)
+        return ready is None or ready(cycle['plan']['contract_id'])
+
     def progress(self,cid,*,allow_open=False,allow_retry=False):
         k=self.kernel
         if k._failed:return
@@ -355,6 +361,9 @@ class ExecutionCoordinator:
                     if manual_limit:continue
                     if manual and effect=='REDUCE':continue
                     if order['send_state']=='DEFINITELY_NOT_SENT' and not allow_retry:continue
+                    if effect == 'REDUCE' and not self._automatic_reduction_ready(
+                            cycle, manual=manual, price_only=price_only):
+                        continue
                     self._replace(cycle,order,action);return
                 if (action['action']=='STOP' and effect=='OPEN' and not ex['entry_stopped'] and
                         (timeout or 'UNEXPECTED_ORDER_TERMINAL' in action['reasons'])):
@@ -374,7 +383,8 @@ class ExecutionCoordinator:
             blocked=blocked or bool(relevant and relevant[-1]['send_state']=='DEFINITELY_NOT_SENT' and not allow_retry)
             if qty and not blocked:
                 priced=self.price(cycle,'REDUCE')
-                if priced['allowed']:self._new_reduction(cycle,qty,priced['price'])
+                if priced['allowed'] and self._automatic_reduction_ready(cycle, manual=manual, price_only=price_only):
+                    self._new_reduction(cycle,qty,priced['price'])
 
     def _replace(self,cycle,old,action):
         k=self.kernel;qty=action['quantity'];price=action['price'];effect=old['effect']

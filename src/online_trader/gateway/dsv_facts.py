@@ -44,13 +44,30 @@ class DsvFactFeed:
         trade = profile.to_record()['settings']['trade']
         self._continuation_seconds = float(trade['chase_window_minutes']) * 60 if trade['continuation_entry'] else None
         self._night_references = {}
+        self.quote_trace = None
+
+    def _trace_batch(self, code, reason, *, session=None, latest=None, previous=None, **facts):
+        if self.quote_trace is None:
+            return
+        session_id = (session or {}).get('session_id')
+        tick_id = latest[0] if latest is not None else None
+        self.quote_trace.record(
+            'TICK_BATCH', contract_id=code,
+            state=(reason, self.port.source_epoch, session_id, tick_id, previous, facts.get('path_complete')),
+            reason=reason, source_epoch=self.port.source_epoch, session_id=session_id,
+            session_open_utc=(session or {}).get('open_utc'), session_close_utc=(session or {}).get('close_utc'),
+            last_tick_id=tick_id, last_tick_utc=utc(latest[1]) if latest is not None else None,
+            previous_accepted_tick_id=previous, **facts)
 
     def batches(self, *, resume_states=None, calendar_event=None, allow_startup_observation=True,
                 reconnect_ready=None):
         result=[];now=self.port.clock.now()
         for code in self.port.grant.value['contracts']:
             at=self.calendar.query(code,utc(now))
-            if not at['complete'] or not at['is_trading']:continue
+            if not at['complete'] or not at['is_trading']:
+                reason = 'OUTSIDE_CURRENT_SESSION' if at['complete'] else 'CALENDAR_COVERAGE_UNKNOWN'
+                self._trace_batch(code, reason, reference_utc=utc(now))
+                continue
             if not self.port.grant.permits_day(at['trading_day']):
                 raise TraderError('E_SCOPE','Current native quotes belong to a different proved trading day')
             session = at['session']
@@ -74,23 +91,33 @@ class DsvFactFeed:
                     # continuity, so a hole in the actual path stays visible.
                     continue
                 try:stamp=native_integer(native_time,minimum=1)
-                except TraderError:raise TraderError('E_FACT_BARRIER','A native tick identity has no valid source time') from None
+                except TraderError:
+                    self._trace_batch(code, 'INVALID_NATIVE_TICK_TIME', session=session, rejected_tick_id=index)
+                    raise TraderError('E_FACT_BARRIER','A native tick identity has no valid source time') from None
                 moment=datetime.fromtimestamp(stamp//1_000_000_000,timezone.utc)
                 moment=moment.replace(microsecond=(stamp%1_000_000_000)//1000)
                 rows.append((index,moment,raw))
             rows.sort(key=lambda row:row[0])
             if len({row[0] for row in rows})!=len(rows):
+                self._trace_batch(code, 'DUPLICATE_NATIVE_TICK_ID', session=session, latest=rows[-1])
                 raise TraderError('E_DUPLICATE_CONFLICT','Native tick serial contains duplicate identities')
             if any(b[1]<a[1] for a,b in zip(rows,rows[1:])):
+                self._trace_batch(code, 'NATIVE_TICK_TIME_REVERSED', session=session, latest=rows[-1])
                 raise TraderError('E_FACT_BARRIER','Native tick identities move backwards in source time')
-            if not rows:continue
+            if not rows:
+                if self.quote_trace is not None:
+                    self._trace_batch(code, 'NO_VALID_SERIAL_ROWS', session=session, previous=previous,
+                                      incremental=bool(same_path and incremental is not None))
+                continue
             session=at['session'];start=datetime.fromisoformat(session['open_utc'])
             close=datetime.fromisoformat(session['close_utc'])
             key=(code,self.port.source_epoch,session['session_id'])
             contiguous=all(b[0]==a[0]+1 for a,b in zip(rows,rows[1:]))
             first_index=next((index for index,row in enumerate(rows) if row[1]>=start),len(rows))
             session_rows=[row for row in rows[first_index:] if row[1]<close]
-            if not session_rows:continue
+            if not session_rows:
+                self._trace_batch(code, 'SERIAL_OUTSIDE_CURRENT_SESSION', session=session, latest=rows[-1], previous=previous)
+                continue
             boundary_rows=rows[max(0,first_index-1):first_index+len(session_rows)]
             session_contiguous=all(b[0]==a[0]+1 for a,b in zip(boundary_rows,boundary_rows[1:]))
             accepted_key=(code,self.port.source_epoch)
@@ -127,7 +154,10 @@ class DsvFactFeed:
                     health = clock.health(sample)
                 latest = session_rows[-1]
                 age = delta_ns(now, latest[1]) - native_integer(latest[2]['datetime'], minimum=1) % 1000
-                if quote_age_quality(age, health)[0] != 'VALID':
+                quality, reason = quote_age_quality(age, health)
+                if quality != 'VALID':
+                    self._trace_batch(code, reason, session=session, latest=latest, previous=previous,
+                                      reference_utc=utc(now), source_age_ns=str(age), clock_quality=quality)
                     continue
             # After account reconciliation, a fresh quote can start a new
             # observation path in this epoch if the old checkpoint did not join.
@@ -157,7 +187,9 @@ class DsvFactFeed:
                 self._path[key] = boundary_proved or subscribed_at_open or observed_from_startup
                 if observed_from_startup:
                     self.rebuild_paths.add(key)
-            if not pending:continue
+            if not pending:
+                self._trace_batch(code, 'NO_NEW_NATIVE_TICK', session=session, latest=session_rows[-1], previous=previous)
+                continue
             if not self._path[key] and boundary_proved:
                 if same_session:
                     # Rebuild the whole proved segment before publishing a complete
@@ -188,7 +220,12 @@ class DsvFactFeed:
                 if night_reference is not None:
                     event['night_reference'] = night_reference
                 events.append(event)
-            if events:result.append((code,events))
+            if events:
+                if self.quote_trace is not None:
+                    self._trace_batch(code, 'CANDIDATES', session=session, latest=pending[-1], previous=previous,
+                                      count=len(events), first_tick_id=pending[0][0], path_complete=self._path[key],
+                                      native_gap=gap or not pending_contiguous, rebuild=key in self.rebuild_paths)
+                result.append((code,events))
         return result
 
     def _night_reference(self, code, rows, start, close, trading_day):
