@@ -11,6 +11,7 @@ from online_trader.scheduling.clock import ClockSample, delta_ns
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _M1_LIMIT_NS = 1_000_000_000
+_WINDOW_NS = 15 * 60 * 1_000_000_000
 
 
 def _records(directory, name, additional, problems):
@@ -156,17 +157,145 @@ def _local_bounds(row, total):
     return _percentile_bounds(total, lowers, uppers)
 
 
+def _counts_consistent(row, total):
+    timely, late, unknown = (int(row[key]) for key in ('m2_timely', 'm2_late', 'm2_unknown'))
+    measured = [int(value) for value in row['m2_histogram_counts']]
+    return (min(total, timely, late, unknown, *measured) >= 0
+            and timely + late + unknown == total
+            and sum(measured) <= timely + late)
+
+
+def _bucket_coverage(windows):
+    groups = defaultdict(list)
+    for key, row in windows.items():
+        groups[key[:-1]].append(row)
+    output = []
+    for key, rows in groups.items():
+        buckets = {int(row['first_seen_window']): row for row in rows if row['first_seen_window'] is not None}
+        session = next((row for row in rows if row['first_seen_window'] is None), None)
+        reference = session or rows[0]
+        opens_utc = reference.get('session_open_utc')
+        closes_utc = reference.get('session_close_utc')
+        missing = None
+        if opens_utc and closes_utc:
+            opens_ns = delta_ns(datetime.fromisoformat(opens_utc), _EPOCH)
+            closes_ns = delta_ns(datetime.fromisoformat(closes_utc), _EPOCH)
+            if closes_ns <= opens_ns:
+                raise ValueError('Session coverage requires an ordered calendar interval')
+            first, last = opens_ns // _WINDOW_NS, (closes_ns - 1) // _WINDOW_NS
+            present = sorted(bucket for bucket in buckets if first <= bucket <= last)
+            missing = []
+            cursor = first
+            for bucket in present:
+                if bucket > cursor:
+                    missing.append([str(cursor), str(bucket - 1)])
+                cursor = bucket + 1
+            if cursor <= last:
+                missing.append([str(cursor), str(last)])
+        output.append({
+            'kernel_boot_id': key[0], 'contract_id': key[1], 'source_epoch': key[2],
+            'trading_day': key[3], 'session_id': key[4],
+            'session_open_utc': opens_utc, 'session_close_utc': closes_utc,
+            'calendar_buckets_without_summary': missing,
+            'summary_buckets_with_polls_and_no_ticks': [
+                str(bucket) for bucket, row in sorted(buckets.items())
+                if int(row.get('sdk_poll_count', 0)) and int(row['observed_candidates']) == 0],
+            'session_summary_present': session is not None,
+        })
+    return output
+
+
+def _score_window(boot, row, intervals, *, coverage, source_coverage):
+    total = int(row['observed_candidates'])
+    counts_match = _counts_consistent(row, total)
+    timely, late = 0, 0
+    lows, highs = defaultdict(int), defaultdict(int)
+    for lower, upper in intervals:
+        timely += upper <= _M1_LIMIT_NS
+        late += lower > _M1_LIMIT_NS
+        lows[max(0, lower)] += 1
+        highs[upper] += 1
+    counts_match = counts_match and len(intervals) <= total
+    lows[0] += max(0, total - len(intervals))
+    coverage = coverage and counts_match and not int(row['coverage_losses'])
+    source_result = p99_budget_result(total, timely, late, coverage_proved=coverage and source_coverage)
+    local_result = p99_budget_result(total, int(row['m2_timely']), int(row['m2_late']), coverage_proved=coverage)
+    return dict(row, kernel_boot_id=boot, m2_p99_result=local_result, m1_budget_ms=1000,
+                m1_timely=str(timely), m1_late=str(late), m1_unknown=str(max(0, total - timely - late)),
+                m1_result=source_result,
+                m1_reason=None if source_result != 'NOT_PROVED' else 'INSUFFICIENT_PROOF_OR_COVERAGE',
+                m1_quantile_bounds_ns=_percentile_bounds(total, lows, highs) if counts_match else {},
+                m2_quantile_bounds_ns=_local_bounds(row, total) if counts_match else {})
+
+
+def _small_groups(windows, inconsistent):
+    by_session = defaultdict(list)
+    for key in windows:
+        if key[-1] is not None:
+            by_session[key[:-1]].append(key)
+    for keys in by_session.values():
+        group, size = [], 0
+        for key in sorted(keys, key=lambda key: int(key[-1])):
+            row = windows[key]
+            count = int(row['observed_candidates'])
+            eligible = key not in inconsistent and 0 < count < 100 and not int(row['coverage_losses'])
+            adjacent = not group or int(key[-1]) == int(group[-1][-1]) + 1
+            if not eligible or not adjacent:
+                if len(group) > 1:
+                    yield group
+                group, size = [], 0
+            if eligible:
+                group.append(key)
+                size += count
+                if size >= 100:
+                    yield group
+                    group, size = [], 0
+        if len(group) > 1:
+            yield group
+
+
+def _merged_small_windows(keys, windows, observed, *, source_coverage):
+    rows = [windows[key] for key in keys]
+    first, last = rows[0], rows[-1]
+    histogram = first['m2_histogram_upper_ms']
+    if any(row['m2_histogram_upper_ms'] != histogram or row['m2_budget_ms'] != first['m2_budget_ms']
+           for row in rows):
+        return None
+    group = {name: first[name] for name in (
+        'contract_id', 'source_epoch', 'trading_day', 'session_id', 'm2_histogram_upper_ms', 'm2_budget_ms')}
+    group.update({
+        'member_windows': [key[-1] for key in keys],
+        'first_observed_poll_ns': first['first_observed_poll_ns'],
+        'last_observed_poll_ns': last['last_observed_poll_ns'],
+        'm2_max_measured_ns': str(max(int(row['m2_max_measured_ns'] or 0) for row in rows)),
+        'm2_histogram_counts': [str(sum(map(int, values))) for values in zip(
+            *(row['m2_histogram_counts'] for row in rows), strict=True)],
+    })
+    for name in ('observed_candidates', 'coverage_losses', 'm2_timely', 'm2_late', 'm2_unknown'):
+        group[name] = str(sum(int(row[name]) for row in rows))
+    intervals = {}
+    expected = 0
+    for key in keys:
+        evidence = observed.get(key, {})
+        expected += len(evidence)
+        intervals.update(evidence)
+    return _score_window(keys[0][0], group, intervals.values(), coverage=True,
+                         source_coverage=source_coverage and len(intervals) == expected)
+
+
 def build_report(directory, proof_path=None, *, trace_files=(), summary_files=()):
     problems = []
     windows = {}
     inconsistent = set()
     summary_losses, trace_losses = set(), set()
     summary_coverage, trace_coverage = {}, {}
+    declared_contracts = defaultdict(set)
     ended_collections, ended_traces = set(), set()
     evidence_boot, clocks, sources = _proof_index(proof_path)
     summary_records = _records(directory, 'market-latency-summary.jsonl', summary_files, problems)
     for record in _distinct_batches(summary_records, 'DSV_MARKET_LATENCY/1', summary_coverage):
         boot = record['kernel_boot_id']
+        declared_contracts[boot].update(record.get('contracts', ()))
         if int(record['previous_diagnostic_failures']) or int(record['previous_unqueued_batches']):
             summary_losses.add(boot)
         if record.get('collection_ended'):
@@ -210,37 +339,43 @@ def build_report(directory, proof_path=None, *, trace_files=(), summary_files=()
     results = []
     for key, row in windows.items():
         total = int(row['observed_candidates'])
-        intervals = observed[key].values()
-        timely = sum(upper <= _M1_LIMIT_NS for _, upper in intervals)
-        late = sum(lower > _M1_LIMIT_NS for lower, _ in intervals)
-        has_coverage = (key not in inconsistent and not int(row['coverage_losses'])
-                        and key[0] not in summary_losses and not problems and len(intervals) <= total)
-        result = p99_budget_result(total, timely, late, coverage_proved=has_coverage)
-        lows, highs = defaultdict(int), defaultdict(int)
-        for lower, upper in intervals:
-            lows[max(0, lower)] += 1
-            highs[upper] += 1
-        lows[0] += max(0, total - len(intervals))
-        local_result = p99_budget_result(total, int(row['m2_timely']), int(row['m2_late']),
-                                         coverage_proved=key not in inconsistent and not int(row['coverage_losses']))
-        results.append(dict(row, kernel_boot_id=key[0], m2_p99_result=local_result, m1_budget_ms=1000,
-                            m1_timely=str(timely), m1_late=str(late),
-                            m1_unknown=str(max(0, total - timely - late)), m1_result=result,
-                            m1_reason=None if result != 'NOT_PROVED' else 'INSUFFICIENT_PROOF_OR_COVERAGE',
-                            m1_quantile_bounds_ns=_percentile_bounds(total, lows, highs),
-                            m2_quantile_bounds_ns=_local_bounds(row, total)))
+        if len(observed[key]) > total or not _counts_consistent(row, total):
+            inconsistent.add(key)
+        results.append(_score_window(key[0], row, observed[key].values(), coverage=key not in inconsistent,
+                                     source_coverage=key[0] not in summary_losses and not problems))
+    merged = []
+    for keys in _small_groups(windows, inconsistent):
+        group = _merged_small_windows(keys, windows, observed,
+                                      source_coverage=keys[0][0] not in summary_losses and not problems)
+        if group is not None:
+            merged.append(group)
 
     missing_summary_batches = {boot: max(numbers) - len(numbers) for boot, numbers in summary_coverage.items()}
     missing_trace_batches = {boot: max(numbers) - len(numbers) for boot, numbers in trace_coverage.items()}
-    gaps = (summary_losses or trace_losses or inconsistent or problems
-            or any(missing_summary_batches.values()) or any(missing_trace_batches.values()))
+    coverage = _bucket_coverage(windows)
+    missing_contracts = {}
+    for boot, expected in declared_contracts.items():
+        seen = {item['contract_id'] for item in coverage if item['kernel_boot_id'] == boot}
+        missing_contracts[boot] = sorted(expected - seen)
+    open_summary_collections = sorted(set(summary_coverage) - ended_collections)
+    unconfirmed_trace_collections = sorted(set(summary_coverage) - ended_traces)
+    gaps = (not windows or summary_losses or trace_losses or inconsistent or problems
+            or open_summary_collections or unconfirmed_trace_collections or any(missing_contracts.values())
+            or any(missing_summary_batches.values()) or any(missing_trace_batches.values())
+            or any(int(row['coverage_losses']) for row in windows.values())
+            or any(item['calendar_buckets_without_summary'] != [] or not item['session_summary_present']
+                   for item in coverage))
     return {'schema_version': 'F5_LATENCY_REPORT/1',
             'recorded_evidence_gaps': bool(gaps), 'malformed_records': problems,
             'time_proof_sha256': None if proof_path is None else sha256(proof_path.read_bytes()).hexdigest(),
             'ended_diagnostic_collections': sorted(ended_collections),
+            'open_or_unconfirmed_diagnostic_collections': open_summary_collections,
+            'contracts_without_observed_session': missing_contracts,
             'ended_trace_collections': sorted(ended_traces),
+            'trace_collections_without_end_marker': unconfirmed_trace_collections,
             'missing_summary_batches_through_last_observed': missing_summary_batches,
-            'missing_trace_batches_through_last_observed': missing_trace_batches, 'windows': results}
+            'missing_trace_batches_through_last_observed': missing_trace_batches,
+            'session_bucket_coverage': coverage, 'windows': results, 'merged_low_sample_windows': merged}
 
 
 def main():

@@ -90,7 +90,8 @@ class DsvSimulationSession(SimulationSession):
         self.monitor = DsvMarketMonitor(monitor_contracts, calendar, diagnostic=monitor_settings['trade']['tick_diag'])
         self._quote_trace = None
         if self.monitor.diagnostic:
-            self._quote_trace = QuoteTrace(self.output / 'market-quote-trace.jsonl', kernel.boot_id, calendar)
+            self._quote_trace = QuoteTrace(
+                self.output / 'market-quote-trace.jsonl', kernel.boot_id, calendar, contracts=monitor_contracts)
             self.feed.quote_trace = self._quote_trace
             self.port._quote_trace = self._quote_trace
             kernel._dsv_quote_trace = self._quote_trace
@@ -364,6 +365,9 @@ class DsvSimulationSession(SimulationSession):
         trace = self._quote_trace
         live_poll = trace.live_poll if trace is not None else False
         if trace is not None:
+            if live_poll:
+                for code in trace.contracts:
+                    trace.market.incomplete(code)
             trace.live_poll = False
         try:
             self._prime(manage_owned=manage_owned, trace=trace)

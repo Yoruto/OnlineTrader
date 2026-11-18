@@ -361,24 +361,25 @@ class TqKqDsvPort(TqKqPort):
             self._rollover_main.clear()
             self._rollover_catalog.clear()
         trace = getattr(self, '_quote_trace', None)
-        if trace is not None and self.last_poll_updated:
-            live = trace.live_poll and not self.fault and self.source_epoch == epoch
+        if trace is not None and (trace.live_poll or self.last_poll_updated):
             pinned = is_pinned_tq_api(self.api)
             for code, serial in self.tick_serials.items():
-                if not pinned or type(serial).__module__ != 'tqsdk.objs_not_entity':
-                    if live:
-                        trace.market.incomplete(code)
-                        trace.record('SDK_TICK_COVERAGE', contract_id=code, state=self.source_epoch,
-                                     source_epoch=self.source_epoch, reason='SDK_SERIAL_CONTRACT_UNVERIFIED')
-                    continue
+                reason = None
+                supported = pinned and type(serial).__module__ == 'tqsdk.objs_not_entity'
                 try:
-                    ready = self.api.is_serial_ready(serial)
+                    ready = supported and self.api.is_serial_ready(serial)
                 except (AttributeError, KeyError, TypeError, ValueError, TraderError):
                     ready = False
-                if ready:
-                    trace.sdk_ticks(code, self.source_epoch, serial, received[0], live=live)
-                if trace.live_poll and not (ready and live):
-                    trace.market.incomplete(code)
+                if self.source_epoch != epoch:
+                    reason = 'SDK_SOURCE_EPOCH_CHANGED'
+                elif self.fault:
+                    reason = 'SDK_CONNECTION_OR_SYNC_UNPROVED'
+                elif not supported:
+                    reason = 'SDK_SERIAL_CONTRACT_UNVERIFIED'
+                elif not ready:
+                    reason = 'SDK_SERIAL_NOT_READY'
+                trace.sdk_ticks(code, self.source_epoch, serial if ready else None, received[0],
+                                updated=self.last_poll_updated, unavailable=reason)
         return received
 
     def observations(self):

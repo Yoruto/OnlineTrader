@@ -20,9 +20,10 @@ def _raw_time(quote):
 
 
 class QuoteTrace:
-    def __init__(self, path, boot_id, calendar):
+    def __init__(self, path, boot_id, calendar, *, contracts):
         self.path = path
         self.boot_id = boot_id
+        self.contracts = tuple(contracts)
         self.market = MarketLatency(self, calendar)
         self.live_poll = False
         self._outbox = Queue(maxsize=8)
@@ -142,13 +143,14 @@ class QuoteTrace:
                     reference_offset_ns=estimate.get('offset_ns'),
                     reference_estimate_ns=estimate.get('estimated_error_ns'))
 
-    def sdk_ticks(self, code, epoch, frame, utc, *, live):
+    def sdk_ticks(self, code, epoch, frame, utc, *, updated, unavailable):
         if self._last_sdk_return_ns is None:
             return
         try:
-            self.market.observe(code, epoch, frame, utc, self._last_sdk_return_ns, live=live)
+            self.market.observe(code, epoch, frame, utc, self._last_sdk_return_ns, live=self.live_poll,
+                                updated=updated, unavailable=unavailable)
         except (AttributeError, KeyError, TypeError, ValueError, OverflowError, TraderError) as error:
-            if live:
+            if self.live_poll:
                 self.market.incomplete(code)
             self.record('SDK_TICK_COVERAGE', contract_id=code, source_epoch=epoch,
                         reason='SDK_TICK_OBSERVATION_FAILED', error_code=getattr(error, 'code', type(error).__name__))
@@ -173,7 +175,7 @@ class QuoteTrace:
             self._summary_batch += 1
             self.enqueue(self.path.with_name('market-latency-summary.jsonl'), {
                 'schema_version': 'DSV_MARKET_LATENCY/1', 'kernel_boot_id': self.boot_id,
-                'batch_number': str(self._summary_batch),
+                'batch_number': str(self._summary_batch), 'contracts': list(self.contracts),
                 'monotonic_ns': str(now_ns), 'collection_ended': finish,
                 'previous_diagnostic_failures': str(self._write_failures),
                 'previous_unqueued_batches': str(self._queue_drops), 'windows': reports})
