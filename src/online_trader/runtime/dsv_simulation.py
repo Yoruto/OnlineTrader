@@ -80,6 +80,7 @@ class DsvSimulationSession(SimulationSession):
             kernel._dsv_diagnostics['run_identity'] = 'E_RUN_IDENTITY_WRITE'
         self.driver.activate();kernel.wait_idle()
         self.feed=DsvFactFeed(self.port,profile,calendar);self.last_decisions={};self._primed=False
+        self.comparison = None
         self.driver.strategy.on_parameters_saved = self._update_feed_parameters
         profile = self.driver.strategy.profile
         self._update_feed_parameters(profile)
@@ -119,7 +120,6 @@ class DsvSimulationSession(SimulationSession):
         self._clock_worker = None
         self.entry_log = DsvEntryLog(kernel, output, profile)
         self._register_operation_log()
-        self.comparison = None
         self.comparison_error = None
         try:
             self.entry_log.start()
@@ -138,6 +138,8 @@ class DsvSimulationSession(SimulationSession):
     def _update_feed_parameters(self, profile):
         self.feed.profile = profile
         self.feed._continuation_seconds = self.driver.strategy._continuation_seconds
+        if self.comparison is not None:
+            self.comparison.update_profile(profile)
 
     def _register_operation_log(self):
         # This binding uses the original writer to locate the diagnostics
@@ -273,34 +275,42 @@ class DsvSimulationSession(SimulationSession):
             self._arm_request_revision=None
             self._entry_resume = None
         self._calendar_anchor=now
-        return bool(changes)
+        return 'DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION' if changes else None
 
     def _check_multi_day(self):
         k=self.kernel;snapshot=self.port.snapshot();day=snapshot['trading_day']
-        if not snapshot['complete']:
+        if not snapshot['complete'] or day is None:
             self.owner.days.invalidate();self._day_resume_revision=None
             self._rollover_key=None
             if not self._incomplete_day_barrier:
                 k._record_conflict('ONLINE_DSV_DAY_SCOPE_INCOMPLETE',{'trading_day':day,'source_epoch':self.port.source_epoch})
                 k.wait_idle();self._incomplete_day_barrier=True
-            return True
+            return 'DSV_WAITING_CABINET_DAY_SYNC'
         self._incomplete_day_barrier=False
         if self._entry_resume is not None and day != self._entry_resume[1]:
             self._entry_resume = None
         if (day==self._managed_day and self.port.source_epoch==self._source_epoch and not self.port.fault
-                and self.owner.days.ready(day)):return False
+                and self.owner.days.ready(day)):return None
+        changed_day = day != self._managed_day
+        phase = ('DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION' if changed_day
+                 else 'DSV_RECONNECT_ORIGINAL_EXITS_NEED_RECONCILIATION')
         key=(day,self.port.source_epoch)
         if self._rollover_key!=key:
-            resume=(day!=self._managed_day and self.port.source_epoch==self._source_epoch and not self.port.fault
+            resume=(changed_day and self.port.source_epoch==self._source_epoch and not self.port.fault
                 and k._armed and self.grant.value['resume_entries_on_day_change'])
             self.owner.days.invalidate()
             # Old cached prices cannot describe the new session. Preserve
             # durable protection, but wait for this day's real fresh quote.
             self.driver._quotes.clear();self.driver._anchors.clear()
-            k._record_conflict('ONLINE_DSV_DAY_CHANGE_REQUIRES_RECONCILIATION',{
-                'transition_hash':content_hash({'old_day':self._managed_day,'current_day':day,'source_epoch':self.port.source_epoch}),
-                'changes':[{'old_day':self._managed_day,'current_day':day}],
-                'native_observations':self.port.observations()})
+            observations = self.port.observations()
+            if changed_day:
+                k._record_conflict('ONLINE_DSV_DAY_CHANGE_REQUIRES_RECONCILIATION',{
+                    'transition_hash':content_hash({'old_day':self._managed_day,'current_day':day,'source_epoch':self.port.source_epoch}),
+                    'changes':[{'old_day':self._managed_day,'current_day':day}],
+                    'native_observations':observations})
+            else:
+                k._record_conflict('ONLINE_DSV_RECONNECT_REQUIRES_RECONCILIATION',{
+                    'trading_day':day,'source_epoch':self.port.source_epoch,'native_observations':observations})
             k.wait_idle();self._rollover_key=key
             self._day_resume_revision=k._authority_revision if resume else None
             self._arm_request_revision=None
@@ -308,14 +318,14 @@ class DsvSimulationSession(SimulationSession):
         try:ready=self.owner.days.reconcile(day)
         except TraderError as error:
             if error.code not in {'E_FACT_BARRIER','E_OWNERSHIP','E_CALENDAR_INCOMPLETE'}:raise
-            return True
-        if not ready:return True
+            return phase
+        if not ready:return phase
         resume=self._day_resume_revision==k._authority_revision
         self._managed_day=day;self._calendar_anchor=utc(self.port.clock.now())
         self.prime(manage_owned=True);self._source_epoch=self.port.source_epoch
         if resume:self._arm_request_revision=k._authority_revision
         self._day_resume_revision=None
-        return False
+        return None
 
     def request_initial_arm(self):
         if self.driver._fault:
@@ -725,7 +735,8 @@ class DsvSimulationSession(SimulationSession):
             if reset is not self._clock_reset_seen:
                 self._calendar_anchor = reset.now_utc
                 self._clock_reset_seen = reset
-            if self.check_day_transition():
+            recovery_phase = self.check_day_transition()
+            if recovery_phase:
                 self._utc_resume = None
                 self.owner.observe_native_orders()
                 k.wait_idle()
@@ -733,8 +744,8 @@ class DsvSimulationSession(SimulationSession):
                     day = self.port.snapshot()['trading_day']
                     if day is not None and day != self._entry_resume[1]:
                         self._entry_resume = None
-                self.status('DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION',armed=False)
-                if k.control.strategy_stop_requested():k._dsv_stop_wait = '等待换日核对'
+                self.status(recovery_phase,armed=False)
+                if k.control.strategy_stop_requested():k._dsv_stop_wait = '等待柜台同步及原委托、持仓核对'
                 return
             if self.port.fault and not self.port.complete():
                 self.owner.tick();k.wait_idle()

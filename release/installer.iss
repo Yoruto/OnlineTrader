@@ -8,6 +8,11 @@
 #ifndef GitLabProjectId
   #define GitLabProjectId 89047383
 #endif
+#if FileExists(AddBackslash(BundleDir) + "OnlineTrader-defaults.json")
+  #define SetupSuffix "-Configured"
+#else
+  #define SetupSuffix ""
+#endif
 [Setup]
 AppId=OnlineTrader.Managed
 AppName=OnlineTrader
@@ -16,7 +21,7 @@ DefaultDirName={localappdata}\Programs\OnlineTrader
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-OutputBaseFilename=OnlineTrader-{#AppVersion}-Setup
+OutputBaseFilename=OnlineTrader-{#AppVersion}-Setup{#SetupSuffix}
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\bootstrap\OnlineTrader.exe
 SetupMutex=OnlineTrader.Managed.Setup

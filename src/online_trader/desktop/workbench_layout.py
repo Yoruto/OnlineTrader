@@ -74,6 +74,8 @@ LOG_PHASES = {
     'DSV_OBSERVING': '策略正在监控所选合约',
     'DSV_MANAGING_OWNED': '继续管理已有持仓',
     'DSV_WAITING_GATEWAY_SYNC': '行情或交易连接中断，等待重新同步',
+    'DSV_WAITING_CABINET_DAY_SYNC': '柜台快照不完整，等待同步并核对交易日',
+    'DSV_RECONNECT_ORIGINAL_EXITS_NEED_RECONCILIATION': '同一交易日重连，等待核对原委托及持仓',
     'DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION': '柜台换日，等待核对原委托及持仓',
     'DSV_STOPPING': '已停止开仓，继续保护并等待核对',
     'DSV_STOPPED': '策略已停止',

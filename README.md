@@ -52,6 +52,8 @@ $env:PYTHONPATH = 'src'
 
 ## Windows 便携发行目录
 
+便携构建须明确选用 `-DeliveryMode Generic` 或 `-DeliveryMode Configured`。配置版用 `-DeliveryConfigDirectory` 提供默认账号文件，可用 `-Archive` 生成经过校验的 ZIP。
+
 安装版的 GitLab 更新入口、制品名称和发布步骤见[Windows 安装版与 GitLab 更新](docs/windows-gitlab-updates.md)。
 
 既有 dev28 发行、目录布局、构建命令及托盘验收见[原发行说明](README.legacy-ddad472.md#windows-便携发行目录)。这些历史制品不能替代新替代链的制品验收；本次 PR 不构建或发布安装包。

@@ -85,9 +85,9 @@ def main(argv=None):
                                   statement_path=Path(args.compare_fills) if args.compare_fills else None)
         pipe = store.pipe_name(account) if account else None
         with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):
-            if accounts is not None and not store.read()['accounts']:
-                account_id = store.initialize_simulation_accounts(accounts)['selected_id']
-                pipe = store.pipe_name(store.get(account_id))
+            if accounts is not None:
+                account_id = store.initialize_simulation_accounts(accounts, packaged=True)['selected_id']
+                pipe = store.pipe_name(store.get(account_id)) if account_id is not None else None
             if (getattr(sys, 'frozen', False) and not args.allow_multi
                     and args.account_store is None and args.dsv_config is None):
                 from online_trader.update_install import managed_root

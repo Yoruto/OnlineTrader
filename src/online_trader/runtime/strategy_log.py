@@ -87,6 +87,8 @@ SESSION_EVENTS = {
     'SCHEDULER_FACT_BARRIER': ('警告', '时钟或盘次证据异常，原持仓目标待核对'),
     'CLOCK_RESET_REQUIRES_FRESH_FACTS': ('恢复', '时钟已重新核对，等待新行情及 F5 启动'),
     'ONLINE_DSV_DAY_CHANGE_REQUIRES_RECONCILIATION': ('警告', '柜台换日，等待核对原持仓及委托'),
+    'ONLINE_DSV_DAY_SCOPE_INCOMPLETE': ('等待', '柜台快照不完整，等待同步并核对交易日'),
+    'ONLINE_DSV_RECONNECT_REQUIRES_RECONCILIATION': ('等待', '同一交易日重连，等待核对原持仓及委托'),
     'ONLINE_DSV_FACT_BARRIER': ('警告', '柜台事实待核对'),
     'ONLINE_ARCHIVED_ORDER_CHANGED': ('警告', '历史委托收到不同的柜台回报，已暂停新增并保留原委托身份'),
     'ONLINE_NATIVE_ORDER_REJECTION_CONFLICT': ('警告', '柜台拒单标记与委托或成交数量冲突，等待核对'),
@@ -140,9 +142,10 @@ class DsvEntryLog:
         self._pending = None
         settings = profile.to_record()['settings']
         self.profile = profile
-        self._identity = {'account_key': kernel.account_key, 'kernel_boot_id': self.boot_id,
-                          'profile_hash': profile.content_hash}
+        self._identity = {'account_key': kernel.account_key, 'kernel_boot_id': self.boot_id}
+        self._active_profile_hash = profile.content_hash
         self._run_record = self._identity | {'run_directory': str(Path(output).resolve()),
+                                            'profile_hash': profile.content_hash,
                                             'from_event_seq': str(self.start_seq)}
         self.trade = settings['trade']
         self.symbols = {row['code']: row for row in settings['symbols']}
@@ -343,7 +346,9 @@ class DsvEntryLog:
         data = data.get('data', data)
         if kind == 'DSV_PARAMETERS_SAVED':
             from online_trader.configuration.dsv import DsvProfile
-            settings = DsvProfile.from_record(data['dsv_execution']['profile']).to_record()['settings']
+            profile = DsvProfile.from_record(data['dsv_execution']['profile'])
+            self._active_profile_hash = profile.content_hash
+            settings = profile.to_record()['settings']
             self.trade = settings['trade']
             self.symbols = {item['code']: item for item in settings['symbols']}
         report = data.get('report', {})
@@ -443,7 +448,8 @@ class DsvEntryLog:
         replacement = done.result()
         self._verify_file(opening=True)
         self.last_event_seq = replacement.last_event_seq
-        for name in ('geometry_days', 'last_time', 'last_hint', 'active_blocks', 'cycle_markers', 'order_markers'):
+        for name in ('_active_profile_hash', 'trade', 'symbols', 'geometry_days', 'last_time', 'last_hint',
+                     'active_blocks', 'cycle_markers', 'order_markers'):
             setattr(self, name, getattr(replacement, name))
         self.recovery.update(status='RECOVERED', recovered_through_event_seq=str(self.last_event_seq))
         self._finish_recovery(archive=False)
@@ -498,7 +504,7 @@ class DsvEntryLog:
     def write(self, rows):
         if not rows:
             return
-        rows = [row | self._identity for row in rows]
+        rows = [{'profile_hash': self._active_profile_hash} | row | self._identity for row in rows]
         if self._event is not None:
             seq, _ = self._event
             first = self._pending or 0
@@ -544,6 +550,7 @@ class DsvEntryLog:
                          'kind': kind, 'tag': tag, 'origin': '策略', 'message': f'{prefix} {message}',
                          'decision_id': decision.get('decision_id'), 'authority_revision': decision.get('authority_revision'),
                          'account_revision': decision.get('account_revision'),
+                         'profile_hash': decision.get('profile_hash') or self._active_profile_hash,
                          'reason_code': kind, **details})
 
         previous = self.active_blocks.get(code, {})
@@ -719,6 +726,11 @@ class DsvEntryLog:
                          'contract_id': code, 'trading_day': day, **facts})
 
         session = SESSION_EVENTS.get(kind)
+        if kind == 'ONLINE_DSV_DAY_CHANGE_REQUIRES_RECONCILIATION':
+            changes = data.get('conflict', {}).get('changes', ())
+            if changes and all(row.get('old_day') and row['old_day'] == row.get('current_day') for row in changes):
+                # Older executors recorded same-day reconnects under the rollover event.
+                session = SESSION_EVENTS['ONLINE_DSV_RECONNECT_REQUIRES_RECONCILIATION']
         if session is not None:
             append(*session)
         if kind == 'DSV_PARAMETERS_SAVED':
@@ -751,8 +763,9 @@ class DsvEntryLog:
         self.cycle_markers[identity] = current
 
         def report(tag, text, **fields):
-            decision_id = (cycle.get('strategy_metadata') or {}).get('decision_id')
-            append(tag, text, code=code, day=day, decision_id=decision_id, **fields)
+            metadata = cycle.get('strategy_metadata') or {}
+            append(tag, text, code=code, day=day, decision_id=metadata.get('decision_id'),
+                   profile_hash=metadata.get('profile_hash') or self._active_profile_hash, **fields)
 
         if kind == 'REPLACEMENT_BLOCKED':
             review = cycle['last_replacement_block']

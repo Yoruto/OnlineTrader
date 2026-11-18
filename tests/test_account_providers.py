@@ -59,6 +59,34 @@ class SimulationAccountTests(unittest.TestCase):
         self.assertEqual(state['selected_id'],row['account_id'])
         self.assertEqual(rows['TQKQ'],row)
 
+    def test_packaged_defaults_fill_missing_slots_without_replacing_existing_credentials(self):
+        state = self.store.change('add', expected_revision=0, alias='已有模拟账户',
+                                  username=self.values['simnow_username'], provider='TQ_SIMNOW')
+        row = state['accounts'][0]
+        selected = self.store.change('select', expected_revision=1, account_id=row['account_id'])
+        trade_target = self.store.target(row) + ':trade'
+        self.vault.put(trade_target, self.values['simnow_username'], 'user-saved')
+
+        self.assertEqual(self.store.initialize_simulation_accounts(self.values, packaged=True), selected)
+        resolved = self.store.credential_reference(row['account_id']).resolve()
+        self.assertEqual(resolved['simnow_password'], 'user-saved')
+        self.assertEqual(resolved['kq_username'], self.values['kq_username'])
+        self.assertEqual(resolved['kq_password'], self.values['kq_password'])
+
+    def test_packaged_defaults_respect_unrelated_selected_account_and_active_owner(self):
+        state = self.store.change('add', expected_revision=0, alias='其他快期', username='offline-unrelated')
+        other = state['accounts'][0]
+        state = self.store.change('select', expected_revision=1, account_id=other['account_id'])
+        self.assertEqual(self.store.initialize_simulation_accounts(self.values, packaged=True), state)
+        self.assertEqual(self.vault.values, {})
+
+        state = self.store.change('add', expected_revision=state['revision'], alias='已有模拟账户',
+                                  username=self.values['simnow_username'], provider='TQ_SIMNOW')
+        row = next(row for row in state['accounts'] if row['provider'] == 'TQ_SIMNOW')
+        with AccountLock(row['account_key']):
+            self.assertEqual(self.store.initialize_simulation_accounts(self.values, packaged=True), state)
+        self.assertEqual(self.vault.values, {})
+
     def test_invalid_input_writes_neither_catalogue_nor_credentials(self):
         for fields in (self.values|{'extra':'no'},self.values|{'kq_password':''},self.values|{'simnow_username':' bad '}):
             with self.subTest(fields=list(fields)),self.assertRaises(TraderError):

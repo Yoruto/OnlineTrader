@@ -190,7 +190,7 @@ class ComparisonRecorder:
     def __init__(self,kernel,output,profile,calendar,*,dsv_config=None,dsv_log_dir=None):
         self.kernel=kernel;self.profile=profile;self.calendar=calendar
         self.source_profile=getattr(kernel,'_auto_source_profile',None)
-        self._last_dsv_profile_hash=None
+        self._last_parameter_binding=None
         self.profile_warning = None
         self.log_warning = None
         self.dsv_config=None if dsv_config is None else Path(dsv_config)
@@ -235,7 +235,11 @@ class ComparisonRecorder:
     def market(self,event,account,instrument,decision):
         self.write('PRODUCT_MARKET_DECISION',{'event':event,'account':account,'instrument':instrument,
             'decision':decision,'durable_seq':str(self.kernel._durable_seq),
-            'source_epoch':self.kernel.port.source_epoch,'profile_hash':self.profile.content_hash})
+            'source_epoch':self.kernel.port.source_epoch,'profile_hash':decision['profile_hash']})
+
+    def update_profile(self, profile):
+        self.profile = profile
+        self.last_profile_check = 0
 
     def poll(self):
         k=self.kernel
@@ -269,14 +273,15 @@ class ComparisonRecorder:
                 return
             matches = dsv_startup_profile(current).content_hash == dsv_startup_profile(self.profile).content_hash if self.source_profile else current.content_hash == self.profile.content_hash
             self.profile_warning = None if matches else 'E_COMPARISON_SETTINGS'
-            if current.content_hash!=self._last_dsv_profile_hash:
+            binding = current.content_hash, self.profile.content_hash
+            if binding != self._last_parameter_binding:
                 self.write('DSV_PARAMETER_BINDING',{'dsv_saved_profile_hash':current.content_hash,
                     'effective_profile_hash':self.profile.content_hash,
-                    'effective_parameters_match':(dsv_startup_profile(current).content_hash==dsv_startup_profile(self.profile).content_hash) if self.source_profile is not None else current.content_hash==self.profile.content_hash,
+                    'effective_parameters_match':matches,
                     'observed_at_reference_utc':self.kernel.port.clock.now().isoformat().replace('+00:00','Z'),
                     'dsv_startup_correction_matches':self.source_profile is not None and current.content_hash==dsv_startup_profile(self.source_profile).content_hash,
                     'calculation_policy_source_matches':self.source_profile is not None and current.content_hash==self.source_profile.content_hash})
-                self._last_dsv_profile_hash=current.content_hash
+                self._last_parameter_binding=binding
 
     def close(self):
         if not self.closed:self.stream.close();self.closed=True

@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+OnlineTrader-defaults.json
 output/
 .pytest_cache/
 *.db

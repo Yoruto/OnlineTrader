@@ -45,6 +45,16 @@ def _password(value):
     return value
 
 
+def validate_simulation_defaults(values):
+    fields = {'simnow_username', 'simnow_password', 'kq_username', 'kq_password'}
+    if type(values) is not dict or set(values) != fields:
+        _error('Expected explicit SimNow and KQ credential fields', 'E_CREDENTIALS')
+    account_identity(values['simnow_username'], 'TQ_SIMNOW')
+    account_identity(values['kq_username'])
+    _password(values['simnow_password'])
+    _password(values['kq_password'])
+
+
 class WindowsVault:
     """Generic per-user credentials, persisted locally; no machine/service fallback."""
     class Credential(ctypes.Structure):
@@ -259,7 +269,7 @@ class AccountStore:
         if market_username is not None or market_password is not None:_error('KQ credentials cannot include another account','E_CREDENTIALS')
         return [(self.target(row),username,password)]
 
-    def _save_vault_values(self,values):
+    def _save_vault_values(self,values,*,only_missing=False):
         """Validate before writing; restore existing entries on a partial failure."""
         original={};changed=[]
         for target,_,_ in values:
@@ -269,7 +279,7 @@ class AccountStore:
                 original[target]=None
         try:
             for target,username,password in values:
-                if original[target]=={'username':username,'password':password}:continue
+                if original[target] is not None and (only_missing or original[target]=={'username':username,'password':password}):continue
                 self.vault.put(target,username,password);changed.append(target)
         except Exception:
             for target in reversed(changed):
@@ -295,25 +305,31 @@ class AccountStore:
         reference=StoredSimNowCredential if row['provider']=='TQ_SIMNOW' else StoredCredential
         return reference(self,account_id)
 
-    def initialize_simulation_accounts(self,values):
+    def initialize_simulation_accounts(self,values,*,packaged=False):
         """Explicit local import of two identities; never reads files or connects.
 
         Existing profiles and selection are retained. Only a catalogue without
         a selected account chooses SimNow; repeated imports append no revision.
+        Packaged defaults seed an empty catalogue, or fill missing slots of
+        matching profiles in an existing catalogue.
         """
-        fields={'simnow_username','simnow_password','kq_username','kq_password'}
-        if type(values) is not dict or set(values)!=fields:_error('Expected explicit SimNow and KQ credential fields','E_CREDENTIALS')
-        for field in ('simnow','kq'):
-            account_identity(values[field+'_username'],'TQ_SIMNOW' if field=='simnow' else 'TQKQ')
-            _password(values[field+'_password'])
+        validate_simulation_defaults(values)
         with AccountLock('CATALOGUE:'+str(self.directory).casefold()),ExitStack() as locks:
             current=self.read();rows=list(current['accounts']);imported=[];writes=[]
+            repair_existing = packaged and bool(rows)
             for provider,prefix,alias,broker,line in (
                     ('TQ_SIMNOW','simnow','SimNow 模拟账号','SimNow','TqAccount / SimNow'),
                     ('TQKQ','kq','快期模拟账号','快期模拟','TqKq')):
                 username=values[prefix+'_username'];key,masked=account_identity(username,provider)
-                locks.enter_context(AccountLock(key))
                 row=next((item for item in rows if item['account_key']==key),None)
+                if repair_existing and row is None:
+                    continue
+                try:
+                    locks.enter_context(AccountLock(key))
+                except TraderError as error:
+                    if repair_existing and error.code == 'E_INSTANCE_EXISTS':
+                        continue
+                    raise
                 if row is None:
                     row={'account_id':'account-'+uuid.uuid4().hex,'alias':alias,'provider':provider,'environment':'ONLINE_SIM',
                          'account_key':key,'masked_login':masked,'broker':broker,'line':line}
@@ -322,10 +338,10 @@ class AccountStore:
                 writes.extend(self._credential_values(row,username,values[prefix+'_password'],
                     values['kq_username'] if provider=='TQ_SIMNOW' else None,
                     values['kq_password'] if provider=='TQ_SIMNOW' else None))
-            selected=current['selected_id'] or imported[0]['account_id']
+            selected = current['selected_id'] if repair_existing else current['selected_id'] or imported[0]['account_id']
             record={'revision':current['revision']+1,'previous_hash':current['journal_hash'],'accounts':rows,'selected_id':selected}
             self._validate(record)
-            self._save_vault_values(writes)
+            self._save_vault_values(writes,only_missing=packaged)
             if rows!=current['accounts'] or selected!=current['selected_id']:
                 publish_new_bytes(canonical_bytes(record),self.directory/'catalogue'/f"{record['revision']:08}.json")
             return self.read()
