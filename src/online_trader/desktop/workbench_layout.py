@@ -1822,7 +1822,7 @@ class WorkbenchLayout:
         if not self.paired:
             actions = row(button('重读 DSV 参数', lambda: self.reload_dsv_parameters()),
                           button('选择 DSV 配置', self.choose_dsv_parameters))
-            if self.window.store is not None:
+            if self.window.store is not None or self.window._runtime_mode:
                 self.quote_reference_button = button('订阅行情（新主力）', self.subscribe_reference_quotes)
                 actions.addWidget(self.quote_reference_button)
             actions.addStretch(1)
@@ -2558,7 +2558,9 @@ class WorkbenchLayout:
         view = self.window.view
         config = view['configuration'] if view is not None else {}
         bound = self.manual_code.currentText() in (config.get('scoped_contracts') or self.names)
-        ready = self.manual_controls_enabled and config.get('manual_workbench',False) and bound
+        ready = (self.manual_controls_enabled and view is not None
+                 and view.get('entry_authority') == 'ARMED'
+                 and config.get('manual_workbench', False) and bound)
         self.submit_button.setEnabled(ready)
         self.latest_button.setEnabled(ready)
         for control in self.quick_sizes:

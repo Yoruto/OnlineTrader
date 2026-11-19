@@ -519,6 +519,119 @@ def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None, native_fa
             result['account_metrics']={key:funds.get(key) for key in
                 ('balance','available','margin','risk_ratio','pre_balance','close_profit','position_profit','float_profit','commission')}
             result['account_metrics'].update(trading_day=day,opening_orders=opening_orders)
+    # Runtime-side presentation capabilities are explanatory facts, never
+    # authorization tickets.  The command handler still performs the final
+    # account, boot, revision, authority, market and risk checks for every
+    # submission.
+    connected = result['connection']['broker_connected'] and result['connection']['synchronized']
+    healthy = connected and not any(result['connection'][key] for key in
+                                    ('fault', 'storage_failed', 'recovery_required'))
+    manual = bool(result['configuration'].get('manual_workbench'))
+    entry_allowed = healthy and result['entry_authority'] == 'ARMED'
+    capability_rows = {
+        'ARM_ENTRIES': (healthy, None if healthy else 'RUNTIME_NOT_READY'),
+        'PAUSE_NEW_ENTRIES': (not result['connection']['storage_failed'],
+                              None if not result['connection']['storage_failed'] else 'LEDGER_WRITE_FAILED'),
+        'STOP_DSV_STRATEGY': (not result['connection']['storage_failed'],
+                              None if not result['connection']['storage_failed'] else 'LEDGER_WRITE_FAILED'),
+        'SET_ENTRY_POLICY': (not result['connection']['storage_failed'],
+                             None if not result['connection']['storage_failed'] else 'LEDGER_WRITE_FAILED'),
+        'SAVE_DSV_PARAMETERS': (bool(result['configuration'].get('live_parameter_save'))
+                                and not result['connection']['storage_failed'],
+                                None if result['configuration'].get('live_parameter_save')
+                                and not result['connection']['storage_failed'] else
+                                'LEDGER_WRITE_FAILED' if result['connection']['storage_failed']
+                                else 'CONFIG_EDIT_OFFLINE_ONLY'),
+        'MANUAL_OPEN': (manual and entry_allowed,
+                        None if manual and entry_allowed else
+                        'MANUAL_MODE_REQUIRED' if not manual else 'ENTRY_NOT_ALLOWED'),
+        'MANUAL_CLOSE': (connected, None if connected else 'GATEWAY_DISCONNECTED'),
+        'MANUAL_CLOSE_ALL': (connected, None if connected else 'GATEWAY_DISCONNECTED'),
+        'CANCEL_SELECTED': (connected, None if connected else 'GATEWAY_DISCONNECTED'),
+        'CANCEL_OWNED': (connected, None if connected else 'GATEWAY_DISCONNECTED'),
+        'FLATTEN_THEN_STOP': (connected, None if connected else 'GATEWAY_DISCONNECTED'),
+        'CANCEL_NATIVE_ACCOUNT': (connected and bool(result['configuration'].get('native_cancel_review', {}).get('eligible')),
+                                  None if connected and result['configuration'].get('native_cancel_review', {}).get('eligible')
+                                  else 'NATIVE_ACCOUNT_REVIEW_REQUIRED'),
+        'REQUEST_RECONCILIATION': (not result['connection']['storage_failed'],
+                                   None if not result['connection']['storage_failed'] else 'LEDGER_WRITE_FAILED'),
+    }
+    result['capabilities'] = {
+        'revision': result['checkpoint_event_seq'],
+        'observed_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        'operations': [
+            {'operation': operation, 'scope_type': 'ACCOUNT', 'allowed': allowed, 'reason': reason}
+            for operation, (allowed, reason) in capability_rows.items()
+        ],
+    }
+
+    code_map = {
+        'E_UNKNOWN_SEND': 'OT-TRD-2101',
+        'RECONCILIATION_REQUIRED': 'OT-TRD-2104',
+        'E_ACCOUNT_SYNC': 'OT-CON-1003',
+        'E_STORAGE': 'OT-DB-5001',
+        'LEDGER_WRITE_FAILED': 'OT-DB-5001',
+    }
+    diagnostic_rows = []
+    for block in result['blocks'][-64:]:
+        reason = block.get('reason_code', 'UNKNOWN_RUNTIME_BLOCK')
+        scope_identity = block.get('contract_id') or 'ACCOUNT'
+        cycle_identity = block.get('position_cycle_id') or 'NONE'
+        diagnostic_rows.append({
+            'diagnostic_version': 1,
+            'code': code_map.get(reason, 'OT-RSK-3001'),
+            'reason': reason,
+            'kind': 'BLOCK',
+            'category': 'RUNTIME_BLOCK',
+            'severity': 'WARNING',
+            'source': 'RUNTIME',
+            'operation': None,
+            'command_id': None,
+            # A continuing block needs a stable identity across publications;
+            # checkpoint sequence is observation time, not event identity.
+            'trace_id': f'block:{reason}:{scope_identity}:{cycle_identity}',
+            'impact_scope': 'ACCOUNT',
+            'recovery_state': 'ACTIVE',
+            'retry_policy': 'RUNTIME_RECOVERY_ONLY',
+            'occurred_at': None,
+            'context': {key: value for key, value in block.items()
+                        if key in {'contract_id', 'position_cycle_id', 'active'}},
+        })
+    for receipt in result['commands'][-64:]:
+        if receipt.get('status') not in {'FAILED', 'REJECTED', 'NEEDS_RECONCILIATION'}:
+            continue
+        reason = receipt.get('error_code') or receipt.get('reason') or 'COMMAND_NOT_COMPLETED'
+        diagnostic_rows.append({
+            'diagnostic_version': 1,
+            'code': code_map.get(reason, 'OT-TRD-2199'),
+            'reason': reason,
+            'kind': 'FAULT' if receipt.get('status') == 'FAILED' else 'BLOCK',
+            'category': 'COMMAND_RESULT',
+            'severity': 'ERROR' if receipt.get('status') == 'FAILED' else 'WARNING',
+            'source': 'RUNTIME',
+            'operation': receipt.get('operation'),
+            'command_id': receipt.get('command_id'),
+            'trace_id': receipt.get('payload_hash'),
+            'impact_scope': 'COMMAND',
+            'recovery_state': 'VERIFYING' if receipt.get('status') == 'NEEDS_RECONCILIATION' else 'ACTIVE',
+            'retry_policy': ('QUERY_ORIGINAL_COMMAND' if reason == 'E_UNKNOWN_SEND'
+                             else 'REQUIRE_USER_ACTION'),
+            'occurred_at': receipt.get('updated_at_utc'),
+            'context': {},
+        })
+    result['diagnostics'] = diagnostic_rows[-128:]
+
+    catalog = set(result['configuration'].get('scoped_contracts', ()))
+    rollover_catalog = getattr(port, '_rollover_catalog', {})
+    for rows in rollover_catalog.values():
+        catalog.update(rows)
+    result['contract_catalog'] = {
+        'revision': result['checkpoint_event_seq'],
+        'observed_at_utc': result['capabilities']['observed_at_utc'],
+        'complete': False,
+        'source': 'RUNTIME_SCOPED_MARKET_CACHE',
+        'contracts': sorted(catalog)[:4_096],
+    }
     # Historical rows may be omitted. Current execution responsibility stays
     # complete, including active children of an otherwise closed cycle.
     current_cycles = {

@@ -319,7 +319,6 @@ class WorkbenchWindow(StatusWindow):
             watcher.unavailable.connect(self._runtime_unavailable)
             watcher.finished.connect(self._runtime_finished)
             self._runtime_watch = watcher
-            self.setWindowTitle('OnlineTrader · 独立运行时工作台')
             watcher.start()
 
     def _read_account_login(self):
@@ -340,6 +339,13 @@ class WorkbenchWindow(StatusWindow):
 
     def display_account(self):
         key = self.view['account_key'] if self.view else self.paired_account_key
+        display = self.view.get('account_display') if self.view else None
+        if isinstance(display, dict):
+            provider = {'TQ_SIMNOW': 'SimNow 模拟', 'TQKQ': '快期模拟'}.get(
+                display.get('provider'), display.get('provider'))
+            masked = display.get('masked_login')
+            if provider and masked:
+                return provider, masked
         account = self.selected_account
         if account and key in (None, account['account_key']):
             environment = account['environment']
@@ -367,6 +373,11 @@ class WorkbenchWindow(StatusWindow):
             self.view['entry_authority']=='ARMED' or ('cancel_on_stop' in self.view['configuration']
             and not self.view['configuration'].get('strategy_stop_requested')))))
         self.dashboard.update_manual_controls(enabled, owner_controls=owner_controls)
+        manual_open = bool(enabled and self.view is not None
+                           and self.view['entry_authority'] == 'ARMED'
+                           and self.view['configuration'].get('manual_workbench'))
+        for name in ('buy', 'sell'):
+            self.command_buttons[name].setEnabled(manual_open)
         self.command_buttons['receipt'].setEnabled(enabled and self.receipt_identity is not None)
 
     def _start_job(self,action,args=None):
@@ -1065,8 +1076,8 @@ class WorkbenchWindow(StatusWindow):
                 for column in range(table.columnCount()):
                     table.setColumnWidth(column, min(260, table.columnWidth(column)))
         self.filter_markets()
-        self.command_buttons['arm'].setText('启用人工开仓 (F5)' if v['configuration'].get('manual_workbench') else '启动策略 (F5)')
-        self.pause_button.setText('停止策略 (F6)' if 'cancel_on_stop' in v['configuration'] else '暂停开仓 (F6)')
+        self.command_buttons['arm'].setText('启动策略 (F5)')
+        self.pause_button.setText('停止策略 (F6)')
         self.command_buttons['arm'].setToolTip(v['configuration'].get('strategy_stop_wait') or
             ('等待原停止指令的撤单结果' if v['configuration'].get('stop_cancel_pending') else ''))
         self.dashboard.render(v)

@@ -10,6 +10,8 @@
 
 Trading Workbench 通过 Runtime 操作员接口直接提交命令：令牌只驻留当前界面进程，每次命令由 Runtime 重新鉴权；命令绑定账号、owner boot 和配置版本。超时只查询原 `command_id`，不自动重发。后续用户级产品测试统一从 Runtime CLI/API/Qt 入口执行；旧工作台直连 Kernel/ControlServer 的回放只保留为 Legacy 或组件回归，不能作为当前产品验收。 [测试入口迁移与固定数据](docs/refactor/standalone-trading-runtime-test-migration-20261119.md)
 
+2026-11-19 的源码实施候选扩展了 Runtime 客户端状态、回执、Capability、结构化诊断、合约目录、参数预览及脱敏日志合同。按用户要求，`online-trader-desktop --runtime-pipe` 与普通 dev 工作台共用同一个 `WorkbenchWindow/WorkbenchLayout`；Runtime 只替换状态、命令和查询通道，不另建一套界面。真实 TQKQ 只读验收已覆盖界面对照、状态流、Qt 生命周期和零交易副作用；最新禁用态与账户标识修复仍需独立复测。未打包。[客户端重构设计与实施状态](docs/refactor/trading-workbench-client-refactor-20261119.md)
+
 当前离线 Runtime 定向自动化由独立测试 Agent 执行 69 项，69 PASS、0 FAIL、0 SKIP；范围覆盖已实现的操作员协议、版本化视图、Workbench 直接提交、公共 IPC 账户读取/平仓/回执和受影响回归。可见 Qt 强杀恢复、完整故障矩阵、联网柜台和最终制品仍为 `NOT_RUN`，不能据此报告完整产品通过。
 
 [完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [运维、配置与账本约定](docs/runtime-operations-and-storage-20261119.md) · [测试入口迁移](docs/refactor/standalone-trading-runtime-test-migration-20261119.md) · [实现与验收记录](docs/refactor/standalone-trading-runtime-acceptance-20261119.md) · [账号数据与原账本查询](docs/account-data-sync-design-20261119.md)

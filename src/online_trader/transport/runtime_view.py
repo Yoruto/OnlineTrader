@@ -49,9 +49,21 @@ def validate_wire(message):
         if message.keys() != {'protocol', 'kind', *DAY_HISTORY_FIELDS}:
             raise TraderError('E_SCHEMA', 'Unexpected account date history request fields')
         return
+    if kind == 'runtime-log':
+        if message.keys() != {'protocol', 'kind', 'before', 'limit'}:
+            raise TraderError('E_SCHEMA', 'Unexpected Runtime log request fields')
+        if message['before'] is not None:
+            sequence(message['before'])
+        if type(message['limit']) is not int or not 1 <= message['limit'] <= 200:
+            raise TraderError('E_SCHEMA', 'Invalid Runtime log page size')
+        return
     if kind in ('HISTORY', 'HISTORY_ERROR'):
         if message.keys() != {'protocol', 'kind', 'body'} or type(message['body']) is not dict:
             raise TraderError('E_SCHEMA', 'Invalid account history response')
+        return
+    if kind in ('RUNTIME_LOG', 'RUNTIME_LOG_ERROR'):
+        if message.keys() != {'protocol', 'kind', 'body'} or type(message['body']) is not dict:
+            raise TraderError('E_SCHEMA', 'Invalid Runtime log response')
         return
     if kind in ('snapshot', 'align', 'subscribe'):
         if message.keys() != {'protocol', 'kind', 'cursor'}:
@@ -250,6 +262,16 @@ class RuntimeViewClient:
     def history_days(self, *, from_day, to_day, section='coverage', contract=None, cursor=None, limit=50):
         return self._read_history('history-days', {'from_day': from_day, 'to_day': to_day, 'section': section,
                                                    'contract': contract, 'cursor': cursor, 'limit': limit})
+
+    def runtime_log(self, *, before=None, limit=100):
+        with connect(self.pipe, timeout=1, validator=validate_wire) as connection:
+            connection.send({'protocol': PROTOCOL, 'kind': 'runtime-log', 'before': before, 'limit': limit}, timeout=1)
+            response = connection.recv(timeout=3)
+        if response['kind'] == 'RUNTIME_LOG_ERROR':
+            raise TraderError(response['body']['code'], response['body']['message'])
+        if response['kind'] != 'RUNTIME_LOG':
+            raise TraderError('E_SCHEMA', 'Expected a Runtime log page')
+        return response['body']
 
     def _read_history(self, kind, fields):
         with connect(self.pipe, timeout=1, validator=validate_wire) as connection:

@@ -11,7 +11,6 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from online_trader import __version__
 from online_trader.accounts import AccountStore
 from online_trader.desktop.dingtalk import DingTalkSettings
-from online_trader.desktop.workbench import run
 from online_trader.errors import TraderError
 from online_trader.runtime.instance import AccountLock
 from online_trader.runtime.launch import SessionLauncher
@@ -75,7 +74,12 @@ def main(argv=None):
     try:
         if args.runtime_pipe is not None:
             with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):
+                # Runtime attachment deliberately reuses the established dev
+                # WorkbenchWindow/WorkbenchLayout.  Only the state and command
+                # transport changes; users keep the exact same interface.
+                from online_trader.desktop.workbench import run
                 return run(args.runtime_pipe, runtime_view=True)
+        from online_trader.desktop.workbench import run
         if args.simnow_packet is not None:
             launcher = SessionLauncher.for_simnow(args.simnow_packet)
             with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):

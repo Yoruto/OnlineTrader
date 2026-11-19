@@ -13,6 +13,7 @@ from threading import Lock
 from uuid import uuid4
 
 from online_trader.contracts.codec import strict_loads
+from online_trader.configuration.dsv import DsvProfile
 from online_trader.domain.values import identifier, sequence
 from online_trader.errors import TraderError
 from online_trader.runtime.portable_config import _read
@@ -43,7 +44,7 @@ def validate_wire(message):
         return
     if message.keys() != {'protocol', 'request_id', 'operation', 'body', 'operator', 'token'}:
         raise TraderError('E_SCHEMA', 'Invalid runtime command request')
-    if message['operation'] not in ('authenticate', 'submit', 'receipt') or type(message['body']) is not dict:
+    if message['operation'] not in ('authenticate', 'submit', 'receipt', 'preview-config') or type(message['body']) is not dict:
         raise TraderError('E_SCHEMA', 'Unknown runtime command operation')
     identifier(message['operator'])
     if type(message['token']) is not str or not 32 <= len(message['token']) <= 256:
@@ -127,6 +128,32 @@ class OperatorEndpoint:
             return {'status': 'AUTHENTICATED', 'operator': request['operator'], 'actor': actor,
                     'account_key': self.account_key, 'operations': sorted(operations),
                     'expires_at_utc': expiry.isoformat().replace('+00:00', 'Z')}
+        if request['operation'] == 'preview-config':
+            if 'SAVE_DSV_PARAMETERS' not in operations:
+                raise TraderError('E_AUTH', 'The operator cannot preview an effective parameter change')
+            if body.keys() != {'profile', 'binding'} or type(body['binding']) is not dict:
+                raise TraderError('E_SCHEMA', 'Provide a profile and its Runtime binding')
+            binding = body['binding']
+            if binding.keys() != {'account_key', 'kernel_boot_id', 'config_revision'}:
+                raise TraderError('E_SCHEMA', 'The configuration preview binding is invalid')
+            if binding['account_key'] != self.account_key:
+                raise TraderError('E_SCOPE', 'The configuration draft belongs to another account')
+            identifier(binding['kernel_boot_id'])
+            sequence(binding['config_revision'], positive=True)
+            profile = DsvProfile.from_record(body['profile'])
+            try:
+                with closing(sqlite3.connect(self.ledger.as_uri() + '?mode=ro', uri=True, timeout=.5)) as stream:
+                    scope = stream.execute('SELECT account_key, environment FROM ledger_scope').fetchall()
+                    current = stream.execute('SELECT config_revision FROM authority WHERE singleton=1').fetchone()
+            except sqlite3.Error:
+                raise TraderError('E_STORAGE', 'Cannot read the current configuration revision') from None
+            if scope != [(self.account_key, 'ONLINE_SIM')] or current is None:
+                raise TraderError('E_SCOPE', 'The configuration ledger does not match this Runtime')
+            if str(current[0]) != binding['config_revision']:
+                raise TraderError('E_CONFIG_EDIT', 'The effective configuration changed before preview')
+            return {'status': 'VALID', 'account_key': self.account_key,
+                    'kernel_boot_id': binding['kernel_boot_id'], 'config_revision': binding['config_revision'],
+                    'profile_hash': profile.content_hash, 'profile': profile.to_record()}
         command_id = identifier(body.get('command_id'))
         if request['operation'] == 'receipt':
             if body.keys() != {'command_id'}:

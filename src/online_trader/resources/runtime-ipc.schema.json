@@ -8,6 +8,8 @@
     {"$ref": "#/$defs/HistoryRequest"},
     {"$ref": "#/$defs/DayHistoryRequest"},
     {"$ref": "#/$defs/HistoryResponse"},
+    {"$ref": "#/$defs/RuntimeLogRequest"},
+    {"$ref": "#/$defs/RuntimeLogResponse"},
     {"$ref": "#/$defs/AccountRead"},
     {"$ref": "#/$defs/AccountObservation"},
     {"$ref": "#/$defs/AccountPage"},
@@ -62,6 +64,23 @@
       "properties": {
         "protocol": {"const": "ONLINE_TRADER_RUNTIME_VIEW/1"},
         "kind": {"enum": ["HISTORY", "HISTORY_ERROR"]}, "body": {"type": "object"}
+      }
+    },
+    "RuntimeLogRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "kind", "before", "limit"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_VIEW/1"}, "kind": {"const": "runtime-log"},
+        "before": {"type": ["string", "null"], "pattern": "^(0|[1-9][0-9]{0,18})$"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+      }
+    },
+    "RuntimeLogResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "kind", "body"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_VIEW/1"},
+        "kind": {"enum": ["RUNTIME_LOG", "RUNTIME_LOG_ERROR"]}, "body": {"type": "object"}
       }
     },
     "DayHistoryRequest": {
@@ -148,7 +167,7 @@
       "required": ["protocol", "request_id", "operation", "body", "operator", "token"],
       "properties": {
         "protocol": {"const": "ONLINE_TRADER_RUNTIME_COMMAND/1"},
-        "request_id": {"$ref": "#/$defs/Id"}, "operation": {"enum": ["authenticate", "submit", "receipt"]},
+        "request_id": {"$ref": "#/$defs/Id"}, "operation": {"enum": ["authenticate", "submit", "receipt", "preview-config"]},
         "body": {"type": "object"}, "operator": {"$ref": "#/$defs/Id"},
         "token": {"type": "string", "minLength": 32, "maxLength": 256}
       },
@@ -159,7 +178,12 @@
          "then": {"properties": {"body": {"additionalProperties": false, "required": ["command_id"],
            "properties": {"command_id": {"$ref": "#/$defs/Id"}}}}}},
         {"if": {"properties": {"operation": {"const": "authenticate"}}},
-         "then": {"properties": {"body": {"maxProperties": 0}}}}
+         "then": {"properties": {"body": {"maxProperties": 0}}}},
+        {"if": {"properties": {"operation": {"const": "preview-config"}}},
+         "then": {"properties": {"body": {"type": "object", "additionalProperties": false,
+           "required": ["profile", "binding"], "properties": {
+             "profile": {"type": "object"}, "binding": {"$ref": "#/$defs/Command/properties/binding"}
+           }}}}}
       ]
     },
     "CommandResponse": {

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from threading import BoundedSemaphore, Event, Thread
+import re
 
 from online_trader.errors import TraderError
 from online_trader.runtime.account_day_history import read_account_days
@@ -147,19 +148,61 @@ class ViewProcess:
         self._thread.join(timeout=5)
 
 
-def _serve_peer(connection, history, history_page, day_history, stopped, slots):
+def _runtime_log_page(root, *, before=None, limit=100):
+    path = Path(root).resolve() / 'logs' / 'runtime-view.log'
+    if not path.is_file():
+        return {'rows': [], 'next_before': None, 'complete': True}
+    try:
+        with path.open('rb') as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            stream.seek(max(0, size - 1_048_576))
+            raw = stream.read(1_048_576)
+    except OSError:
+        raise TraderError('E_RUNTIME_LOG', 'The Runtime interface log cannot be read') from None
+    lines = raw.decode('utf-8', errors='replace').splitlines()[-10_000:]
+    end = len(lines) if before is None else min(int(before), len(lines))
+    start = max(0, end - limit)
+    pattern = re.compile(r'^(\S+) SUPERVISOR (START pid=\d+|EXIT code=-?\d+ uptime_ms=\d+|START_FAILED error=[A-Za-z0-9_]+)$')
+    rows = []
+    for index, line in enumerate(lines[start:end], start=start):
+        match = pattern.fullmatch(line)
+        rows.append({'sequence': str(index + 1),
+                     'occurred_at': match.group(1) if match else None,
+                     'source': 'RUNTIME_VIEW_SUPERVISOR',
+                     'message': match.group(2) if match else 'INTERFACE_PROCESS_OUTPUT_REDACTED'})
+    return {'rows': rows, 'next_before': str(start) if start else None, 'complete': start == 0}
+
+
+def _account_display(root, account_key):
+    """Read only the already-masked account label for the dev workbench shell."""
+    try:
+        from online_trader.runtime.portable_config import PortableAccountStore
+        store = PortableAccountStore(root)
+        row = next(item for item in store.read()['accounts'] if item['account_key'] == account_key)
+        return {key: row[key] for key in ('provider', 'masked_login', 'alias')}
+    except (TraderError, OSError, KeyError, StopIteration, TypeError, ValueError):
+        return None
+
+
+def _serve_peer(connection, history, history_page, day_history, runtime_log, stopped, slots):
     try:
         with connection:
             request = connection.recv(timeout=1)
-            if request['kind'] in ('history', 'history-days'):
+            if request['kind'] in ('history', 'history-days', 'runtime-log'):
                 try:
                     if request['kind'] == 'history':
                         page = history_page(before=request['before'], limit=request['limit'])
+                        reply = {'protocol': PROTOCOL, 'kind': 'HISTORY', 'body': page}
+                    elif request['kind'] == 'runtime-log':
+                        page = runtime_log(before=request['before'], limit=request['limit'])
+                        reply = {'protocol': PROTOCOL, 'kind': 'RUNTIME_LOG', 'body': page}
                     else:
                         page = day_history(**{field: request[field] for field in DAY_HISTORY_FIELDS})
-                    reply = {'protocol': PROTOCOL, 'kind': 'HISTORY', 'body': page}
+                        reply = {'protocol': PROTOCOL, 'kind': 'HISTORY', 'body': page}
                 except TraderError as error:
-                    reply = {'protocol': PROTOCOL, 'kind': 'HISTORY_ERROR',
+                    reply = {'protocol': PROTOCOL,
+                             'kind': 'RUNTIME_LOG_ERROR' if request['kind'] == 'runtime-log' else 'HISTORY_ERROR',
                              'body': {'code': error.code, 'message': str(error)}}
                 connection.send(reply, timeout=.5)
                 return
@@ -226,7 +269,9 @@ def serve(pipe, account_key, root, ledger):
     history = ViewHistory()
     stopped = Event()
     endpoint = OperatorEndpoint(pipe, root, ledger, account_key)
+    account_display = _account_display(root, account_key)
     history_page = partial(account_history, ledger, account_key)
+    runtime_log = partial(_runtime_log_page, root)
     day_history_slots = BoundedSemaphore(2)
     account_value = AccountObservation.waiting(account_key, 'E_ACCOUNT_SOURCE_UNAVAILABLE')
 
@@ -260,6 +305,8 @@ def serve(pipe, account_key, root, ledger):
         while not stopped.is_set():
             value = read_workbench_publication(pipe, account_key)
             if value is not None:
+                if account_display is not None:
+                    value = value | {'view': value['view'] | {'account_display': account_display}}
                 history.publish(value)
             stopped.wait(.15)
 
@@ -279,7 +326,8 @@ def serve(pipe, account_key, root, ledger):
                 Thread(target=read_account_owner, daemon=True).start()
                 Thread(target=_accept, args=(accounts, _serve_account, (current_account,), BoundedSemaphore(4), stopped),
                        daemon=True).start()
-            _accept(views, _serve_peer, (history, history_page, day_history, stopped), BoundedSemaphore(12), stopped)
+            _accept(views, _serve_peer, (history, history_page, day_history, runtime_log, stopped),
+                    BoundedSemaphore(12), stopped)
     finally:
         stopped.set()
         if accounts is not None:

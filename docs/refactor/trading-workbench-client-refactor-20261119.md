@@ -1,11 +1,21 @@
 # OnlineTrader Trading Workbench（Client）重构设计与实施计划
 
-> 状态：设计草案 v1.0 · 2026-11-19  
+> 状态：源码实施候选 · 2026-11-19；编译检查通过；首轮 Windows Qt + 快期隔离账号验收已执行，界面缺陷修复后待独立复测；未打包
 > 范围：Qt/PySide6 客户端及其与 Trading Runtime 的接口适配  
-> 仓库基线：`main`（编制时最近已核对提交 `1f0ab648136519e364bf3267c6dab51ffdd76e15`）  
-> 本文仅为实施计划，不代表代码已完成或测试已通过。
+> 设计基线：`1f0ab648136519e364bf3267c6dab51ffdd76e15`；实施起点：`c891e512ed6559505160cccd80bfd90a40ae5262`
+> 本文所列实现状态不代表最终独立复测、模拟柜台交易闭环或最终制品已经通过。
 
 **关联文档：** [独立交易运行时与交易工作台设计](standalone-trading-runtime-20261119.md) · [Runtime 运维、配置与账本](../runtime-operations-and-storage-20261119.md) · [账户数据与历史查询](../account-data-sync-design-20261119.md)
+
+### 2026-11-19 源码实施候选
+
+- `online-trader-desktop --runtime-pipe` 与普通 dev 入口共用原 `WorkbenchWindow`/`WorkbenchLayout`；窗口、导航、页面、控件、文案和位置只有一份实现。Runtime 兼容启动器也只委托该窗口，不保留第二套可见页面。
+- 客户端基础层已提供版本化状态 Store、状态订阅/命令/慢查询分离、CommandBus、原命令回执恢复及稳定行 ID 模型；产品入口通过既有 Workbench 的 Runtime view/操作员适配逐步接入，不以替换 UI 的方式切换。
+- Runtime 投影新增说明性 Capability、结构化 Diagnostic 和 Owner 已有行情缓存中的合约目录；命令仍由 Runtime 逐次最终校验。
+- 参数草稿必须先通过带账号、boot 和配置版本绑定的 Runtime 预览，再使用原 `SAVE_DSV_PARAMETERS` 命令提交；Qt 不直接写生效配置。
+- Runtime 接口日志通过有界、脱敏的只读页返回；新客户端不直接读取执行器日志文件。
+- 首轮独立验收曾发现替代 UI 偏离 dev；该替代窗口已撤除。后续真实 TQKQ 验收确认 Runtime 入口实际类、标题、尺寸、五任务区、二级页签、首页 5 列行情表、K 线、解释、事件和状态栏均来自同一 dev 实现。已进一步修复 F5/F6 固定文案、脱敏账户显示、原“订阅行情（新主力）”入口及 DISARMED 开仓控件禁用；这些最新修复等待独立复测。
+- 未执行任何开仓、平仓、撤单或其他交易操作，未打包；模拟柜台交易闭环和最终制品仍为 `NOT_RUN`。
 
 ## 1. 背景、目标与不变约束
 
