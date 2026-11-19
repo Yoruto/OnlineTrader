@@ -8,7 +8,7 @@
 
 便携运行目录使用相对路径配置，不依赖 Windows 凭据库，也不新增 `runtime.sqlite3`。全新目录首次启动自动建立原执行账本；换机交接携带配置和原账本的一致性副本。人工与策略开仓权限分别持久化，人工禁开可否决策略新增，原平仓和保护路径保持可用。公开 CLI/Python 接口支持状态、账户、行情、命令、回执、跨日历史和交接导出。
 
-[完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [账号数据与原账本查询](docs/account-data-sync-design-20261119.md)
+[完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [实现与验收记录](docs/refactor/standalone-trading-runtime-acceptance-20261119.md) · [账号数据与原账本查询](docs/account-data-sync-design-20261119.md)
 
 该入口当前只支持已验收的模拟账户范围，不表示 DSV replacement 链已经切换，也不表示真实资金账户或发行制品已验收。当前源码验收状态见[功能清单](docs/功能实现与待办清单_20261110.md)。
 
