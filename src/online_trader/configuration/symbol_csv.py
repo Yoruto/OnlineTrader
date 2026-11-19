@@ -62,6 +62,33 @@ class SymbolCsvError(TraderError):
         super().__init__("E_SYMBOL_CSV", f"CSV line {line}, field {field}: {reason}")
 
 
+def match_contract_catalog(value, contracts, *, limit=100):
+    """Filter an already-discovered futures catalog by code, product alias or Chinese name."""
+    if type(value) is not str or not isinstance(contracts, (list, tuple)):
+        return []
+    from online_trader.configuration.rollover import future_product
+
+    term = value.strip().casefold()
+    if not term:
+        return []
+    prefix = term.rstrip('0123456789')
+    alias = ALIASES.get(prefix)
+    matches = []
+    for code in dict.fromkeys(contracts):
+        product = future_product(code)
+        if product is None:
+            continue
+        symbol = '.'.join(product)
+        name = PRODUCT_NAMES.get(symbol, '').casefold()
+        suffix = code[len(symbol):]
+        if (term in code.casefold() or term in name
+                or alias == product and suffix.endswith(term[len(prefix):])):
+            matches.append(code)
+        if len(matches) >= limit:
+            break
+    return matches
+
+
 def resolve_contract(value):
     """Resolve a DSV alias plus an explicit month; never infer a main contract."""
     if type(value) is not str:
