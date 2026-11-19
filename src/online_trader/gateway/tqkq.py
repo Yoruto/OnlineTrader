@@ -36,7 +36,13 @@ def broker_account_facts(api, account):
     """Copy the native sections from one SDK update without inferring ownership."""
     funds = api.get_account(account=account)
     positions = [
-        {'contract_id': code, 'long': position.pos_long, 'short': position.pos_short}
+        {'contract_id': code, 'long': position.pos_long, 'short': position.pos_short,
+         'long_today': getattr(position, 'pos_long_today', None),
+         'long_historical': getattr(position, 'pos_long_his', None),
+         'short_today': getattr(position, 'pos_short_today', None),
+         'short_historical': getattr(position, 'pos_short_his', None),
+         'long_reference_price': number(getattr(position, 'open_price_long', None)),
+         'short_reference_price': number(getattr(position, 'open_price_short', None))}
         for code, position in api.get_position(account=account).items()
         if position.pos_long or position.pos_short
     ]

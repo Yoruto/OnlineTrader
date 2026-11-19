@@ -75,7 +75,7 @@ class DsvStrategyRuntime:
         self._continuation_seconds=float(trade['chase_window_minutes'])*60 if trade['continuation_entry'] else None
         self._quote_age_limit = Decimal(trade['max_quote_age_seconds'])
         self._converted = {}
-        self._states={};self._stop_states={};self._latest={};self._rebuilds={};self._pending=None;self.epoch=None;self._account_revision=0
+        self._states={};self._stop_states={};self._latest={};self._decision_views={};self._rebuilds={};self._pending=None;self.epoch=None;self._account_revision=0
         def restore_state(state, *, trusted_consumption=False):
             if state is None:return
             state=copy.deepcopy(state)
@@ -123,6 +123,9 @@ class DsvStrategyRuntime:
             if state is not None and report.get("event_mode") == "OBSERVATION":
                 live = False
             restore_state(state, trusted_consumption=live or bool(state and state.get("consumption_version") == 1))
+            if state is not None and report:
+                key = state["contract_id"], state["trading_day"]
+                self._decision_views[key] = {"state": copy.deepcopy(state), "report": copy.deepcopy(report)}
             stops=data.get("dsv_strategy_stops")
             if stops is not None:self._stop_states[(stops["state"]["contract_id"],stops["state"]["trading_day"])]=stops
             cycle=data.get("cycle")
@@ -908,6 +911,7 @@ class DsvStrategyRuntime:
                  canonical_bytes(state).decode(),seq))
         def accepted():
             self._states[key]=copy.deepcopy(state);self._pending=None
+            self._decision_views[key] = {"state": copy.deepcopy(state), "report": copy.deepcopy(report)}
             if stop_result is not None:self._stop_states[key]=copy.deepcopy(stop_result)
             if not result.done():
                 outcome=copy.deepcopy(report)|{"durable_seq":str(k._durable_seq)}
