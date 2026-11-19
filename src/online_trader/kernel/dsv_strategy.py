@@ -125,16 +125,25 @@ class DsvStrategyRuntime:
             restore_state(state, trusted_consumption=live or bool(state and state.get("consumption_version") == 1))
             if state is not None and report:
                 key = state["contract_id"], state["trading_day"]
-                self._decision_views[key] = {"state": copy.deepcopy(state), "report": copy.deepcopy(report)}
+                self._remember_decision(key, state, report)
             stops=data.get("dsv_strategy_stops")
             if stops is not None:self._stop_states[(stops["state"]["contract_id"],stops["state"]["trading_day"])]=stops
             cycle=data.get("cycle")
             if row["event_type"]=="ENTRY_PREPARED" and cycle and cycle.get("strategy_metadata",{}):
                 state=cycle["strategy_metadata"].get("strategy_state")
                 restore_state(state, trusted_consumption=True)
+                if state is not None and report:
+                    self._remember_decision((state["contract_id"], state["trading_day"]), state, report)
                 stops=cycle["strategy_metadata"].get("stop_result")
                 if stops is not None:self._stop_states[(stops["state"]["contract_id"],stops["state"]["trading_day"])]=stops
         kernel._dsv_runtime=self
+
+    def _remember_decision(self, key, state, report):
+        """Keep only the latest committed workbench decision for each contract."""
+        for previous in tuple(self._decision_views):
+            if previous[0] == key[0] and previous != key:
+                self._decision_views.pop(previous, None)
+        self._decision_views[key] = {"state": copy.deepcopy(state), "report": copy.deepcopy(report)}
 
     def _development(self):
         self.kernel._writable()
@@ -911,7 +920,7 @@ class DsvStrategyRuntime:
                  canonical_bytes(state).decode(),seq))
         def accepted():
             self._states[key]=copy.deepcopy(state);self._pending=None
-            self._decision_views[key] = {"state": copy.deepcopy(state), "report": copy.deepcopy(report)}
+            self._remember_decision(key, state, report)
             if stop_result is not None:self._stop_states[key]=copy.deepcopy(stop_result)
             if not result.done():
                 outcome=copy.deepcopy(report)|{"durable_seq":str(k._durable_seq)}

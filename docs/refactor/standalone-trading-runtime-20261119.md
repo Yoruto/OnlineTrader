@@ -348,6 +348,19 @@ sequenceDiagram
 
 `runtime.json` 使用 `schema_version` 值 `ONLINE_TRADER_RUNTIME/1`、`selected_account` 及 `accounts` 列表，每个账户定义 `id`、`alias`、`provider`、`broker`、`line`。`private/OnlineTrader-defaults.json` 的 `accounts` 对象用配置中相同的 `id` 索引登录资料，`TQKQ` 用 `username` 和 `password`，`TQ_SIMNOW` 用 `simnow_username`、`simnow_password`、`kq_username`、`kq_password`。策略配置用 `OnlineTrader-parameters.json`，格式沿用原 `DsvProfile`。
 
+运行级自动启动配置采用独立文件：
+
+```json
+{
+  "schema_version": "ONLINE_TRADER_RUNTIME_CONTROL/1",
+  "scheduled_start": {
+    "enabled": false
+  }
+}
+```
+
+新交付必须显式携带 `runtime-control.json`；默认建议为 `false`，确认无人值守启动后再改为 `true`。
+
 | 操作 | 实际入口 |
 | --- | --- |
 | 读取快照与订阅 | `runtime status --root <目录>` 与 `runtime watch --root <目录>`。Python 用 `RuntimeViewClient` 取得基线、差量、对齐或账本观察历史。`runtime quotes` 和 `runtime catalog` 使用所选配置独立只读查询行情。`runtime schema` 输出本机接口的版本化 Schema。 |

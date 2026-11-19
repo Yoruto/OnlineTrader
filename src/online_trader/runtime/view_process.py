@@ -53,12 +53,21 @@ def _start(pipe, account_key, root, ledger):
     program = bundled_cli()
     prefix = [str(program)] if program is not None else [sys.executable, '-m', 'online_trader']
     log_path = _view_log(root)
-    with log_path.open('ab', buffering=0) as output:
+    output = None
+    try:
+        output = log_path.open('ab', buffering=0)
+    except OSError:
+        pass
+    try:
         process = subprocess.Popen([*prefix, 'runtime-view-process', '--pipe', pipe, '--account-key', account_key,
                                     '--root', str(root), '--ledger', str(ledger)],
-            stdin=subprocess.PIPE, stdout=output, stderr=output,
+            stdin=subprocess.PIPE, stdout=output if output is not None else subprocess.DEVNULL,
+            stderr=output if output is not None else subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW,
             env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1'))
+    finally:
+        if output is not None:
+            output.close()
     _supervisor_log(root, f'START pid={process.pid}')
     return process
 
