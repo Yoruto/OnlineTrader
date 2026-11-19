@@ -112,16 +112,24 @@ class SymbolEditorDialog(QDialog):
         self.fields['code'].textEdited.connect(self._refresh_contract_suggestions)
         self.fields['code'].editingFinished.connect(self._normalize_contract)
         self._sync_contract()
-        if self.adding and not self._contract_catalog and self._catalog_loader is not None:
-            self._catalog_loading = True
-            self.contract_hint.setText('正在加载可选期货合约；也可以直接输入完整合约代码。')
-            self._catalog_loader()
         fit_dialog(self, 620, 610)
         self.fields['code'].setFocus()
 
     def _show_more(self, checked):
         self.more_body.setVisible(checked)
         self.more_button.setText('更多设置 ▾' if checked else '更多设置 ▸')
+
+    def start_catalog_load(self):
+        if not self.adding or self._contract_catalog or self._catalog_loader is None:
+            return
+        self._catalog_loading = True
+        self.contract_hint.setText('正在加载可选期货合约；也可以直接输入完整合约代码。')
+        try:
+            started = self._catalog_loader()
+        except Exception:
+            started = False
+        if started is False and self._catalog_loading:
+            self.set_contract_catalog_error('E_CONTRACT_CATALOG')
 
     def set_contract_catalog(self, contracts):
         self._contract_catalog = tuple(dict.fromkeys(code for code in (contracts or ()) if isinstance(code, str)))

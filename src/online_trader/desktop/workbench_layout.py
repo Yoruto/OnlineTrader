@@ -2573,13 +2573,19 @@ class WorkbenchLayout:
 
     def load_manual_catalog(self):
         account = self.window.selected_account
+        dialog = self.window._settings_dialog
         if self.quote_worker is not None:
-            return
+            if dialog is not None:
+                dialog.set_contract_catalog_error('E_BUSY')
+            return False
         if account is None:
             self.manual_catalog_status.setText('请先选择提供行情的模拟账号')
-            return
+            if dialog is not None:
+                dialog.set_contract_catalog_error('E_ACCOUNT')
+            return False
         self.manual_catalog_status.setText('正在加载期货合约…')
         self.start_market_read(account['account_id'],catalog=True)
+        return True
 
     def manual_catalog_edited(self, text):
         self.filter_manual_catalog(text)

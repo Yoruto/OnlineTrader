@@ -353,6 +353,7 @@ class SettingsDialog(QDialog):
                                         contract_catalog=self._contract_catalog,
                                         catalog_loader=self._contract_catalog_loader)
             self._symbol_editor = dialog
+            dialog.start_catalog_load()
         else:
             from online_trader.desktop.editor import ParameterEditorDialog
             dialog = ParameterEditorDialog(self._profile, self)
