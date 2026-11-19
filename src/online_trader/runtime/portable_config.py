@@ -1,6 +1,7 @@
 """Machine-independent input for the standalone simulation runtime."""
 
 from contextlib import closing
+import os
 from pathlib import Path
 import sqlite3
 
@@ -179,11 +180,43 @@ class PortableAccountStore(AccountStore):
             raise TraderError('E_STORAGE', 'The existing execution ledger is missing')
         if path.exists() and not existing:
             raise TraderError('E_STORAGE', 'The execution ledger path is not a file')
+        if not existing:
+            self._reject_parallel_desktop_ledger(row, path)
         with Ledger(path, row['account_key'], environment=row['environment'], broker_identity=row['provider'],
                     existing_only=existing):
             pass
         if not marker.exists():
             publish_new_bytes(canonical_bytes(identity), marker)
+
+    @staticmethod
+    def _reject_parallel_desktop_ledger(row, target):
+        """Require an explicit handoff instead of silently forking a local account ledger."""
+        local = os.environ.get('LOCALAPPDATA')
+        if not local:
+            return
+        base = Path(local).resolve() / 'OnlineTrader' / 'accounts' / 'data'
+        if row['provider'] == 'TQ_SIMNOW':
+            base = base / 'simnow'
+        source = (base / row['account_key'].split(':')[-1] / 'ledger.db').resolve()
+        if source == target or not source.exists():
+            return
+        if not source.is_file():
+            raise TraderError('E_STORAGE', 'The standard account ledger path is not a file')
+        try:
+            with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
+                db.execute('PRAGMA query_only=ON')
+                db.execute('BEGIN')
+                scope = db.execute('''SELECT account_key, environment, broker_identity, schema_version
+                    FROM ledger_scope''').fetchall()
+        except sqlite3.Error:
+            raise TraderError('E_STORAGE', 'The standard account ledger cannot be validated for handoff') from None
+        expected = (row['account_key'], row['environment'], row['provider'], 1)
+        if scope != [expected]:
+            raise TraderError('E_SCOPE', 'The standard account ledger identity differs from Runtime configuration')
+        raise TraderError(
+            'E_RUNTIME_HANDOFF',
+            'This account already has an initialized desktop ledger; create a consistent Runtime handoff instead of a parallel ledger',
+        )
 
     def effective_profile(self, row, default):
         """Recover the original owner's committed profile after the ledger identity check."""

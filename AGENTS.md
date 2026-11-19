@@ -3,6 +3,12 @@
 Independent Windows product. G0 source specifications are recorded in docs/spec-source.json.
 Preserve existing work; do not import V7, vnpy, DSV, their credentials, databases or environments.
 
+## 默认启动与交付路径
+
+- 未明确指定执行路径时，OnlineTrader 的启动、重启、用户验收、测试候选和打包默认采用 **Standalone Trading Runtime**：执行 Owner 使用 `runtime run` 或 `runtime schedule`，桌面界面使用 `online-trader-desktop --runtime-pipe` 附着 Runtime。Runtime Workbench 与 dev 共用同一个 `WorkbenchWindow` / `WorkbenchLayout`；不要另建或交付第二套界面。
+- 默认 Runtime 路径不授予账号连接、订单操作、测试或打包权限；这些动作仍按本次用户授权执行。用户明确要求 Legacy 维护、replacement candidate 或 isolated QA 时，才切换相应路径，并在报告中标明。
+- 默认打包目标是可实际运行的 Runtime 完整交付单元，不是仅含普通工作台的 Legacy 包。除通用便携依赖外，按接收方带齐 Runtime 配置、操作员授权和已初始化账户所需的原账本；从最终 ZIP/安装器按 `runtime run`/`runtime schedule` → `--runtime-pipe` 实际入口独立验收。
+
 ## 所有软件制品必须随包交付配置
 
 - OnlineTrader 每次出包都必须带齐本次交付所需的配置。安装器、便携包、更新 ZIP、客户专用包和测试包均适用。打包前确认目标设备或接收方使用的配置来源和文件清单。需要预配账户和交易参数时，必须随包带入已确认的 `OnlineTrader-defaults.json` 和 `OnlineTrader-parameters.json`，以及该包所需的启动和更新配置。独立 Trading Runtime 的新交付还必须显式带入 `runtime.json`、`runtime-control.json` 和相应的 `private/operators.json`；不要用缺少自动启动总开关的目录猜测默认行为。
@@ -28,8 +34,8 @@ Keep the explicit controller's per-child pre-send durability and the existing cu
 
 | Path | Entry points and owner | Applicable contract |
 | --- | --- | --- |
-| Legacy, not yet retired | `simulation run`, `dsv run`, `simnow run`, and the ordinary workbench's existing launch route | Preserve the original Kernel owner and that route's recovery contract until approved cutover. |
-| Standalone Trading Runtime | `runtime run`, `runtime schedule`, `runtime command`, attached status/account/history and runtime Workbench | Reuse the original Kernel/SQLite execution owner through portable configuration. Qt and runtime-view are read/control-side processes, not senders. Follow [runtime operations and storage](docs/runtime-operations-and-storage-20261119.md). |
+| Legacy, not yet retired; explicit maintenance only | `simulation run`, `dsv run`, `simnow run`, and the ordinary workbench's existing launch route | Preserve the original Kernel owner and that route's recovery contract until approved cutover. Do not select this as the default launch or package path. |
+| Standalone Trading Runtime; default | `runtime run`, `runtime schedule`, `runtime command`, attached status/account/history and runtime Workbench | Reuse the original Kernel/SQLite execution owner through portable configuration. Qt and runtime-view are read/control-side processes, not senders. Follow [runtime operations and storage](docs/runtime-operations-and-storage-20261119.md). |
 | Replacement candidate | `dsv replacement-run`, `simnow replacement-run` | `DsvSession` + `ExplicitOrderController` + `Journal` + `DsvSdkAdapter`; share the compatible account lock, not the legacy Kernel sender. See [candidate startup](docs/refactor/dsv-parity-20261114/10-sdk-startup-and-same-day-rollback.md). |
 | Isolated QA | `offline-dsv` and `qa/dsv_parity/` replay tools | DEV/OFFLINE fixtures or locally bounded SDK replay; no real account connection or order authority. |
 

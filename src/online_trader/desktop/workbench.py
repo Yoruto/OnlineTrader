@@ -200,6 +200,7 @@ class WorkbenchWindow(StatusWindow):
         super().__init__(pipe_name,client_factory=client_factory)
         self._runtime_mode = runtime_view
         self._runtime_watch = None
+        self._runtime_query_worker = None
         self._runtime_command_worker = None
         self._runtime_operator_id = None
         self._runtime_operator_token = None
@@ -313,6 +314,13 @@ class WorkbenchWindow(StatusWindow):
         self._enable_commands(False)
         if runtime_view:
             from online_trader.desktop.runtime_watch import RuntimeWatch
+            from online_trader.desktop.runtime_client.client import RuntimeQueryWorker
+            query_worker = RuntimeQueryWorker(pipe_name, self)
+            query_worker.result.connect(self._runtime_query_result)
+            query_worker.failed.connect(self._runtime_query_failed)
+            query_worker.finished.connect(self._runtime_query_finished)
+            self._runtime_query_worker = query_worker
+            query_worker.start()
             watcher = RuntimeWatch(pipe_name, self)
             watcher.updated.connect(self._runtime_updated)
             watcher.observed.connect(self._runtime_observed)
@@ -428,8 +436,27 @@ class WorkbenchWindow(StatusWindow):
             self._clear_runtime_operator('Runtime 已重启，请重新解锁操作员。')
         self._job_result(result)
         self._restore_runtime_receipt()
+        self.dashboard.ensure_account_history()
         self._enable_commands(not self._closing and self._runtime_command_worker is None
                               and not self._stale and not self.view['truncated'])
+
+    def enqueue_runtime_history(self, request):
+        worker = self._runtime_query_worker
+        if worker is None or not worker.isRunning() or self._closing:
+            raise TraderError('E_RUNTIME_CONNECTION', 'Runtime history query is unavailable')
+        worker.enqueue(request)
+
+    def _runtime_query_result(self, response):
+        if not self._closing and response.get('kind') == 'history':
+            self.dashboard.apply_account_history(response)
+
+    def _runtime_query_failed(self, response):
+        if not self._closing and response.get('kind') == 'history':
+            self.dashboard.fail_account_history(response)
+
+    def _runtime_query_finished(self):
+        if self._closing:
+            self.close()
 
     def _runtime_observed(self, stamp):
         if self._closing or self.view is None:
@@ -442,6 +469,12 @@ class WorkbenchWindow(StatusWindow):
 
     def _runtime_unavailable(self, code):
         if self._closing:
+            return
+        # A subscription reconnect must not make a still-current publication
+        # flash between READY and STALE.  RuntimeWatch retries continuously; if
+        # the outage persists, a later failure will cross MAX_AGE_NS and take
+        # the existing fail-closed path below.
+        if self.view is not None and not self.published_snapshot_expired():
             return
         self._stale = True
         self._enable_commands(False)
@@ -1053,6 +1086,10 @@ class WorkbenchWindow(StatusWindow):
             diagnostic_notice += ' · 诊断日志写入失败'
         self.connection_detail.setText(f"账户连接：{'已连接' if c['broker_connected'] else '未连接'} · 事实同步：{'完整' if c['synchronized'] else '不完整'} · 通道：{'故障' if c['fault'] else '无已知故障'} · 持仓核对：{'待处理' if c['recovery_required'] else '无未决屏障'} · 时钟：{'故障' if c['clock_fault'] else '无已知故障'} · {authority_label}：{v['entry_authority']}" + diagnostic_notice)
         for name,table in self.tables.items():
+            if name in {'orders', 'trades'}:
+                # WorkbenchLayout owns the user-facing columns for these tables.
+                # Writing the raw projection first made every Runtime refresh repaint them twice.
+                continue
             rows = v['cycles'] if name == 'protection' else v.get(name, [])
             resized = table.rowCount() != len(rows)
             table.setRowCount(len(rows))
@@ -1680,6 +1717,12 @@ class WorkbenchWindow(StatusWindow):
             self._closing = True
             self.hide()
             self._runtime_watch.requestInterruption()
+            event.ignore()
+            return
+        if self._runtime_query_worker is not None and self._runtime_query_worker.isRunning():
+            self._closing = True
+            self.hide()
+            self._runtime_query_worker.shutdown()
             event.ignore()
             return
         if self.monitor_worker is not None and self.monitor_worker.isRunning():

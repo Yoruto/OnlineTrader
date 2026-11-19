@@ -2,6 +2,54 @@
 
 2026-11-19 · Trading Runtime 实施说明 · 源码基线 `10b915fa23f33860712ec491a7aa74d015c46203`（dev36，合入 F5 时钟和行情稳定性修改）。
 
+## 2026-11-19：单账本与 Workbench 历史接入修复
+
+现场排查发现，同一台电脑上的同一 TQKQ 账号可以在桌面账号库和一个全新便携 Runtime 目录中分别初始化 `ledger.db`。账号锁阻止两个执行 Owner 同时运行，但不会阻止它们先后使用两份不同账本。结果是新 Runtime 只看到自身启动后的资金观察，Workbench 的收益曲线丢失原账本已记录日期；同时页面把“自有成交/自有终态订单”简称为“成交记录/历史订单”，容易被误解成柜台账号全历史。
+
+本次修复遵循以下决定：
+
+1. **同机已初始化账号不得静默创建平行账本。** 便携 Runtime 首次初始化前检查本机标准 OnlineTrader 账号库。若同一规范账号已有有效原账本，而当前 Runtime 目录没有经验证的 handoff，则拒绝启动并要求走一致性交接；不自动复制热库、不删除 WAL、不合并两份执行事实。
+2. **Workbench 历史只经 Runtime 查询。** Qt 不直接打开 SQLite。Runtime `history-days` 返回的资金、柜台委托、柜台成交和覆盖状态由独立慢查询线程读取，结果绑定账号、Owner boot、日期范围和查询 generation；迟到的旧账号结果丢弃。
+3. **自有事实和柜台观察分开展示。** 当前委托、自有成交、自有终态订单继续来自 Runtime 实时投影；新增账号委托历史、账号成交历史和覆盖说明来自原账本中的完整账户观察。外部成交不写入 `fill_facts`，不取得策略所有权，也不触发保护。
+4. **收益曲线使用原账本资金历史。** Workbench 将 `history-days/funds` 的每日最后完整观察并入曲线，按交易日去重；当前 Runtime 投影的更新值优先。没有观察或结算来源的日期明确显示为未覆盖，不从成交或余额倒推。
+5. **旧日柜台缺口不在本次自动补造。** TqSdk `get_trade()` 只提供当前交易日成交。QPro 8815 可以提供已经同步、解析的结算资金、成交和日终持仓，但需要显式账户映射、覆盖范围和来源身份；在完成独立导入合同前只保留现有 `COMPARISON_ONLY` 能力，不把未核实结果写入执行账本。
+
+```mermaid
+flowchart TD
+    A[Runtime 首次初始化账号] --> B{当前 Runtime 已有账本或有效 handoff?}
+    B -->|是| C[校验账号/provider/账本身份]
+    B -->|否| D{本机标准账号库已有同账号原账本?}
+    D -->|是| E[拒绝创建平行账本\n要求一致性交接]
+    D -->|否| F[首次创建原账本]
+    C --> G[单一 Owner + 单一 writer]
+    F --> G
+    G --> H[账户观察写入 event_journal]
+    H --> I[Runtime history-days 只读分页]
+    I --> J[Qt 慢查询线程]
+    J --> K[账号历史表 / 收益曲线 / 覆盖说明]
+```
+
+```mermaid
+sequenceDiagram
+    participant UI as Workbench
+    participant Q as RuntimeQueryWorker
+    participant V as runtime-view-process
+    participant L as 原 ledger.db
+    UI->>Q: query(account, boot, generation, 365日范围)
+    Q->>V: history-days(coverage/funds/orders/trades)
+    V->>L: mode=ro 一致性读取（包含 WAL）
+    L-->>V: checkpoint + coverage + records + cursor
+    V-->>Q: 分页结果
+    Q-->>UI: 原请求绑定 + 结果
+    alt 账号/boot/generation 仍一致
+        UI->>UI: 合并稳定 record_id，更新对应表和曲线
+    else 已切账号或重新请求
+        UI->>UI: 丢弃迟到结果
+    end
+```
+
+状态与失败合同：账号历史缓存是只读展示状态，不参与交易裁决；`NOT_OBSERVED`、查询超时、容量限制或 Runtime 断线不得清空最后可信结果并声称“无历史”。并行账本检测失败使用明确错误停止首次初始化。兼容回退只需移除 Workbench 历史接入；已有账本和事件 schema 不迁移、不重写。当前正在运行的 Owner 不因源码更新自动切库，实际迁移必须另行停止、核对并执行一致性交接。
+
 最终采用原每账户 SQLite 执行账本，不创建单独的 `runtime.sqlite3` 或账号历史档案。运行中的全账户截面、停机最终观察和策略自有成交写入原 writer 已有的事实链；查询端只读稳定前缀。全新运行目录只带配置并在首次启动建原账本，换机交接携带配置和该原账本的一致性副本。已经初始化的账户把运行配置和原账本视为共同的可恢复状态：配置表达未来运行意图，账本保存已经发生且需要恢复、核对或审计的事实。
 
 ## 目标与现状

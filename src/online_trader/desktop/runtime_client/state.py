@@ -37,6 +37,7 @@ class PendingCommandState:
     status: PendingCommandStatus
     reason: str | None = None
     receipt: MappingProxyType | None = None
+    scope_hash: str | None = None
 
 
 @dataclass
@@ -72,6 +73,7 @@ class ClientStateStore(QObject):
     configuration_changed = Signal(object)
     diagnostics_changed = Signal(object)
     receipts_changed = Signal(object)
+    owner_boot_changed = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -99,19 +101,22 @@ class ClientStateStore(QObject):
         view = state['view']
         account_key = view['account_key']
         boot_id = view['kernel_boot_id']
+        previous_boot = None
         if self.runtime is not None:
             previous = self.runtime['view']
             if previous['account_key'] != account_key:
                 self.set_connection(ClientConnectionState.RESYNC_REQUIRED, 'E_ACCOUNT_CHANGED')
                 return False
             if previous['kernel_boot_id'] != boot_id:
-                self.pending.clear()
+                previous_boot = previous['kernel_boot_id']
         old = self.runtime
         self.runtime = _freeze(state)
         self.cursor = _freeze(cursor)
         self.published_ns = published_ns
         self.ui.select_account(account_key)
         self.set_connection(ClientConnectionState.READY)
+        if previous_boot is not None:
+            self.owner_boot_changed.emit(previous_boot, boot_id)
         self.runtime_changed.emit(self.runtime)
         changed = lambda key: old is None or old['view'].get(key) != state['view'].get(key)
         for key, signal in (

@@ -60,6 +60,8 @@ QUIET_ENTRY_REASONS = {'CANDLE_OPPORTUNITY_CONSUMED', 'OBSERVATION_ONLY_BACKLOG'
                        'LONG:TRIGGER_NOT_REACHED', 'SHORT:TRIGGER_NOT_REACHED', 'DUPLICATE_MARKET_EVENT'}
 ORDER_HEADERS = ('报单号','合约','方向','开平','委托量','未成交','委托价','状态','报单时间','消息')
 TRADE_HEADERS = ('成交号','合约','方向','开平','手数','成交价','手续费','成交时间')
+ACCOUNT_ORDER_HEADERS = ('交易日',) + ORDER_HEADERS + ('来源状态',)
+ACCOUNT_TRADE_HEADERS = ('交易日',) + TRADE_HEADERS + ('来源状态',)
 POSITION_HEADERS = ('合约','方向','持仓量','成交价','止损价','止盈价','实时价格',
                     '盈利价差','持仓盈亏','浮盈比例','保证金','手续费')
 SYMBOL_HEADERS = ('品种名', '合约代码', '开仓', '止损', '止盈', '下单手数', '半仓参数', '滞回点')
@@ -326,13 +328,40 @@ def table(headers, rows=()):
 
 
 def populate(grid, rows):
-    grid.setRowCount(len(rows))
-    for i, values in enumerate(rows):
-        for j, value in enumerate(values):
-            item = QTableWidgetItem(str(value))
-            item.setTextAlignment(Qt.AlignCenter)
-            item.setToolTip(str(value))
-            grid.setItem(i, j, item)
+    """Update a table in place so periodic Runtime snapshots do not repaint it wholesale."""
+    rows = list(rows)
+    changed = grid.rowCount() != len(rows)
+    if not changed:
+        for i, values in enumerate(rows):
+            if any(grid.item(i, j) is None or grid.item(i, j).text() != str(value)
+                   for j, value in enumerate(values)):
+                changed = True
+                break
+    if not changed:
+        return
+    updates = grid.updatesEnabled()
+    blocked = grid.blockSignals(True)
+    grid.setUpdatesEnabled(False)
+    try:
+        if grid.rowCount() != len(rows):
+            grid.setRowCount(len(rows))
+        for i, values in enumerate(rows):
+            for j, value in enumerate(values):
+                label = str(value)
+                item = grid.item(i, j)
+                if item is None:
+                    item = QTableWidgetItem(label)
+                    item.setTextAlignment(Qt.AlignCenter)
+                    grid.setItem(i, j, item)
+                elif item.text() != label:
+                    item.setText(label)
+                if item.toolTip() != label:
+                    item.setToolTip(label)
+    finally:
+        grid.setUpdatesEnabled(updates)
+        grid.blockSignals(blocked)
+    if updates:
+        grid.viewport().update()
 
 
 def beijing(stamp):
@@ -451,6 +480,38 @@ def trade_cells(item):
     )]
 
 
+def account_order_cells(record):
+    fact = record.get('fact')
+    if not isinstance(fact, dict):
+        return [record.get('trading_day', '—'), record.get('record_id', '—'), *(['—'] * 9),
+                record.get('status', 'CONFLICT')]
+    offset = {'OPEN':'开仓','CLOSE':'平仓','CLOSETODAY':'平今','CLOSEYESTERDAY':'平昨'}
+    state = {'FINISHED':'已结束','ALIVE':'挂单','FILLED':'全部成交','CANCELLED':'已撤单','REJECTED':'已拒绝'}
+    quantity, remaining = fact.get('quantity'), fact.get('remaining')
+    return [display_value(value) for value in (
+        record.get('trading_day'), fact.get('order_id') or record.get('record_id'), fact.get('contract_id'),
+        {'BUY':'买','SELL':'卖'}.get(fact.get('direction'), fact.get('direction')),
+        offset.get(fact.get('offset'), fact.get('offset')), quantity, remaining, fact.get('limit_price'),
+        state.get(fact.get('status'), fact.get('status')), None,
+        f"账本观察 {record.get('observed_at_utc') or '—'}", record.get('status'),
+    )]
+
+
+def account_trade_cells(record):
+    fact = record.get('fact')
+    if not isinstance(fact, dict):
+        return [record.get('trading_day', '—'), record.get('record_id', '—'), *(['—'] * 7),
+                record.get('status', 'CONFLICT')]
+    return [display_value(value) for value in (
+        record.get('trading_day'), fact.get('trade_id') or record.get('record_id'), fact.get('contract_id'),
+        {'BUY':'买','SELL':'卖'}.get(fact.get('direction'), fact.get('direction')),
+        {'OPEN':'开仓','CLOSE':'平仓','CLOSETODAY':'平今','CLOSEYESTERDAY':'平昨'}.get(
+            fact.get('offset'), fact.get('offset')),
+        fact.get('quantity'), fact.get('price'), None, native_time(fact.get('source_time_ns')),
+        record.get('status'),
+    )]
+
+
 def position_cells(item):
     floating = item.get('floating_profit')
     margin = item.get('margin')
@@ -473,13 +534,22 @@ class MinuteCandles(QWidget):
         self.setMinimumHeight(105)
 
     def select(self, code):
-        self.code = code
-        self.update()
+        if self.code != code:
+            self.code = code
+            self.update()
 
     def show_native_bars(self, payload):
-        self.native_series = {code:[(row[0],*map(Decimal,row[1:])) for row in bars]
-                              for code,bars in payload.items()}
-        self.update()
+        value = {code:[(row[0],*map(Decimal,row[1:])) for row in bars]
+                 for code,bars in payload.items()}
+        if value != self.native_series:
+            self.native_series = value
+            self.update()
+
+    def set_trigger_lines(self, lines):
+        value = dict(lines)
+        if value != self.trigger_lines:
+            self.trigger_lines = value
+            self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -674,6 +744,13 @@ class WorkbenchLayout:
         self.home_updated_at = None
         self.quote_reference = {}
         self.quote_worker = None
+        self.account_history_binding = None
+        self.account_history_generation = 0
+        self.account_history_request_number = 0
+        self.account_history_records = {'funds': {}, 'orders': {}, 'trades': {}}
+        self.account_history_coverage = []
+        self.account_history_pending = set()
+        self.account_history_error = None
 
         original = window.takeCentralWidget()
         for widget in (window.connection_label, window.account_label, window.kernel_label,
@@ -709,8 +786,10 @@ class WorkbenchLayout:
 
         _, self.order_sections = self.section('订单与成交')
         self.order_tab = self.add_page(self.order_sections, '当前委托', self.orders_page)
-        self.add_page(self.order_sections, '成交记录', self.fills_page)
-        self.history_tab = self.add_page(self.order_sections, '历史订单', self.history_page)
+        self.add_page(self.order_sections, '自有成交', self.fills_page)
+        self.history_tab = self.add_page(self.order_sections, '自有历史订单', self.history_page)
+        self.add_page(self.order_sections, '账号委托历史', self.account_orders_page)
+        self.add_page(self.order_sections, '账号成交历史', self.account_trades_page)
         self.add_page(self.order_sections, '对账与报表', self.reports_page, scroll=True)
         self.manual_tab = self.add_page(self.order_sections, '手动下单', self.manual_page, scroll=True)
 
@@ -1091,8 +1170,8 @@ class WorkbenchLayout:
         rows = [(title, value(active, key), value(draft, key)) for title, key in zip(SYMBOL_HEADERS[2:], fields)] if draft else []
         populate(self.parameter_comparison, rows)
         for index, (_, current, edited) in enumerate(rows):
-            if current != '—' and current != edited:
-                self.parameter_comparison.item(index, 2).setForeground(QColor('#075de5'))
+            self.parameter_comparison.item(index, 2).setForeground(
+                QColor('#075de5' if current != '—' and current != edited else '#172438'))
 
     @staticmethod
     def fill_selectable(grid, rows, keys):
@@ -1102,9 +1181,13 @@ class WorkbenchLayout:
         try:
             populate(grid, rows)
             for index, key in enumerate(keys):
-                grid.item(index, 0).setData(Qt.UserRole, key)
+                item = grid.item(index, 0)
+                if item.data(Qt.UserRole) != key:
+                    item.setData(Qt.UserRole, key)
             if keys:
-                grid.setCurrentCell(keys.index(selected) if selected in keys else 0, 0)
+                row = keys.index(selected) if selected in keys else 0
+                if grid.currentRow() != row or grid.currentColumn() != 0:
+                    grid.setCurrentCell(row, 0)
         finally:
             grid.blockSignals(blocked)
 
@@ -1183,21 +1266,29 @@ class WorkbenchLayout:
                          focus, position, status))
             self.dashboard_market_rows[code] = (status, quote, lines, decision, explanation, nearby)
         self.fill_selectable(self.dashboard_markets, rows, codes)
-        self.dashboard_markets.setFixedHeight(
-            self.dashboard_markets.horizontalHeader().sizeHint().height()
-            + max(1, min(6, len(codes))) * self.dashboard_markets.verticalHeader().defaultSectionSize() + 4)
+        table_height = (self.dashboard_markets.horizontalHeader().sizeHint().height()
+                        + max(1, min(6, len(codes)))
+                        * self.dashboard_markets.verticalHeader().defaultSectionSize() + 4)
+        if self.dashboard_markets.height() != table_height:
+            self.dashboard_markets.setFixedHeight(table_height)
         for index, (_, _, _, position, status) in enumerate(rows):
             contract = self.dashboard_markets.item(index, 0)
             font = QFont(self.dashboard_markets.font())
             font.setWeight(QFont.DemiBold)
-            contract.setFont(font)
-            if position.startswith(('多', '空')) and '/' not in position:
-                self.dashboard_markets.item(index, 3).setForeground(
-                    QColor('#bd263e' if position.startswith('多') else '#08764d'))
+            if contract.font() != font:
+                contract.setFont(font)
+            position_color = QColor(
+                '#bd263e' if position.startswith('多') and '/' not in position else
+                '#08764d' if position.startswith('空') and '/' not in position else '#172438')
+            position_item = self.dashboard_markets.item(index, 3)
+            if position_item.foreground().color() != position_color:
+                position_item.setForeground(position_color)
             item = self.dashboard_markets.item(index, 4)
             color = ('#087453' if status == '持仓中' else '#965619'
                      if status in {'平仓待确认', '行情滞后', '当日停开', '已停用'} else '#075de5')
-            item.setForeground(QColor(color))
+            status_color = QColor(color)
+            if item.foreground().color() != status_color:
+                item.setForeground(status_color)
         self.select_dashboard_market()
 
     def market_view_current(self, view):
@@ -1222,8 +1313,8 @@ class WorkbenchLayout:
         cell = self.dashboard_markets.item(self.dashboard_markets.currentRow(), 0)
         code = cell.data(Qt.UserRole) if cell is not None else ''
         record = self.dashboard_market_rows.get(code)
-        self.candles.trigger_lines = {}
         details = {}
+        lines = {}
         explanation = ()
         if record is None:
             self.decision_status.setText('等待行情')
@@ -1239,7 +1330,7 @@ class WorkbenchLayout:
             if nearby and quote.get('price_tick') and Decimal(quote['price_tick']) > 0:
                 ticks = abs(Decimal(lines[nearby]) - Decimal(quote['last'])) / Decimal(quote['price_tick'])
                 details['距离最近触发'] = f'{ticks.normalize():f} 跳'
-            self.candles.trigger_lines = lines
+        self.candles.set_trigger_lines(lines)
         for key, (band, value) in self.decision_fields.items():
             value.setText(details.get(key, '—'))
             band.setVisible(key in details)
@@ -1252,7 +1343,9 @@ class WorkbenchLayout:
             self.decision_reason.setToolTip(reasons)
         layout = self.explanation_card.layout()
         layout.invalidate()
-        self.explanation_card.setFixedHeight(layout.sizeHint().height() + 26)
+        card_height = layout.sizeHint().height() + 26
+        if self.explanation_card.height() != card_height:
+            self.explanation_card.setFixedHeight(card_height)
         self.select_candles(code)
 
     def selected_position(self):
@@ -1444,6 +1537,15 @@ class WorkbenchLayout:
             self.log_tails.clear()
         self.balance_history.clear()
         self.last_balance_slot = None
+        self.account_history_binding = None
+        self.account_history_generation += 1
+        self.account_history_records = {'funds': {}, 'orders': {}, 'trades': {}}
+        self.account_history_coverage = []
+        self.account_history_pending.clear()
+        self.account_history_error = None
+        self._set_account_history_status('账号历史尚未读取。')
+        populate(self.account_history_orders, [])
+        populate(self.account_history_trades, [])
         self.equity.set_rows([])
         self.candles.native_series.clear()
         self.candles.select('')
@@ -1582,7 +1684,9 @@ class WorkbenchLayout:
             label.setText(f'{title} {value}')
             label.setToolTip(description if title == '策略' else label.text())
             color = '#14a163' if good else '#eea124' if alert else '#a1afc1'
-            dot.setStyleSheet(f'background:{color}; border-radius:4px;')
+            style = f'background:{color}; border-radius:4px;'
+            if dot.styleSheet() != style:
+                dot.setStyleSheet(style)
         self.home_state.setText(state)
         self.home_connection.setText(description if snapshot_age is None else
                                      f'{description} · 快照 {snapshot_age} 秒前')
@@ -1608,7 +1712,9 @@ class WorkbenchLayout:
                 caption.setText(f'保证金占用 {self.yuan(margin)}')
             else:
                 color = '#a22c37' if amount and amount.startswith('+') else '#07634d' if amount and amount.startswith('-') else '#172438'
-                value.setStyleSheet(f'color: {color};')
+                style = f'color: {color};'
+                if value.styleSheet() != style:
+                    value.setStyleSheet(style)
 
         pending, positions = self.home_position_rows(view, cycles, available)
         if w.home_issue:
@@ -1628,8 +1734,7 @@ class WorkbenchLayout:
             direction = self.home_positions.item(index, 1)
             direction.setForeground(QColor('#bd263e' if position[1] == '多' else '#08764d'))
             color = {'+': '#a22c37', '-': '#07634d'}.get(position[3][:1])
-            if color:
-                self.home_positions.item(index, 3).setForeground(QColor(color))
+            self.home_positions.item(index, 3).setForeground(QColor(color or '#172438'))
             status = position[4]
             status_color = '#07634d' if status == '保护中' else '#7c4c08'
             self.home_positions.item(index, 4).setForeground(QColor(status_color))
@@ -2257,6 +2362,10 @@ class WorkbenchLayout:
     def reports_page(self, layout):
         equity = group('权益曲线', layout, stretch=1)
         self.equity_panel = equity.parentWidget()
+        self.equity_history_status = QLabel('账号历史尚未读取。')
+        self.equity_history_status.setWordWrap(True)
+        equity.addLayout(row(self.equity_history_status,
+                             button('刷新账号历史', lambda: self.request_account_history(force=True))))
         self.equity_mode = QComboBox()
         self.equity_mode.addItems(['权益曲线','收益曲线'])
         self.equity_from = QComboBox()
@@ -2356,6 +2465,141 @@ class WorkbenchLayout:
         split.addWidget(self.historical_orders)
         split.addWidget(self.order_details_panel(self.historical_orders))
         split.setSizes([950, 440])
+
+    def account_orders_page(self, layout):
+        self.account_history_status = QLabel('账号历史尚未读取。')
+        self.account_history_status.setWordWrap(True)
+        layout.addLayout(row(self.account_history_status,
+                             button('刷新账号历史', lambda: self.request_account_history(force=True))))
+        self.account_history_orders = table(ACCOUNT_ORDER_HEADERS)
+        self.account_history_orders.setObjectName('dashboardGrid')
+        layout.addWidget(self.account_history_orders)
+
+    def account_trades_page(self, layout):
+        self.account_trade_history_status = QLabel('账号历史尚未读取。')
+        self.account_trade_history_status.setWordWrap(True)
+        layout.addLayout(row(self.account_trade_history_status,
+                             button('刷新账号历史', lambda: self.request_account_history(force=True))))
+        self.account_history_trades = table(ACCOUNT_TRADE_HEADERS)
+        self.account_history_trades.setObjectName('dashboardGrid')
+        layout.addWidget(self.account_history_trades)
+
+    def ensure_account_history(self):
+        self.request_account_history(force=False)
+
+    def request_account_history(self, *, force=False):
+        if not self.window._runtime_mode or self.rendered_view is None:
+            return
+        day = self.current_trading_day(self.rendered_view)
+        if day is None:
+            self._set_account_history_status('等待 Runtime 确认柜台交易日。')
+            return
+        try:
+            last = datetime.strptime(day, '%Y-%m-%d').date()
+        except (TypeError, ValueError):
+            self._set_account_history_status('Runtime 返回的柜台交易日无效。')
+            return
+        binding = (self.rendered_view['account_key'], self.rendered_view['kernel_boot_id'], day)
+        same_binding = self.account_history_binding == binding
+        if self.account_history_pending and same_binding:
+            return
+        if (not force and same_binding
+                and (self.account_history_coverage or self.account_history_error)):
+            return
+        old_account = self.account_history_binding[0] if self.account_history_binding else None
+        self.account_history_binding = binding
+        self.account_history_generation += 1
+        self.account_history_pending.clear()
+        self.account_history_error = None
+        if old_account not in (None, binding[0]):
+            self.account_history_records = {'funds': {}, 'orders': {}, 'trades': {}}
+            self.account_history_coverage = []
+        first = last - timedelta(days=365)
+        self.account_history_range = (first.isoformat(), last.isoformat())
+        self._set_account_history_status('正在从 Runtime 原账本读取账号历史…')
+        for section in ('coverage', 'funds', 'orders', 'trades'):
+            self._enqueue_account_history(section, None)
+
+    def _enqueue_account_history(self, section, cursor):
+        self.account_history_request_number += 1
+        request_id = f'{self.account_history_generation}:{self.account_history_request_number}'
+        request = {
+            'kind': 'history', 'request_id': request_id, 'section': section,
+            'history_generation': self.account_history_generation,
+            'history_binding': self.account_history_binding,
+            'parameters': {'from_day': self.account_history_range[0], 'to_day': self.account_history_range[1],
+                           'section': section, 'cursor': cursor, 'limit': 200},
+        }
+        self.account_history_pending.add(request_id)
+        try:
+            self.window.enqueue_runtime_history(request)
+        except TraderError as error:
+            self.account_history_pending.discard(request_id)
+            self.account_history_error = error.code
+            self._render_account_history()
+
+    def apply_account_history(self, response):
+        if (response.get('history_generation') != self.account_history_generation
+                or tuple(response.get('history_binding') or ()) != self.account_history_binding):
+            return
+        request_id = response.get('request_id')
+        self.account_history_pending.discard(request_id)
+        value = response.get('value')
+        section = response.get('section')
+        if (not isinstance(value, dict) or value.get('account_key') != self.account_history_binding[0]
+                or value.get('schema_version') != 'ONLINE_TRADER_ACCOUNT_DAY_HISTORY/1'):
+            self.account_history_error = 'E_SCHEMA'
+            self._render_account_history()
+            return
+        self.account_history_coverage = value.get('coverage', [])
+        if section in self.account_history_records:
+            records = self.account_history_records[section]
+            for record in value.get('records', []):
+                key = (record.get('trading_day'), record.get('gateway_identity'), record.get('record_id'))
+                records[key] = record
+        cursor = value.get('next_cursor')
+        if cursor:
+            self._enqueue_account_history(section, cursor)
+        self._render_account_history()
+
+    def fail_account_history(self, response):
+        if (response.get('history_generation') != self.account_history_generation
+                or tuple(response.get('history_binding') or ()) != self.account_history_binding):
+            return
+        self.account_history_pending.discard(response.get('request_id'))
+        self.account_history_error = response.get('code') or 'E_RUNTIME_QUERY'
+        self._render_account_history()
+
+    def _set_account_history_status(self, text):
+        for name in ('account_history_status', 'account_trade_history_status', 'equity_history_status'):
+            label = getattr(self, name, None)
+            if label is not None:
+                label.setText(text)
+
+    def _render_account_history(self):
+        coverage = self.account_history_coverage
+        observed = sum(item.get('status') in {'OBSERVED_PARTIAL', 'OBSERVED_INCOMPLETE'} for item in coverage)
+        incomplete = sum(item.get('status') == 'OBSERVED_INCOMPLETE' for item in coverage)
+        facts_only = sum(item.get('status') == 'LEDGER_FACTS_ONLY' for item in coverage)
+        missing = sum(item.get('status') == 'NOT_OBSERVED' for item in coverage)
+        status = (f'账号原账本覆盖：已观察 {observed} 日（不完整 {incomplete} 日），'
+                  f'仅有自有事实 {facts_only} 日，未观察 {missing} 日。'
+                  '未观察不代表零成交；旧日缺口需经核实的结算来源补齐。')
+        if self.account_history_pending:
+            status = '正在读取账号历史；保留上次可信结果。 ' + status
+        if self.account_history_error:
+            status = f'账号历史本次更新失败 · {self.account_history_error}；保留上次可信结果。 ' + status
+        self._set_account_history_status(status)
+        first, last = getattr(self, 'account_history_range', (None, None))
+        inside = lambda item: (not first or item.get('trading_day', '') >= first) and (
+            not last or item.get('trading_day', '') <= last)
+        orders = sorted(filter(inside, self.account_history_records['orders'].values()),
+                        key=lambda item: (item.get('trading_day', ''), item.get('record_id', '')), reverse=True)
+        trades = sorted(filter(inside, self.account_history_records['trades'].values()),
+                        key=lambda item: (item.get('trading_day', ''), item.get('record_id', '')), reverse=True)
+        populate(self.account_history_orders, (account_order_cells(item) for item in orders))
+        populate(self.account_history_trades, (account_trade_cells(item) for item in trades))
+        self.render_equity_chart()
 
     def order_details_panel(self, grid):
         panel = QWidget()
@@ -2682,9 +2926,13 @@ class WorkbenchLayout:
             grid.setRowHidden(row,not visible)
             if visible:
                 for column,value in enumerate(position_cells(item)):
-                    cell = QTableWidgetItem(value)
-                    cell.setTextAlignment(Qt.AlignCenter)
-                    grid.setItem(row,column,cell)
+                    cell = grid.item(row,column)
+                    if cell is None:
+                        cell = QTableWidgetItem(value)
+                        cell.setTextAlignment(Qt.AlignCenter)
+                        grid.setItem(row,column,cell)
+                    elif cell.text() != value:
+                        cell.setText(value)
 
     def submit(self):
         self.window.submit_manual(self.manual_code.currentText(),
@@ -3314,8 +3562,7 @@ class WorkbenchLayout:
         self.balance_history.append({'trading_day':day,'balance':value,'observed_at_utc':now.isoformat()})
 
     def equity_rows(self):
-        view = self.rendered_view or {}
-        daily = view.get('equity_history',[])
+        daily = self._equity_daily()
         days = set(item['trading_day'] for item in daily) | {item['trading_day'] for item in self.balance_history}
         entries = ['全部',*sorted(days)]
         for combo in (self.equity_from,self.equity_to):
@@ -3329,10 +3576,25 @@ class WorkbenchLayout:
         rows = [item for item in daily if item['trading_day'] in selected_days]
         return rows,selected_days
 
+    def _equity_daily(self):
+        """Merge broker-observed funds history with the current owner projection by trading day."""
+        merged = {}
+        first, last = getattr(self, 'account_history_range', (None, None))
+        for record in self.account_history_records['funds'].values():
+            day, fact = record.get('trading_day'), record.get('fact')
+            if (record.get('status') != 'OBSERVED' or not isinstance(fact, dict)
+                    or not day or (first and day < first) or (last and day > last)):
+                continue
+            merged[day] = fact | {'trading_day': day, 'observed_at_utc': record.get('observed_at_utc'),
+                                  'complete': True, 'source': 'ACCOUNT_OBSERVATION'}
+        for record in (self.rendered_view or {}).get('equity_history', []):
+            merged[record['trading_day']] = record
+        return [merged[day] for day in sorted(merged)]
+
     def equity_anchor(self):
         view = self.rendered_view or {}
         source = view.get('configuration', {}).get('equity_base')
-        daily = [source] if source is not None else sorted(view.get('equity_history', ()), key=lambda row: row['trading_day'])
+        daily = [source] if source is not None else self._equity_daily()
         for row in daily:
             balance = row.get('balance')
             if balance is None or Decimal(balance) <= 0:

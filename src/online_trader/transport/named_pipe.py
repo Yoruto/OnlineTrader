@@ -8,6 +8,7 @@ bytes; no Python object serialization or arbitrary RPC is accepted.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes as w
 import math
@@ -203,6 +204,7 @@ class PipeConnection:
         self._handle = handle
         self._server_side = server_side
         self._closed = False
+        self._close_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._receive_lock = threading.Lock()
         self._decoder = FrameDecoder()
@@ -262,10 +264,11 @@ class PipeConnection:
             return message
 
     def close(self) -> None:
-        if not self._closed:
-            self._closed = True
-            _k.CancelIoEx(self._handle, None)
-            _k.CloseHandle(self._handle)
+        with self._close_lock:
+            if not self._closed:
+                self._closed = True
+                _k.CancelIoEx(self._handle, None)
+                _k.CloseHandle(self._handle)
 
     def __enter__(self):
         return self
@@ -378,3 +381,41 @@ def connect(name: str, *, timeout: float = 5.0, expected_server_pid: int | None 
             time.sleep(min(0.01, max(0, deadline - time.monotonic())))
         else:
             raise _error("E_AUTH" if error == 5 else "E_PIPE", "Cannot open local pipe")
+
+
+class CancellablePipeClient:
+    """Own at most one client connection and cancel its blocking I/O on close."""
+
+    def __init__(self) -> None:
+        self._client_lock = threading.Lock()
+        self._client_connection = None
+        self._client_closed = False
+
+    @contextmanager
+    def open_connection(self, name: str, *, timeout: float, validator):
+        with self._client_lock:
+            if self._client_closed:
+                raise TraderError("E_PIPE_CLOSED", "Pipe client is closed")
+        connection = connect(name, timeout=timeout, validator=validator)
+        with self._client_lock:
+            if self._client_closed:
+                connection.close()
+                raise TraderError("E_PIPE_CLOSED", "Pipe client is closed")
+            if self._client_connection is not None:
+                connection.close()
+                raise TraderError("E_BUSY", "Pipe client already has an active request")
+            self._client_connection = connection
+        try:
+            yield connection
+        finally:
+            with self._client_lock:
+                if self._client_connection is connection:
+                    self._client_connection = None
+            connection.close()
+
+    def close(self) -> None:
+        with self._client_lock:
+            self._client_closed = True
+            connection = self._client_connection
+        if connection is not None:
+            connection.close()

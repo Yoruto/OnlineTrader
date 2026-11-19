@@ -1,13 +1,13 @@
 """Bounded Runtime I/O lanes and the single Qt command bus."""
 
 from contextlib import closing
+from dataclasses import replace
 from queue import Empty, Queue
-import time
 from uuid import uuid4
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from online_trader.contracts.codec import canonical_bytes, strict_loads
+from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.desktop.preferences import workbench_preferences
 from online_trader.errors import TraderError
 from online_trader.runtime.operator_api import RuntimeCommandClient
@@ -41,13 +41,21 @@ class RuntimeSubscriptionWorker(QThread):
                             self.state_received.emit(replica.state, replica.cursor, int(message['published_ns']))
                             self.connection_changed.emit('READY', '')
             except TraderError as error:
+                if self.isInterruptionRequested():
+                    return
                 state = 'INCOMPATIBLE' if error.code == 'E_SCHEMA' else 'RESYNC_REQUIRED'
                 self.connection_changed.emit(state, error.code)
                 replica = ViewReplica()
             except (OSError, KeyError, TypeError, ValueError):
+                if self.isInterruptionRequested():
+                    return
                 self.connection_changed.emit('STALE', 'E_RUNTIME_VIEW')
                 replica = ViewReplica()
             self.msleep(300)
+
+    def shutdown(self):
+        self.requestInterruption()
+        self.client.close()
 
 
 class RuntimeCommandWorker(QThread):
@@ -71,16 +79,28 @@ class RuntimeCommandWorker(QThread):
                 request = self.queue.get(timeout=.2)
             except Empty:
                 continue
-            if request is None:
+            if request is None or self.isInterruptionRequested():
                 return
             try:
                 value = self.client.request(request['action'], request['body'], operator=request['operator'],
                                             token=request['token'])
                 self.result.emit(request | {'value': value})
             except TraderError as error:
+                if self.isInterruptionRequested():
+                    return
                 self.failed.emit(request | {'code': error.code, 'message': str(error)})
             except OSError as error:
+                if self.isInterruptionRequested():
+                    return
                 self.failed.emit(request | {'code': 'E_RUNTIME_CONNECTION', 'message': str(error)})
+
+    def shutdown(self):
+        self.requestInterruption()
+        try:
+            self.queue.put_nowait(None)
+        except Exception:
+            pass
+        self.client.close()
 
 
 class RuntimeQueryWorker(QThread):
@@ -105,7 +125,7 @@ class RuntimeQueryWorker(QThread):
                 request = self.queue.get(timeout=.2)
             except Empty:
                 continue
-            if request is None:
+            if request is None or self.isInterruptionRequested():
                 return
             try:
                 if request['kind'] == 'account':
@@ -118,8 +138,19 @@ class RuntimeQueryWorker(QThread):
                     raise TraderError('E_SCHEMA', 'Unknown Runtime query')
                 self.result.emit(request | {'value': value})
             except (TraderError, OSError) as error:
+                if self.isInterruptionRequested():
+                    return
                 self.failed.emit(request | {'code': getattr(error, 'code', 'E_RUNTIME_QUERY'),
                                              'message': str(error)})
+
+    def shutdown(self):
+        self.requestInterruption()
+        try:
+            self.queue.put_nowait(None)
+        except Exception:
+            pass
+        self.view.close()
+        self.account.close()
 
 
 class RuntimeClientCoordinator(QObject):
@@ -140,21 +171,23 @@ class RuntimeClientCoordinator(QObject):
         self.commands.failed.connect(self.command_failed)
         self.queries.result.connect(self.query_result)
         self.queries.failed.connect(self.query_failed)
+        self._closed = False
 
     def start(self):
+        if self._closed:
+            raise TraderError('E_PIPE_CLOSED', 'Runtime client coordinator is closed')
         self.subscription.start()
         self.commands.start()
         self.queries.start()
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         for worker in (self.subscription, self.commands, self.queries):
-            worker.requestInterruption()
-            try:
-                worker.queue.put_nowait(None)
-            except (AttributeError, Exception):
-                pass
+            worker.shutdown()
         for worker in (self.subscription, self.commands, self.queries):
-            worker.wait(4000)
+            worker.wait()
 
 
 class CommandBus(QObject):
@@ -176,6 +209,7 @@ class CommandBus(QObject):
         self._requests = {}
         coordinator.command_result.connect(self._result)
         coordinator.command_failed.connect(self._failed)
+        store.owner_boot_changed.connect(self._owner_boot_changed)
         self._restore_pending()
 
     def authenticate(self, operator, token):
@@ -203,6 +237,13 @@ class CommandBus(QObject):
         allowed, reason = self.store.capability(operation)
         if not allowed:
             raise TraderError('E_CAPABILITY', reason or '当前 Runtime 不允许此操作')
+        scope_hash = content_hash({'operation': operation, 'scope': scope})
+        duplicate = next((item for item in self.store.pending.values()
+                          if item.account_key == view['account_key'] and item.operation == operation
+                          and item.scope_hash in (None, scope_hash)), None)
+        if duplicate is not None:
+            raise TraderError('E_PENDING_COMMAND',
+                              f'原命令 {duplicate.command_id} 结果仍待核对，请先查询原回执')
         command_id = 'qt-' + uuid4().hex
         body = {'command_id': command_id, 'operation': operation, 'scope': scope,
                 'parameters': parameters, 'binding': {
@@ -210,10 +251,11 @@ class CommandBus(QObject):
                     'config_revision': view['configuration']['config_revision']}}
         request_id = 'client-' + uuid4().hex
         pending = PendingCommandState(command_id, view['account_key'], operation,
-                                      PendingCommandStatus.SUBMITTING)
+                                      PendingCommandStatus.SUBMITTING, scope_hash=scope_hash)
         self.store.pending[command_id] = pending
         self._requests[request_id] = {'kind': 'submit', 'command_id': command_id,
-                                      'account_key': view['account_key'], 'operation': operation}
+                                      'account_key': view['account_key'], 'operation': operation,
+                                      'scope_hash': scope_hash}
         self._persist_pending()
         self.command_changed.emit(pending)
         self.coordinator.commands.enqueue({'request_id': request_id, 'action': 'submit', 'body': body,
@@ -241,8 +283,12 @@ class CommandBus(QObject):
     def query(self, command_id):
         if self.token is None or self.operator_id is None:
             raise TraderError('E_AUTH', '请先解锁 Runtime 操作员')
+        prior = self.store.pending.get(command_id)
         request_id = 'client-' + uuid4().hex
-        self._requests[request_id] = {'kind': 'receipt', 'command_id': command_id}
+        self._requests[request_id] = {'kind': 'receipt', 'command_id': command_id,
+                                      'account_key': prior.account_key if prior else '',
+                                      'operation': prior.operation if prior else '',
+                                      'scope_hash': prior.scope_hash if prior else None}
         self.coordinator.commands.enqueue({'request_id': request_id, 'action': 'receipt',
                                            'body': {'command_id': command_id},
                                            'operator': self.operator_id, 'token': self.token})
@@ -281,7 +327,8 @@ class CommandBus(QObject):
         view = self.store.view
         account_key = view['account_key'] if view else request.get('account_key', '')
         pending = PendingCommandState(command_id, account_key, value.get('operation') or request.get('operation', ''),
-                                      mapped, value.get('reason'), _freeze_receipt(value))
+                                      mapped, value.get('reason'), _freeze_receipt(value),
+                                      request.get('scope_hash'))
         self.store.pending[command_id] = pending
         if status in self._TERMINAL:
             self.store.pending.pop(command_id, None)
@@ -295,12 +342,24 @@ class CommandBus(QObject):
             self.lock()
         command_id = request.get('command_id')
         if command_id:
-            unknown = request.get('kind') == 'submit' and response['code'] in self._CONNECTION_ERRORS
             prior = self.store.pending.get(command_id)
+            if request.get('kind') == 'receipt':
+                pending = (replace(prior, status=PendingCommandStatus.OUTCOME_UNKNOWN,
+                                   reason=response['code']) if prior else
+                           PendingCommandState(command_id, request.get('account_key', ''),
+                               request.get('operation', ''), PendingCommandStatus.OUTCOME_UNKNOWN,
+                               response['code'], scope_hash=request.get('scope_hash')))
+                self.store.pending[command_id] = pending
+                self._persist_pending()
+                self.command_changed.emit(pending)
+                self.feedback.emit(
+                    f'原命令 {command_id} 的回执查询未完成；结果仍未知，已保留原命令 ID。')
+                return
+            unknown = request.get('kind') == 'submit' and response['code'] in self._CONNECTION_ERRORS
             pending = PendingCommandState(command_id, request.get('account_key', ''),
                 request.get('operation', prior.operation if prior else ''),
                 PendingCommandStatus.SUBMISSION_UNKNOWN if unknown else PendingCommandStatus.REJECTED,
-                response['code'])
+                response['code'], scope_hash=request.get('scope_hash'))
             self.store.pending[command_id] = pending
             if not unknown:
                 self.store.pending.pop(command_id, None)
@@ -312,7 +371,9 @@ class CommandBus(QObject):
         self.feedback.emit(f"Runtime 操作未完成 · {response['code']}")
 
     def _persist_pending(self):
-        rows = [{'account_key': item.account_key, 'command_id': item.command_id, 'operation': item.operation}
+        rows = [({'account_key': item.account_key, 'command_id': item.command_id,
+                  'operation': item.operation} |
+                 ({'scope_hash': item.scope_hash} if item.scope_hash is not None else {}))
                 for item in list(self.store.pending.values())[-64:]]
         workbench_preferences().setValue('runtime/pending_receipts_v2', canonical_bytes(rows).decode())
 
@@ -327,9 +388,26 @@ class CommandBus(QObject):
                                                  for key in ('account_key', 'command_id', 'operation')):
                     self.store.pending[row['command_id']] = PendingCommandState(
                         row['command_id'], row['account_key'], row['operation'],
-                        PendingCommandStatus.OUTCOME_UNKNOWN, 'RESTORED_PENDING_RECEIPT')
+                        PendingCommandStatus.OUTCOME_UNKNOWN, 'RESTORED_PENDING_RECEIPT',
+                        scope_hash=row.get('scope_hash') if isinstance(row.get('scope_hash'), str) else None)
         except (ValueError, TypeError):
             pass
+
+    def _owner_boot_changed(self, previous_boot, current_boot):
+        self.lock()
+        changed = []
+        for command_id, pending in tuple(self.store.pending.items()):
+            value = replace(pending, status=PendingCommandStatus.OUTCOME_UNKNOWN,
+                            reason='OWNER_RESTARTED')
+            self.store.pending[command_id] = value
+            changed.append(value)
+        self._persist_pending()
+        for value in changed:
+            self.command_changed.emit(value)
+        if changed:
+            self.feedback.emit(
+                f'Runtime Owner 已从 {previous_boot} 切换到 {current_boot}；'
+                f'已保留 {len(changed)} 个原命令 ID，重新认证后请查询回执。')
 
 
 def _freeze_receipt(value):

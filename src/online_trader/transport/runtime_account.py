@@ -7,7 +7,7 @@ import time
 from online_trader.contracts.codec import canonical_bytes
 from online_trader.domain.values import identifier, sequence
 from online_trader.errors import TraderError
-from online_trader.transport.named_pipe import connect
+from online_trader.transport.named_pipe import CancellablePipeClient, connect
 
 
 PROTOCOL = 'ONLINE_TRADER_RUNTIME_ACCOUNT/1'
@@ -161,10 +161,12 @@ class AccountObservation:
         return self.state | sections | {'schema_version': PROTOCOL, 'complete': self.state['counts'] is not None}
 
 
-def read_observation(pipe, *, account_key=None, previous=None):
+def read_observation(pipe, *, account_key=None, previous=None, _client=None):
     known_id = previous.state['snapshot_id'] if previous is not None else None
     deadline = time.monotonic() + 3
-    with connect(pipe, timeout=.8, validator=validate_wire) as connection:
+    opening = (connect(pipe, timeout=.8, validator=validate_wire) if _client is None else
+               _client.open_connection(pipe, timeout=.8, validator=validate_wire))
+    with opening as connection:
         connection.send({'protocol': PROTOCOL, 'kind': 'read', 'known_id': known_id}, timeout=.5)
         response = connection.recv(timeout=1)
         if response['kind'] != 'observation':
@@ -199,10 +201,11 @@ def read_observation(pipe, *, account_key=None, previous=None):
     return AccountObservation(state, tuple(pages))
 
 
-class RuntimeAccountClient:
+class RuntimeAccountClient(CancellablePipeClient):
     def __init__(self, pipe, *, expected_account_key=None):
+        super().__init__()
         self.pipe = pipe + '.account'
         self.expected_account_key = expected_account_key
 
     def read(self):
-        return read_observation(self.pipe, account_key=self.expected_account_key).record()
+        return read_observation(self.pipe, account_key=self.expected_account_key, _client=self).record()

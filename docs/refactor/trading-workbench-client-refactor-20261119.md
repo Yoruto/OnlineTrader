@@ -1,6 +1,6 @@
 # OnlineTrader Trading Workbench（Client）重构设计与实施计划
 
-> 状态：源码实施候选 · 2026-11-19；编译检查通过；首轮 Windows Qt + 快期隔离账号验收已执行，界面缺陷修复后待独立复测；未打包
+> 状态：Phase 1 三项 Integration Gate 已通过独立定向自动化；Phase 2 已开始把账号历史慢查询接入既有 Workbench，状态订阅和交易控制仍未迁移 · 2026-11-19；未打包
 > 范围：Qt/PySide6 客户端及其与 Trading Runtime 的接口适配  
 > 设计基线：`1f0ab648136519e364bf3267c6dab51ffdd76e15`；实施起点：`c891e512ed6559505160cccd80bfd90a40ae5262`
 > 本文所列实现状态不代表最终独立复测、模拟柜台交易闭环或最终制品已经通过。
@@ -11,11 +11,24 @@
 
 - `online-trader-desktop --runtime-pipe` 与普通 dev 入口共用原 `WorkbenchWindow`/`WorkbenchLayout`；窗口、导航、页面、控件、文案和位置只有一份实现。Runtime 兼容启动器也只委托该窗口，不保留第二套可见页面。
 - 客户端基础层已提供版本化状态 Store、状态订阅/命令/慢查询分离、CommandBus、原命令回执恢复及稳定行 ID 模型；产品入口通过既有 Workbench 的 Runtime view/操作员适配逐步接入，不以替换 UI 的方式切换。
+- 账号历史是首个接入既有 Workbench 的慢查询：只在 `RuntimeQueryWorker` 中分页调用 `history-days`，结果按账号、Owner boot、柜台日和本地 generation 绑定；Qt 不直接打开账本。自有订单/成交与账号观察历史分开展示，资金历史按交易日并入权益曲线。该接入和增量表格刷新本轮仅做源码编译检查，尚未获得新的 GUI/行为验收证据。
 - Runtime 投影新增说明性 Capability、结构化 Diagnostic 和 Owner 已有行情缓存中的合约目录；命令仍由 Runtime 逐次最终校验。
 - 参数草稿必须先通过带账号、boot 和配置版本绑定的 Runtime 预览，再使用原 `SAVE_DSV_PARAMETERS` 命令提交；Qt 不直接写生效配置。
 - Runtime 接口日志通过有界、脱敏的只读页返回；新客户端不直接读取执行器日志文件。
 - 首轮独立验收曾发现替代 UI 偏离 dev；该替代窗口已撤除。后续真实 TQKQ 验收确认 Runtime 入口实际类、标题、尺寸、五任务区、二级页签、首页 5 列行情表、K 线、解释、事件和状态栏均来自同一 dev 实现。已进一步修复 F5/F6 固定文案、脱敏账户显示、原“订阅行情（新主力）”入口及 DISARMED 开仓控件禁用；这些最新修复等待独立复测。
 - 未执行任何开仓、平仓、撤单或其他交易操作，未打包；模拟柜台交易闭环和最终制品仍为 `NOT_RUN`。
+
+### Phase 1 接入结论与门禁
+
+原审核时新 `runtime_client` 基础层尚未接入实际 Workbench。以下三项同时修复并通过独立自动化测试前，禁止把交易控制、状态订阅或慢查询切换到新基础层；门禁通过后，本次仅接入账号历史慢查询，交易控制和状态订阅仍沿用现有路径：
+
+1. 关闭协调器必须主动取消三个 I/O lane 当前持有的 Named Pipe，使阻塞中的 `recv` 立即返回；所有 QThread 必须在其父 QObject 析构前确认结束。
+2. Runtime owner boot 改变时保留全部未决 `command_id`，将其状态降级为 `OUTCOME_UNKNOWN / OWNER_RESTARTED`，持久化后重新认证并查询原回执；boot 改变不是删除未知责任的证据。
+3. 原命令的 receipt 查询失败只表示本次查询未完成。超时、断线、鉴权失败或暂未找到回执均不得把原命令标成 `REJECTED`，也不得清除 pending；只有 Runtime 返回明确终态回执后才可清除。
+
+“尚未接入”是分阶段迁移状态，不单列为产品缺陷。原 `dd85523` 只能称为 Phase 1 初步落地；当前账号历史的局部接入也不能称为 Workbench Client 重构完成。
+
+2026-11-19 独立测试 Agent 在基线 `dd8552366db6f91140b590850503cb31a4847f3c`、源码 patch identity `4f9825bfa5fd2419019aaca77f2157edcce0f74f` 上执行隔离 Windows/Qt/Named Pipe 定向测试。新增 9 项门禁用例并连同受影响既有用例共执行 25 项：25 PASS、0 FAIL、0 SKIP、0 NOT_RUN。覆盖阻塞 command/subscription/history 主动取消、全部 QThread 退出、重复关闭、排队请求不续发、unknown 跨 boot 与客户端重建恢复、receipt 查询失败保留、明确终态清除、非终态保留及同范围重复意图阻断；Windows 原生管道验证关闭未等待 8 秒业务接收超时。实际 Workbench 接入、可见 GUI、真实 Owner/账号/柜台、SimNow、打包与制品均不在本轮范围，不能据此声称整体重构完成。
 
 ## 1. 背景、目标与不变约束
 
@@ -348,7 +361,61 @@ Model 应按稳定身份维护行映射，不依赖 row index 保存所选订单
 
 每阶段单独 PR，先引入新路径和测试，再切换页面，最后删除旧路径。禁止“旧按钮和新 Controller 同时发送同一命令”。新 API 扩展与 GUI 改动尽量分 PR，确保可回退；回退 GUI 不得删除或回滚 Runtime 已提交账本事实。开发开关仅用于迁移期，不应长期向最终发行版暴露两套功能。
 
-### 14.1 Phase 0 必须交付的接口缺口表
+### 14.1 Phase 1 Integration Gate 设计走读
+
+```mermaid
+flowchart TD
+    C[Workbench 关闭] --> I[请求所有 Worker 中断]
+    I --> P[主动关闭各 lane 当前 Pipe]
+    P --> W[阻塞 connect/send/recv 退出]
+    W --> J[逐个等待 QThread 完全结束]
+    J --> D[允许 Coordinator/QObject 析构]
+    B[新 Snapshot 的 boot 改变] --> K[保留原 pending command_id]
+    K --> U[标记 OUTCOME_UNKNOWN / OWNER_RESTARTED]
+    U --> S[同步客户端持久化]
+    S --> A[清除旧认证并要求重新认证]
+    A --> Q[仅查询原 command_id]
+    Q -->|明确终态| T[清除 pending]
+    Q -->|查询失败或无明确终态| U
+```
+
+```mermaid
+sequenceDiagram
+    participant UI as Qt / Coordinator
+    participant Worker as I/O Worker
+    participant Pipe as Named Pipe
+    participant Store as StateStore / CommandBus
+    participant RT as Runtime
+    UI->>Worker: requestInterruption + shutdown
+    UI->>Pipe: close active connection
+    Pipe-->>Worker: E_PIPE_CLOSED / cancelled
+    Worker-->>UI: QThread finished
+    UI->>UI: wait complete, then destroy QObject
+    RT-->>Store: baseline(boot-B)
+    Store->>Store: keep command-A, mark OUTCOME_UNKNOWN
+    Store->>Store: persist + lock operator
+    UI->>RT: receipt(command-A)
+    alt terminal receipt
+        RT-->>Store: SUCCEEDED / FAILED / REJECTED / SUPERSEDED
+        Store->>Store: remove persisted pending
+    else query failed or result still unknown
+        RT--xUI: timeout / disconnect / E_OWNERSHIP
+        Store->>Store: retain command-A as OUTCOME_UNKNOWN
+    end
+```
+
+| 项目 | 接入契约 |
+| --- | --- |
+| 状态所有者 | Runtime 账本拥有命令事实；客户端只持久化待查询的原 ID、账号和操作提示，不创造终态。 |
+| 关闭顺序 | 先请求中断，再关闭活动 Pipe，最后等待线程退出；不以固定 `wait(ms)` 超时后继续析构。 |
+| boot 迁移 | 同账号的新 boot 使客户端观察与认证失效，但不使旧账本回执或未知责任失效。 |
+| 查询失败 | 只更新本次查询的诊断原因；pending 保持未知，禁止映射成原命令拒绝。 |
+| 兼容与回退 | 当前 Workbench 仍使用原 RuntimeWatch/操作员适配；门禁失败时继续不接入新基础层，不迁移或改写账本。旧版 pending 记录仍按原 ID 恢复为未知。 |
+| 诊断点 | 关闭可核对每个 lane 的 finished 状态；boot 变化与查询失败通过 `command_changed`/feedback 暴露原 command_id 和保留原因，内容不得含令牌。 |
+
+可执行验收条件：阻塞 command、history/query 和 subscription 时关闭均能在受控时间内结束全部线程；`SUBMISSION_UNKNOWN` 经 boot 变化及 UI 重建仍保留原 ID；receipt 查询超时、断线、鉴权失败和暂未找到均保留 pending；仅明确终态回执清除；测试不连接账号、不发送交易命令、不构建制品。
+
+### 14.2 Phase 0 必须交付的接口缺口表
 
 至少逐项检查：权限 Capability 投影、命令回执查询/幂等保证、合约目录只读查询、运行中配置预览/提交、Runtime 日志查询、诊断事件订阅、账户截面时效与完整性、历史分页稳定游标。注明“已有/部分已有/缺失”和真实代码位置，不凭设计稿声称接口已实现。
 

@@ -8,7 +8,7 @@ from uuid import uuid4
 from online_trader.contracts.codec import MAX_FRAME_BYTES, canonical_bytes, content_hash
 from online_trader.domain.values import identifier, sequence
 from online_trader.errors import TraderError
-from online_trader.transport.named_pipe import connect
+from online_trader.transport.named_pipe import CancellablePipeClient
 from online_trader.transport.workbench_snapshot import MAX_AGE_NS
 
 
@@ -237,8 +237,9 @@ class ViewReplica:
         return True
 
 
-class RuntimeViewClient:
+class RuntimeViewClient(CancellablePipeClient):
     def __init__(self, pipe):
+        super().__init__()
         self.pipe = pipe + '.view'
 
     @staticmethod
@@ -246,12 +247,12 @@ class RuntimeViewClient:
         return {'protocol': PROTOCOL, 'kind': kind, 'cursor': cursor}
 
     def read(self, cursor=None):
-        with connect(self.pipe, timeout=1, validator=validate_wire) as connection:
+        with self.open_connection(self.pipe, timeout=1, validator=validate_wire) as connection:
             connection.send(self._request('align' if cursor else 'snapshot', cursor), timeout=1)
             return connection.recv(timeout=2)
 
     def subscribe(self, cursor=None):
-        with connect(self.pipe, timeout=1, validator=validate_wire) as connection:
+        with self.open_connection(self.pipe, timeout=1, validator=validate_wire) as connection:
             connection.send(self._request('subscribe', cursor), timeout=1)
             while True:
                 yield connection.recv(timeout=3)
@@ -264,7 +265,7 @@ class RuntimeViewClient:
                                                    'contract': contract, 'cursor': cursor, 'limit': limit})
 
     def runtime_log(self, *, before=None, limit=100):
-        with connect(self.pipe, timeout=1, validator=validate_wire) as connection:
+        with self.open_connection(self.pipe, timeout=1, validator=validate_wire) as connection:
             connection.send({'protocol': PROTOCOL, 'kind': 'runtime-log', 'before': before, 'limit': limit}, timeout=1)
             response = connection.recv(timeout=3)
         if response['kind'] == 'RUNTIME_LOG_ERROR':
@@ -274,7 +275,7 @@ class RuntimeViewClient:
         return response['body']
 
     def _read_history(self, kind, fields):
-        with connect(self.pipe, timeout=1, validator=validate_wire) as connection:
+        with self.open_connection(self.pipe, timeout=1, validator=validate_wire) as connection:
             connection.send({'protocol': PROTOCOL, 'kind': kind, **fields}, timeout=1)
             response = connection.recv(timeout=7 if kind == 'history-days' else 3)
         if response['kind'] == 'HISTORY_ERROR':

@@ -18,7 +18,7 @@ from online_trader.domain.values import identifier, sequence
 from online_trader.errors import TraderError
 from online_trader.runtime.portable_config import _read
 from online_trader.scheduling.calendar import _utc
-from online_trader.transport.named_pipe import connect
+from online_trader.transport.named_pipe import CancellablePipeClient
 from online_trader.transport.status_client import StatusClient
 
 
@@ -191,15 +191,16 @@ class OperatorEndpoint:
             self._submission.release()
 
 
-class RuntimeCommandClient:
+class RuntimeCommandClient(CancellablePipeClient):
     def __init__(self, pipe):
+        super().__init__()
         self.pipe = pipe + '.control'
 
     def request(self, operation, body, *, operator, token):
         request_id = 'request-' + uuid4().hex
         request = {'protocol': PROTOCOL, 'request_id': request_id, 'operation': operation,
                    'body': body, 'operator': operator, 'token': token}
-        with connect(self.pipe, timeout=2, validator=validate_wire) as connection:
+        with self.open_connection(self.pipe, timeout=2, validator=validate_wire) as connection:
             connection.send(request, timeout=2)
             response = connection.recv(timeout=8)
         if response['request_id'] != request_id:

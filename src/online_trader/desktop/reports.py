@@ -68,8 +68,10 @@ class EquityChart(QWidget):
         self.setMaximumHeight(170)
 
     def set_rows(self, rows):
-        self.rows = copy.deepcopy(rows)
-        self.update()
+        value = copy.deepcopy(rows)
+        if value != self.rows:
+            self.rows = value
+            self.update()
 
     def values(self):
         values = []

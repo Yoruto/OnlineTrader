@@ -4,6 +4,12 @@
 
 本文说明独立 Trading Runtime 的运行目录、自动启动、进程/线程职责、SQLite 长期账本、WAL/SHM、接口进程故障和验收方法。它补充[独立运行时设计](refactor/standalone-trading-runtime-20261119.md)与[账号数据同步设计](account-data-sync-design-20261119.md)，不把候选源码、模拟柜台或最终制品描述成已经发布验收。
 
+## 默认产品入口
+
+后续未明确指定路径的 OnlineTrader 启动、重启、验收候选和打包均默认指 Standalone Trading Runtime。执行 Owner 使用 `runtime run` 或受 `runtime-control.json` 约束的 `runtime schedule`；用户从 `online-trader-desktop --runtime-pipe` 进入与 dev 共用的 `WorkbenchWindow` / `WorkbenchLayout`。普通 Legacy 工作台不作为默认启动或交付入口，只在用户明确要求旧路径维护时使用。
+
+该默认只决定目标架构，不扩大当次权限：账号连接、测试、订单操作和打包仍分别需要用户授权。打包时交付并验收 Runtime 完整目录/ZIP，配置、操作员授权与已初始化账户原账本均按接收方核对；禁止用能够打开但缺少 Runtime 配置或账本的普通工作台包替代。
+
 ## 1. 运行目录由配置和原执行账本共同组成
 
 对已经启动过的账户，**配置和原每账户 SQLite 执行账本缺一不可**。配置描述“下一次怎样运行”，账本保存“已经发生并需要恢复、核对或审计的事实”。不新增第二个 Runtime 数据库。
