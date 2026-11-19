@@ -7,6 +7,7 @@ from online_trader.configuration.baseline import (
     check_reference_profile, legacy_baseline_available, load_parameter_reference, load_reference_approval,
 )
 from online_trader.configuration.files import export_profile, load_profile
+from online_trader.errors import TraderError
 
 
 def add_parameter_parser(commands):
@@ -109,7 +110,6 @@ def run_parameters(args):
     if args.parameter_action == "calculate":
         from online_trader.configuration.offsets import load_daily, calculate_offsets, export_calculation
         from online_trader.contracts.codec import strict_loads
-        from online_trader.errors import TraderError
         if bool(args.apply_output) != bool(args.contracts):
             raise TraderError("E_OFFSET", "Saving calculated parameters requires both --apply-output and --contracts")
         candidate = load_profile(args.input, dsv=args.dsv) if args.input is not None else load_parameter_reference()[0]
