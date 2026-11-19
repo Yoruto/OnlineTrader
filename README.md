@@ -8,7 +8,11 @@
 
 便携运行目录使用相对路径配置，不依赖 Windows 凭据库，也不新增 `runtime.sqlite3`。全新目录首次启动自动建立原执行账本；换机交接携带配置和原账本的一致性副本。已经启动过的账户以“运行配置 + 原每账户 SQLite 执行账本”共同构成可恢复状态：配置描述下一次如何运行，账本保存已经发生并需恢复或审计的交易事实。无人值守启动另由 `runtime-control.json` 明确总开关。人工与策略开仓权限分别持久化，人工禁开可否决策略新增，原平仓和保护路径保持可用。公开 CLI/Python 接口支持状态、账户、行情、命令、回执、跨日历史和交接导出。
 
-[完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [运维、配置与账本约定](docs/runtime-operations-and-storage-20261119.md) · [实现与验收记录](docs/refactor/standalone-trading-runtime-acceptance-20261119.md) · [账号数据与原账本查询](docs/account-data-sync-design-20261119.md)
+Trading Workbench 通过 Runtime 操作员接口直接提交命令：令牌只驻留当前界面进程，每次命令由 Runtime 重新鉴权；命令绑定账号、owner boot 和配置版本。超时只查询原 `command_id`，不自动重发。后续用户级产品测试统一从 Runtime CLI/API/Qt 入口执行；旧工作台直连 Kernel/ControlServer 的回放只保留为 Legacy 或组件回归，不能作为当前产品验收。 [测试入口迁移与固定数据](docs/refactor/standalone-trading-runtime-test-migration-20261119.md)
+
+当前离线 Runtime 定向自动化由独立测试 Agent 执行 69 项，69 PASS、0 FAIL、0 SKIP；范围覆盖已实现的操作员协议、版本化视图、Workbench 直接提交、公共 IPC 账户读取/平仓/回执和受影响回归。可见 Qt 强杀恢复、完整故障矩阵、联网柜台和最终制品仍为 `NOT_RUN`，不能据此报告完整产品通过。
+
+[完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [运维、配置与账本约定](docs/runtime-operations-and-storage-20261119.md) · [测试入口迁移](docs/refactor/standalone-trading-runtime-test-migration-20261119.md) · [实现与验收记录](docs/refactor/standalone-trading-runtime-acceptance-20261119.md) · [账号数据与原账本查询](docs/account-data-sync-design-20261119.md)
 
 该入口当前只支持已验收的模拟账户范围，不表示 DSV replacement 链已经切换，也不表示真实资金账户或发行制品已验收。当前源码验收状态见[功能清单](docs/功能实现与待办清单_20261110.md)。
 

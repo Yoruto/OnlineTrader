@@ -69,6 +69,8 @@ OnlineTraderCLI.exe runtime schedule --root .\runtime --operator <operator>
 
 新交付建议把 `scheduled_start.enabled` 初始设置为 `false`；确认目标电脑、账户、参数、操作员授权和开机启动方式后再显式开启。
 
+换机交接导出时，如果源目录尚无 `runtime-control.json`，导出入口会在源目录原子创建上述 `enabled=false` 的默认配置并随交接清单复制；已有文件仍按原内容严格校验，格式非法时停止交接，不覆盖或猜测用户配置。
+
 ## 3. 交易 Owner 与辅助线程/进程
 
 ### 3.1 必须保留在交易 Owner 的工作
@@ -94,6 +96,8 @@ Trading Runtime 的 Owner 主线程仍是唯一的交易决策和 SDK 驱动线�
 - 完整账户截面（资金、持仓、全部原生委托和成交）的采集目标周期约 2.5 s。
 - 大帧编码在后台线程完成；已有编码任务积压时不在 Owner 线程不断重复构造新帧。
 - runtime-view-process 负责对外状态、历史、账户读取和操作员接口，可退出并重建。
+
+Trading Workbench 通过 runtime-view-process 的操作员协议直接提交命令。首次操作时输入操作员 ID和令牌，令牌只驻留当前 Qt 进程；接口对每条命令重新核对账号、能力和有效期。提交绑定当前账号、owner boot 和配置版本。超时或断线保留原 `command_id`，只能查询原回执，不能由界面自动生成新 ID重发。Qt 和 runtime-view-process 仍只是控制/读侧，不因此成为 SDK sender 或账本 writer。
 
 750 ms 和 2.5 s 是当前实现的发布节奏，不是交易 SLA，也不改变报单、撤单、策略或保护轮次。性能评审应观察 `OWNER_LOOP_SLOW`、SDK 泵间隔以及 Tick → 决策 → 发送的 P95/P99。
 
@@ -187,6 +191,13 @@ runtime/logs/runtime-view.log.1
 - 日志能看到退出码/异常，但日志写失败本身不阻断交易 owner。
 - Qt 重连取得新基线，不能用旧窗口状态推断已经平仓或已撤单。
 
+### Runtime 测试入口
+
+- 后续用户级产品测试从 Runtime CLI/API、`RuntimeViewClient`、`RuntimeCommandClient` 或 `online-trader-desktop --runtime-pipe` 执行。
+- 旧工作台或 QA 直接持有 Kernel/ControlServer 的回放只保留为 Legacy 或组件不变量测试，不能作为 Runtime 产品验收。
+- 纯离线事实只进入 `qa/` 中不随 wheel 发布的宿主，生产 `runtime run` 不增加 QA 注入开关。
+- 固定边界、退役入口和离线证据范围见[测试入口迁移](refactor/standalone-trading-runtime-test-migration-20261119.md)。
+
 ## 8. 发布边界
 
 本说明描述源码合同，不等于最终制品验收。正式放行仍分别需要：
@@ -198,5 +209,7 @@ runtime/logs/runtime-view.log.1
 - 冷热 WAL 与并发历史读取；
 - 最终便携目录/ZIP 的配置、数据库和摘要检查；
 - 干净目标电脑按用户实际入口启动。
+
+源码层快速 Runtime 定向测试不能替代上述联网、可见 Qt、故障恢复或最终制品验收。每次报告都要分别列出已经执行和 `NOT_RUN` 的范围。
 
 验收记录应注明完整候选 SHA、配置摘要（不含秘密）、环境、实际命令、PASS/FAIL/SKIP/NOT_RUN 和制品 SHA-256。

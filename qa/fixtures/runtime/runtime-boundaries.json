@@ -1,0 +1,26 @@
+{
+  "schema_version": "ONLINE_TRADER_RUNTIME_QA_BOUNDARIES/1",
+  "source": "Runtime public contract and independently designed coverage RT-01 through RT-23",
+  "network_authority": false,
+  "artifact_authority": false,
+  "contracts": ["DCE.p2701", "DCE.l2701"],
+  "operator_classes": [
+    {"id": "operator-full", "capabilities": ["SET_ENTRY_POLICY", "MANUAL_OPEN", "MANUAL_CLOSE", "CANCEL_SELECTED", "STOP_DSV_STRATEGY"]},
+    {"id": "operator-close", "capabilities": ["MANUAL_CLOSE"]},
+    {"id": "operator-no-open", "capabilities": ["MANUAL_CLOSE", "CANCEL_SELECTED"]},
+    {"id": "operator-expired", "expires": "past"},
+    {"id": "operator-other-account", "account": "other"}
+  ],
+  "business_states": ["flat-ready", "active-open-order", "partial-3-of-5", "holding-5", "unknown-send", "external-position"],
+  "view_stream": [
+    {"generation": "g1", "sequence": "120", "kind": "BASELINE"},
+    {"generation": "g1", "sequence": "121", "kind": "DELTA"},
+    {"generation": "g1", "sequence": "122", "kind": "DELTA"},
+    {"generation": "g1", "sequence": "122", "kind": "DUPLICATE"},
+    {"generation": "g1", "sequence": "124", "kind": "OUT_OF_ORDER"},
+    {"generation": "g1", "sequence": "123", "kind": "MISSING_RECOVERY"},
+    {"generation": "g2", "sequence": "1", "kind": "BASELINE"}
+  ],
+  "command_variants": ["same-id-same-body", "same-id-different-body", "old-boot", "old-config", "wrong-account"],
+  "faults": ["disconnect-before-submit", "reply-lost-after-commit", "view-process-exit", "slow-subscriber", "malformed-frame", "history-read-lock", "ledger-readonly", "unknown-send"]
+}

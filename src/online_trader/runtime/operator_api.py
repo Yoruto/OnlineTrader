@@ -43,7 +43,7 @@ def validate_wire(message):
         return
     if message.keys() != {'protocol', 'request_id', 'operation', 'body', 'operator', 'token'}:
         raise TraderError('E_SCHEMA', 'Invalid runtime command request')
-    if message['operation'] not in ('submit', 'receipt') or type(message['body']) is not dict:
+    if message['operation'] not in ('authenticate', 'submit', 'receipt') or type(message['body']) is not dict:
         raise TraderError('E_SCHEMA', 'Unknown runtime command operation')
     identifier(message['operator'])
     if type(message['token']) is not str or not 32 <= len(message['token']) <= 256:
@@ -86,7 +86,7 @@ def authenticate_operator(root, account_key, operator_id, token):
         if (account_key not in accounts or datetime.now(timezone.utc) >= expiry
                 or not compare_digest(expected, sha256(token.encode()).hexdigest())):
             raise ValueError()
-        return 'operator-' + operator_id, operations
+        return 'operator-' + operator_id, operations, expiry
     except (ValueError, KeyError, TypeError):
         raise TraderError('E_AUTH', 'The operator token or its account grant is invalid') from None
 
@@ -118,8 +118,15 @@ class OperatorEndpoint:
         return {key: command[key] for key in _COMMAND_FIELDS}, receipt
 
     def handle(self, request):
-        actor, operations = authenticate_operator(self.root, self.account_key, request['operator'], request['token'])
+        actor, operations, expiry = authenticate_operator(
+            self.root, self.account_key, request['operator'], request['token'])
         body = request['body']
+        if request['operation'] == 'authenticate':
+            if body:
+                raise TraderError('E_SCHEMA', 'Operator authentication does not accept a command body')
+            return {'status': 'AUTHENTICATED', 'operator': request['operator'], 'actor': actor,
+                    'account_key': self.account_key, 'operations': sorted(operations),
+                    'expires_at_utc': expiry.isoformat().replace('+00:00', 'Z')}
         command_id = identifier(body.get('command_id'))
         if request['operation'] == 'receipt':
             if body.keys() != {'command_id'}:
@@ -173,3 +180,6 @@ class RuntimeCommandClient:
         if error := response.get('error'):
             raise TraderError(error['code'], error.get('message', 'The runtime refused the command'))
         return response['result']
+
+    def authenticate(self, *, operator, token):
+        return self.request('authenticate', {}, operator=operator, token=token)

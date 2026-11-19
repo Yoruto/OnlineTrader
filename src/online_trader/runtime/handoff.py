@@ -15,13 +15,13 @@ from online_trader.errors import TraderError
 from online_trader.ledger.store import Ledger
 from online_trader.runtime.desktop_bootstrap import _check_existing_ledger
 from online_trader.runtime.instance import AccountLock
-from online_trader.runtime.portable_config import PortableAccountStore, _read
+from online_trader.runtime.portable_config import PortableAccountStore, _read, ensure_runtime_control
 
 
 _SCHEMA = 'ONLINE_TRADER_HANDOFF/1'
-_CONFIG_FILES = ('runtime.json', 'OnlineTrader-parameters.json', 'private/OnlineTrader-defaults.json')
+_CONFIG_FILES = ('runtime.json', 'runtime-control.json', 'OnlineTrader-parameters.json',
+                 'private/OnlineTrader-defaults.json')
 _OPERATORS = 'private/operators.json'
-_RUNTIME_CONTROL = 'runtime-control.json'
 
 
 def _digest(path):
@@ -38,8 +38,6 @@ def _inside(root, relative):
 
 def _config_files(root):
     result = list(_CONFIG_FILES)
-    if _inside(root, _RUNTIME_CONTROL).is_file():
-        result.append(_RUNTIME_CONTROL)
     if _inside(root, _OPERATORS).is_file():
         result.append(_OPERATORS)
     return tuple(result)
@@ -111,6 +109,7 @@ def export_handoff(store, output):
         with ExitStack() as locks, TemporaryDirectory(dir=destination.parent, prefix='.online-trader-handoff-') as work:
             for row in rows:
                 locks.enter_context(AccountLock(row['account_key']))
+            ensure_runtime_control(root)
             required = validate_handoff(store)
             staged = Path(work) / 'runtime'
             staged.mkdir()
@@ -173,6 +172,7 @@ def validate_handoff(store, *, require_checksums=False):
             or not manifest['handoff_id'].startswith('handoff-') or type(manifest['accounts']) is not list
             or type(manifest['files']) is not dict):
         raise TraderError('E_RUNTIME_HANDOFF', 'The handoff manifest format is invalid')
+    store.runtime_control()
     marker = root / 'handoff-imported.json'
     if not require_checksums and marker.exists():
         imported = _read(root, marker.name)

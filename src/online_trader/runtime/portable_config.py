@@ -20,6 +20,10 @@ _KQ_FIELDS = {'username', 'password'}
 _SIMNOW_FIELDS = {'simnow_username', 'simnow_password', 'kq_username', 'kq_password'}
 _RUNTIME_CONTROL_FILE = 'runtime-control.json'
 _RUNTIME_CONTROL_SCHEMA = 'ONLINE_TRADER_RUNTIME_CONTROL/1'
+_DEFAULT_RUNTIME_CONTROL = {
+    'schema_version': _RUNTIME_CONTROL_SCHEMA,
+    'scheduled_start': {'enabled': False},
+}
 
 
 def _read(root, name):
@@ -48,6 +52,21 @@ def read_runtime_control(root):
     except (KeyError, TypeError, ValueError):
         raise TraderError('E_RUNTIME_CONFIG', 'The runtime control configuration is invalid') from None
     return value
+
+
+def ensure_runtime_control(root):
+    """Create the safe disabled supervisor gate when a handoff source lacks it."""
+    directory = Path(root).resolve()
+    path = (directory / _RUNTIME_CONTROL_FILE).resolve()
+    if not path.is_relative_to(directory):
+        raise TraderError('E_RUNTIME_CONFIG', 'runtime-control.json must resolve inside the runtime directory')
+    if not path.exists():
+        try:
+            publish_new_bytes(canonical_bytes(_DEFAULT_RUNTIME_CONTROL), path)
+        except TraderError as error:
+            if error.code != 'E_DUPLICATE_CONFLICT':
+                raise TraderError('E_RUNTIME_CONFIG', 'Cannot create the default runtime control configuration') from None
+    return read_runtime_control(directory)
 
 
 class _ConfiguredCredentials:

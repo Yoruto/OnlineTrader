@@ -42,7 +42,7 @@ def _announce(previous, status, **details):
 def schedule_session(store, row, operator, token):
     """Wait for configured start points and reload local controls before every trigger."""
     def authorize():
-        actor, capabilities = authenticate_operator(store.directory, row['account_key'], operator, token)
+        actor, capabilities, _ = authenticate_operator(store.directory, row['account_key'], operator, token)
         if 'SCHEDULE_STRATEGY' not in capabilities:
             raise TraderError('E_AUTH', 'The operator has no scheduled strategy capability')
         return actor

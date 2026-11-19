@@ -148,14 +148,19 @@
       "required": ["protocol", "request_id", "operation", "body", "operator", "token"],
       "properties": {
         "protocol": {"const": "ONLINE_TRADER_RUNTIME_COMMAND/1"},
-        "request_id": {"$ref": "#/$defs/Id"}, "operation": {"enum": ["submit", "receipt"]},
+        "request_id": {"$ref": "#/$defs/Id"}, "operation": {"enum": ["authenticate", "submit", "receipt"]},
         "body": {"type": "object"}, "operator": {"$ref": "#/$defs/Id"},
         "token": {"type": "string", "minLength": 32, "maxLength": 256}
       },
-      "if": {"properties": {"operation": {"const": "submit"}}},
-      "then": {"properties": {"body": {"$ref": "#/$defs/Command"}}},
-      "else": {"properties": {"body": {"additionalProperties": false, "required": ["command_id"],
-        "properties": {"command_id": {"$ref": "#/$defs/Id"}}}}}
+      "allOf": [
+        {"if": {"properties": {"operation": {"const": "submit"}}},
+         "then": {"properties": {"body": {"$ref": "#/$defs/Command"}}}},
+        {"if": {"properties": {"operation": {"const": "receipt"}}},
+         "then": {"properties": {"body": {"additionalProperties": false, "required": ["command_id"],
+           "properties": {"command_id": {"$ref": "#/$defs/Id"}}}}}},
+        {"if": {"properties": {"operation": {"const": "authenticate"}}},
+         "then": {"properties": {"body": {"maxProperties": 0}}}}
+      ]
     },
     "CommandResponse": {
       "type": "object", "additionalProperties": false,

@@ -32,6 +32,8 @@ Use [the runtime operations and storage guide](../runtime-operations-and-storage
 - WAL is part of the durable database view. Never delete `ledger.db-wal` to repair, package or test a ledger. A stopped ledger with no WAL/SHM may use immutable read-only mode while the account startup lock is held; a stopped ledger with WAL/SHM must use normal read-only WAL handling. Serialize cold history readers so another reader is not mistaken for a live execution owner.
 - runtime-view-process is disposable. Its failure must not stop the trading owner. Diagnose it from `runtime/logs/runtime-view.log` and its bounded restart behavior, then reacquire a fresh baseline. Do not restart the trading owner merely because the UI/read process failed.
 - For handoff, use the consistent SQLite backup/export path and carry the matching runtime configuration. A copied live `ledger.db` without its required WAL is evidence-corrupting; a query copy is never authority for a second sender.
+- Runtime Workbench authenticates an operator and submits through the Runtime command protocol. Keep the raw token only in the current Qt process, authenticate every command at the interface, bind submissions to account/owner boot/config revision, and query the original `command_id` after timeout instead of resending.
+- Use Runtime CLI/API/Qt as the product-test entry for subsequent standalone work. Direct Kernel/ControlServer workbench rehearsals remain Legacy or component coverage and cannot establish Runtime acceptance. Offline facts stay in QA-only hosts outside the wheel; do not add an online injection switch. See `refactor/standalone-trading-runtime-test-migration-20261119.md`.
 
 ## Frozen DSV parity
 

@@ -1,47 +1,24 @@
 """Standalone runtime IPC rehearsal using only native-shaped offline facts."""
 
 import argparse
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
-from secrets import token_urlsafe
 import sys
 from threading import Event, Thread
 import time
-from types import SimpleNamespace
 from uuid import uuid4
 
 from online_trader.errors import TraderError
 from online_trader.kernel.server import ControlServer
 from online_trader.runtime.operator_api import RuntimeCommandClient
 from online_trader.runtime.view_process import ViewProcess
+from online_trader.transport.runtime_account import RuntimeAccountClient
 from online_trader.transport.runtime_view import RuntimeViewClient
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tests.test_online_dsv import OnlineDsvTests
-
-
-@contextmanager
-def fixture(output):
-    case = OnlineDsvTests()
-    case.setUp()
-    case.temp.cleanup()
-    case.temp = SimpleNamespace(name=str(output), cleanup=lambda: None)
-    case.path = output / 'ledger.db'
-    try:
-        case.start(quantity=5)
-        case.quote()
-        orders = case.api.inserted
-        if len(orders) != 1 or orders[0]['volume'] != 5:
-            raise AssertionError('The fixed fixture must submit an opening target of five')
-        case.api.fill(orders[0]['order_id'], 3, 1055, finish=False)
-        case.session.step()
-        yield case
-    finally:
-        case.tearDown()
+from qa.runtime_fixture import OfflineRuntimeFixture
 
 
 def wait_view(client, predicate, deadline):
@@ -60,15 +37,9 @@ def wait_view(client, predicate, deadline):
 
 
 def replay(case, output):
-    account = case.kernel.account_key
+    account = case.account_key
     pipe = 'OnlineTrader.RuntimeReplay.' + uuid4().hex
-    token = token_urlsafe(48)
-    expiry = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat().replace('+00:00', 'Z')
-    private = output / 'private'
-    private.mkdir()
-    (private / 'operators.json').write_text(json.dumps({'schema_version': 'ONLINE_TRADER_OPERATORS/1', 'operators': [
-        {'id': 'qa', 'token_sha256': sha256(token.encode()).hexdigest(), 'account_keys': [account],
-         'operations': ['MANUAL_CLOSE'], 'expires_at_utc': expiry}]}), 'utf-8')
+    operator, token = case.operator({'MANUAL_CLOSE'})
     more_fills = Event()
     stop = Event()
     observations = {}
@@ -80,6 +51,16 @@ def replay(case, output):
         try:
             partial = wait_view(view_client, lambda view: any(c['remaining_quantity'] == 3 for c in view['cycles']), deadline)
             observations['partial_seq'] = partial['checkpoint_event_seq']
+            observations['history'] = view_client.history(limit=5)
+            account_client = RuntimeAccountClient(pipe, expected_account_key=account)
+            while time.monotonic() < deadline:
+                account_view = account_client.read()
+                if account_view['status'] == 'READY':
+                    observations['account'] = account_view
+                    break
+                time.sleep(.05)
+            if 'account' not in observations:
+                raise TimeoutError('The attached Runtime account view did not become READY')
             more_fills.set()
             holding = wait_view(view_client, lambda view: any(c['remaining_quantity'] == 5 for c in view['cycles']), deadline)
             observations['complete_seq'] = holding['checkpoint_event_seq']
@@ -89,15 +70,28 @@ def replay(case, output):
             command = {'command_id': 'qa-close-five', 'operation': 'MANUAL_CLOSE',
                        'scope': {'scope_type': 'CYCLE', 'scope_ids': [cycle_id]},
                        'parameters': {'position_cycle_id': cycle_id, 'quantity': 5,
-                                      'execution_policy_id': policy, 'external_takeover_id': None}}
+                                      'execution_policy_id': policy, 'external_takeover_id': None},
+                       'binding': {'account_key': holding['account_key'],
+                                   'kernel_boot_id': holding['kernel_boot_id'],
+                                   'config_revision': holding['configuration']['config_revision']}}
             client = RuntimeCommandClient(pipe)
-            observations['submit'] = client.request('submit', command, operator='qa', token=token)
+            observations['authentication'] = client.authenticate(operator=operator, token=token)
+            observations['submit'] = client.request('submit', command, operator=operator, token=token)
             closed = wait_view(view_client, lambda view: any(
                 c['position_cycle_id'] == cycle_id and c['remaining_quantity'] == 0 for c in view['cycles']), deadline)
             observations['close_seq'] = closed['checkpoint_event_seq']
-            observations['receipt'] = client.request('receipt', {'command_id': 'qa-close-five'}, operator='qa', token=token)
+            observations['receipt'] = client.request(
+                'receipt', {'command_id': 'qa-close-five'}, operator=operator, token=token)
             if observations['receipt']['status'] != 'SUCCEEDED':
                 raise AssertionError('The close did not reach a proved terminal receipt')
+            observations['duplicate'] = client.request('submit', command, operator=operator, token=token)
+            conflict = command | {'parameters': command['parameters'] | {'quantity': 4}}
+            try:
+                client.request('submit', conflict, operator=operator, token=token)
+            except TraderError as error:
+                observations['duplicate_conflict'] = error.code
+            if observations.get('duplicate_conflict') != 'E_DUPLICATE_CONFLICT':
+                raise AssertionError('A changed body reused the command ID without a conflict')
         except (AssertionError, OSError, TimeoutError, TraderError, KeyError, StopIteration) as error:
             failures.append(str(error))
         finally:
@@ -109,10 +103,10 @@ def replay(case, output):
             return
         if more_fills.is_set():
             more_fills.clear()
-            case.api.fill(case.api.inserted[0]['order_id'], 2, 1055)
+            case.fill(case.api.inserted[0]['order_id'], 2, 1055)
         for order in case.api.inserted[1:]:
             if order['offset'] in {'CLOSE', 'CLOSETODAY'} and case.api.orders[order['order_id']].volume_left:
-                case.api.fill(order['order_id'], case.api.orders[order['order_id']].volume_left, 1055)
+                case.fill(order['order_id'], case.api.orders[order['order_id']].volume_left, 1055)
         case.quote(milliseconds=20)
 
     interface = ViewProcess(pipe, account, output, case.path)
@@ -136,8 +130,19 @@ def main():
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    with fixture(output) as case:
+    case = OfflineRuntimeFixture(output, quantity=5)
+    try:
+        case.quote()
+        orders = case.api.inserted
+        if len(orders) != 1 or orders[0]['volume'] != 5:
+            raise AssertionError('The fixed fixture must submit an opening target of five')
+        case.fill(orders[0]['order_id'], 3, 1055, finish=False)
         result = replay(case, output)
+    finally:
+        case.close()
+    boundary = ROOT / 'qa/fixtures/runtime/runtime-boundaries.json'
+    result['fixture'] = {'path': boundary.relative_to(ROOT).as_posix(),
+                         'sha256': sha256(boundary.read_bytes()).hexdigest()}
     (output / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), 'utf-8')
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result['status'] == 'PASS' else 2
