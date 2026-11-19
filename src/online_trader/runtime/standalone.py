@@ -61,6 +61,9 @@ def run_cli(args):
         except KeyboardInterrupt:
             pass
         return 0
+    if args.runtime_action == 'schedule':
+        from online_trader.runtime.portable_schedule import schedule_session
+        return schedule_session(store, selected, args.operator, _read_token(args))
     profile = store.profile()
     if args.runtime_action == 'quotes':
         from online_trader.runtime.startup_metadata import read_startup_metadata
@@ -72,9 +75,6 @@ def run_cli(args):
         print(json.dumps({'account': selected, 'profile_hash': profile.content_hash,
                           'pipe': pipe, 'ledger_exists': store.ledger_path(selected).is_file()}, ensure_ascii=False))
         return 0
-    if args.runtime_action == 'schedule':
-        from online_trader.runtime.portable_schedule import schedule_session
-        return schedule_session(store, selected, profile, args.operator, _read_token(args))
     request = build_start_request(store, selected['account_id'], profile, arm=False, manual=args.mode == 'manual')
     return run_session(store, selected, request, use_profile_file=args.use_profile_file)
 

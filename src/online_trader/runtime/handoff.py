@@ -21,6 +21,7 @@ from online_trader.runtime.portable_config import PortableAccountStore, _read
 _SCHEMA = 'ONLINE_TRADER_HANDOFF/1'
 _CONFIG_FILES = ('runtime.json', 'OnlineTrader-parameters.json', 'private/OnlineTrader-defaults.json')
 _OPERATORS = 'private/operators.json'
+_RUNTIME_CONTROL = 'runtime-control.json'
 
 
 def _digest(path):
@@ -36,7 +37,12 @@ def _inside(root, relative):
 
 
 def _config_files(root):
-    return (*_CONFIG_FILES, _OPERATORS) if _inside(root, _OPERATORS).is_file() else _CONFIG_FILES
+    result = list(_CONFIG_FILES)
+    if _inside(root, _RUNTIME_CONTROL).is_file():
+        result.append(_RUNTIME_CONTROL)
+    if _inside(root, _OPERATORS).is_file():
+        result.append(_OPERATORS)
+    return tuple(result)
 
 
 def _ledger_entry(root, path, row):
