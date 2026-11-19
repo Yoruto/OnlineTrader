@@ -14,7 +14,9 @@ from pathlib import Path
 import time
 from uuid import uuid4
 
-from online_trader.configuration.baseline import load_confirmed_baseline
+from online_trader.configuration.baseline import (
+    legacy_baseline_available, load_parameter_reference, load_reference_approval,
+)
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.domain.orders import OrderState
@@ -40,14 +42,16 @@ class DsvStrategyRuntime:
             raise TraderError("E_OWNER","This owner already has a DSV strategy runtime")
         self.kernel=kernel
         self.online=bool(getattr(kernel.simulation,'strategy_enabled',False))
-        self.profile,self.approval=load_confirmed_baseline()
-        self._baseline_profile_hash=self.profile.content_hash
-        if profile is not None:
+        if profile is None:
+            self.profile, self.approval = load_parameter_reference()
+        else:
+            self.approval = load_reference_approval()
             if not isinstance(profile,DsvProfile):
                 raise TraderError("E_CONFIG","Expected an immutable development DSV profile")
             if (not kernel.development and not self.online) or isinstance(kernel.port,UnavailablePort):
                 raise TraderError("E_RULE_UNAPPROVED","Development profile variants require an isolated development port")
             self.profile=profile
+        self._baseline_profile_hash = self.approval["profile_hash"]
         if self.online and self.profile.content_hash!=kernel.simulation.grant.value['profile_hash']:
             raise TraderError('E_ONLINE_SCOPE','The selected DSV profile differs from the explicit strategy grant')
         self._profile_effective_after = None
@@ -141,7 +145,11 @@ class DsvStrategyRuntime:
             raise TraderError("E_NOT_READY","Resolve existing management barriers before strategy activation")
         if self.epoch is not None and self.epoch==k.active_epoch:
             return self.status()
-        reference=k.configurations.register_confirmed_baseline();k.wait_idle();reference.result()
+        rule_set_id = k._configuration["rule_set_id"]
+        if k.configurations.current_revision or legacy_baseline_available():
+            reference = k.configurations.register_confirmed_baseline()
+            k.wait_idle()
+            rule_set_id = reference.result()["rule_set_id"]
         from online_trader.strategy import entry,risk,plan,stops,statistics
         from online_trader.dsv_core import business_statistics, entry_rules, price_rules, protection_rules, sizing_rules
         from online_trader.protection import reducer
@@ -187,12 +195,14 @@ class DsvStrategyRuntime:
             authority=k._authority()|{"config_revision":revision,"armed":False}
             def mutate(conn,seq):
                 conn.execute("INSERT INTO config_revisions VALUES(?,?,?,?,'NEXT_CYCLE',?)",
-                    (revision,self.approval["rule_set_id"],canonical_bytes(descriptor).decode(),digest,seq))
+                    (revision,rule_set_id,canonical_bytes(descriptor).decode(),digest,seq))
                 k._write_authority(conn,seq,authority)
             def accepted():
                 k._config_revision=revision
-                k._configuration={"payload_hash":digest,"rule_set_id":self.approval["rule_set_id"]}
-            k._submit("TX_CONFIG","DSV_DEVELOPMENT_CONFIG_ACTIVATED",{"authority":authority,"dsv_execution":descriptor},mutate,after=accepted)
+                k._configuration={"payload_hash":digest,"rule_set_id":rule_set_id}
+            k._submit("TX_CONFIG", "DSV_DEVELOPMENT_CONFIG_ACTIVATED",
+                      {"authority": authority, "dsv_execution": descriptor, "rule_set_id": rule_set_id},
+                      mutate, after=accepted)
             k.wait_idle()
         coordinator=StrategyCoordinator(k)
         for _ in range(2):

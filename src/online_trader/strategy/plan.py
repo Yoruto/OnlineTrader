@@ -11,7 +11,7 @@ from datetime import date
 from decimal import Decimal, ROUND_FLOOR, localcontext
 import re
 
-from online_trader.configuration.baseline import load_confirmed_baseline
+from online_trader.configuration.baseline import load_reference_approval
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes, content_hash
 from online_trader.contracts.validation import validate_plan
@@ -54,7 +54,7 @@ def capability_notes(profile: DsvProfile, *, execution_version="1.1") -> list[st
         notes.append("DSV_TRAILING_DAYSTOP_SHADOWED_BRANCH_REPAIRED_WITH_SAVED_SWITCH")
     if not trade["half_close_enabled"] and (trade["half_stage2"] or trade["half_breakeven"]):
         notes.append("HALF_SUBSWITCHES_DORMANT_WITH_HALF_DISABLED")
-    if profile.content_hash != load_confirmed_baseline()[0].content_hash:
+    if profile.content_hash != load_reference_approval()["profile_hash"]:
         notes.append("DEVELOPMENT_VARIANT_IS_NOT_THE_APPROVED_SAVED_CONFIGURATION")
     return notes
 
@@ -139,7 +139,7 @@ def build_development_plan(profile, candidate, *, account_key, trading_day,
         trailing_activation = decimal_value(trade["trailing_activate_ratio"])
     if gap_ms > 2_147_483_647:
         _unsupported("Data gap duration exceeds the frozen millisecond contract")
-    baseline, approval = load_confirmed_baseline()
+    approval = load_reference_approval()
     partial = {"enabled": False}
     if first_enabled:
         partial = {"enabled": True, "first_trigger_ratio": decimal_text(first_ratio),
@@ -157,7 +157,7 @@ def build_development_plan(profile, candidate, *, account_key, trading_day,
         "contract_id": contract, "trading_day": trading_day, "direction": candidate["direction"],
         "theoretical_entry_price": theoretical, "initial_open_quantity": quantity,
         "rule_set_id": rule_set_id, "config_revision": config_revision, "config_hash": config_hash,
-        "execution_scope": "DEVELOPMENT", "approval_record_id": approval["record_id"] if profile.content_hash == baseline.content_hash else None,
+        "execution_scope": "DEVELOPMENT", "approval_record_id": approval["record_id"] if profile.content_hash == approval["profile_hash"] else None,
         "market_quality_policy_id": reference("market"), "price_field": "LAST",
         "fixed_stop_loss": {"enabled": True, "distance_points": symbol["stop_offset"]},
         "fixed_take_profit": {"enabled": True, "distance_points": symbol["profit_offset"]},

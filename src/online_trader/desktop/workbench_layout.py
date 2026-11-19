@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from online_trader.configuration.baseline import load_confirmed_baseline
+from online_trader.configuration.baseline import default_preview_profile
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.files import load_profile, publish_new_bytes
 from online_trader.configuration.rollover import expiry_date, expiry_warning, future_product, preview_rollover
@@ -612,20 +612,21 @@ class WorkbenchLayout:
         self.dsv_config = Path(dsv_config) if dsv_config is not None and not self.paired else None
         self.require_reviewed_profile = require_reviewed_profile
         self.dsv_profile_loaded = False
-        self.profile_source = '本次绑定参数' if self.paired else '历史 DSV 基准（2026-11-09）'
+        self.profile_source = '本次绑定参数' if self.paired else '离线预览'
         if self.paired:
             self.profile = DsvProfile.from_record(strict_loads(self.paired.paths[1].read_bytes()))
         else:
-            self.profile = load_confirmed_baseline()[0]
+            self.profile = default_preview_profile()
             if self.dsv_config is not None:
                 try:
                     self.profile = load_profile(self.dsv_config, dsv=True)
                     self.profile_source = '本机 DSV 已保存参数'
                     self.dsv_profile_loaded = True
-                except TraderError:
-                    self.profile_source = 'DSV 配置读取失败 · 显示历史基准'
+                except TraderError as error:
+                    reason = '无法读取 DSV 配置' if error.code == 'E_CONFIG_FILE' else 'DSV 参数无效'
+                    self.profile_source = f'{reason} · 显示离线预览'
             elif require_reviewed_profile:
-                self.profile_source = '未找到本机 DSV 配置 · 显示历史基准'
+                self.profile_source = '未找到本机 DSV 配置 · 显示离线预览'
         self.symbols = self.profile.to_record()['settings']['symbols']
         self.preview_symbols = self.symbols
         self.names = {item['code']: item['name'] for item in self.symbols}

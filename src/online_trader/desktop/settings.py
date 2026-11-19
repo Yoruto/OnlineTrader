@@ -80,8 +80,8 @@ _CSV_REASONS = {
 
 
 def _default_baseline():
-    from online_trader.configuration.baseline import load_confirmed_baseline
-    return load_confirmed_baseline()
+    from online_trader.configuration.baseline import default_preview_profile
+    return default_preview_profile(), {"rule_set_id": "离线预览"}
 
 
 def _display(value):

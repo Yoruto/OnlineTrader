@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $DeliveryMode) { throw 'Specify -DeliveryMode Generic or Configured.' }
 if ($DeliveryMode -eq 'Configured' -and -not $DeliveryConfigDirectory) {
-    throw 'Configured delivery requires -DeliveryConfigDirectory with OnlineTrader-defaults.json.'
+    throw 'Configured delivery requires -DeliveryConfigDirectory with OnlineTrader-defaults.json and OnlineTrader-parameters.json.'
 }
 if ($DeliveryMode -eq 'Generic' -and $DeliveryConfigDirectory) {
     throw 'A delivery config directory requires -DeliveryMode Configured.'

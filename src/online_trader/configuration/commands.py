@@ -3,7 +3,9 @@
 import json
 from pathlib import Path
 
-from online_trader.configuration.baseline import load_confirmed_baseline
+from online_trader.configuration.baseline import (
+    check_reference_profile, legacy_baseline_available, load_parameter_reference, load_reference_approval,
+)
 from online_trader.configuration.files import export_profile, load_profile
 
 
@@ -19,9 +21,10 @@ def add_parameter_parser(commands):
         command = actions.add_parser(action)
         command.add_argument("--data-dir", type=Path, required=True)
         command.add_argument("--account-key", required=True)
-        if action == "save":
-            command.add_argument("--input", type=Path, required=True)
+        if action in {"register", "save"}:
+            command.add_argument("--input", type=Path, required=action == "save")
             command.add_argument("--dsv", action="store_true")
+        if action == "save":
             command.add_argument("--expected-revision", type=int, required=True)
     actions.add_parser("desktop", help="打开离线参数预览窗口")
     calculator = actions.add_parser("calculate", help="从本地日线计算DSV偏移（只预览）")
@@ -60,7 +63,7 @@ def _run_workspace(args):
     if action == "template-list": return TemplateStore(args.store).read().summary()
     if action == "template-delete":
         return TemplateStore(args.store).delete(args.name, expected_revision=args.expected_revision).summary()
-    candidate = load_profile(args.input, dsv=args.dsv) if args.input is not None else load_confirmed_baseline()[0]
+    candidate = load_profile(args.input, dsv=args.dsv) if args.input is not None else load_parameter_reference()[0]
     if action == "template-save":
         return TemplateStore(args.store).save(args.name, candidate, expected_revision=args.expected_revision,
                                              overwrite=args.overwrite).summary()
@@ -109,7 +112,7 @@ def run_parameters(args):
         from online_trader.errors import TraderError
         if bool(args.apply_output) != bool(args.contracts):
             raise TraderError("E_OFFSET", "Saving calculated parameters requires both --apply-output and --contracts")
-        candidate = load_profile(args.input, dsv=args.dsv) if args.input is not None else load_confirmed_baseline()[0]
+        candidate = load_profile(args.input, dsv=args.dsv) if args.input is not None else load_parameter_reference()[0]
         ranges = None
         if args.ranges is not None:
             try:
@@ -134,29 +137,39 @@ def run_parameters(args):
         result = read_catalog_file(args.data_dir / "ledger.db", args.account_key)
     elif args.parameter_action in {"register", "save"}:
         # Parse explicit input before opening a writer or creating a boot.
-        candidate = load_profile(args.input, dsv=args.dsv) if args.parameter_action == "save" else None
+        candidate = load_profile(args.input, dsv=args.dsv) if args.input is not None else None
+        ledger_path = args.data_dir / "ledger.db"
+        if args.parameter_action == "register":
+            if candidate is not None:
+                check_reference_profile(candidate, load_reference_approval())
+            elif not legacy_baseline_available():
+                from online_trader.kernel.configuration import read_catalog_file
+                if not ledger_path.is_file() or not read_catalog_file(ledger_path, args.account_key):
+                    raise TraderError("E_CONFIG_FILE", "Supply the confirmed original DSV profile with --input")
         from online_trader.kernel.engine import Kernel
-        with Kernel(args.data_dir / "ledger.db", args.account_key) as kernel:
+        with Kernel(ledger_path, args.account_key) as kernel:
             kernel.wait_idle()
-            if candidate is None:future = kernel.configurations.register_confirmed_baseline()
-            else:future = kernel.configurations.save(candidate, expected_revision=args.expected_revision)
+            if args.parameter_action == "register":
+                future = kernel.configurations.register_confirmed_baseline(candidate)
+            else:
+                future = kernel.configurations.save(candidate, expected_revision=args.expected_revision)
             kernel.wait_idle()
             result = future.result()
     else:
-        baseline, approval = load_confirmed_baseline()
+        baseline, approval = load_parameter_reference()
         candidate = load_profile(args.input, dsv=args.dsv) if args.input is not None else baseline
         if args.parameter_action == "diff":
             result = {"baseline_hash": baseline.content_hash, "profile_hash": candidate.content_hash,
-                      "matches_confirmed_baseline": candidate.content_hash == baseline.content_hash,
+                      "matches_confirmed_baseline": candidate.content_hash == approval["profile_hash"],
                       "changes": parameter_diff(baseline, candidate), "diagnostics": candidate.diagnostics()}
         elif args.parameter_action == "export":
             path = export_profile(candidate, args.output)
             result = {"exported": str(path), "profile_hash": candidate.content_hash,
-                      "matches_confirmed_baseline": candidate.content_hash == baseline.content_hash}
+                      "matches_confirmed_baseline": candidate.content_hash == approval["profile_hash"]}
         else:
             result = {"rule_set_id": approval["rule_set_id"], "reference_approval_id": approval["record_id"],
                       "profile_hash": candidate.content_hash,
-                      "matches_confirmed_baseline": candidate.content_hash == baseline.content_hash,
+                      "matches_confirmed_baseline": candidate.content_hash == approval["profile_hash"],
                       "runtime_activation": False, "summary": candidate.summary(),
                       "diagnostics": candidate.diagnostics(), "settings_record": candidate.to_record()}
     print(json.dumps(result, ensure_ascii=False, indent=2))

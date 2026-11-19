@@ -6,6 +6,9 @@ from pathlib import Path
 import sqlite3
 import uuid
 
+from online_trader.configuration.baseline import (
+    check_reference_profile, load_confirmed_baseline, load_reference_approval,
+)
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.errors import TraderError
 
@@ -26,16 +29,16 @@ class ConfigurationCatalog:
         self.kernel = kernel
         self._entries = {}
         self._baseline_entry = None
-        self._baseline_material = None
+        self._reference_manifest = None
         self._pending = None
         rows = kernel.ledger.query("SELECT * FROM config_revisions WHERE json_extract(payload_json,'$.kind')=? ORDER BY config_revision", (KIND,))
         for row in rows:
             body = strict_loads(row["payload_json"])
             if content_hash(body) != row["payload_hash"] or row["effective_boundary"] != "NON_TRADING":
                 raise TraderError("E_CONFIG", "Saved configuration integrity differs")
-            profile, manifest = self._baseline()
+            manifest = self._manifest()
             saved = self._decode_profile(body["settings_record"])
-            confirmed = saved.content_hash == profile.content_hash
+            confirmed = saved.content_hash == manifest["profile_hash"]
             if (body.get("profile_hash") != saved.content_hash or body.get("runtime_activation") is not False
                     or body.get("reference_approval_id") != manifest["record_id"]
                     or body.get("matches_confirmed_baseline") is not confirmed
@@ -57,27 +60,13 @@ class ConfigurationCatalog:
         from online_trader.configuration.dsv import DsvProfile
         return DsvProfile.from_record(record)
 
-    def _baseline(self):
-        if self._baseline_material is None:
-            from online_trader.configuration.baseline import load_confirmed_baseline
-            profile, manifest = load_confirmed_baseline()
-            manifest = copy.deepcopy(manifest)
-            if (manifest.get("schema_version") != "DSV_REFERENCE_APPROVAL/1"
-                    or manifest.get("status") != "APPROVED"
-                    or manifest.get("approval_kind") != "DSV_REFERENCE_AND_SAVED_CONFIGURATION"
-                    or manifest.get("profile_hash") != profile.content_hash
-                    or manifest.get("effective_scope") != {"purpose": "REFERENCE_ONLY", "runtime_activation": False,
-                        "broker_connection_authorized": False, "account_operations_authorized": False}
-                    or [d.get("b_code") for d in manifest.get("decisions", [])] != [f"B{i:02}" for i in range(1, 21)]
-                    or any(d.get("status") != "APPROVED" for d in manifest["decisions"])):
-                raise TraderError("E_CONFIG", "Bundled approval is not a non-trading DSV reference")
-            canonical_bytes(manifest)
-            self._baseline_material = (profile, manifest)
-        return self._baseline_material
+    def _manifest(self):
+        if self._reference_manifest is None:
+            self._reference_manifest = load_reference_approval()
+        return self._reference_manifest
 
     def _verify_reference(self):
-        _, manifest = self._baseline()
-        self._verify_reference_query(self.kernel.ledger.query, manifest)
+        self._verify_reference_query(self.kernel.ledger.query, self._manifest())
 
     @staticmethod
     def _verify_reference_query(query, manifest):
@@ -149,14 +138,18 @@ class ConfigurationCatalog:
         if self.kernel._command_binding is not None:
             raise TraderError("E_SCOPE", "Configuration catalog is not an operator command action")
 
-    def register_confirmed_baseline(self):
+    def register_confirmed_baseline(self, profile=None):
         self.kernel._writable(); self.poll()
+        manifest = self._manifest()
+        if profile is not None:
+            check_reference_profile(profile, manifest)
         if self._baseline_entry is not None:
             return _ready(self._receipt(self._baseline_entry, replayed=True))
         if self._pending is not None and self._pending["source"] == "CONFIRMED_DSV_BASELINE":
             return self._pending["result"]
         self._boundary()
-        profile, manifest = self._baseline()
+        if profile is None:
+            profile, _ = load_confirmed_baseline()
         if self.kernel.ledger.query("SELECT 1 FROM rule_sets WHERE rule_set_id=?", (manifest["rule_set_id"],)):
             raise TraderError("E_CONFIG", "Reference identity exists without a complete catalog baseline")
         return self._save(profile, manifest, "CONFIRMED_DSV_BASELINE", register=True)
@@ -176,7 +169,7 @@ class ConfigurationCatalog:
         current = self._entries[self.current_revision]
         if profile.content_hash == current["profile_hash"]:
             return _ready(self._receipt(current, replayed=True))
-        _, manifest = self._baseline()
+        manifest = self._manifest()
         return self._save(profile, manifest, "LOCAL_DRAFT", register=False)
 
     def _receipt(self, entry, *, tx_id=None, replayed=False):
@@ -228,7 +221,6 @@ class ConfigurationCatalog:
 
 def read_catalog_file(path, account_key):
     """Read committed catalog facts without acquiring execution ownership or a new boot."""
-    from online_trader.configuration.baseline import load_confirmed_baseline
     from online_trader.domain.values import identifier
     account_key = identifier(account_key)
     path = Path(path).resolve()
@@ -244,13 +236,13 @@ def read_catalog_file(path, account_key):
                 raise TraderError("E_SCOPE", "Configuration ledger belongs to another account")
             rows = query("SELECT * FROM config_revisions WHERE json_extract(payload_json,'$.kind')=? ORDER BY config_revision", (KIND,))
             if not rows: return []
-            baseline, manifest = load_confirmed_baseline()
+            manifest = load_reference_approval()
             ConfigurationCatalog._verify_reference_query(query, manifest)
             result = []; baseline_count = 0
             for row in rows:
                 body = strict_loads(row["payload_json"])
                 profile = ConfigurationCatalog._decode_profile(body["settings_record"])
-                confirmed = profile.content_hash == baseline.content_hash
+                confirmed = profile.content_hash == manifest["profile_hash"]
                 if (content_hash(body) != row["payload_hash"] or row["effective_boundary"] != "NON_TRADING"
                         or row["rule_set_id"] != manifest["rule_set_id"]
                         or body.get("reference_approval_id") != manifest["record_id"]

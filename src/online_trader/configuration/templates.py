@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import unicodedata
 
-from online_trader.configuration.baseline import load_confirmed_baseline
+from online_trader.configuration.baseline import default_preview_profile
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.files import publish_new_bytes
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
@@ -46,7 +46,7 @@ def _name(name):
 def _trade(values):
     if type(values) is not dict or values.keys() != TEMPLATE_KEYS:
         _error("Template fields must match the DSV saved trade form")
-    record = load_confirmed_baseline()[0].to_record()
+    record = default_preview_profile().to_record()
     record["settings"]["trade"].update(values)
     try:
         validated = DsvProfile.from_record(record).to_record()["settings"]["trade"]

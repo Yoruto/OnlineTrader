@@ -4,7 +4,7 @@ from pathlib import Path
 from decimal import Decimal
 import hashlib,json,queue,threading,time,uuid
 
-from online_trader.configuration.baseline import load_confirmed_baseline
+from online_trader.configuration.baseline import load_parameter_reference
 from online_trader.configuration.files import publish_new_bytes
 from online_trader.contracts.codec import canonical_bytes,content_hash
 from online_trader.errors import TraderError
@@ -26,7 +26,7 @@ class SimulationSession:
         self._reference_results=queue.Queue(1);self._reference_worker=None;self._reference_closed=False
         self._start_sequence=kernel._durable_seq
         self._start_authority_revision=kernel._authority_revision
-        if profile is None:profile,_=load_confirmed_baseline()
+        if profile is None:profile,_=load_parameter_reference()
         self.symbols={row['code']:row for row in profile.to_record()['settings']['symbols']}
         if any(code not in self.symbols for code in self.grant.value['contracts']):raise TraderError('E_CONFIG','Simulation test contracts must have explicit saved DSV distance parameters')
 

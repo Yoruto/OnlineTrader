@@ -16,10 +16,18 @@ fingerprinted_sources = (
     'scheduling/clock.py', 'statement_workflow.py', 'strategy/entry.py',
     'strategy/plan.py', 'strategy/risk.py', 'strategy/statistics.py', 'strategy/stops.py',
 )
+# The original five-symbol DSV fixture stays with the source. The immutable
+# approval and schema resources are sufficient to validate saved ledgers.
+resource_root = package / 'resources'
+resources = [
+    (str(path), (Path('online_trader/resources') / path.relative_to(resource_root).parent).as_posix())
+    for path in sorted(resource_root.rglob('*'))
+    if path.is_file() and path != resource_root / 'dsv-baseline-20261109.json'
+]
 analysis = Analysis(
     [str(release / 'entry.py')],
     pathex=[str(root / 'src')],
-    datas=[(str(package / 'resources'), 'online_trader/resources')]
+    datas=resources
           + [(str(package / path), str(Path('online_trader', path).parent)) for path in fingerprinted_sources]
           + collect_data_files('tqsdk') + copy_metadata('tqsdk'),
 )
