@@ -38,14 +38,31 @@ class TqKqDsvPort(TqKqPort):
     def _quote_age_acceptable(self, code, now, source, age, check_age):
         if hasattr(self.clock, 'health') and hasattr(self.clock, 'capture'):
             sample = self.clock.capture_live() if hasattr(self.clock, 'capture_live') else self.clock.capture()
-            if quote_age_quality(age, self.clock.health(sample))[0] == 'SOURCE_ANOMALY':
-                return False
+            health = self.clock.health(sample)
+            quality, reason = quote_age_quality(age, health)
+            if quality == 'SOURCE_ANOMALY':
+                reference = health.get('reference') or {}
+                return self._quote_rejected(code, 'NATIVE_AGE', reason, source_age_ns=str(age),
+                                            ntp_offset_ns=reference.get('offset_ns'),
+                                            ntp_uncertainty_ns=reference.get('estimated_error_ns'))
         if self.calendar is None or self.grant.manual_workbench:
             return super()._quote_age_acceptable(code, now, source, age, check_age)
         current = self.calendar.query(code, utc_text(now))
         quoted = self.calendar.query(code, utc_text(source))
-        return bool(current['is_trading'] and current['session'] == quoted['session']
-                    and self.grant.permits_day(current['trading_day']) and (not check_age or age <= 5 * NS_PER_SECOND))
+        if not current['is_trading'] or current['session'] != quoted['session']:
+            return self._quote_rejected(code, 'NATIVE_AGE', 'QUOTE_SESSION_MISMATCH',
+                                        active=current['is_trading'], calendar_complete=current.get('complete'),
+                                        current_session=(current['session'] or {}).get('session_id'),
+                                        quote_session=(quoted['session'] or {}).get('session_id'),
+                                        reference_utc=utc_text(now), source_age_ns=str(age))
+        if not self.grant.permits_day(current['trading_day']):
+            return self._quote_rejected(code, 'NATIVE_AGE', 'QUOTE_DAY_OUTSIDE_SCOPE',
+                                        trading_day=current['trading_day'])
+        if check_age and age > 5 * NS_PER_SECOND:
+            return self._quote_rejected(code, 'NATIVE_AGE', 'QUOTE_AGE_LIMIT',
+                                        reference_utc=utc_text(now), source_age_ns=str(age),
+                                        maximum_age_ns=str(5 * NS_PER_SECOND))
+        return True
 
     def current_strategy_quote(self, event):
         """Prove the current native last price before restoring entry authority."""
@@ -65,48 +82,87 @@ class TqKqDsvPort(TqKqPort):
         try:
             q = self.quotes[code]
             source = datetime.fromisoformat(event['source_time_utc'])
-            if (source_age_ns(now, source, q.datetime) > self.kernel.max_quote_age_ms * 1_000_000
-                    or not self.fresh(code, now=now) or not self._matches_strategy_quote(q, event)
-                    or (number(q.bid_price1), number(q.ask_price1), number(q.price_tick)) != (
-                        event['bid1'], event['ask1'], event['tick_size'])
-                    or not all(math.isfinite(size) for size in (q.bid_volume1, q.ask_volume1))
-                    or not q.lower_limit <= q.last_price <= q.upper_limit):
+            age_ns = source_age_ns(now, source, q.datetime)
+            limit_ns = self.kernel.max_quote_age_ms * 1_000_000
+            if age_ns > limit_ns:
+                return self._quote_rejected(code, 'PROTECTION', 'TICK_AGE_LIMIT',
+                                            native_tick_id=event.get('native_tick_id'),
+                                            accepted_time_utc=event['source_time_utc'],
+                                            source_age_ns=str(age_ns), maximum_age_ns=str(limit_ns))
+            if not self.fresh(code, now=now):
                 return False
+            if not self._matches_strategy_quote(q, event):
+                return self._quote_rejected(code, 'PROTECTION', 'QUOTE_TICK_IDENTITY_MISMATCH',
+                                            native_tick_id=event.get('native_tick_id'),
+                                            accepted_time_utc=event['source_time_utc'], accepted_last=event['last'],
+                                            raw_last=number(q.last_price))
+            if (number(q.bid_price1), number(q.ask_price1), number(q.price_tick)) != (
+                    event['bid1'], event['ask1'], event['tick_size']):
+                return self._quote_rejected(code, 'PROTECTION', 'QUOTE_TICK_BOOK_MISMATCH',
+                                            native_tick_id=event.get('native_tick_id'),
+                                            accepted_bid=event['bid1'], accepted_ask=event['ask1'],
+                                            accepted_tick_size=event['tick_size'])
+            if not all(math.isfinite(size) for size in (q.bid_volume1, q.ask_volume1)):
+                return self._quote_rejected(code, 'PROTECTION', 'INVALID_BOOK_SIZE')
+            if not q.lower_limit <= q.last_price <= q.upper_limit:
+                return self._quote_rejected(code, 'PROTECTION', 'LAST_OUT_OF_LIMIT')
             for price in ('last', 'bid1', 'ask1'):
                 order_price(event[price], event['tick_size'])
             return True
-        except (TraderError, KeyError, AttributeError, TypeError, ValueError):
-            return False
+        except (TraderError, KeyError, AttributeError, TypeError, ValueError) as error:
+            return self._quote_rejected(code, 'PROTECTION', 'UNUSABLE_PROTECTION_QUOTE',
+                                        native_tick_id=event.get('native_tick_id'),
+                                        error_code=getattr(error, 'code', type(error).__name__))
 
     def fresh_strategy_entry(self, code, side, event, *, profile=None):
         """Use the strategy age rule and verify the exact legal native quote."""
         if event is None:
-            return False
+            return self._quote_rejected(code, 'OPEN', 'NO_ACCEPTED_TICK', side=side)
         runtime = getattr(getattr(self, 'kernel', None), '_dsv_runtime', None)
         try:
             quote = self.quotes[code]
             now = self.clock.utc_now() if hasattr(self.clock, 'utc_now') else self.clock.now()
-            if (not self._matches_strategy_quote(quote, event) or
-                    (runtime is not None and runtime.ordinary_quote_stale(event, now=now, profile=profile))):
-                return False
+            if not self._matches_strategy_quote(quote, event):
+                return self._quote_rejected(code, 'OPEN', 'QUOTE_TICK_IDENTITY_MISMATCH', side=side,
+                                            native_tick_id=event.get('native_tick_id'),
+                                            accepted_time_utc=event['source_time_utc'], accepted_last=event['last'],
+                                            raw_last=number(quote.last_price))
+            if runtime is not None and runtime.ordinary_quote_stale(event, now=now, profile=profile):
+                if getattr(self, '_quote_trace', None) is None:
+                    return False
+                limit = (runtime._quote_age_limit if profile is None else
+                         profile.to_record()['settings']['trade']['max_quote_age_seconds'])
+                return self._quote_rejected(code, 'OPEN', 'STRATEGY_QUOTE_AGE_LIMIT', side=side,
+                                            native_tick_id=event.get('native_tick_id'),
+                                            source_age_seconds=str(runtime.ordinary_quote_age(event, now=now)),
+                                            maximum_age_seconds=str(limit))
             field = 'ask1' if side == 'BUY' else 'bid1'
             opponent, other, volume = ((getattr(quote,'ask_price1',None), getattr(quote,'bid_price1',None),
                                         getattr(quote,'bid_volume1',None)) if side == 'BUY' else
                                        (getattr(quote,'bid_price1',None), getattr(quote,'ask_price1',None),
                                         getattr(quote,'ask_volume1',None)))
             if event[field] is not None:
-                return (number(quote.ask_price1) == event['ask1'] and number(quote.bid_price1) == event['bid1']
-                        and self.fresh(code, check_age=runtime is None))
-            if not self._fresh_last(code, check_age=runtime is None) or not _missing_book_price(opponent):
+                if number(quote.ask_price1) != event['ask1'] or number(quote.bid_price1) != event['bid1']:
+                    return self._quote_rejected(code, 'OPEN', 'QUOTE_TICK_BOOK_MISMATCH', side=side,
+                                                native_tick_id=event.get('native_tick_id'),
+                                                accepted_bid=event['bid1'], accepted_ask=event['ask1'])
+                return self.fresh(code, check_age=runtime is None)
+            if not self._fresh_last(code, check_age=runtime is None):
                 return False
+            if not _missing_book_price(opponent):
+                return self._quote_rejected(code, 'OPEN', 'OPPONENT_PRICE_CHANGED', side=side,
+                                            opponent_price=number(opponent))
             if not _missing_book_price(other) and not (type(other) in (int, float) and math.isfinite(other)
                     and quote.lower_limit <= other <= quote.upper_limit and type(volume) in (int, float)
                     and math.isfinite(volume) and volume > 0):
-                return False
+                return self._quote_rejected(code, 'OPEN', 'INVALID_REMAINING_BOOK_SIDE', side=side,
+                                            other_price=number(other), other_size=number(volume))
             order_price(event['last'], number(quote.price_tick))
             return True
-        except (TraderError, KeyError, AttributeError, TypeError, ValueError):
-            return False
+        except (TraderError, KeyError, AttributeError, TypeError, ValueError) as error:
+            return self._quote_rejected(code, 'OPEN', 'UNUSABLE_ENTRY_QUOTE', side=side,
+                                        native_tick_id=event.get('native_tick_id'),
+                                        error_code=getattr(error, 'code', type(error).__name__))
 
     def __init__(self,api,account,grant,clock):
         if type(grant) is not DsvSimulationGrant:
@@ -384,6 +440,8 @@ class TqKqDsvPort(TqKqPort):
         else:
             fresh = self.fresh(code) or (direct and self.fresh_manual_reduction(code))
         if not fresh:
+            self._quote_rejected(code, 'SEND', 'E_NATIVE_QUOTE_NOT_CURRENT', effect=request['effect'],
+                                 child_order_id=request['child_order_id'], trading_day=request['trading_day'])
             raise TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '报单需要当前有效的原生报价。')
         expected='BUY' if (cycle['plan']['direction']=='LONG')==(order['effect']=='OPEN') else 'SELL'
         if request['direction']!=expected:raise TraderError('E_OWNERSHIP','Native order direction differs from the original cycle')
@@ -411,6 +469,10 @@ class TqKqDsvPort(TqKqPort):
                 raise TraderError('E_ENTRY_WINDOW_EXPIRED', '当前时刻超出已确认的开仓窗口。')
             window = self.calendar.query(code, utc_text(send_now))
             if not window['is_trading'] or window['session']['session_id'] != facts['event']['session_id']:
+                self._quote_rejected(code, 'SEND', 'QUOTE_SESSION_CHANGED_BEFORE_SEND', effect=request['effect'],
+                                     child_order_id=request['child_order_id'], reference_utc=utc_text(send_now),
+                                     accepted_session=facts['event']['session_id'],
+                                     current_session=(window['session'] or {}).get('session_id'))
                 raise TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '报单前已离开原报价盘段。')
             if kernel.recovery_required:
                 raise TraderError('RECONCILIATION_REQUIRED', '原委托和持仓需要核对。')
@@ -459,7 +521,12 @@ class TqKqDsvPort(TqKqPort):
                 and backfill.iloc[-1]['id']>=serial.iloc[-1]['id']):
             serial=self.tick_serials[code]=self._tick_backfill_serials.pop(code)
             after_id = None
-        if not self.api.is_serial_ready(serial):return []
+        if not self.api.is_serial_ready(serial):
+            trace = getattr(self, '_quote_trace', None)
+            if trace is not None:
+                trace.record('SDK_SERIAL_NOT_READY', contract_id=code, state=(self.source_epoch, after_id),
+                             source_epoch=self.source_epoch, after_tick_id=after_id)
+            return []
         self.subscription_ready_at.setdefault(code,self.clock.now())
         if after_id is not None:
             serial = serial.loc[serial['id'] >= after_id]

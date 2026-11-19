@@ -38,6 +38,7 @@ class ContextRegistry:
         self._clock = clock
         self._capacity = capacity
         self._contexts: dict[str, _Context] = {}
+        self._revoked: dict[str, tuple[str, int]] = {}
         self._lock = threading.RLock()
 
     def issue(self, peer_id: str, purpose: str, operation: str, scope_id: str, *, kernel_epoch: str = "1",
@@ -78,8 +79,14 @@ class ContextRegistry:
             raise TraderError("E_SCOPE", "Context belongs to another account")
         with self._lock:
             ctx = self._contexts.get(context_id)
-            if ctx is None or self._clock() >= ctx.deadline:
-                raise TraderError("E_CONTEXT_EXPIRED", "Context is missing or expired")
+            now = self._clock()
+            if ctx is None:
+                revoked = self._revoked.get(context_id)
+                reason = (f'命令授权已撤销 · {revoked[0]} · 签发后 {revoked[1]} ms'
+                          if revoked is not None else '执行器未找到该命令的授权')
+                raise TraderError("E_CONTEXT_EXPIRED", reason)
+            if now >= ctx.deadline:
+                raise TraderError("E_CONTEXT_EXPIRED", f'命令授权超过有效期 {ctx.body["valid_for_ms"]} ms')
             if (peer_id, purpose, operation, scope_id) != (ctx.peer_id, ctx.purpose, ctx.operation, ctx.scope_id):
                 raise TraderError("E_AUTH", "Context is not transferable")
             if kernel_epoch is not None and kernel_epoch != ctx.kernel_epoch:
@@ -92,8 +99,22 @@ class ContextRegistry:
 
     def revoke_peer(self, peer_id: str) -> None:
         with self._lock:
+            self._remember_revoked((key for key, ctx in self._contexts.items() if ctx.peer_id == peer_id),
+                                   'PEER_DISCONNECTED')
             self._contexts = {key: ctx for key, ctx in self._contexts.items() if ctx.peer_id != peer_id}
 
-    def revoke_all(self) -> None:
+    def _remember_revoked(self, keys, reason):
+        now = self._clock()
+        for key in keys:
+            ctx = self._contexts[key]
+            if now < ctx.deadline:
+                age = ctx.body['valid_for_ms'] - round((ctx.deadline - now) * 1000)
+                self._revoked[key] = (reason, max(0, age))
+        while len(self._revoked) > self._capacity:
+            del self._revoked[next(iter(self._revoked))]
+
+    def revoke_all(self, *, reason='AUTHORITY_OR_STATE_CHANGED') -> None:
         with self._lock:
+            if self._contexts:
+                self._remember_revoked(self._contexts, reason)
             self._contexts.clear()

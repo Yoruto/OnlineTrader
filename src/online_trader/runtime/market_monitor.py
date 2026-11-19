@@ -67,8 +67,14 @@ class DsvMarketMonitor:
             return
         self.recoveries.clear()
 
-        lag = max(((wall - arrival['wall']).total_seconds() for arrival in self.arrivals.values()), default=None)
-        status = '等待行情'
+        monitored_contracts = {code for code, window in self.sessions.items()
+                               if window['is_trading'] or not window['complete']}
+        status_contract = next((code for code, window in self.sessions.items() if window['is_trading']), None)
+        if status_contract is None:
+            status_contract = next((code for code in self.contracts if code in monitored_contracts), None)
+        lag = max(((wall - self.arrivals[code]['wall']).total_seconds()
+                   for code in monitored_contracts if code in self.arrivals), default=None)
+        status = '等待行情' if monitored_contracts or not self.contracts else '休市'
         for code in self.contracts:
             quote = port.quotes.get(code)
             if quote is None:
@@ -79,7 +85,7 @@ class DsvMarketMonitor:
                 source = datetime.fromisoformat(raw)
             except (ValueError, TypeError):
                 self.margin_rates.pop(code, None)
-                if raw and code == self.contracts[0]:
+                if raw and code == status_contract:
                     status = '未知'
                 continue
             if source.tzinfo is None:
@@ -91,7 +97,7 @@ class DsvMarketMonitor:
                     self.recoveries[code] = max(0, (wall - previous['wall']).total_seconds())
                 self.arrivals[code] = {'source': source, 'wall': wall, 'monotonic_ns': returned_ns}
                 source_lag = (wall - source.replace(microsecond=0)).total_seconds()
-                if 0 <= source_lag < 86_400:
+                if code in monitored_contracts and 0 <= source_lag < 86_400:
                     lag = source_lag
                 if self.diagnostic:
                     count, previous, gap = self.loop_samples.get(code, (0, returned_ns, 0))
@@ -100,10 +106,9 @@ class DsvMarketMonitor:
                 margin = live_margin_rate(*(number(getattr(quote, key, None))
                                             for key in ('margin', 'last_price', 'volume_multiple')))
                 self.margin_rates[code] = None if margin is None else decimal_text(margin)
-                if code == self.contracts[0]:
+                if code == status_contract:
                     age = (wall - source.replace(microsecond=0)).total_seconds()
-                    active = self.sessions[code]['is_trading']
-                    status = '正常' if age < 60 else '延迟' if age < 300 else '无行情' if active else '休市'
+                    status = '正常' if age < 60 else '延迟' if age < 300 else '无行情'
 
         self.latest = {'sample_at_utc': utc(wall), 'quote_delay_seconds': None if lag is None else f'{lag:.6f}',
                        'quote_status': status}

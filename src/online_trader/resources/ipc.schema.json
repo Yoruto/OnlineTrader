@@ -1041,7 +1041,8 @@
     },
     "Params_STOP_DSV_STRATEGY": {
       "type": "object",
-      "properties": {"evidence_hash": {"$ref": "#/$defs/hash"}},
+      "properties": {"evidence_hash": {"$ref": "#/$defs/hash"}, "recover_flat": {"const": true}},
+      "not": {"required": ["evidence_hash", "recover_flat"]},
       "additionalProperties": false
     },
     "Params_SAVE_DSV_PARAMETERS": {

@@ -107,7 +107,7 @@ class ScheduledRuntime:
         except Exception:
             if self._fault is None:self._fault=['CLOCK_SOURCE_FAILED']
         if self._fault:
-            k=self.kernel;k._armed=False;k.contexts.revoke_all()
+            k=self.kernel;k._armed=False;k.contexts.revoke_all(reason=self._fault[0])
             if self._fault_monotonic is None:
                 k._recovery_pending.update(c['position_cycle_id'] for c in k._staged.values() if c['lifecycle']!='CLOSED')
                 k.recovery_required |= bool(k._recovery_pending)
@@ -404,7 +404,7 @@ class ScheduledRuntime:
     def received_for(self,contract):return self._quotes[contract]['received_ns']
 
     def _block(self,reason,cid=None,*,require_cycle_reconciliation=True):
-        k=self.kernel;k._armed=False;k.contexts.revoke_all()
+        k=self.kernel;k._armed=False;k.contexts.revoke_all(reason=reason)
         ids=[cid] if cid else [c['position_cycle_id'] for c in k._staged.values() if c['lifecycle']!='CLOSED']
         if require_cycle_reconciliation:
             k._recovery_pending.update(ids)
@@ -491,7 +491,7 @@ class ScheduledRuntime:
         self._quotes.clear();self._ages.clear();self._anchors.clear();self._driven.clear();self._gaps.clear()
         self.strategy._latest.clear()
         k._armed = False
-        k.contexts.revoke_all()
+        k.contexts.revoke_all(reason='CLOCK_RESET')
         k._authority_revision += 1
         authority = k._authority()
 

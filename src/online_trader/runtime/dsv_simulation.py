@@ -21,6 +21,7 @@ from online_trader.runtime.simulation import SimulationSession
 from online_trader.runtime.instance import AccountLock, ClockActivity
 from online_trader.runtime.identity import runtime_identity
 from online_trader.runtime.market_monitor import DsvMarketMonitor, append_latency
+from online_trader.runtime.quote_trace import QuoteTrace
 from online_trader.scheduling.calendar import TradingCalendar
 from online_trader.scheduling.holdover import ProtectionClockAnchor, legacy_protection_pending
 from online_trader.scheduling.reference import CalibratedClock, LocalWallClock, check_wall_clock
@@ -88,6 +89,17 @@ class DsvSimulationSession(SimulationSession):
         monitor_settings = profile.to_record()['settings']
         monitor_contracts = [row['code'] for row in monitor_settings['symbols'] if row['code'] in scoped]
         self.monitor = DsvMarketMonitor(monitor_contracts, calendar, diagnostic=monitor_settings['trade']['tick_diag'])
+        self._quote_trace = None
+        if self.monitor.diagnostic:
+            self._quote_trace = QuoteTrace(self.output / 'market-quote-trace.jsonl', kernel.boot_id)
+            self.feed.quote_trace = self._quote_trace
+            self.port._quote_trace = self._quote_trace
+            kernel._dsv_quote_trace = self._quote_trace
+            self._quote_trace.record('SESSION_START', contracts=monitor_contracts, profile_hash=profile.content_hash,
+                                     calendar_hash=calendar.content_hash, clock=type(source_clock).__name__,
+                                     cache_age_limit_ms=kernel.max_quote_age_ms,
+                                     opening_age_limit_seconds=monitor_settings['trade']['max_quote_age_seconds'])
+            self._quote_trace.flush(phase='SESSION_START', force=True)
         kernel._dsv_market_monitor = self.monitor
         kernel._dsv_monitor_rows = []
         self._monitor_scope = None
@@ -243,6 +255,14 @@ class DsvSimulationSession(SimulationSession):
         self._operation_log('close')
         self._comparison('poll')
         self._comparison('close')
+        if self._quote_trace is not None:
+            self._quote_trace.flush(phase='SESSION_CLOSE', force=True)
+
+    def _trace_tick(self, stage, event, **details):
+        if self._quote_trace is not None:
+            identity = {key: event.get(key) for key in ('contract_id', 'trading_day', 'session_id', 'source_epoch',
+                                                       'native_tick_id', 'native_time_ns', 'source_time_utc', 'path_complete')}
+            self._quote_trace.record(stage, **identity, **details)
 
     def check_day_transition(self):
         """Persist a day-change barrier, retaining every original exit/UNKNOWN.
@@ -346,10 +366,16 @@ class DsvSimulationSession(SimulationSession):
 
     def prime(self,*,manage_owned=False):
         """Rebuild available history with zero signal execution and no arming."""
+        trace = self._quote_trace
+        if trace is not None:
+            trace.record('PRIME_START', manage_owned=manage_owned)
+            trace.flush(phase='PRIME_START', force=True)
         self.kernel.pause();self.kernel.wait_idle()
         if self.driver._fault:
             self.driver.clock_rebuild_pending = True
             self._primed = True
+            if trace is not None:
+                trace.record('PRIME_WAIT_CLOCK', reasons=list(self.driver._fault))
             return  # Startup still exposes the original callbacks and reconciliation entry.
         rebuilt={}
         for code,events in self._market_batches():
@@ -362,52 +388,124 @@ class DsvSimulationSession(SimulationSession):
                     and state['session_id']==first['session_id']
                     and state['last_sequence']+1==first['sequence'])
                 rebuilt[code]=self._prime_path(code,events,extend=True) if extends_checkpoint else self._prime_path(code,events)
-        # Replaying a long session can outlive the freshness budget. Catch up
-        # the native path first, then register a fresh quote for execution.
-        catchup_deadline=time.monotonic()+8
-        while rebuilt and time.monotonic()<catchup_deadline:
-            self.port.poll_updates(.2)
+        # Keep advancing every rebuilt contract while any contract is waiting.
+        # Removing a ready contract here would leave its early quote aging
+        # until the rest of startup finishes.
+        waiting = set(rebuilt)
+        resting = set()
+        catchup_deadline = time.monotonic() + 8
+        while waiting:
+            remaining = catchup_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.port.poll_updates(min(.2, remaining))
             if isinstance(self.port.clock, LocalWallClock):
                 self.port.clock.begin_turn()
             self.driver.preflight()
             if self.driver._fault:
                 self.driver.clock_rebuild_pending = True
                 self._primed = True
+                if trace is not None:
+                    trace.record('PRIME_WAIT_CLOCK', reasons=list(self.driver._fault))
                 return
-            pending=dict(self._market_batches())
-            for code,event in tuple(rebuilt.items()):
-                suffix=pending.get(code,[])
-                if (suffix and all(row['path_complete'] for row in suffix)
-                        and suffix[0]['source_epoch']==event['source_epoch']
-                        and suffix[0]['session_id']==event['session_id']):
-                    event=self._prime_path(code,suffix,extend=True)
-                    rebuilt[code]=event
-                now=self.port.clock.now()
-                age=(now-datetime.fromisoformat(event['source_time_utc'])).total_seconds()
-                at=self.driver.calendar.query(code,utc(now))
-                if (event['source_epoch']!=self.port.source_epoch or not 0<=age<=self.kernel.max_quote_age_ms/1000
-                        or not at['is_trading'] or at['session']['session_id']!=event['session_id']):continue
-                account,instrument=self.feed.facts(event,self.kernel)
-                try:future=self.driver.on_market(event,account,instrument,_allow_entry=False)
-                except ExpiredMarketQuote:continue
-                self.kernel.wait_idle();future.result()
-                del rebuilt[code]
-                if manage_owned:
-                    for cycle in tuple(self.kernel._staged.values()):
-                        if (cycle['plan']['contract_id']!=code or cycle['lifecycle']=='CLOSED'
-                                or not self.owner.exit_day_ready(cycle,event['trading_day'])):continue
-                        tick=self.driver.execution_event(cycle,event,instrument)
-                        future=self.kernel.execution.tick(cycle['position_cycle_id'],tick,
-                            _market_received_ns=self.driver.received_for(code))
-                        self.kernel.wait_idle();future.result()
+            pending = dict(self._market_batches())
+            for code, event in rebuilt.items():
+                suffix = pending.get(code)
+                if suffix:
+                    first = suffix[0]
+                    continues_path = (first['source_epoch'] == event['source_epoch']
+                                      and first['trading_day'] == event['trading_day']
+                                      and first['session_id'] == event['session_id']
+                                      and first['sequence'] == event['sequence'] + 1
+                                      and int(first['native_tick_id']) > int(event['native_tick_id'])
+                                      and all(row['path_complete'] for row in suffix))
+                    if continues_path:
+                        event = rebuilt[code] = self._prime_path(code, suffix, extend=True)
+                        waiting.add(code)
+                    else:
+                        self._trace_tick('PRIME_SUFFIX_DEFERRED', first, reason='OBSERVATION_SUFFIX_NOT_CONTINUOUS',
+                                         accepted_tick_id=event['native_tick_id'])
+                if code in waiting and self._register_prime_quote(event, manage_owned=manage_owned):
+                    waiting.remove(code)
+            # Registration and protection for the other contracts take time.
+            # A quote may need another distinct Tick before leaving catch-up.
+            reference_utc = utc(self.port.clock.now())
+            closed = {code for code in rebuilt
+                      if self.driver.calendar.query(code, reference_utc)['is_trading'] is False}
+            if trace is not None and closed - resting:
+                for code in rebuilt:
+                    if code in closed and code not in resting:
+                        self._trace_tick('PRIME_CONTRACT_RESTING', rebuilt[code], reference_utc=reference_utc,
+                                         reason='QUOTE_OUTSIDE_CURRENT_SESSION')
+            resting = closed
+            waiting.difference_update(resting)
+            for code, event in rebuilt.items():
+                if code in waiting or code in resting:
+                    continue
+                if not self._prime_quote_current(event):
+                    waiting.add(code)
+                    continue
+                cached = self.driver._quotes.get(code)
+                age_ns = self.driver.quote_age_ns(cached['received_ns']) if cached is not None else None
+                if age_ns is None or age_ns > self.kernel.max_quote_age_ms * 1_000_000:
+                    self._trace_tick('PRIME_QUOTE_REJECTED', event, reason='REGISTERED_QUOTE_NOT_FRESH',
+                                     cache_age_ns=age_ns, age_limit_ms=self.kernel.max_quote_age_ms)
+                    waiting.add(code)
         self._primed=True
         self.driver.clock_rebuild_pending = False
         self._comparison('poll')
         self.status('DSV_PRIMED_DISARMED',strategy=self.driver.strategy.status())
+        if trace is not None:
+            trace.record('PRIME_FINISHED',
+                         ready_contracts=[code for code in rebuilt if code not in waiting and code not in resting],
+                         waiting_contracts=[code for code in rebuilt if code in waiting],
+                         resting_contracts=[code for code in rebuilt if code in resting],
+                         unreconstructed_contracts=[code for code in self.grant.value['contracts'] if code not in rebuilt])
+            trace.flush(phase=self.phase, force=True)
+
+    def _prime_quote_current(self, event):
+        now = self.port.clock.now()
+        age = (now - datetime.fromisoformat(event['source_time_utc'])).total_seconds()
+        age_limit_ms = self.kernel.max_quote_age_ms
+        at = self.driver.calendar.query(event['contract_id'], utc(now))
+        current = (event['source_epoch'] == self.port.source_epoch and 0 <= age <= age_limit_ms / 1000
+                   and at['is_trading'] and at['session']['session_id'] == event['session_id'])
+        if not current:
+            self._trace_tick('PRIME_QUOTE_REJECTED', event, reason='CATCH_UP_QUOTE_NOT_CURRENT',
+                             source_age_seconds=str(age), age_limit_ms=age_limit_ms,
+                             reference_utc=utc(now), current_epoch=self.port.source_epoch,
+                             active=at['is_trading'], current_session=(at['session'] or {}).get('session_id'))
+        return current
+
+    def _register_prime_quote(self, event, *, manage_owned):
+        if not self._prime_quote_current(event):
+            return False
+        account, instrument = self.feed.facts(event, self.kernel)
+        try:
+            future = self.driver.on_market(event, account, instrument, _allow_entry=False)
+        except ExpiredMarketQuote:
+            self._trace_scheduler_expiry(event)
+            return False
+        self.kernel.wait_idle()
+        future.result()
+        self._trace_tick('ACCEPTED_TICK', event, origin='PRIME')
+        if manage_owned:
+            code = event['contract_id']
+            for cycle in tuple(self.kernel._staged.values()):
+                if (cycle['plan']['contract_id'] != code or cycle['lifecycle'] == 'CLOSED'
+                        or not self.owner.exit_day_ready(cycle, event['trading_day'])):
+                    continue
+                tick = self.driver.execution_event(cycle, event, instrument)
+                future = self.kernel.execution.tick(cycle['position_cycle_id'], tick,
+                                                    _market_received_ns=self.driver.received_for(code))
+                self.kernel.wait_idle()
+                future.result()
+        return True
 
     def _prime_path(self,code,events,*,extend=False,preserve_authority=False):
         started = time.monotonic_ns()
         epoch = events[0]['source_epoch']
+        completed = False
 
         def progress():
             self._pump_rebuild_responsibilities()
@@ -423,9 +521,13 @@ class DsvSimulationSession(SimulationSession):
             self.kernel.wait_idle();future.result()
             self.feed.resume_anchors.pop(anchor_key,None)
             self.feed.accept(events[-1])
+            completed = True
             return events[-1]
         finally:
-            self._path_rebuild_ns += time.monotonic_ns() - started
+            elapsed_ns = time.monotonic_ns() - started
+            self._path_rebuild_ns += elapsed_ns
+            self._trace_tick('REPLAY_PATH', events[-1], elapsed_ns=elapsed_ns, tick_count=len(events),
+                             first_tick_id=events[0].get('native_tick_id'), extend=extend, completed=completed)
 
     def _pump_rebuild_responsibilities(self):
         """Let the original owner process native facts while rebuilding observations."""
@@ -541,8 +643,22 @@ class DsvSimulationSession(SimulationSession):
         return {'reason_code': 'ENTRY_RESUME_ACCOUNT_SYNC'}
 
     def _quote_expired(self,event):
-        age=(self.port.clock.now()-datetime.fromisoformat(event['source_time_utc'])).total_seconds()
-        return age>self.kernel.max_quote_age_ms/1000
+        now = self.port.clock.now()
+        age = (now - datetime.fromisoformat(event['source_time_utc'])).total_seconds()
+        expired = age > self.kernel.max_quote_age_ms / 1000
+        if expired:
+            self._trace_tick('TICK_REJECTED', event, reason='BACKLOG_AGE_LIMIT',
+                             source_age_seconds=str(age), age_limit_ms=self.kernel.max_quote_age_ms,
+                             reference_utc=utc(now))
+        return expired
+
+    def _trace_scheduler_expiry(self, event):
+        if self._quote_trace is not None:
+            sample = self.driver._sample
+            age = (sample.utc - datetime.fromisoformat(event['source_time_utc'])).total_seconds()
+            self._trace_tick('TICK_REJECTED', event, reason='SCHEDULER_AGE_LIMIT',
+                             source_age_seconds=str(age), age_limit_ms=self.kernel.max_quote_age_ms,
+                             reference_utc=sample.now_utc)
 
     def _update_monitor(self):
         from online_trader.kernel.workbench import monitor_symbols
@@ -799,9 +915,11 @@ class DsvSimulationSession(SimulationSession):
                     entry_recovery = self._try_resume_entries(event, account) if live else None
                     try:future=self.driver.on_market(event,account,instrument,_allow_entry=live,_entry_recovery=entry_recovery)
                     except ExpiredMarketQuote:
+                        self._trace_scheduler_expiry(event)
                         late.append(event)
                         continue
                     k.wait_idle();self.last_decisions[code]=future.result();self.feed.accept(event)
+                    self._trace_tick('ACCEPTED_TICK', event, origin='LIVE' if live else 'BACKLOG')
                     strategy_end = time.monotonic_ns()
                     timings['策略处理'] = timings.get('策略处理', 0) + strategy_end - strategy_start
                     if self.monitor.diagnostic:
@@ -887,6 +1005,16 @@ class DsvSimulationSession(SimulationSession):
                 self._operation_log('poll')
                 self._comparison('poll')
             finally:
+                if self._quote_trace is not None:
+                    elapsed_ns = time.monotonic_ns() - loop_start
+                    if elapsed_ns >= 100_000_000:
+                        self._quote_trace.record('OWNER_LOOP_SLOW', elapsed_ns=elapsed_ns,
+                                                 phase=self.phase, timings_ns=timings)
+                    self._quote_trace.flush(phase=self.phase, timings=timings)
+                    if self._quote_trace.write_failed:
+                        k._dsv_diagnostics['quote_trace'] = 'E_QUOTE_TRACE_WRITE'
+                    else:
+                        k._dsv_diagnostics.pop('quote_trace', None)
                 if isinstance(clock, LocalWallClock):
                     clock.end_turn()
 

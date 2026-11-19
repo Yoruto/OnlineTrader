@@ -53,6 +53,27 @@ def prepare_strategy_stop(control,binding):
     if not getattr(owner,'strategy_enabled',False) or runtime is None:
         raise TraderError('E_SCOPE','Current owner has no active DSV profile')
 
+    if binding['body']['parameters'].get('recover_flat'):
+        from online_trader.runtime.dsv_simulation import verify_closed_snapshot
+
+        snapshot = owner.port.snapshot()
+        if (getattr(owner.grant, 'manual_workbench', False)
+                or k._armed or owner.port.fault or not snapshot['complete'] or snapshot['positions']
+                or any(order['status'] == 'ALIVE' or (order['quantity'] > 0 and order['status'] != 'FINISHED')
+                       for order in snapshot['orders'])
+                or k._pending or control.stop_cancel_pending()
+                or any(cycle.get('statistics_review_required') for cycle in k._staged.values())):
+            raise TraderError('E_FACT_BARRIER', '恢复要求原执行器已停开、柜台空仓无单且账本已核对。')
+        owner._validate_snapshot(snapshot)
+        verify_closed_snapshot(k, snapshot)
+        control.entry_stop_generation += 1
+        k.contexts.revoke_all(reason='WORKBENCH_RECOVERY_STOP')
+        k._authority_revision += 1
+        binding['metadata']['strategy_stop_grant_id'] = owner.grant.value['grant_id']
+        binding.update(initial_status='SUCCEEDED', reason='空仓恢复退出已受理，等待原执行器退出回执。')
+        control._stage([], 'TX_AUTH', 'DSV_RECOVERY_STOP_REQUESTED')
+        return
+
     k._armed=False;k.contexts.revoke_all();k._authority_revision+=1
     binding['metadata']['strategy_stop_grant_id'] = owner.grant.value['grant_id']
     cancel=runtime.profile.to_settings()['trade']['cancel_on_stop']

@@ -133,6 +133,8 @@ def workbench_view(kernel, *, snapshot=None):
     if snapshot is None:
         snapshot = kernel._make_snapshot()
     port=kernel.port
+    quote_trace = getattr(kernel, '_dsv_quote_trace', None)
+    cache_trace = {} if quote_trace is not None else None
     records=projection_batch(snapshot, include_orders=False)['records'];scheduler=getattr(kernel,'_scheduled_runtime',None)
     runtime=getattr(kernel,'_dsv_runtime',None)
     markets=[];decisions={}
@@ -168,11 +170,17 @@ def workbench_view(kernel, *, snapshot=None):
     for code,(row,from_scheduler) in sorted(latest.items()):
         event=row['event'];name=event['contract_id']
         symbol=symbols.get(name,{})
-        received=row.get('received_ns');fresh=received is not None and kernel._quote_age_ns(received)<=kernel.max_quote_age_ms*1000000
+        received = row.get('received_ns')
+        cache_age_ns = None if received is None else kernel._quote_age_ns(received)
+        fresh = cache_age_ns is not None and cache_age_ns <= kernel.max_quote_age_ms * 1_000_000
         if from_scheduler:
             fresh=fresh and scheduler.scope_current(code,event['trading_day'],event['session_id'])
             if scoped:
                 fresh=fresh and day is not None and not port.fault and event['source_epoch']==port.source_epoch
+        if cache_trace is not None:
+            cache_trace[code] = {'native_tick_id': event.get('native_tick_id'), 'source_epoch': event['source_epoch'],
+                                 'cache_age_ns': str(cache_age_ns) if cache_age_ns is not None else None,
+                                 'cache_origin': 'SCHEDULER' if from_scheduler else 'STRATEGY'}
         quote_details={}
         quote=getattr(port,'quotes',{}).get(name)
         if fresh and quote is not None:
@@ -236,6 +244,8 @@ def workbench_view(kernel, *, snapshot=None):
                        else delta_ns(scheduler._sample.utc, source))
                 source_session = scheduler.calendar.query(code, utc_text(source))['session']
             row['market_session_active'] = at['is_trading']
+            if at['complete'] and not at['is_trading']:
+                row['fresh'] = False
             row['source_time_raw'] = raw if isinstance(raw, str) and raw else stamp
             row['source_age_raw_ns'] = None if age is None else str(age)
             row['quote_time_reason'] = (
@@ -245,6 +255,18 @@ def workbench_view(kernel, *, snapshot=None):
                 'QUOTE_SESSION_MISMATCH' if source_session != at['session'] else
                 'QUOTE_LEADS_LOCAL_UTC' if age < 0 else
                 None if row['fresh'] else 'QUOTE_STALE')
+    if quote_trace is not None:
+        for row in markets:
+            code = row['contract_id']
+            projection = {key: row.get(key) for key in ('fresh', 'session_id', 'market_session_active',
+                          'source_time_utc', 'source_time_raw', 'source_age_raw_ns', 'quote_time_reason')}
+            cache = cache_trace.get(code, {})
+            quote_trace.record('WORKBENCH_QUOTE', contract_id=code,
+                               state=(day, cache.get('source_epoch'), cache.get('native_tick_id'),
+                                      projection['source_time_raw'], projection['fresh'],
+                                      projection['market_session_active'], projection['quote_time_reason']),
+                               trading_day=row['trading_day'], cache_limit_ms=kernel.max_quote_age_ms,
+                               **projection, **cache)
     day_stops={}
     for cycle in snapshot['cycles']:
         plan=cycle['plan'];protection=cycle['protection']

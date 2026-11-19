@@ -3,6 +3,19 @@
 Independent Windows product. G0 source specifications are recorded in docs/spec-source.json.
 Preserve existing work; do not import V7, vnpy, DSV, their credentials, databases or environments.
 
+## 所有软件制品必须随包交付配置
+
+- OnlineTrader 每次出包都必须带齐本次交付所需的配置。安装器、便携包、更新 ZIP、客户专用包和测试包均适用。打包前确认目标设备或接收方使用的配置来源和文件清单。需要预配账户和交易参数时，必须随包带入已确认的 `OnlineTrader-defaults.json` 和 `OnlineTrader-parameters.json`，以及该包所需的启动和更新配置。
+- 禁止将缺少交付配置的通用包、空配置包或占位配置包作为制品交付。客户包使用为该客户或设备确认的配置。测试包使用能完成指定场景的隔离测试配置。配置缺失、归属不明，或分发渠道无法承载经授权的配置时，停止出包或发布并说明原因。含账户口令的制品只通过获准的私有渠道交付。
+- 正式交付的安装器、便携包和更新 ZIP 禁止随包配置白银。检查品种列表、交易参数、默认策略和自动加载的预设，排除白银主连及上期所全部 `ag` 合约月。发现任何白银配置项时停止交付。
+- 交付前检查最终制品本身。对 ZIP 检查实际归档内容，对安装器在隔离目录安装验证，核对配置文件的路径、有效内容及其与已确认输入的一致性。使用用户实际启动入口验证配置可读取。交付记录写明版本、制品 SHA-256 和配置验证结果，省略口令等秘密。任一检查缺失或失败，该制品不能交付。
+
+## 完整制品与关键流程评审
+
+- 便携版以包含 EXE、`_internal`、必需脚本和配置的完整 ZIP 为交付单元。交付链接指向已验收的 ZIP 或安装器。承诺单文件交付时，独立测试只复制该文件到干净的目标环境，按用户实际方式验证。构建和验收记录均关联最终制品 SHA-256。发现缺依赖或配置时停止交付，替换件须复跑原接收场景。
+- 改动执行入口、订单与账本、时钟与行情判定、换机恢复或安装更新等跨模块行为时，先定位实际入口的第一处差异。实现前在现有设计中评审流程图、时序图、状态归属、兼容与回退及异常验收条件。
+- 开发时加入关联得到的诊断证据。关键行情拒绝须能追出实际失败的年龄、时段或盘口条件及其输入依据。订单链路须能区分触发、发送前中止、实际发送、回执、成交与保护。独立验收用代表性故障验证日志能还原原因。
+
 For DSV parity, start with the [current refactor index](docs/refactor/dsv-parity-20261114/README.md)
 and [the connected strategy and SDK replay](docs/refactor/dsv-parity-20261114/15-strategy-sdk-schedule.md).
 Verify the frozen archive and run the original code in isolated QA when it can be reused.
@@ -28,8 +41,7 @@ fact/ownership requirement. QA input injection must never become an online input
 For slow partial fills, honor the approved behavior in
 [the decision register](docs/refactor/dsv-parity-20261114/00-evidence-and-decisions.md#用户批准的行为差异).
 In the fixed sample, keep the 5-lot opening target when 3 lots are proved, then hold the
-5 proved lots after the remaining 2 fill. Include the fixed round 7 and 9 replay when changing
-affected behavior. This approval does not approve unrelated month-stop or restart deviations.
+5 proved lots after the remaining 2 fill. When testing an affected change within an authorized scope, include the fixed round 7 and 9 replay. This approval does not approve unrelated month-stop or restart deviations.
 
 Current implementation and evidence are indexed in [README](README.md) and the
 [96-item checklist](docs/功能实现与待办清单_20261110.md). The product has separate
@@ -50,7 +62,10 @@ and orders are quantity-consistent terminal facts. It appends statement fees and
 in one original-writer transaction, never imports or rewrites trade prices, quantities or protection,
 and leaves entry authority DISARMED. A CSV/export/preview alone is not a registration instruction.
 
-Tests and QA are outside the production wheel. For a full source regression on Windows, run
+Tests and QA are outside the production wheel. After routine changes, run compilation only.
+Do not add, adjust, or run tests without an explicit request for testing or packaging.
+Before authorized packaging, independently run global product tests, then independently
+verify the final artifact after building. When full source regression is in scope, run
 `.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v` with `PYTHONPATH=src`.
 Use `.venv\Scripts\python.exe -X utf8 -m compileall -q src tests qa` for source compilation.
 Follow the global independent-testing instructions for delivery acceptance and use the actual

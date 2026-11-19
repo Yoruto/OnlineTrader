@@ -32,6 +32,15 @@ START_ERRORS = {
 }
 
 
+def launch_desktop_request(store, request):
+    from online_trader.runtime.startup_environment import launch_bootstrap
+
+    directory = store.directory / 'desktop-starts' / request['request_id']
+    request_path = publish_new_bytes(canonical_bytes(request), directory / 'request.json')
+    output = directory / 'run'
+    return {'run_directory': str(output), 'launch': launch_bootstrap(request_path, output)}
+
+
 class _StartWorker(QThread):
     started_run = Signal(object)
     failed = Signal(object)
@@ -44,7 +53,6 @@ class _StartWorker(QThread):
     def run(self):
         try:
             from online_trader.runtime.desktop_bootstrap import _original_scope, build_start_request
-            from online_trader.runtime.startup_environment import launch_bootstrap
             from online_trader.scheduling.holdover import ProtectionClockAnchor
             from online_trader.scheduling.reference import CalibratedClock
 
@@ -70,11 +78,7 @@ class _StartWorker(QThread):
                                           now=instant, timed_trigger=self.timed_trigger)
             if recovering:
                 request['recover_original'] = True
-            directory = self.store.directory / 'desktop-starts' / request['request_id']
-            request_path = publish_new_bytes(canonical_bytes(request), directory / 'request.json')
-            output = directory / 'run'
-            result = launch_bootstrap(request_path, output)
-            self.started_run.emit({'run_directory': str(output), 'launch': result})
+            self.started_run.emit(launch_desktop_request(self.store, request))
         except (TraderError, OSError, ValueError) as error:
             self.failed.emit({'code': getattr(error, 'code', 'E_DEPENDENCY'), 'exception': exception_record(error)})
         except Exception as error:

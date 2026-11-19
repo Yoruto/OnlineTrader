@@ -234,7 +234,8 @@ class ControlProtocol:
             if any(expected[key] != current[key] for key in keys):
                 raise TraderError("E_REVISION_CONFLICT", "Relevant state changed")
             if operation in {"PAUSE_NEW_ENTRIES", "STOP_DSV_STRATEGY", "ENTER_MAINTENANCE",
-                             "FLATTEN_THEN_STOP", "BEGIN_TAKEOVER"} and scope["scope_type"] == "ACCOUNT":
+                             "FLATTEN_THEN_STOP", "BEGIN_TAKEOVER"} and scope["scope_type"] == "ACCOUNT" and not (
+                                 operation == "STOP_DSV_STRATEGY" and body["parameters"].get("recover_flat")):
                 self.entry_stop_generation += 1
             self._dispatch(binding)
             if not binding.get("bound"):

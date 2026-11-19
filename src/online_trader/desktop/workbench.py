@@ -37,8 +37,10 @@ class _WorkbenchRequest(QThread):
         self.account_key=account_key;self.boot=boot
         self.publication_after_ns = publication_after_ns
         self.direct_refresh = direct_refresh
+        self._arm_receipt_from_lookup = False
     def run(self):
         client=None
+        previous_receipt = None
         try:
             if self.action == 'refresh' and self.factory is StatusClient and not self.direct_refresh:
                 value = read_workbench_publication(self.pipe, self.account_key)
@@ -65,11 +67,55 @@ class _WorkbenchRequest(QThread):
                 value = {'monitor': client.workbench_monitor(), 'metadata': client.last_metadata}
             elif self.action=='close_positions':
                 value = client.workbench_positions(self.args[1])
-            else:value=client.command(*self.args)
-            if not self.isInterruptionRequested():self.result.emit({'action':self.action,'value':value})
+            elif self.action == 'recover':
+                from online_trader.desktop.recovery import recover_workbench
+                value = recover_workbench(client, *self.args, self.isInterruptionRequested)
+            else:
+                if self.args[0] != 'ARM_ENTRIES':
+                    value = client.command(*self.args)
+                else:
+                    value = self._submit_arm(client)
+                if (self.args[0] == 'ARM_ENTRIES' and value['status'] == 'REJECTED'
+                        and value['error_code'] == 'E_CONTEXT_EXPIRED' and not self._arm_receipt_from_lookup
+                        and not self.isInterruptionRequested()):
+                    try:
+                        view = client.workbench()
+                    except TraderError:
+                        view = None
+                    if view is not None and self._can_reissue_arm(view) and not self.isInterruptionRequested():
+                        previous_receipt = value
+                        client.last_command = None
+                        value = self._submit_arm(client)
+            if not self.isInterruptionRequested():
+                self.result.emit({'action':self.action,'value':value,'previous_receipt':previous_receipt})
         except Exception as error:
             if not self.isInterruptionRequested():self.failed.emit({'code':getattr(error,'code','E_INTERNAL'),
-                'identity':None if client is None else client.last_command})
+                'identity':None if client is None else client.last_command,
+                'reason':str(error) if isinstance(error, TraderError) else None,
+                'previous_receipt':previous_receipt})
+
+    def _submit_arm(self, client):
+        try:
+            return client.command(*self.args)
+        except TraderError as error:
+            if error.code not in CONNECTION_ERRORS or client.last_command is None or self.isInterruptionRequested():
+                raise
+            receipt = client.command_status(client.last_command)
+            # A timeout only permits reading the original receipt.
+            self._arm_receipt_from_lookup = True
+            return receipt
+
+    def _can_reissue_arm(self, view):
+        parameters = self.args[2]
+        config, connection = view['configuration'], view['connection']
+        return (self.account_key == view['account_key'] and self.boot == view['kernel_boot_id']
+                and view['entry_authority'] == 'DISARMED' and not view['truncated']
+                and config['rule_set_id'] == parameters['rule_set_id']
+                and config['config_revision'] == parameters['config_revision']
+                and {'policy_kind': 'AUTHORITY', 'policy_id': parameters['authority_policy_id']} in view['policies']
+                and not config.get('strategy_stop_requested') and not config.get('stop_cancel_pending')
+                and connection['broker_connected'] and connection['synchronized']
+                and not any(connection[key] for key in ('fault', 'recovery_required', 'storage_failed', 'clock_fault')))
 
 
 TABLES={
@@ -127,6 +173,7 @@ class WorkbenchWindow(StatusWindow):
         self.snapshot_published_ns = None
         self._publication_after_ns = 0
         self.connection_recovery_source = None
+        self._recovery_launch = None
         self._connection_interrupted_ns = 0
         self._connection_retry_deadline_ns = 0
         self._connection_retry_pending = False
@@ -290,11 +337,52 @@ class WorkbenchWindow(StatusWindow):
         direct_refresh = action == 'refresh' and self._connection_retry_pending
         if direct_refresh:
             self._connection_retry_pending = False
-        worker=_WorkbenchRequest(self.pipe_name,self._factory,action,args,account,None if action=='refresh' else self._boot,
+        boot = args[2][1] if action == 'recover' else None if action == 'refresh' else self._boot
+        worker=_WorkbenchRequest(self.pipe_name,self._factory,action,args,account,boot,
                                  publication_after_ns=self._publication_after_ns,direct_refresh=direct_refresh)
         self._worker=worker;worker.result.connect(self._job_result);worker.failed.connect(self._job_failed);worker.finished.connect(self._finished);worker.start()
 
     def refresh(self):self._start_job('refresh')
+
+    def force_recover_workbench(self):
+        if self.paired_launcher is not None or self.store is None or self.selected_account is None:
+            self._recovery_feedback('请选择普通工作台的模拟账号。')
+            return
+        if self._closing or self._startup_in_progress or self._worker is not None or self._deferred_request is not None:
+            self._recovery_feedback('当前请求仍在处理，请等到回执后再恢复。')
+            return
+        if self.home_issue and self.receipt_identity is not None:
+            self._recovery_feedback('存在结果待核对的命令，请先查询上次回执。')
+            return
+        if self.view is not None:
+            config = self.view['configuration']
+            identity = (self.view['account_key'], self._boot, config['rule_set_id'], config['config_revision'])
+            run = self.dashboard.latest_run()
+        elif self._finished_run is not None:
+            account, boot, run = self._finished_run
+            identity = (account, boot, None, None)
+        else:
+            self._connection_retry_pending = True
+            self.refresh()
+            self._recovery_feedback('正在直连查询原执行器，请在取得运行状态后再恢复。')
+            return
+        if run is None:
+            self._recovery_feedback('找不到原执行器的运行记录，请在日志与诊断核对。')
+            return
+        self.cancel_timed_start()
+        self._recovery_feedback('正在直查原执行器，核对空仓、委托和账本。')
+        self._start_job('recover', (self.store, self.selected_account['account_id'], identity, run))
+
+    def _recovery_feedback(self, message):
+        self.dashboard.recovery_status.setText(message)
+        self.dashboard.add_activity('强制恢复工作台 · ' + message)
+
+    def _recovery_sync_timeout(self, launch):
+        if self._recovery_launch == launch and not self._closing:
+            self._recovery_launch = None
+            self._startup_in_progress = False
+            self._recovery_feedback('恢复进程启动后尚未取得新执行器的同步回执，请查看运行日志。')
+            self._enable_commands(False)
 
     def _observe_connection_recovery(self, source):
         if source is None:
@@ -494,6 +582,15 @@ class WorkbenchWindow(StatusWindow):
             self.snapshot_published_ns = value.get('published_ns')
             self._stale = self.published_snapshot_expired()
             connection = self.view['connection']
+            launch = self._recovery_launch
+            if (launch is not None and self._boot != launch[0] and self.view['account_key'] == launch[1]
+                    and not self._stale and not self.view['truncated']
+                    and connection['broker_connected'] and connection['synchronized']):
+                self._recovery_launch = None
+                self._startup_in_progress = False
+                state = ('开仓保持停用。' if self.view['entry_authority'] == 'DISARMED'
+                         else '新执行器已同步，但开仓权限已被其他操作修改。')
+                self._recovery_feedback('新执行器柜台同步已完成。' + state)
             if self._stale or self.view['truncated']:
                 if self.connection_recovery_source is not None:
                     self._observe_connection_recovery('owner')
@@ -509,7 +606,19 @@ class WorkbenchWindow(StatusWindow):
             self._restore_selection(selected)
         elif result['action'] == 'close_positions':
             self._close_positions_result = (self._worker.args, result['value'])
+        elif result['action'] == 'recover':
+            self._stale = True
+            self._connection_retry_pending = True
+            self._publication_after_ns = time.monotonic_ns()
+            _, _, identity, _ = self._worker.args
+            self._recovery_launch = (identity[1], identity[0], result['value']['launch']['pid'])
+            self._startup_in_progress = True
+            launch = self._recovery_launch
+            QTimer.singleShot(30_000, lambda: self._recovery_sync_timeout(launch))
+            self._recovery_feedback('恢复进程已启动，正在等待柜台同步。开仓保持停用。')
         else:
+            if result.get('previous_receipt') is not None:
+                self._show_receipt(result['previous_receipt'])
             receipt=result['value'];self.receipt_identity={k:receipt[k] for k in ('command_id','payload_hash')}
             self._publication_after_ns = time.monotonic_ns()
             self._stale=True
@@ -542,6 +651,15 @@ class WorkbenchWindow(StatusWindow):
                     if name in {'cycles','external_positions'}:break
 
     def _job_failed(self,error):
+        if error.get('previous_receipt') is not None:
+            self._show_receipt(error['previous_receipt'])
+        if self._worker is not None and self._worker.action == 'recover':
+            if error['identity'] is not None:
+                self.receipt_identity = error['identity']
+                self.home_issue = '恢复退出命令结果待核对，请查询原回执'
+            self._recovery_feedback(f"{error.get('reason') or '恢复未完成，请核对运行日志。'} · {error['code']}")
+            self._connection_retry_pending = True
+            return
         if self._worker is not None and self._worker.action == 'close_positions':
             message = f"未能从执行器查询可平持仓 · {error['code']}"
             self.notice_label.setText(message)

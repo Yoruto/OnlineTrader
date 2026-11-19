@@ -253,7 +253,7 @@ class Kernel:
             except BaseException as exc:
                 self._armed = False
                 self._failed = True
-                self.contexts.revoke_all()
+                self.contexts.revoke_all(reason='STORAGE_COMMIT_FAILED')
                 self._entry_gates.clear()
                 self._errors.append(getattr(exc, "code", "E_STORAGE"))
                 self._errors=self._errors[-64:]
@@ -1012,7 +1012,7 @@ class Kernel:
         self._armed=False
         self.recovery_required=True
         self._recovery_pending.update(cid for cid,c in self._staged.items() if c['lifecycle']!='CLOSED')
-        self.contexts.revoke_all()
+        self.contexts.revoke_all(reason=event_type)
         self._state_revision+=1
         self._authority_revision+=1
         authority=self._authority()
@@ -1146,7 +1146,7 @@ class Kernel:
             return
         self._check_owner()
         self._armed=False
-        self.contexts.revoke_all()
+        self.contexts.revoke_all(reason='EXECUTOR_CLOSED')
         try:
             try:self.wait_idle()
             finally:self.ledger.close()
