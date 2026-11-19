@@ -2,6 +2,16 @@
 
 [DSV 行为基准](docs/dsv-behavior-baseline-20261113.md) · [重构计划与阶段记录](docs/refactor/dsv-parity-20261114/README.md) · [当前功能状态及开放问题](docs/功能实现与待办清单_20261110.md) · [验收证据索引](docs/validation/README.md)
 
+## Trading Runtime 独立运行入口
+
+2026-11-19 已将普通模拟执行链封装为可脱离 Qt 启动的 **Trading Runtime**。运行时继续由原 `Kernel`、原策略规则和原每账户 SQLite 账本负责登录、行情、策略、人工命令、开平仓、保护与恢复；**Trading Workbench** 和本机接口进程只读取版本化投影并提交命令。界面卡死或退出不会释放运行时的持仓和保护责任。
+
+便携运行目录使用相对路径配置，不依赖 Windows 凭据库，也不新增 `runtime.sqlite3`。全新目录首次启动自动建立原执行账本；换机交接携带配置和原账本的一致性副本。人工与策略开仓权限分别持久化，人工禁开可否决策略新增，原平仓和保护路径保持可用。公开 CLI/Python 接口支持状态、账户、行情、命令、回执、跨日历史和交接导出。
+
+[完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [账号数据与原账本查询](docs/account-data-sync-design-20261119.md)
+
+该入口当前只支持已验收的模拟账户范围，不表示 DSV replacement 链已经切换，也不表示真实资金账户或发行制品已验收。当前源码验收状态见[功能清单](docs/功能实现与待办清单_20261110.md)。
+
 ## DSV 替代链开发与验收
 
 2026-11-18 的 dev32 Windows 便携版通过普通交易工作台和 SimNow 测试了棕榈油、塑料、沥青和菜油。前三笔各 1 手的试单完成开平。取消人为手数限制后，棕榈油自动算量并卖开成交 30 手。午休按用户要求暂停，原执行器继续管理这笔持仓。 [制品、四合约结果和重连验收](docs/refactor/dsv-parity-20261114/30-dev32-simnow-and-workbench-reconnect.md)
@@ -52,7 +62,7 @@ $env:PYTHONPATH = 'src'
 
 ## Windows 便携发行目录
 
-便携构建须明确选用 `-DeliveryMode Generic` 或 `-DeliveryMode Configured`。配置版用 `-DeliveryConfigDirectory` 提供默认账号文件，可用 `-Archive` 生成经过校验的 ZIP。
+便携构建须明确选用 `-DeliveryMode Generic` 或 `-DeliveryMode Configured`。同一次构建生成本地可直接启动的便携目录和分发用 ZIP，并输出 ZIP 的 SHA-256。`-Output` 指定便携目录，ZIP 默认生成在同级目录，可用 `-Archive` 指定其他位置。配置版用 `-DeliveryConfigDirectory` 提供已确认的账户和交易参数文件。
 
 安装版的 GitLab 更新入口、制品名称和发布步骤见[Windows 安装版与 GitLab 更新](docs/windows-gitlab-updates.md)。
 

@@ -22,7 +22,7 @@ FINAL = frozenset({"SUCCEEDED", "REJECTED", "FAILED", "SUPERSEDED"})
 OPERATIONS = frozenset({"PAUSE_NEW_ENTRIES", "STOP_DSV_STRATEGY", "ARM_ENTRIES", "FLATTEN_THEN_STOP", "BEGIN_TAKEOVER", "CONFIRM_TAKEOVER",
     "ENTER_MAINTENANCE", "MANUAL_OPEN", "MANUAL_CLOSE", "MANUAL_CLOSE_ALL", "CANCEL_SELECTED", "CANCEL_OWNED", "CANCEL_ACCOUNT_CONFIRMED",
     "REQUEST_RECONCILIATION", "RESUME_ORIGINAL_EXITS", "ADOPT_EXTERNAL_POSITION", "CANCEL_NATIVE_ACCOUNT",
-    "SAVE_DSV_PARAMETERS"})
+    "SAVE_DSV_PARAMETERS", "SET_ENTRY_POLICY"})
 
 
 def _new(prefix): return prefix + "-" + uuid.uuid4().hex
@@ -46,6 +46,7 @@ class ControlProtocol:
         self.preserve_open_orders_revision = None
         self.entry_stop_generation = 0
         self.symbol_entries={};self._symbol_staged={}
+        self.entry_policies = {}
         for row in kernel.ledger.query("SELECT command_id,payload_hash,payload_json,result_json FROM operator_commands"):
             self.states[row["command_id"]] = {"body": strict_loads(row["payload_json"]), "digest": row["payload_hash"], "receipt": strict_loads(row["result_json"]), "metadata": {}}
         for row in kernel.ledger.query("SELECT event_type,payload_json FROM event_journal ORDER BY event_seq"):
@@ -58,9 +59,13 @@ class ControlProtocol:
             if data.get("control_evidence"):
                 item = data["control_evidence"]; self.evidence[item["id"]] = item
             if data.get('symbol_entry_state'):self.symbol_entries.update(data['symbol_entry_state'])
+            if data.get('entry_origin_policy'):
+                record = data['entry_origin_policy']
+                self.entry_policies[record['scope_key']] = record
             if row["event_type"]=="NATIVE_ACCOUNT_CANCEL_RESULTS":
                 self.native_cancel_results[data['command_id']]=data['attempts']
         self._symbol_staged=copy.deepcopy(self.symbol_entries)
+        self._entry_policy_staged = self.entry_policies.copy()
         # A safe window from another boot is never a current stopping decision.
         if self.maintenance and self.maintenance["status"]=="SAFE_TO_STOP":self.poll()
 
@@ -208,7 +213,7 @@ class ControlProtocol:
         if not state or state["digest"] != digest: raise TraderError("E_OWNERSHIP", "Command record is unavailable")
         return state["future"] if "future" in state else _ready(state["receipt"])
 
-    def execute(self, message, peer_id):
+    def execute(self, message, peer_id, *, operator_actor=None):
         self.kernel._writable(); validate_message(message)
         if message["type"] != "OperatorCommand" or message["account_key"] != self.kernel.account_key:
             raise TraderError("E_SCOPE", "Command account is not bound to this endpoint")
@@ -219,6 +224,8 @@ class ControlProtocol:
             return self.get_status(cid, digest)
         binding = {"body": body, "digest": digest, "peer_id": peer_id, "result": Future(), "initial_status": "COMMITTED",
             "expected_boot": message["kernel_boot_id"], "metadata": {"operation": body["operation"], "scope": body["scope"]}}
+        if operator_actor is not None:
+            binding['metadata']['actor'] = {'kind': 'OPERATOR', 'id': identifier(operator_actor)}
         self.states[cid] = {"body": body, "digest": digest, "future": binding["result"], "metadata": binding["metadata"]}
         self.kernel._command_binding = binding
         try:
@@ -230,7 +237,8 @@ class ControlProtocol:
                 kernel_boot_id=self.kernel.boot_id,kernel_epoch=body["kernel_epoch"],revisions=body["expected_revisions"])
             current = self.kernel.revisions
             expected = body["expected_revisions"]
-            keys = ('config_revision', 'authority_revision') if operation == 'SAVE_DSV_PARAMETERS' else current
+            keys = {'SAVE_DSV_PARAMETERS': ('config_revision', 'authority_revision'),
+                    'SET_ENTRY_POLICY': ()}.get(operation, current)
             if any(expected[key] != current[key] for key in keys):
                 raise TraderError("E_REVISION_CONFLICT", "Relevant state changed")
             if operation in {"PAUSE_NEW_ENTRIES", "STOP_DSV_STRATEGY", "ENTER_MAINTENANCE",
@@ -280,8 +288,9 @@ class ControlProtocol:
                    and state.get("receipt", {}).get("status") in {"SUCCEEDED", "EXECUTING", "NEEDS_RECONCILIATION"}
                    for state in self.states.values())
 
-    def can_increase(self, contract_id=None):
+    def can_increase(self, contract_id=None, *, origin=None):
         if contract_id is not None and not self.symbol_entry_enabled(contract_id):return False
+        if origin is not None and not self.entry_origin_allowed(origin, contract_id):return False
         if self.maintenance and self.maintenance["status"] not in {"COMPLETE", "FAILED"}: return False
         if any(c.get("management_state") in {"TAKEOVER_PENDING","TAKEN_OVER"} and (contract_id is None or c["plan"]["contract_id"] == contract_id) for c in self.kernel._staged.values()): return False
         if any(s["metadata"].get("operation") == "ENTER_MAINTENANCE" and s.get("receipt",{}).get("status") not in FINAL for s in self.states.values()): return False
@@ -291,6 +300,54 @@ class ControlProtocol:
     def symbol_entry_enabled(self,contract_id,*,committed=False):
         current=self.symbol_entries.get(contract_id,{}).get('enabled',True)
         return current if committed else current and self._symbol_staged.get(contract_id,{}).get('enabled',True)
+
+    def entry_origin_allowed(self, origin, contract_id):
+        keys = (origin + ':ACCOUNT', origin + ':' + contract_id) if contract_id else (origin + ':ACCOUNT',)
+        return all(self.entry_policies.get(key, {}).get('enabled', True)
+                   and self._entry_policy_staged.get(key, {}).get('enabled', True) for key in keys)
+
+    def _set_entry_policy(self, binding):
+        k = self.kernel
+        actor = binding['metadata'].get('actor')
+        if actor is None or not getattr(k.simulation, 'strategy_enabled', False):
+            raise TraderError('E_AUTH', 'The standalone operator capability is required to change entry policy')
+        body = binding['body']
+        scope, params = body['scope'], body['parameters']
+        if scope['scope_type'] == 'ACCOUNT' and not scope['scope_ids']:
+            contract = None
+        elif (scope['scope_type'] == 'CONTRACT' and len(scope['scope_ids']) == 1
+              and scope['scope_ids'][0] in k.simulation.grant.value['contracts']):
+            contract = scope['scope_ids'][0]
+        else:
+            raise TraderError('E_SCOPE', 'Choose the account or one contract in the current simulation scope')
+        origin = params['origin']
+        scope_key = origin + ':' + (contract or 'ACCOUNT')
+        previous = self._entry_policy_staged.get(scope_key, {'revision': '0', 'enabled': True})
+        if previous['revision'] != params['expected_policy_revision']:
+            raise TraderError('E_REVISION_CONFLICT', 'The human entry policy revision has changed')
+        record = {'scope_key': scope_key, 'contract_id': contract, 'origin': origin,
+                  'enabled': params['enabled'], 'previous_enabled': previous['enabled'],
+                  'revision': str(int(previous['revision']) + 1), 'actor': actor,
+                  'command_id': body['command_id'], 'reason': params['reason']}
+        targets = []
+        if not record['enabled'] and params['cancel_owned_entry_remainders']:
+            targets = [order['child_order_id'] for cycle in k._staged.values()
+                       if cycle.get('entry_origin') == origin and (contract is None or cycle['plan']['contract_id'] == contract)
+                       for order in cycle['orders'] if order['effect'] == 'OPEN' and OrderState.from_dict(order).potential_remaining]
+        self._entry_policy_staged[scope_key] = record
+        binding['metadata'].update(entry_origin_policy=record, order_ids=targets)
+        binding.update(initial_status='EXECUTING' if targets else 'SUCCEEDED',
+                       reason='Human entry policy applied; original exit and native order responsibility retained')
+        k._state_revision += 1
+        authority = k._authority()
+
+        def accepted():
+            self.entry_policies[scope_key] = record
+            for child in targets:
+                k.request_cancel(child)
+
+        k._submit('TX_AUTH', 'ENTRY_ORIGIN_POLICY', {'entry_origin_policy': record, 'authority': authority},
+                  lambda conn, seq: k._write_authority(conn, seq, authority), after=accepted)
 
     def _symbol_entry_command(self,binding):
         k=self.kernel;b=binding['body'];scope=b['scope'];p=b['parameters'];enabled=b['operation']=='ARM_ENTRIES'
@@ -327,6 +384,8 @@ class ControlProtocol:
     def _dispatch(self, binding):
         k = self.kernel; b = binding["body"]; op, p, scope = b["operation"], b["parameters"], b["scope"]
         ids = self._cycles(scope); binding["metadata"]["cycle_ids"] = ids
+        if op == 'SET_ENTRY_POLICY':
+            return self._set_entry_policy(binding)
         if op in {'PAUSE_NEW_ENTRIES','ARM_ENTRIES'} and scope['scope_type']=='CONTRACT':
             return self._symbol_entry_command(binding)
         if op in {"PAUSE_NEW_ENTRIES", "STOP_DSV_STRATEGY", "ARM_ENTRIES", "FLATTEN_THEN_STOP", "MANUAL_CLOSE_ALL", "ENTER_MAINTENANCE", "CANCEL_ACCOUNT_CONFIRMED", "CANCEL_NATIVE_ACCOUNT"} and scope["scope_type"] != "ACCOUNT":
@@ -598,7 +657,7 @@ class ControlProtocol:
                     return "SUCCEEDED","NONE",f"Native terminal order confirmed; filled quantity {sum(o['filled_qty'] for o in selected)}",m["order_ids"]
                 return "SUCCEEDED","NONE","Entry cycle reached a proved order terminal state",m["order_ids"]
             if any(o["send_state"]=="UNKNOWN" for o in selected):return "NEEDS_RECONCILIATION","E_UNKNOWN_SEND","Opening result is unknown; original identity retained",m.get("order_ids",[])
-        elif op in {"CANCEL_SELECTED","CANCEL_OWNED","CANCEL_ACCOUNT_CONFIRMED","PAUSE_NEW_ENTRIES"}:
+        elif op in {"CANCEL_SELECTED","CANCEL_OWNED","CANCEL_ACCOUNT_CONFIRMED","PAUSE_NEW_ENTRIES","SET_ENTRY_POLICY"}:
             selected=[orders[oid] for oid in m.get("order_ids",[]) if oid in orders]
             if selected and all(o["terminal_confirmed"] and o["reported_fill_qty"]==o["filled_qty"] for o in selected):return "SUCCEEDED","NONE","Related orders reached quantity-consistent terminal states",m.get("order_ids",[])
             if any(o["send_state"]=="UNKNOWN" or o["cancel_status"]=="UNKNOWN" or (o["cancel_status"]=="SEND_POSSIBLE" and o["kernel_boot_id"]!=k.boot_id) for o in selected):return "NEEDS_RECONCILIATION","E_UNKNOWN_SEND","Cancellation outcome is unknown; quantity remains reserved",m.get("order_ids",[])

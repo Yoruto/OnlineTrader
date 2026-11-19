@@ -748,10 +748,13 @@ class DsvSimulationSession(SimulationSession):
             except TraderError:
                 reason = '等待柜台终态与逐笔成交核对'
             else:
-                self.owner.capture('ONLINE_DSV_STOP_VERIFIED', {
+                stop_evidence = {
                     'grant_hash':self.grant.content_hash, 'native_snapshot_id':snapshot['snapshot_id'],
                     'trading_day':snapshot['trading_day'], 'source_epoch':snapshot['source_epoch'],
-                    'positions':0, 'active_orders':0})
+                    'positions':0, 'active_orders':0}
+                if not k._legacy_stream:
+                    stop_evidence['final_account_observation'] = snapshot
+                self.owner.capture('ONLINE_DSV_STOP_VERIFIED', stop_evidence)
                 result = {'status':'DSV_STOPPED', 'execution_scope':'ONLINE_SIMULATION',
                           'account_key':k.account_key, 'kernel_boot_id':k.boot_id,
                           'checkpoint_event_seq':str(k._durable_seq), 'grant_hash':self.grant.content_hash,
@@ -1081,15 +1084,16 @@ class DsvSimulationSession(SimulationSession):
 
 
 def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=False,dsv_config=None,dsv_log_dir=None,
-        _execution_lock=None,_reference=None):
+        _execution_lock=None,_reference=None,_existing_ledger=False,_trusted_control_pid=None):
     """Future explicitly scoped connection path. Offline tests never call it."""
     with ClockActivity():
         return _run(scope, credentials, profile_path, calendar_path, output, pipe=pipe, arm=arm,
                     dsv_config=dsv_config, dsv_log_dir=dsv_log_dir, _execution_lock=_execution_lock,
-                    _reference=_reference)
+                    _reference=_reference, _existing_ledger=_existing_ledger, _trusted_control_pid=_trusted_control_pid)
 
 
-def _run(scope,credentials,profile_path,calendar_path,output,*,pipe,arm,dsv_config,dsv_log_dir,_execution_lock,_reference):
+def _run(scope, credentials, profile_path, calendar_path, output, *, pipe, arm, dsv_config, dsv_log_dir,
+         _execution_lock, _reference, _existing_ledger=False, _trusted_control_pid=None):
     grant,profile,calendar=load_inputs(scope,profile_path,calendar_path)
     if grant.replacement:
         raise TraderError('E_ONLINE_SCOPE','A replacement grant requires the replacement SDK startup')
@@ -1128,7 +1132,8 @@ def _run(scope,credentials,profile_path,calendar_path,output,*,pipe,arm,dsv_conf
                 'effective_profile_hash':profile.content_hash,'offset_changes':preparation['offset_changes'],
                 'entry_authority':'DISARMED'}),Path(output)/'auto-offsets-completed.json')
         kernel=Kernel(grant.value['ledger_path'],grant.account_key,port=port,simulation_grant=grant,
-                      risk_budget=grant.value['risk_budget'],max_quote_age_ms=5000,_execution_lock=lease)
+                      risk_budget=grant.value['risk_budget'],max_quote_age_ms=5000,_execution_lock=lease,
+                      _existing_ledger=_existing_ledger, _legacy_stream=_trusted_control_pid is None)
         kernel.simulation.initialize()
         if automatic:
             kernel._auto_source_profile=source_profile
@@ -1148,7 +1153,8 @@ def _run(scope,credentials,profile_path,calendar_path,output,*,pipe,arm,dsv_conf
         if arm and not restoring and reference.entry_ready():session.request_initial_arm()
         if pipe:
             from online_trader.kernel.server import ControlServer
-            ControlServer(kernel,pipe).serve(session.stop,owner_tick=session.step,publish_workbench=True)
+            ControlServer(kernel, pipe, trusted_client_pid=_trusted_control_pid).serve(
+                session.stop, owner_tick=session.step, publish_workbench=True)
         else:
             while not session.stop.is_set():session.step();time.sleep(.01)
         return 0 if session.result and (session.result['status']=='DSV_STOPPED' or final_relogin(kernel,session,credentials)) else 2

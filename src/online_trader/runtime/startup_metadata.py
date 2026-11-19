@@ -45,7 +45,7 @@ def _get(value, key, default=None):
     return value.get(key, default) if hasattr(value, 'get') else getattr(value, key, default)
 
 
-def _sdk_factory(auth, *, deadline):
+def _sdk_factory(auth, *, deadline, account=None):
     try:
         if version('tqsdk') != SDK_VERSION:
             _error('启动需要已核验的行情组件。', 'E_DEPENDENCY')
@@ -53,7 +53,7 @@ def _sdk_factory(auth, *, deadline):
         _error('未找到启动所需行情组件。', 'E_DEPENDENCY')
     from tqsdk import TqApi, TqAuth, TqSim
 
-    class MetadataApi(TqApi):
+    class ReadOnlyApi(TqApi):
         def wait_update(self, deadline=None, **kwargs):
             remaining = self._metadata_deadline - time.monotonic()
             if remaining <= 0:
@@ -62,16 +62,17 @@ def _sdk_factory(auth, *, deadline):
             return super().wait_update(deadline=min(deadline, limit) if deadline is not None else limit, **kwargs)
 
         def insert_order(self, *args, **kwargs):
-            _error('启动资料读取器不能下单。', 'E_READ_ONLY')
+            _error('只读连接不能下单。', 'E_READ_ONLY')
 
         def cancel_order(self, *args, **kwargs):
-            _error('启动资料读取器不能撤单。', 'E_READ_ONLY')
+            _error('只读连接不能撤单。', 'E_READ_ONLY')
 
     # Set the deadline before TqApi's synchronous initialization starts.
-    api = MetadataApi.__new__(MetadataApi)
+    api = ReadOnlyApi.__new__(ReadOnlyApi)
     api._metadata_deadline = deadline
     try:
-        MetadataApi.__init__(api, account=TqSim(), auth=TqAuth(auth['username'], auth['password']),
+        ReadOnlyApi.__init__(api, account=TqSim() if account is None else account,
+                             auth=TqAuth(auth['username'], auth['password']),
                              debug=False, web_gui=False, disable_print=True)
     except BaseException:
         # Some SDK setup failures happen before its own cleanup try/finally.

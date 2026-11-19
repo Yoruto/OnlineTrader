@@ -326,7 +326,11 @@ class ExecutionCoordinator:
                          and ex['elapsed_ms']>cycle['plan']['execution_policy']['entry_confirm_timeout_ms'])
             hold_open = (effect=='OPEN' and not stop_open
                          and k.control.preserve_open_orders_revision==k._authority_revision)
-            can_increase=not stop_open and not timeout and k._armed and not k.recovery_required and k.control.can_increase(cycle['plan']['contract_id'])
+            contract = cycle['plan']['contract_id']
+            origin = cycle.get('entry_origin')
+            origin_allowed = origin is None or k.control.entry_origin_allowed(origin, contract)
+            can_increase = (not stop_open and not timeout and k._armed and not k.recovery_required
+                            and k.control.can_increase(contract))
             priced=self.price(cycle,effect)
             working=[o for o in orders if OrderState.from_dict(o).potential_remaining]
             candidates=working or [orders[-1]]
@@ -335,7 +339,8 @@ class ExecutionCoordinator:
                     continue
                 pending=sum(OrderState.from_dict(o).potential_remaining for o in orders if o['child_order_id']!=order['child_order_id'])
                 manual_limit=(effect=='OPEN' and cycle.get('manual_limit_order')) or (manual and order['child_order_id'] in manual_children)
-                desired_price=order['limit_price'] if manual_limit else priced['price'] if priced['allowed'] else None
+                keep_price = manual_limit or (effect == 'OPEN' and not origin_allowed)
+                desired_price = order['limit_price'] if keep_price else priced['price'] if priced['allowed'] else None
                 action=decide_order_action(order|{'side':self.side(cycle,effect)},desired_price,
                     can_increase=can_increase if effect=='OPEN' else True,remaining_quantity=0 if stop_open else desired,
                     other_pending_quantity=pending,timeout_due=timeout,
@@ -357,7 +362,7 @@ class ExecutionCoordinator:
                     cycle['revision']+=1;ex['last_action']='WAIT_RECONCILIATION';ex['last_reasons']=['CANCEL_TERMINAL_TIMEOUT']
                     k._armed=False;k.contexts.revoke_all();k._recovery_pending.add(cid);k.recovery_required=True
                     k._stage_cycle(cycle,'TX_RECONCILE','EXECUTION_CANCEL_TIMEOUT');return
-                if action['action']=='REPLACE' and (effect!='OPEN' or allow_open):
+                if action['action']=='REPLACE' and (effect!='OPEN' or (allow_open and origin_allowed)):
                     if manual_limit:continue
                     if manual and effect=='REDUCE':continue
                     if order['send_state']=='DEFINITELY_NOT_SENT' and not allow_retry:continue

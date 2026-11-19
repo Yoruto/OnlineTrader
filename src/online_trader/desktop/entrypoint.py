@@ -51,6 +51,7 @@ def main(argv=None):
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--simnow-packet', type=Path)
     source.add_argument('--account-store', type=Path)
+    source.add_argument('--runtime-pipe', help='通过独立接口附着交易运行时')
     parser.add_argument('--dsv-config', type=Path, help='读取原 DSV 已保存的业务参数')
     parser.add_argument('--allow-multi', action='store_true', help='允许打开多个工作台窗口')
     parser.add_argument('--autostart', action='store_true', help='打开工作台并显示守护启动反馈')
@@ -72,6 +73,9 @@ def main(argv=None):
     app = QApplication.instance() or QApplication([])
     app.setApplicationName('OnlineTrader')
     try:
+        if args.runtime_pipe is not None:
+            with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):
+                return run(args.runtime_pipe, runtime_view=True)
         if args.simnow_packet is not None:
             launcher = SessionLauncher.for_simnow(args.simnow_packet)
             with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):

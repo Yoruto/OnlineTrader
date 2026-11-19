@@ -212,7 +212,7 @@ class OnlineDsvSimulation(OnlineSimulation):
             raise TraderError('E_NOT_READY', '完整核对后需等待下一笔实时行情。')
         if (event['source_epoch']!=self.port.source_epoch or
                 k._quote_age_ns(facts['received_ns'])>k.max_quote_age_ms*1_000_000 or
-                runtime._blocked(event,exclude_decision=exclude_decision) or
+                runtime._blocked(event, exclude_decision=exclude_decision, origin='MANUAL') or
                 (facts.get('stop_result') and not facts['stop_result']['allow_new_entries'])):
             raise TraderError('E_NOT_READY','Current session, account and stop gates block manual entry')
         account,instrument=self.manual_native_facts(event,k)

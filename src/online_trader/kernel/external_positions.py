@@ -14,9 +14,9 @@ from online_trader.protection.reducer import ProtectionState, initial_state, red
 from online_trader.strategy.plan import build_simulation_plan
 
 
-def review_positions(owner):
+def review_positions(owner, *, snapshot=None):
     port=owner.port;k=owner.kernel
-    snapshot=port.snapshot()
+    snapshot=port.snapshot() if snapshot is None else snapshot
     if not snapshot['complete']:return snapshot,[]
     owner._validate_snapshot(snapshot)
     rows=[]

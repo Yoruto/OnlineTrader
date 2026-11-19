@@ -433,7 +433,7 @@ class DsvStrategyRuntime:
             return 'LAST_NEAR_PRICE_LIMIT'
         return None
 
-    def _blocked(self,event,*,exclude_decision=None,resuming=False,profile=None):
+    def _blocked(self,event,*,exclude_decision=None,resuming=False,profile=None,origin='STRATEGY'):
         k=self.kernel;reasons=[]
         reasons+=k.statistics.entry_reasons(event['contract_id'],event['trading_day'],profile=profile or self.profile,
             now_utc=event['source_time_utc'])
@@ -443,7 +443,7 @@ class DsvStrategyRuntime:
         if not k._armed and not resuming:reasons.append("ENTRY_AUTHORITY_DISARMED")
         if k.recovery_required:reasons.append("RECONCILIATION_REQUIRED")
         if self.epoch!=k.active_epoch or self.epoch is None:reasons.append("STRATEGY_EPOCH_REVOKED")
-        if not k.control.can_increase(event["contract_id"]):reasons.append("CONTROL_BARRIER")
+        if not k.control.can_increase(event['contract_id'], origin=origin):reasons.append('CONTROL_BARRIER')
         for (contract,day),stops in self._stop_states.items():
             if contract==event["contract_id"] and ((day==event["trading_day"] and not stops["allow_new_entries"])
                     or stops["state"].get("month_stop")==event["trading_day"][:7]):

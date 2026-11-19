@@ -31,6 +31,35 @@ def account_number(value):
         context.prec = 40
         return decimal_text(Decimal(text).quantize(Decimal('0.000000000001'), rounding=ROUND_HALF_EVEN))
 
+
+def broker_account_facts(api, account):
+    """Copy the native sections from one SDK update without inferring ownership."""
+    funds = api.get_account(account=account)
+    positions = [
+        {'contract_id': code, 'long': position.pos_long, 'short': position.pos_short}
+        for code, position in api.get_position(account=account).items()
+        if position.pos_long or position.pos_short
+    ]
+    orders = [
+        {'order_id': order_id, 'contract_id': order.exchange_id + '.' + order.instrument_id,
+         'direction': order.direction, 'offset': order.offset, 'quantity': order.volume_orign,
+         'remaining': order.volume_left, 'status': order.status, 'limit_price': number(order.limit_price)}
+        for order_id, order in api.get_order(account=account).items()
+    ]
+    trades = [
+        {'trade_id': trade_id, 'order_id': trade.order_id, 'contract_id': trade.exchange_id + '.' + trade.instrument_id,
+         'direction': trade.direction, 'offset': trade.offset, 'quantity': trade.volume,
+         'price': number(trade.price), 'source_time_ns': str(trade.trade_date_time)}
+        for trade_id, trade in api.get_trade(account=account).items()
+    ]
+    amounts = ('balance', 'pre_balance', 'available', 'margin', 'frozen_margin', 'close_profit',
+               'position_profit', 'float_profit', 'commission')
+    account_funds = {key: account_number(getattr(funds, key, None)) for key in amounts}
+    # Preserve the broker value until the strategy applies its risk-ratio precision.
+    account_funds['risk_ratio'] = number(getattr(funds, 'risk_ratio', None))
+    return {'funds': account_funds, 'positions': positions, 'orders': orders, 'trades': trades}
+
+
 def credentials(path):
     from online_trader.accounts import StoredCredential,StoredSimNowCredential
     if type(path) is StoredCredential:return path.resolve()
@@ -239,25 +268,10 @@ class TqKqPort(OnlineSimulationPort):
                 'lower_limit':number(q.lower_limit),'upper_limit':number(q.upper_limit),**self.instrument(code)}
 
     def snapshot(self):
-        funds=self.api.get_account(account=self.account)
-        orders=[];trades=[];positions=[]
-        for code,p in self.api.get_position(account=self.account).items():
-            if p.pos_long or p.pos_short:positions.append({'contract_id':code,'long':p.pos_long,'short':p.pos_short})
-        for oid,o in self.api.get_order(account=self.account).items():
-            orders.append({'order_id':oid,'contract_id':o.exchange_id+'.'+o.instrument_id,'direction':o.direction,'offset':o.offset,
-                'quantity':o.volume_orign,'remaining':o.volume_left,'status':o.status,'limit_price':number(o.limit_price)})
-        for tid,t in self.api.get_trade(account=self.account).items():
-            trades.append({'trade_id':tid,'order_id':t.order_id,'contract_id':t.exchange_id+'.'+t.instrument_id,'direction':t.direction,'offset':t.offset,
-                'quantity':t.volume,'price':number(t.price),'source_time_ns':str(t.trade_date_time)})
-        amounts = ('balance', 'pre_balance', 'available', 'margin', 'frozen_margin', 'close_profit',
-                   'position_profit', 'float_profit', 'commission')
-        account_funds = {key: account_number(getattr(funds, key, None)) for key in amounts}
-        # Preserve the broker value until the strategy applies its risk-ratio precision.
-        account_funds['risk_ratio'] = number(getattr(funds, 'risk_ratio', None))
+        facts = broker_account_facts(self.api, self.account)
         return {'snapshot_id':'kq-snapshot-'+uuid.uuid4().hex,'gateway_identity':self.gateway_identity,'source_epoch':self.source_epoch,
             'account_key':self.grant.account_key,'trading_day':self.grant.value['trading_day'],'complete':self.complete(),
-            'funds':account_funds,
-            'positions':positions,'orders':orders,'trades':trades}
+            **facts}
 
     def validate_send(self,request):
         self.check_dispatch_clock(request['effect'])

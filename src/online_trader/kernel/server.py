@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 import queue
 import threading
 import time
@@ -15,6 +16,9 @@ from online_trader.kernel.streams import StreamHub
 from online_trader.kernel.control import OPERATIONS
 from online_trader.transport.named_pipe import PipeListener
 from online_trader.runtime.processes import parent_pid
+
+
+_STANDALONE_PUBLICATION_INTERVAL_NS = 500_000_000
 
 
 def _id():return uuid.uuid4().hex
@@ -49,8 +53,9 @@ class _Peer:
 
 
 class ControlServer:
-    def __init__(self,kernel:Kernel,pipe_name:str):
+    def __init__(self,kernel:Kernel,pipe_name:str, *, trusted_client_pid=None):
         self.kernel=kernel;self.listener=PipeListener(pipe_name)
+        self._trusted_client_pid = trusted_client_pid
         self._inbound=queue.Queue(256);self._stop=threading.Event();self._peers=set();self._workers=[];self._waiting=[]
         self._peers_lock=threading.Lock();self._queue_lock=threading.Lock();self._inbound_bytes=0
         self._registered={}
@@ -69,6 +74,20 @@ class ControlServer:
 
     def _peer_snapshot(self):
         with self._peers_lock:return tuple(self._peers)
+
+    def _publish_workbench(self, publication, *, standalone=False, native_snapshot=None):
+        from online_trader.kernel.workbench import prepare_workbench_publication, workbench_publication
+
+        if standalone:
+            publication.publish(lambda: prepare_workbench_publication(self.kernel, native_snapshot=native_snapshot))
+        else:
+            publication.publish(lambda: workbench_publication(self.kernel))
+        diagnostics = getattr(self.kernel, '_dsv_diagnostics', None)
+        if diagnostics is not None:
+            if publication.status['error_code']:
+                diagnostics['workbench_publication'] = publication.status.copy()
+            else:
+                diagnostics.pop('workbench_publication', None)
 
     def _reply(self,peer,request,kind,body):
         return {"protocol_version":"1.0","type":kind,"message_id":_id(),"connection_id":peer.connection_id,
@@ -111,6 +130,11 @@ class ControlServer:
                 continue
             except OSError:
                 if self._stop.is_set():break
+                continue
+            trusted_pid = self._trusted_client_pid() if callable(self._trusted_client_pid) else self._trusted_client_pid
+            if trusted_pid is not None and (trusted_pid <= 0 or (
+                    connection.peer_pid != trusted_pid and parent_pid(connection.peer_pid) != trusted_pid)):
+                connection.close()
                 continue
             peer=_Peer(connection)
             with self._peers_lock:
@@ -189,7 +213,10 @@ class ControlServer:
             peer.enqueue(self._reply(peer,message,"RequestContext",context))
         elif kind=="OperatorCommand":
             if len(self._waiting)>=256:raise TraderError("E_QUEUE_OVERFLOW","Pending control capacity reached")
-            result=self.kernel.execute_command(message,peer.peer_id)
+            if self._trusted_client_pid is None:
+                result = self.kernel.execute_command(message, peer.peer_id)
+            else:
+                result = self.kernel.execute_command(message, peer.peer_id, operator_actor=peer.instance_id)
             self._waiting.append((peer,message,result))
         elif kind=="GetCommandStatus":
             if len(self._waiting)>=256:raise TraderError("E_QUEUE_OVERFLOW","Pending control capacity reached")
@@ -290,13 +317,24 @@ class ControlServer:
 
     def serve(self,stop_event=None,*,owner_tick=None,publish_workbench=False):
         acceptor=threading.Thread(target=self._acceptor,daemon=True);acceptor.start()
-        publication = None
+        publication = accounts = None
+        standalone = self._trusted_client_pid is not None
+        next_publication_ns = 0
         try:
+            if standalone:
+                from online_trader.runtime.account_publication import AccountPublication
+
+                try:
+                    accounts = AccountPublication(self.listener.name, self.kernel.account_key, self._trusted_client_pid)
+                except (OSError, TraderError) as error:
+                    logging.getLogger(__name__).warning('E_ACCOUNT_SOURCE_BIND: %s', getattr(error, 'code', 'OSError'))
             if publish_workbench:
-                from online_trader.kernel.workbench import workbench_publication
                 from online_trader.transport.workbench_snapshot import WorkbenchPublication
                 try:
-                    publication = WorkbenchPublication(self.listener.name)
+                    if standalone:
+                        publication = WorkbenchPublication(self.listener.name, interval_ns=0, deferred=True)
+                    else:
+                        publication = WorkbenchPublication(self.listener.name)
                 except (OSError, TraderError):
                     # The original control endpoint remains available.
                     pass
@@ -304,15 +342,14 @@ class ControlServer:
                 self.kernel.poll()
                 self._sync_streams()
                 self._service_inbound();self._flush_receipts()
-                if publication is not None:
-                    publication.publish(lambda: workbench_publication(self.kernel))
-                    diagnostics = getattr(self.kernel, '_dsv_diagnostics', None)
-                    if diagnostics is not None:
-                        if publication.status['error_code']:
-                            diagnostics['workbench_publication'] = publication.status.copy()
-                        else:
-                            diagnostics.pop('workbench_publication', None)
+                if publication is not None and not standalone:
+                    self._publish_workbench(publication)
                 if owner_tick is not None:owner_tick()
+                if standalone and time.monotonic_ns() >= next_publication_ns:
+                    native_snapshot = accounts.capture(self.kernel) if accounts is not None else None
+                    if publication is not None:
+                        self._publish_workbench(publication, standalone=True, native_snapshot=native_snapshot)
+                    next_publication_ns = time.monotonic_ns() + _STANDALONE_PUBLICATION_INTERVAL_NS
                 self._sync_streams()
                 self._service_inbound(closing=bool(self._stop.is_set() or (stop_event and stop_event.is_set())))
                 self._flush_receipts()
@@ -330,6 +367,8 @@ class ControlServer:
                 with self._peers_lock:self._workers=[worker for worker in self._workers if worker.is_alive()]
                 self._stop.wait(.01)
         finally:
+            if accounts is not None:
+                accounts.close()
             if publication is not None:
                 publication.close()
             self._drain_outgoing()

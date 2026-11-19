@@ -1045,6 +1045,18 @@
       "not": {"required": ["evidence_hash", "recover_flat"]},
       "additionalProperties": false
     },
+    "Params_SET_ENTRY_POLICY": {
+      "type": "object",
+      "properties": {
+        "origin": {"enum": ["STRATEGY", "MANUAL"]},
+        "enabled": {"type": "boolean"},
+        "expected_policy_revision": {"$ref": "#/$defs/seq"},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 200},
+        "cancel_owned_entry_remainders": {"type": "boolean"}
+      },
+      "required": ["origin", "enabled", "expected_policy_revision", "reason", "cancel_owned_entry_remainders"],
+      "additionalProperties": false
+    },
     "Params_SAVE_DSV_PARAMETERS": {
       "type": "object",
       "properties": {"profile": {"type": "object"}},
@@ -1279,6 +1291,7 @@
           "enum": [
             "PAUSE_NEW_ENTRIES",
             "STOP_DSV_STRATEGY",
+            "SET_ENTRY_POLICY",
             "SAVE_DSV_PARAMETERS",
             "ARM_ENTRIES",
             "FLATTEN_THEN_STOP",
@@ -1333,6 +1346,12 @@
               "properties": {
                 "operation": {"const": "STOP_DSV_STRATEGY"},
                 "parameters": {"$ref": "#/$defs/Params_STOP_DSV_STRATEGY"}
+              }
+            },
+            {
+              "properties": {
+                "operation": {"const": "SET_ENTRY_POLICY"},
+                "parameters": {"$ref": "#/$defs/Params_SET_ENTRY_POLICY"}
               }
             },
             {

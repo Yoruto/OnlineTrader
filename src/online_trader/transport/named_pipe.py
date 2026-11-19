@@ -23,6 +23,7 @@ from online_trader.errors import TraderError
 _WINDOWS = os.name == "nt"
 _INVALID = ctypes.c_void_p(-1).value
 _IO_PENDING = 997
+_NO_DATA = 232
 _PIPE_CONNECTED = 535
 _TIMEOUT = 258
 _MAX_TIMEOUT = 30.0
@@ -312,13 +313,20 @@ class PipeListener:
                 raise _error()
             overlap = _OVERLAPPED(hEvent=event)
             try:
-                success = _k.ConnectNamedPipe(handle, ctypes.byref(overlap))
-                if not success:
+                while not _k.ConnectNamedPipe(handle, ctypes.byref(overlap)):
                     error = ctypes.get_last_error()
                     if error == _IO_PENDING:
                         _await(handle, overlap, deadline)
-                    elif error != _PIPE_CONNECTED:
+                        break
+                    if error == _PIPE_CONNECTED:
+                        break
+                    if error != _NO_DATA:
                         raise _error("E_PIPE_CLOSED", "Cannot accept pipe client")
+                    # A client can open and close the reserved instance before
+                    # the next accept. Windows requires a disconnect before reuse.
+                    if not _k.DisconnectNamedPipe(handle):
+                        raise _error("E_PIPE_CLOSED", "Cannot release the previous pipe client")
+                    _milliseconds(deadline)
                 connection = PipeConnection(handle, server_side=True, allowed_sid=self.owner_sid,
                                             validator=self._validator)
                 try:

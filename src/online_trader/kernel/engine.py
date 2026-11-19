@@ -48,8 +48,9 @@ class Kernel:
     def __init__(self, path, account_key: str, *, development: bool = False,
                  port=None, risk_budget: str = "0", tick_size: str = "1",
                  multiplier: str = "1", max_quote_age_ms: int = 30_000, simulation_grant=None, _execution_lock=None,
-                 _archive_source=None) -> None:
+                 _archive_source=None, _existing_ledger=False, _legacy_stream=True) -> None:
         self._owner = threading.get_ident()
+        self._legacy_stream = _legacy_stream
         self.account_key = identifier(account_key)
         self.boot_id = _id("boot")
         self.development = development
@@ -84,7 +85,9 @@ class Kernel:
         self._lock = _execution_lock if _execution_lock is not None else AccountLock(account_key)
         self._closed = False
         try:
-            self.ledger = Ledger(path, account_key,broker_identity=getattr(simulation_grant,'provider','TQKQ') if simulation_grant is not None else 'development')
+            self.ledger = Ledger(path, account_key,
+                broker_identity=getattr(simulation_grant, 'provider', 'TQKQ') if simulation_grant is not None else 'development',
+                existing_only=_existing_ledger)
             ack = self.ledger.bootstrap(self.boot_id, hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
         except BaseException:
             if hasattr(self,"ledger"):
@@ -249,7 +252,8 @@ class Kernel:
                 if pending.authority is not None:self._committed_authority=pending.authority
                 if pending.after is not None:
                     pending.after()
-                self._append_committed_view()
+                if self._legacy_stream:
+                    self._append_committed_view()
             except BaseException as exc:
                 self._armed = False
                 self._failed = True
@@ -362,8 +366,8 @@ class Kernel:
     def execute_pause_command(self, message: dict, peer_id: str) -> Future:
         return self.execute_command(message,peer_id)
 
-    def execute_command(self,message:dict,peer_id:str)->Future:
-        return self.control.execute(message,peer_id)
+    def execute_command(self,message:dict,peer_id:str,*,operator_actor=None)->Future:
+        return self.control.execute(message,peer_id,operator_actor=operator_actor)
 
     def _has_unknown(self) -> bool:
         return any(o["send_state"] in {"SEND_POSSIBLE", "UNKNOWN"} for c in self._staged.values() for o in c["orders"])
@@ -392,7 +396,9 @@ class Kernel:
             raise TraderError("E_RULE_UNAPPROVED", "This baseline only executes isolated development events")
         if not self._armed or self.recovery_required:
             raise TraderError("E_NOT_READY", "New openings are disarmed")
-        if not self.control.can_increase(plan["contract_id"]):raise TraderError("E_NOT_READY","A control barrier blocks this contract")
+        origin = 'STRATEGY' if _strategy is not None else 'MANUAL'
+        if not self.control.can_increase(plan['contract_id'], origin=origin):
+            raise TraderError('E_NOT_READY', 'A control barrier blocks this contract and entry origin')
         if self.statistics.entry_reasons(plan['contract_id'],plan['trading_day']):
             raise TraderError('E_NOT_READY','Committed local nominal statistics block this opening')
         if any(c["plan"]["contract_id"]==plan["contract_id"] and c["plan"]["trading_day"]==plan["trading_day"]
@@ -437,6 +443,9 @@ class Kernel:
                  "strategy_epoch":None if _strategy is None else _strategy["epoch"],
                  "strategy_metadata":copy.deepcopy(_manual if _strategy is None else _strategy["metadata"]),"instrument":instrument}
         if _manual is not None:cycle['manual_limit_order']=True
+        if (_manual is not None and self._command_binding is not None
+                and self._command_binding['metadata'].get('actor') is not None):
+            cycle['entry_authorization']['operator_command_id'] = self._command_binding['body']['command_id']
         cycle['financial_instrument']={'multiplier':instrument.get('multiplier',str(self.multiplier)),
             'currency':'CNY','basis':'ORIGINAL_INSTRUMENT','max_quote_age_ms':self.max_quote_age_ms}
         if _strategy is not None and self.simulation and getattr(self.simulation,'strategy_enabled',False):
@@ -704,10 +713,24 @@ class Kernel:
             authorization=cycle["entry_authorization"]
             try:
                 strategy=cycle.get("entry_origin")=="STRATEGY"
-                self.contexts.validate(authorization["context_id"],authorization["peer_id"],authorization.get("purpose","OPERATOR_COMMAND"),authorization.get("operation","MANUAL_OPEN"),cycle["plan"]["contract_id"],
-                                       kernel_boot_id=self.boot_id,kernel_epoch=str(self.kernel_epoch),strategy_epoch=str(cycle["strategy_epoch"]) if strategy else None)
+                if command_id := authorization.get('operator_command_id'):
+                    # The original intent and command must share a confirmed ledger commit.
+                    command = self.control.states.get(command_id, {})
+                    committed = self._committed.get(cid) or {}
+                    if (strategy or committed.get('entry_authorization') != authorization
+                            or command.get('body', {}).get('operation') != 'MANUAL_OPEN'
+                            or cid not in command.get('metadata', {}).get('cycle_ids', ())
+                            or command.get('metadata', {}).get('actor') is None):
+                        raise TraderError('E_AUTH', 'The original accepted operator authorization is unavailable')
+                else:
+                    self.contexts.validate(authorization['context_id'], authorization['peer_id'],
+                        authorization.get('purpose', 'OPERATOR_COMMAND'), authorization.get('operation', 'MANUAL_OPEN'),
+                        cycle['plan']['contract_id'], kernel_boot_id=self.boot_id, kernel_epoch=str(self.kernel_epoch),
+                        strategy_epoch=str(cycle['strategy_epoch']) if strategy else None)
                 checks['ENTRY_AUTHORITY'] = (self._armed and not order["cancel_status"] and not order["terminal_confirmed"]
                                              and authorization["authority_revision"]==self._authority_revision)
+                origin = 'STRATEGY' if strategy else 'MANUAL'
+                checks['HUMAN_ENTRY_POLICY'] = self.control.entry_origin_allowed(origin, cycle['plan']['contract_id'])
                 if all(checks.values()):
                     checks['RISK_BUDGET'] = self._exposure() <= self.budget
                     if checks['RISK_BUDGET']:

@@ -11,13 +11,13 @@
 ## 制品和发布
 
 1. 分发项目为 [Yoruto/OnlineTrader-Releases](https://gitlab.com/Yoruto/onlinetrader-releases)，项目 ID 为 `89047383`，默认分支为 `main`。首发前确认 Package Registry 可匿名读取，并核对 Generic Package 重复文件设置。固定同一版本对应的构建目录、ZIP 和 SHA256。
-2. 公开交付使用 `scripts/build-portable.ps1 -DeliveryMode Generic`。可用 `-Archive` 生成已校验的根目录布局 ZIP，文件名为 `OnlineTrader-<版本>-windows-x64.zip`。首次安装使用 `release/installer.iss` 并提供 `AppVersion` 和 `BundleDir`。安装器默认使用项目 `89047383`，可通过 `GitLabProjectId` 指定试验项目。
+2. 公开更新 ZIP 使用 `scripts/build-portable.ps1 -DeliveryMode Generic`。同一次冻结构建生成两个产物。`-Output` 是本地快速测试用的便携目录，直接双击其中的 `OnlineTrader.exe`。同级的 `OnlineTrader-<版本>-windows-x64.zip` 用于 Releases，`-Archive` 可显式指定 ZIP 路径，发布时须使用该标准文件名。脚本输出两个路径和 ZIP SHA-256。脚本内的检查限于构建环境、冻结版运行时身份、随包文件及 ZIP 完整性。首次安装使用 `release/installer.iss` 并提供 `AppVersion` 和 `BundleDir`。安装器默认使用项目 `89047383`，可通过 `GitLabProjectId` 指定试验项目。
 3. 使用 `python scripts/publish_gitlab_update.py --version <版本> --archive <ZIP>` 检查本地制品。实际发布时增传 `--publish --project-id 89047383 --ref main`，发布端通过环境变量提供 `GITLAB_TOKEN`。脚本将 ZIP 上传到 `online-trader-windows-x64`，匿名回读文件大小、摘要及完整 ZIP 后，才创建 `onlinetrader-<版本>` Release。首个带更新器的安装版与用于验收的下一版应使用不同版本号。
 
 上线验证使用干净 Windows 和两个实包，核对任务守护、Qt 可见窗口、实际执行文件路径、已有账户数据及回退。源码样本可以验证 GitLab 请求契约与切换控制，实包路径仍需在获准出包后验证。
 
 ## 指定设备的配置版
 
-使用 `-DeliveryMode Configured -DeliveryConfigDirectory <配置目录>`。打包要求目录中有 `OnlineTrader-defaults.json`，且包含 SimNow 和快期行情的账号口令。可同时提供 `OnlineTrader-parameters.json`。构建前检查输入，构建后核对随包文件，传入 `-Archive` 时同时校验 ZIP 的文件列表、CRC 与关键成员摘要。配置版 ZIP 和安装器名称都以 `-Configured` 标识。公开更新入口拒绝包含默认账号配置的 ZIP。
+使用 `-DeliveryMode Configured -DeliveryConfigDirectory <配置目录>`。输入目录必须包含 `OnlineTrader-defaults.json` 和 `OnlineTrader-parameters.json`，前者提供 SimNow 和快期行情的账号口令，后者提供已确认的交易参数。构建前检查输入，构建后核对便携目录中的配置与输入文件一致，同时校验 ZIP 的文件列表、CRC 与关键成员摘要。配置版 ZIP 和安装器名称都以 `-Configured` 标识。公开更新入口拒绝包含默认账号配置的 ZIP。
 
 普通双击配置版工作台首次启动时登记默认账号。已有档案时只为匹配身份补齐缺失的凭据，保留已保存的口令和当前账号选择。配置版含可读取的凭据，应存放和交付在获准的范围内。

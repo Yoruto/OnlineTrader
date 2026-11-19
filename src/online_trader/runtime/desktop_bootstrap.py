@@ -114,10 +114,13 @@ def _limits(profile):
     return maximum, per_contract
 
 
-def build_start_request(store, account_id, profile, *, arm=True, now=None, timed_trigger=None):
+def build_start_request(store, account_id, profile, *, arm=True, now=None, timed_trigger=None, manual=False,
+                        scheduled_operator=None):
     """Called after the user's start confirmation. Never connects or reads secrets."""
     if not isinstance(profile, DsvProfile) or type(arm) is not bool:
         raise TraderError('E_DESKTOP_START_REQUEST', 'Expected a business profile and explicit startup intent')
+    if manual and (arm or timed_trigger is not None):
+        raise TraderError('E_DESKTOP_START_REQUEST', 'Manual mode requires explicit arming after startup')
     row = _selected(store, account_id)
     _limits(profile)
     instant = _now(now)
@@ -129,6 +132,12 @@ def build_start_request(store, account_id, profile, *, arm=True, now=None, timed
         'arm': arm, 'confirmed': True}
     if timed_trigger is not None:
         request['timed_trigger'] = timed_trigger
+    if scheduled_operator is not None:
+        if timed_trigger is None:
+            raise TraderError('E_DESKTOP_START_REQUEST', 'Scheduled operator identity requires a timed request')
+        request['scheduled_operator'] = identifier(scheduled_operator)
+    if manual:
+        request['manual'] = True
     return request
 
 
@@ -138,7 +147,7 @@ def _request(path, instant=None):
             raw = stream.read(MAX_REQUEST_BYTES + 1)
         value = strict_loads(raw)
         if (len(raw) > MAX_REQUEST_BYTES or type(value) is not dict
-                or set(value) - {'timed_trigger', 'recover_original'} != _REQUEST_KEYS):
+                or set(value) - {'timed_trigger', 'recover_original', 'manual', 'scheduled_operator'} != _REQUEST_KEYS):
             raise ValueError()
         if value['schema_version'] != REQUEST_SCHEMA or value['confirmed'] is not True or type(value['arm']) is not bool:
             raise ValueError()
@@ -149,6 +158,12 @@ def _request(path, instant=None):
         if 'recover_original' in value and (value['recover_original'] is not True or value['arm']
                                              or 'timed_trigger' in value):
             raise ValueError()
+        if 'manual' in value and (value['manual'] is not True or value['arm'] or 'timed_trigger' in value):
+            raise ValueError()
+        if 'scheduled_operator' in value:
+            if 'timed_trigger' not in value or not value['arm']:
+                raise ValueError()
+            identifier(value['scheduled_operator'])
         directory = Path(value['account_store'])
         if not directory.is_absolute():
             raise ValueError()
@@ -284,6 +299,10 @@ def compile_start_scope(request, store, metadata, *, now=None):
         'max_order_quantity': maximum, 'daily_targets_per_contract': targets, 'risk_budget': risk_budget,
         'profile_hash': effective.content_hash, 'calendar_hash': calendar.content_hash,
         'authorization_reference': 'DESKTOP_CONFIRM:' + content_hash(request)}
+    if request.get('manual'):
+        value['schema_version'] = 'SIMNOW_WORKBENCH_SIM/1' if row['provider'] == 'TQ_SIMNOW' else 'KQ_WORKBENCH_SIM/1'
+        value['opening_attempts'] = value.pop('daily_targets_per_contract')
+        value['allow_external_allocation'] = False
     grant = DsvSimulationGrant.parse(canonical_bytes(value))
     dsv_simulation.validate_inputs(grant, effective, calendar)
     details = {'request_hash': content_hash(request), 'source_profile_hash': source_profile.content_hash,
@@ -301,11 +320,24 @@ def compile_start_scope(request, store, metadata, *, now=None):
 
 def run_desktop_start(request_path, output, *, now=None):
     """Explicit child entry; called only after desktop confirmation, never by preview."""
+    return run_confirmed_start(request_path, output, now=now)
+
+
+def run_confirmed_start(request_path, output, *, now=None, configured_store=None, trusted_control_pid=None,
+                        use_portable_profile_file=False, check_scheduled_authorization=None):
+    """Run the original owner using the selected desktop or portable account inputs."""
     directory = Path(output).resolve()
     directory.mkdir(parents=True, exist_ok=False)
     try:
         request, source_profile = _request(request_path, now)
-        store = AccountStore(request['account_store'])
+        if 'manual' in request and configured_store is None:
+            raise TraderError('E_AUTH', 'Standalone configuration is required for this manual startup request')
+        if 'scheduled_operator' in request and (configured_store is None or check_scheduled_authorization is None
+                or check_scheduled_authorization() != request['scheduled_operator']):
+            raise TraderError('E_AUTH', 'The scheduled start requires its original operator capability')
+        store = configured_store if configured_store is not None else AccountStore(request['account_store'])
+        if store.directory != Path(request['account_store']).resolve():
+            raise TraderError('E_SCOPE', 'The confirmed start belongs to another account directory')
         row = _selected(store, request['account_id'])
         if row['account_key'] != request['account_key'] or row['provider'] != request['provider']:
             raise TraderError('E_SCOPE', ERROR_MESSAGES['E_SCOPE'])
@@ -314,6 +346,13 @@ def run_desktop_start(request_path, output, *, now=None):
                 'entry_authority': 'DISARMED', **extra}), directory / f'phase-{index:03}-bootstrap.json')
         phase(0, 'STARTUP_CHECKING')
         with ClockActivity(), AccountLock(row['account_key']) as lease:
+            runtime_options = {}
+            if configured_store is not None:
+                configured_store.initialize_ledger(row, lease)
+                runtime_options.update(_existing_ledger=True, _trusted_control_pid=trusted_control_pid or -1)
+                if not use_portable_profile_file:
+                    source_profile = configured_store.effective_profile(row, source_profile)
+                    request.update(profile=source_profile.to_record(), profile_hash=source_profile.content_hash)
             recovering = request.get('recover_original', False)
             if not recovering:
                 try:
@@ -345,7 +384,7 @@ def run_desktop_start(request_path, output, *, now=None):
                       trading_day=grant.value['trading_day'], pipe=store.pipe_name(row))
                 return dsv_simulation.run(directory / 'scope.json', store.credential_reference(row['account_id']),
                     directory / 'profile.json', directory / 'calendar.json', directory, pipe=store.pipe_name(row), arm=False,
-                    _execution_lock=lease, _reference=clock)
+                    _execution_lock=lease, _reference=clock, **runtime_options)
             phase(1, 'STARTUP_READING_MARKET')
             from online_trader.runtime.startup_metadata import read_metadata
             codes = [symbol['code'] for symbol in source_profile.to_record()['settings']['symbols']]
@@ -358,6 +397,9 @@ def run_desktop_start(request_path, output, *, now=None):
             if trigger and trigger != timed_start_trigger(source_profile, _utc(request['created_at_utc']),
                     on_launch=trigger=='AUTO_START_ON_LAUNCH', metadata=metadata):
                 raise TraderError('E_CALENDAR_INCOMPLETE', '定时启动未找到匹配的当前或临近交易时段。')
+            if 'scheduled_operator' in request:
+                if check_scheduled_authorization() != request['scheduled_operator']:
+                    raise TraderError('E_AUTH', 'The scheduled start operator changed during connection preparation')
             grant, effective, calendar, details = compile_start_scope(request, store, metadata, now=current)
             for name, record in (('scope.json', grant.value), ('profile.json', effective.to_record()),
                                  ('calendar.json', calendar.to_record()), ('startup-preparation.json', details)):
@@ -370,7 +412,7 @@ def run_desktop_start(request_path, output, *, now=None):
             row = _selected(store, request['account_id'])
             return dsv_simulation.run(directory / 'scope.json', reference, directory / 'profile.json',
                 directory / 'calendar.json', directory, pipe=store.pipe_name(row), arm=request['arm'],
-                _execution_lock=lease, **({'_reference': clock} if clock is not None else {}))
+                _execution_lock=lease, **({'_reference': clock} if clock is not None else {}), **runtime_options)
     except Exception as error:
         code = error.code if isinstance(error, TraderError) else 'E_DESKTOP_START'
         failure = {'status': 'STARTUP_FAILED', 'error_code': code, 'entry_authority': 'DISARMED',

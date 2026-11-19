@@ -19,6 +19,7 @@ from referencing.exceptions import NoSuchResource
 from online_trader import __version__
 from online_trader.contracts.codec import canonical_bytes, content_hash, payload_hash, strict_loads
 from online_trader.contracts.validation import validate_message
+from online_trader.domain.values import identifier
 from online_trader.errors import TraderError
 from online_trader.transport.named_pipe import connect
 
@@ -51,7 +52,8 @@ class StatusClient:
     """Pull-only G1 client. No stream resume, SDK, stop-kernel or raw event API."""
 
     def __init__(self, pipe_name: str, *, timeout: float = 5.0,
-                 expected_server_pid: int | None = None, expected_account_key=None, expected_kernel_boot_id=None) -> None:
+                 expected_server_pid: int | None = None, expected_account_key=None, expected_kernel_boot_id=None,
+                 client_instance_id=None) -> None:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 30:
             raise TraderError("E_SCHEMA", "Client timeout must be at most thirty seconds")
         self.pipe_name = pipe_name
@@ -59,6 +61,7 @@ class StatusClient:
         self.expected_server_pid = expected_server_pid
         self.expected_account_key=expected_account_key
         self.expected_kernel_boot_id=expected_kernel_boot_id
+        self.client_instance_id = identifier(client_instance_id) if client_instance_id is not None else None
         self.last_command=None
         self.last_metadata: dict[str, Any] | None = None
 
@@ -98,7 +101,7 @@ class StatusClient:
 
     def _hello(self, connection, deadline: float) -> dict:
         request = self._message("Hello", {
-            "client_instance_id": _id("desktop"), "requested_role": "DESKTOP", "supported_versions": ["1.0"],
+            "client_instance_id": self.client_instance_id or _id("desktop"), "requested_role": "DESKTOP", "supported_versions": ["1.0"],
             "requested_account_key": self.expected_account_key, "client_build_id": "online-trader-" + __version__,
         })
         connection.send(request, timeout=self._remaining(deadline))
@@ -142,7 +145,7 @@ class StatusClient:
                 'checkpoint_event_seq':value['checkpoint_event_seq'], 'reply_sent_at_utc':response['sent_at_utc'], **timings}
             return value
 
-    def command(self,operation,scope,parameters):
+    def command(self,operation,scope,parameters,*,command_id=None,expected_config_revision=None):
         """One explicit attempt through the original context/hash/Ack chain.
 
         A timeout retains last_command for GetCommandStatus, never replays it.
@@ -159,7 +162,10 @@ class StatusClient:
             context=self._receive(connection,deadline,request=request,welcome=welcome,expected_type='RequestContext')['body']
             if context['scope_id']!=scope_id or context['purpose']!='OPERATOR_COMMAND' or context['kernel_epoch']!=welcome['body']['kernel_epoch']:
                 raise TraderError('E_SCOPE','Command context differs from the negotiated scope')
-            request=self._message('OperatorCommand',{'command_id':_id('desktop-command'),'context_id':context['context_id'],
+            if (expected_config_revision is not None
+                    and context['related_revisions']['config_revision'] != expected_config_revision):
+                raise TraderError('E_REVISION_CONFLICT', 'The draft was prepared for a different strategy configuration')
+            request=self._message('OperatorCommand',{'command_id':command_id or _id('desktop-command'),'context_id':context['context_id'],
                 'kernel_epoch':context['kernel_epoch'],'expected_revisions':context['related_revisions'],'operation':operation,
                 'scope':scope,'parameters':parameters,'payload_hash':'0'*64},welcome)
             request['body']['payload_hash']=payload_hash(request);validate_message(request)

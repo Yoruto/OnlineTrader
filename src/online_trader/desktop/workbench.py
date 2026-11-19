@@ -162,8 +162,9 @@ def display_cell(key,value):
 
 class WorkbenchWindow(StatusWindow):
     def __init__(self,pipe_name,*,store=None,account_id=None,client_factory=StatusClient,paired_launcher=None,
-                 dsv_config=None, use_desktop_dsv=False, autostart=False, notification=None):
+                 dsv_config=None, use_desktop_dsv=False, autostart=False, notification=None, runtime_view=False):
         super().__init__(pipe_name,client_factory=client_factory)
+        self._runtime_watch = None
         self.store=store;self.selected_account=store.get(account_id) if store is not None and account_id is not None else None
         self.paired_launcher=paired_launcher
         self.paired_account_key=None
@@ -251,7 +252,8 @@ class WorkbenchWindow(StatusWindow):
         self.monitor_timer = QTimer(self)
         self.monitor_timer.setInterval(1000)
         self.monitor_timer.timeout.connect(self.refresh_monitor)
-        self.monitor_timer.start()
+        if not runtime_view:
+            self.monitor_timer.start()
         self.connection_retry_timer = QTimer(self)
         self.connection_retry_timer.setInterval(1000)
         self.connection_retry_timer.timeout.connect(self._update_connection_recovery)
@@ -264,6 +266,16 @@ class WorkbenchWindow(StatusWindow):
         if self._guard_launch and self.store is not None:
             QTimer.singleShot(0, self.check_timed_start)
         self._enable_commands(False)
+        if runtime_view:
+            from online_trader.desktop.runtime_watch import RuntimeWatch
+            watcher = RuntimeWatch(pipe_name, self)
+            watcher.updated.connect(self._runtime_updated)
+            watcher.observed.connect(self._runtime_observed)
+            watcher.unavailable.connect(self._runtime_unavailable)
+            watcher.finished.connect(self._runtime_finished)
+            self._runtime_watch = watcher
+            self.setWindowTitle('OnlineTrader · 独立运行时工作台')
+            watcher.start()
 
     def _read_account_login(self):
         account = self.selected_account
@@ -314,6 +326,14 @@ class WorkbenchWindow(StatusWindow):
 
     def _start_job(self,action,args=None):
         if self._closing:return
+        if self._runtime_watch is not None:
+            if action == 'refresh':
+                self._runtime_watch.align()
+            elif action == 'command':
+                self._action(lambda: self._save_runtime_draft(*args))
+            else:
+                self.show_home_feedback('请使用独立运行时的操作员入口查询。')
+            return
         if (action == 'command' and self.published_snapshot_expired()
                 and args[0] not in OWNER_RECHECK_OPERATIONS):
             self._stale = True
@@ -343,6 +363,44 @@ class WorkbenchWindow(StatusWindow):
         self._worker=worker;worker.result.connect(self._job_result);worker.failed.connect(self._job_failed);worker.finished.connect(self._finished);worker.start()
 
     def refresh(self):self._start_job('refresh')
+
+    def _runtime_updated(self, result):
+        self._job_result(result)
+        self._enable_commands(not self._closing and not self._stale and not self.view['truncated'])
+
+    def _runtime_observed(self, stamp):
+        if self._closing or self.view is None:
+            return
+        self.snapshot_published_ns = stamp
+        if self._stale and not self.published_snapshot_expired():
+            self._stale = False
+            self.render_view()
+            self._enable_commands(not self.view['truncated'])
+
+    def _runtime_unavailable(self, code):
+        if self._closing:
+            return
+        self._stale = True
+        self._enable_commands(False)
+        self.show_home_feedback(f'等待独立运行时同步 · {code}')
+
+    def _runtime_finished(self):
+        if self._closing:
+            self.close()
+
+    def _save_runtime_draft(self, operation, scope, parameters):
+        if self.view is None or self._stale or self.published_snapshot_expired():
+            raise TraderError('E_NOT_READY', '请先取得当前运行时状态，再保存操作草稿')
+        from online_trader.configuration.files import publish_new_bytes
+        from online_trader.contracts.codec import canonical_bytes
+        command_id = 'qt-' + uuid.uuid4().hex
+        binding = {'account_key': self.view['account_key'], 'kernel_boot_id': self._boot,
+                   'config_revision': self.view['configuration']['config_revision']}
+        path, _ = QFileDialog.getSaveFileName(self, '保存操作草稿', command_id + '.json', 'JSON (*.json)')
+        if path:
+            publish_new_bytes(canonical_bytes({'command_id': command_id, 'operation': operation,
+                                               'scope': scope, 'parameters': parameters, 'binding': binding}), Path(path))
+            self.show_home_feedback('已保存草稿 · 请由操作员通过独立命令入口确认。')
 
     def force_recover_workbench(self):
         if self.paired_launcher is not None or self.store is None or self.selected_account is None:
@@ -778,12 +836,28 @@ class WorkbenchWindow(StatusWindow):
             diagnostic_notice += ' · 诊断日志写入失败'
         self.connection_detail.setText(f"账户连接：{'已连接' if c['broker_connected'] else '未连接'} · 事实同步：{'完整' if c['synchronized'] else '不完整'} · 通道：{'故障' if c['fault'] else '无已知故障'} · 持仓核对：{'待处理' if c['recovery_required'] else '无未决屏障'} · 时钟：{'故障' if c['clock_fault'] else '无已知故障'} · {authority_label}：{v['entry_authority']}" + diagnostic_notice)
         for name,table in self.tables.items():
-            rows=v['cycles'] if name=='protection' else v.get(name,[]);table.setRowCount(len(rows))
+            rows = v['cycles'] if name == 'protection' else v.get(name, [])
+            resized = table.rowCount() != len(rows)
+            table.setRowCount(len(rows))
             for i,row in enumerate(rows):
                 for j,key in enumerate(TABLES[name][1]):
-                    value=row.get(key);item=QTableWidgetItem(display_cell(key,value));item.setToolTip(str(value));table.setItem(i,j,item)
-            table.resizeColumnsToContents()
-            for column in range(table.columnCount()):table.setColumnWidth(column,min(260,table.columnWidth(column)))
+                    value = row.get(key)
+                    label = display_cell(key, value)
+                    item = table.item(i, j) if self._runtime_watch is not None else None
+                    if item is None:
+                        item = QTableWidgetItem(label)
+                        item.setToolTip(str(value))
+                        table.setItem(i, j, item)
+                        resized = True
+                    else:
+                        if item.text() != label:
+                            item.setText(label)
+                        if item.toolTip() != str(value):
+                            item.setToolTip(str(value))
+            if resized:
+                table.resizeColumnsToContents()
+                for column in range(table.columnCount()):
+                    table.setColumnWidth(column, min(260, table.columnWidth(column)))
         self.filter_markets()
         self.command_buttons['arm'].setText('启用人工开仓 (F5)' if v['configuration'].get('manual_workbench') else '启动策略 (F5)')
         self.pause_button.setText('停止策略 (F6)' if 'cancel_on_stop' in v['configuration'] else '暂停开仓 (F6)')
@@ -975,6 +1049,17 @@ class WorkbenchWindow(StatusWindow):
             if not selected:raise TraderError('E_SCOPE','请在行情页选择要启停的品种')
             codes=sorted({self.view['markets'][index]['contract_id'] for index in selected})
             scope={'scope_type':'CONTRACT','scope_ids':codes}
+            if self._runtime_watch is not None:
+                if len(codes) != 1:
+                    raise TraderError('E_SCOPE', '请一次确认一个合约的开仓权限')
+                origin = 'MANUAL' if self.view['configuration'].get('manual_workbench') else 'STRATEGY'
+                state = self.view.get('entry_policies', {}).get(f'{origin}:{codes[0]}', {})
+                reason, confirmed = QInputDialog.getText(self, '调整开仓权限', '请输入操作原因')
+                if confirmed and reason.strip():
+                    self.send('SET_ENTRY_POLICY', scope, {'origin': origin, 'enabled': enabled,
+                        'expected_policy_revision': state.get('revision', '0'), 'reason': reason.strip(),
+                        'cancel_owned_entry_remainders': not enabled})
+                return
             if enabled:
                 config=self.view['configuration']
                 self.send('ARM_ENTRIES',scope,{'authority_policy_id':self.policy('AUTHORITY'),
@@ -1366,6 +1451,12 @@ class WorkbenchWindow(StatusWindow):
         if not self._closing and self._tray.minimize_on_close():
             event.ignore()
             return
+        if self._runtime_watch is not None and self._runtime_watch.isRunning():
+            self._closing = True
+            self.hide()
+            self._runtime_watch.requestInterruption()
+            event.ignore()
+            return
         if self.monitor_worker is not None and self.monitor_worker.isRunning():
             self._closing = True
             self.hide()
@@ -1390,10 +1481,11 @@ class WorkbenchWindow(StatusWindow):
 
 
 def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None,autostart=False,
-        update_root=None, notification=None):
+        update_root=None, notification=None, runtime_view=False):
     app=QApplication.instance() or QApplication([])
     window=WorkbenchWindow(pipe_name,store=store,account_id=account_id,paired_launcher=paired_launcher,
-                           dsv_config=dsv_config,use_desktop_dsv=True,autostart=autostart, notification=notification)
+                           dsv_config=dsv_config,use_desktop_dsv=not runtime_view,autostart=autostart,
+                           notification=notification,runtime_view=runtime_view)
     window.setAttribute(Qt.WA_DeleteOnClose)
     window.destroyed.connect(app.quit)
     window.show();QTimer.singleShot(0,window.refresh)

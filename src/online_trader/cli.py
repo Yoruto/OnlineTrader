@@ -64,6 +64,60 @@ def main(argv=None):
     desktop_start=commands.add_parser('desktop-start',help='执行桌面确认的本次模拟策略启动')
     desktop_start.add_argument('--request',type=Path,required=True)
     desktop_start.add_argument('--output',type=Path,required=True)
+    runtime = commands.add_parser('runtime', help='以便携配置核对或运行独立模拟执行器')
+    runtime_actions = runtime.add_subparsers(dest='runtime_action', required=True)
+    runtime_actions.add_parser('schema', help='输出独立运行时接口的 JSON Schema')
+    for name, help_text in (('inspect', '脱敏核对配置，不连接账户'), ('run', '独立启动模拟执行器，默认停开'),
+                            ('status', '通过独立通信进程查询执行器'), ('watch', '订阅执行器状态的有序变化'),
+                            ('account', '只读登录模拟柜台并查询资金、持仓、委托和成交'),
+                            ('history', '读取原账本确认的账户历史观察'),
+                            ('report', '读取执行账本的自有逐笔成交和损益'),
+                            ('quotes', '通过配置的行情身份只读查询合约报价'),
+                            ('catalog', '通过配置的行情身份只读查询期货合约目录')):
+        command = runtime_actions.add_parser(name, help=help_text)
+        command.add_argument('--root', type=Path, required=True)
+        command.add_argument('--account', help='runtime.json 中的账户 ID，省略时按已配置的账户')
+        if name == 'account':
+            command.add_argument('--attached', action='store_true', help='读取已运行执行器的全账户截面')
+        if name == 'run':
+            command.add_argument('--mode', choices=('strategy', 'manual'), default='strategy')
+            command.add_argument('--use-profile-file', action='store_true', help='本次以明确选定的参数文件建立新范围')
+        if name == 'history':
+            from online_trader.runtime.account_day_history import SECTIONS
+            command.add_argument('--before', help='上页输出的历史游标')
+            command.add_argument('--limit', type=int)
+            command.add_argument('--from-day', help='柜台交易日起点 YYYY-MM-DD')
+            command.add_argument('--to-day', help='柜台交易日终点 YYYY-MM-DD')
+            command.add_argument('--section', choices=SECTIONS, help='按日期查询的记录类型，默认覆盖情况')
+            command.add_argument('--contract', help='按合约筛选指定记录类型')
+            command.add_argument('--cursor', help='日期查询返回的下一页游标')
+        if name == 'report':
+            command.add_argument('--checkpoint-event-seq', help='读取指定的已提交账本水位')
+        if name == 'quotes':
+            command.add_argument('--symbol', action='append', help='合约代码，可重复指定，默认使用策略配置品种')
+    handoff = runtime_actions.add_parser('export-handoff', help='停机后导出配置与模拟执行账本的一致性副本')
+    handoff.add_argument('--root', type=Path, required=True)
+    handoff.add_argument('--output', type=Path, required=True)
+    schedule = runtime_actions.add_parser('schedule', help='由无界面运行时等待已授权的定时策略启动')
+    schedule.add_argument('--root', type=Path, required=True)
+    schedule.add_argument('--account')
+    schedule.add_argument('--operator', required=True)
+    schedule.add_argument('--token-stdin', action='store_true')
+    for name in ('command', 'receipt'):
+        command = runtime_actions.add_parser(name, help='提交获授权的模拟命令' if name == 'command' else '查询原命令回执')
+        command.add_argument('--root', type=Path, required=True)
+        command.add_argument('--account')
+        command.add_argument('--operator', required=True)
+        command.add_argument('--token-stdin', action='store_true', help='从标准输入读取操作令牌')
+        if name == 'command':
+            command.add_argument('--input', type=Path, required=True)
+        else:
+            command.add_argument('--command-id', required=True)
+    runtime_view = commands.add_parser('runtime-view-process', help=argparse.SUPPRESS)
+    runtime_view.add_argument('--pipe', required=True)
+    runtime_view.add_argument('--account-key', required=True)
+    runtime_view.add_argument('--root', type=Path, required=True)
+    runtime_view.add_argument('--ledger', type=Path, required=True)
     qpro=commands.add_parser('qpro-history',help='从本机快期专业版查询历史成交，仅用于对照')
     for field in ('company','client-id','start-day','end-day'):qpro.add_argument('--'+field,required=True)
     qpro.add_argument('--port',type=int,default=8815)
@@ -196,6 +250,12 @@ def main(argv=None):
         if args.action=='desktop-start':
             from online_trader.runtime.desktop_bootstrap import run_desktop_start
             return run_desktop_start(args.request,args.output)
+        if args.action=='runtime':
+            from online_trader.runtime.standalone import run_cli
+            return run_cli(args)
+        if args.action=='runtime-view-process':
+            from online_trader.runtime.view_process import serve
+            return serve(args.pipe, args.account_key, args.root, args.ledger)
         if args.action=='qpro-history':
             from online_trader.configuration.files import publish_new_bytes
             from online_trader.gateway.qpro_history import query_trades

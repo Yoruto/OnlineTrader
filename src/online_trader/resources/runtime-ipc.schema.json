@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.onlinetrader.local/runtime-ipc/1",
+  "title": "OnlineTrader standalone runtime local IPC",
+  "oneOf": [
+    {"$ref": "#/$defs/ViewRequest"},
+    {"$ref": "#/$defs/ViewResponse"},
+    {"$ref": "#/$defs/HistoryRequest"},
+    {"$ref": "#/$defs/DayHistoryRequest"},
+    {"$ref": "#/$defs/HistoryResponse"},
+    {"$ref": "#/$defs/AccountRead"},
+    {"$ref": "#/$defs/AccountObservation"},
+    {"$ref": "#/$defs/AccountPage"},
+    {"$ref": "#/$defs/CommandRequest"},
+    {"$ref": "#/$defs/CommandResponse"}
+  ],
+  "$defs": {
+    "Id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "Sequence": {"type": "string", "pattern": "^[1-9][0-9]{0,18}$"},
+    "Hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "Cursor": {
+      "type": "object", "additionalProperties": false,
+      "required": ["generation", "sequence", "digest"],
+      "properties": {
+        "generation": {"$ref": "#/$defs/Id"},
+        "sequence": {"$ref": "#/$defs/Sequence"},
+        "digest": {"$ref": "#/$defs/Hash"}
+      }
+    },
+    "ViewRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "kind", "cursor"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_VIEW/1"},
+        "kind": {"enum": ["snapshot", "align", "subscribe"]},
+        "cursor": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Cursor"}]}
+      }
+    },
+    "ViewResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "kind", "cursor", "published_ns", "body"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_VIEW/1"},
+        "kind": {"enum": ["BASELINE", "DELTA", "CURRENT", "UNAVAILABLE"]},
+        "cursor": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Cursor"}]},
+        "published_ns": {"type": ["string", "null"], "pattern": "^[0-9]{1,20}$"},
+        "body": {"type": ["object", "null"]}
+      }
+    },
+    "HistoryRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "kind", "before", "limit"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_VIEW/1"}, "kind": {"const": "history"},
+        "before": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Sequence"}]},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+      }
+    },
+    "HistoryResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "kind", "body"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_VIEW/1"},
+        "kind": {"enum": ["HISTORY", "HISTORY_ERROR"]}, "body": {"type": "object"}
+      }
+    },
+    "DayHistoryRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "kind", "from_day", "to_day", "section", "contract", "cursor", "limit"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_VIEW/1"}, "kind": {"const": "history-days"},
+        "from_day": {"type": "string", "format": "date"}, "to_day": {"type": "string", "format": "date"},
+        "section": {"enum": ["coverage", "funds", "positions", "orders", "trades", "owned-trades"]},
+        "contract": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Id"}]},
+        "cursor": {"type": ["string", "null"], "pattern": "^(0|[1-9][0-9]{0,18})\\.[1-9][0-9]{0,8}\\.[a-f0-9]{64}$"},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 200}
+      }
+    },
+    "AccountRead": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "kind", "known_id"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_ACCOUNT/1"}, "kind": {"const": "read"},
+        "known_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Id"}]}
+      }
+    },
+    "AccountObservation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "kind", "state", "reused"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_ACCOUNT/1"}, "kind": {"const": "observation"},
+        "reused": {"type": "boolean"},
+        "state": {
+          "type": "object", "additionalProperties": false,
+          "required": ["account_key", "environment", "kernel_boot_id", "snapshot_id", "gateway_identity",
+            "source_epoch", "observed_at_utc", "observed_ns", "trading_day", "checkpoint_event_seq",
+            "status", "reason_code", "coverage", "funds", "counts"],
+          "properties": {
+            "account_key": {"$ref": "#/$defs/Id"}, "environment": {"const": "ONLINE_SIM"},
+            "kernel_boot_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Id"}]},
+            "snapshot_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Id"}]},
+            "gateway_identity": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Id"}]},
+            "source_epoch": {"type": ["integer", "null"], "minimum": 1},
+            "observed_at_utc": {"type": ["string", "null"], "format": "date-time"},
+            "observed_ns": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Sequence"}]},
+            "trading_day": {"type": ["string", "null"], "format": "date"},
+            "checkpoint_event_seq": {"type": ["string", "null"], "pattern": "^(0|[1-9][0-9]{0,18})$"},
+            "status": {"enum": ["READY", "STALE", "WAITING"]},
+            "reason_code": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/Id"}]},
+            "coverage": {"enum": ["CURRENT_BROKER_SNAPSHOT", null]}, "funds": {"type": ["object", "null"]},
+            "counts": {"type": ["object", "null"], "additionalProperties": false,
+              "required": ["positions", "orders", "trades"],
+              "properties": {"positions": {"$ref": "#/$defs/AccountRowCount"},
+                "orders": {"$ref": "#/$defs/AccountRowCount"}, "trades": {"$ref": "#/$defs/AccountRowCount"}}}
+          }
+        }
+      }
+    },
+    "AccountRowCount": {"type": "integer", "minimum": 0, "maximum": 32768},
+    "AccountPage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "kind", "snapshot_id", "table", "start", "rows"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_ACCOUNT/1"}, "kind": {"const": "page"},
+        "snapshot_id": {"$ref": "#/$defs/Id"}, "table": {"enum": ["positions", "orders", "trades"]},
+        "start": {"type": "integer", "minimum": 0, "maximum": 32767},
+        "rows": {"type": "array", "items": {"type": "object"}, "minItems": 1, "maxItems": 256}
+      }
+    },
+    "Command": {
+      "type": "object", "additionalProperties": false,
+      "required": ["command_id", "operation", "scope", "parameters"],
+      "properties": {
+        "command_id": {"$ref": "#/$defs/Id"}, "operation": {"$ref": "#/$defs/Id"},
+        "scope": {"type": "object"}, "parameters": {"type": "object"},
+        "binding": {
+          "type": "object", "additionalProperties": false,
+          "required": ["account_key", "kernel_boot_id", "config_revision"],
+          "properties": {
+            "account_key": {"$ref": "#/$defs/Id"}, "kernel_boot_id": {"$ref": "#/$defs/Id"},
+            "config_revision": {"$ref": "#/$defs/Sequence"}
+          }
+        }
+      }
+    },
+    "CommandRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "request_id", "operation", "body", "operator", "token"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_COMMAND/1"},
+        "request_id": {"$ref": "#/$defs/Id"}, "operation": {"enum": ["submit", "receipt"]},
+        "body": {"type": "object"}, "operator": {"$ref": "#/$defs/Id"},
+        "token": {"type": "string", "minLength": 32, "maxLength": 256}
+      },
+      "if": {"properties": {"operation": {"const": "submit"}}},
+      "then": {"properties": {"body": {"$ref": "#/$defs/Command"}}},
+      "else": {"properties": {"body": {"additionalProperties": false, "required": ["command_id"],
+        "properties": {"command_id": {"$ref": "#/$defs/Id"}}}}}
+    },
+    "CommandResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol", "request_id"],
+      "properties": {
+        "protocol": {"const": "ONLINE_TRADER_RUNTIME_COMMAND/1"}, "request_id": {"$ref": "#/$defs/Id"},
+        "result": {"type": "object"}, "error": {"type": "object", "required": ["code", "message"]}
+      },
+      "oneOf": [{"required": ["result"]}, {"required": ["error"]}]
+    }
+  }
+}

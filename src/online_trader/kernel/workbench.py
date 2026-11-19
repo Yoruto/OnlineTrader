@@ -129,6 +129,10 @@ def workbench_monitor_view(kernel):
 
 
 def workbench_view(kernel, *, snapshot=None):
+    return _complete_workbench_view(*_capture_workbench_view(kernel, snapshot))
+
+
+def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None):
     kernel._check_owner()
     if snapshot is None:
         snapshot = kernel._make_snapshot()
@@ -144,7 +148,7 @@ def workbench_view(kernel, *, snapshot=None):
         from online_trader.kernel.external_positions import review_positions
         from online_trader.kernel.native_control import cancel_review
         try:
-            native,external_positions=review_positions(kernel.simulation)
+            native,external_positions=review_positions(kernel.simulation, snapshot=native_snapshot)
             if kernel.simulation.grant.manual_workbench:
                 _,_,native_cancel_review=cancel_review(kernel.simulation, snapshot=native)
         except TraderError as error:
@@ -440,6 +444,13 @@ def workbench_view(kernel, *, snapshot=None):
         'blocks':[r for r in records if r['record_type']=='BLOCK']+[{'reason_code':e,'active':True} for e in snapshot['errors'][-64:]]+exit_blocks,
         'commands':commands,'policies':policies,'truncated':False}
     result['symbol_entry_switches']=copy.deepcopy(kernel.control.symbol_entries)
+    if kernel.control.entry_policies:
+        result['entry_policies'] = copy.deepcopy(kernel.control.entry_policies)
+        origin = 'MANUAL' if scoped and kernel.simulation.grant.manual_workbench else 'STRATEGY'
+        for market in markets:
+            keys = (origin + ':ACCOUNT', origin + ':' + market['contract_id'])
+            if any(not result['entry_policies'].get(key, {}).get('enabled', True) for key in keys):
+                market['enabled'] = False
     diagnostics = getattr(kernel, '_dsv_diagnostics', None)
     if diagnostics:
         result['configuration']['strategy_diagnostics'] = diagnostics.copy()
@@ -521,6 +532,10 @@ def workbench_view(kernel, *, snapshot=None):
                    and (not order['terminal_confirmed'] or order['reported_fill_qty'] != order['filled_qty']))
                for order in cycle['orders'])
     }
+    return result, records, snapshot['cycles'], current_cycles
+
+
+def _complete_workbench_view(result, records, cycles, current_cycles):
     historical = {
         'cycles': [row for row in result['cycles'] if row['position_cycle_id'] not in current_cycles],
         'orders': [row for row in result['orders'] if row['position_cycle_id'] not in current_cycles],
@@ -563,9 +578,9 @@ def workbench_view(kernel, *, snapshot=None):
             result['detail_unavailable'] = 'CURRENT_STATE_OVERSIZE'
             result['current_responsibility'] = {
                 'cycles': len(current_cycles),
-                'owned_quantity': sum(cycle['protection']['owned_qty'] for cycle in snapshot['cycles']),
+                'owned_quantity': sum(cycle['protection']['owned_qty'] for cycle in cycles),
                 'active_orders': sum(bool(OrderState.from_dict(order).potential_remaining)
-                                     for cycle in snapshot['cycles'] for order in cycle['orders']),
+                                     for cycle in cycles for order in cycle['orders']),
             }
             result['detail_omitted'] = {name: len(result.get(name, [])) for name in (
                 'cycles', 'orders', 'trades', 'markets', 'blocks', 'commands', 'external_positions')}
@@ -588,3 +603,13 @@ def workbench_publication(kernel):
     snapshot = kernel._make_snapshot()
     view = workbench_view(kernel, snapshot=snapshot)
     return view['status_projection'], view
+
+
+def prepare_workbench_publication(kernel, *, native_snapshot=None):
+    captured = _capture_workbench_view(kernel, kernel._make_snapshot(), native_snapshot=native_snapshot)
+
+    def complete():
+        view = _complete_workbench_view(*captured)
+        return view['status_projection'], view
+
+    return complete

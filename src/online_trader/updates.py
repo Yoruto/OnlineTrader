@@ -187,6 +187,8 @@ def extract_bundle(archive, destination):
             key = entry.filename.rstrip('/').casefold()
             if 'onlinetrader-defaults.json' in key.split('/'):
                 raise UpdateError('公开更新 ZIP 不能包含默认账号配置')
+            if key.split('/')[0] == 'runtime':
+                raise UpdateError('公开更新 ZIP 不能包含账户运行目录')
             total += entry.file_size
             if key in paths or len(paths) >= 12000 or total > 2 * MAX_BUNDLE:
                 raise UpdateError('更新 ZIP 文件重复或超出限制')
