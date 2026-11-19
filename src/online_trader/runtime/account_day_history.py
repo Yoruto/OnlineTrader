@@ -201,7 +201,9 @@ def history_database(path, account_key):
             try:
                 from online_trader.runtime.instance import AccountLock
                 lease = AccountLock(account_key)
-            except TraderError:
+            except TraderError as error:
+                if error.code not in {'E_INSTANCE_EXISTS', 'E_PLATFORM'}:
+                    raise
                 # A live execution owner keeps SQLite's normal WAL locking. History
                 # readers themselves are serialized above, so reader-reader
                 # contention cannot be misclassified as an execution owner.

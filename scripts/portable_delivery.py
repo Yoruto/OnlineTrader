@@ -212,7 +212,7 @@ def main():
                                                configured=args.config_directory is not None,
                                                important_members=important or ())
                 print(f'ZIP SHA-256: {archive_sha256}')
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, TraderError) as error:
         print(error, file=sys.stderr)
         return 2
     return 0

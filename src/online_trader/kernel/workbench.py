@@ -9,7 +9,7 @@ from decimal import Decimal
 from heapq import nsmallest
 import time
 
-from online_trader.contracts.codec import canonical_bytes, strict_loads
+from online_trader.contracts.codec import canonical_bytes
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text
 from online_trader.kernel.projection import projection_batch

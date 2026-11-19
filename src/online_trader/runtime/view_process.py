@@ -135,6 +135,9 @@ class ViewProcess:
                             print(f'E_RUNTIME_VIEW: {type(error).__name__}', file=sys.stderr)
                         last_error = type(error)
                         rapid_failures = min(rapid_failures + 1, 5)
+                        delay = min(10.0, .5 * (2 ** rapid_failures))
+                        if self._stopped.wait(delay):
+                            break
                 self._stopped.wait(.5)
         finally:
             _close(self._process)
