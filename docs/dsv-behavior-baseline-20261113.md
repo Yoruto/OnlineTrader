@@ -2,7 +2,7 @@
 
 取证日期为 2026-11-13（北京时间）。唯一业务参考是本机 [trading.exe](C:/Users/xyc/Desktop/trading/trading.exe)，SHA-256 为 `aabeafd83d265ab9b1cf5cc3fd0e9b0f21963ddcc95daa70feefc209997269a3`。归档 `gui` 对象 SHA-256 为 `07c82c9ada765284ed5a929227024cbf192f5f72192636900740d9a5764032ea`。行号指该代码对象。采用发行版可复查结果、同版日志与状态、静态代码和随包说明。记录发生冲突的输入、版本及可观察结果。产品起点为 `944ab1115e4ca09e48c05e98de00b5522bbaf18f` 加原有棕榈油回补及默认托盘等工作区修改。仅使用业务配置，凭据留在原位置。
 
-[原 96 项](功能实现与待办清单_20261110.md) · [旧版差异审计及 B01–B20](dsv-onlinetrader-parity-audit-20261112.md) · [策略、保护、执行及统计取证](strategy-dsv-evidence.md) · [资金及日报取证](money-dsv-evidence.md) · [成交对照取证](trade-reconciliation-dsv-evidence.md)
+[原 96 项](功能实现与待办清单_20261110.md) · [旧版差异审计及 B01–B20](history/legacy-runtime/dsv-onlinetrader-parity-audit-20261112.md) · [策略、保护、执行及统计取证](strategy-dsv-evidence.md) · [资金及日报取证](money-dsv-evidence.md) · [成交对照取证](trade-reconciliation-dsv-evidence.md)
 
 ## 已确认的根因
 

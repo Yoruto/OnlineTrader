@@ -1,6 +1,6 @@
 # OnlineTrader
 
-[DSV 行为基准](docs/dsv-behavior-baseline-20261113.md) · [重构计划与阶段记录](docs/refactor/dsv-parity-20261114/README.md) · [当前功能状态及开放问题](docs/功能实现与待办清单_20261110.md) · [验收证据索引](docs/validation/README.md)
+[文档导航](docs/README.md) · [DSV 行为基准](docs/dsv-behavior-baseline-20261113.md) · [重构计划与阶段记录](docs/refactor/dsv-parity-20261114/README.md) · [当前功能状态及开放问题](docs/功能实现与待办清单_20261110.md) · [验收证据索引](docs/validation/README.md)
 
 ## Trading Runtime 独立运行入口
 
@@ -58,7 +58,7 @@ $env:PYTHONPATH = 'src'
 
 ## 历史验收与桌面交付
 
-[早期设计与 G0 规格归档](docs/history/early-design/README.md)收录 2026-11-09 的三份设计稿和 OT-G0-1 规格。
+[早期设计与 G0 规格归档](docs/history/early-design/README.md)收录 2026-11-09 的三份设计稿和 OT-G0-1 规格；[旧 G1 与修复前审计](docs/history/legacy-runtime/README.md)保留已被当前入口取代的早期实现记录。
 
 `ddad472` 原 README 已**逐字节保留**为 [README.legacy-ddad472.md](README.legacy-ddad472.md)，Git blob 为 `26beae2901169b8da5e27d86cb7e11e9566c79fa`。归档仍在根目录，原相对链接保持原定位；其内容、历史测试数量与版本说明未被重新认定为当前替代链的完成状态。
 
