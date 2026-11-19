@@ -34,8 +34,12 @@ class LocalWallClock(SystemClock):
     def capture(self):
         return self._sample if self._sample is not None else super().capture()
 
+    def capture_live(self):
+        """Capture an observation independently of the current decision turn."""
+        return super().capture()
+
     def begin_turn(self):
-        self._sample = super().capture()
+        self._sample = self.capture_live()
 
     def end_turn(self):
         self._sample = None
@@ -132,7 +136,12 @@ def measure_utc_anchor():
                 raise ValueError('Invalid NTP round trip')
             utc_at_receive = transmit_utc - 2_208_988_800 + delay / 2
             estimates.append(utc_at_receive - received)
-            samples.append({'host': host, 'valid': True, 'rtt_seconds': str(delay)})
+            root_delay, root_dispersion = struct.unpack_from('!iI', raw, 4)
+            samples.append({
+                'host': host, 'valid': True, 'rtt_seconds': str(delay), 'stratum': raw[1],
+                'root_delay_seconds': str(root_delay / 65536),
+                'root_dispersion_seconds': str(root_dispersion / 65536),
+            })
         except (OSError, ValueError):
             samples.append({'host': host, 'valid': False})
     if len(estimates) < 2 or max(estimates) - min(estimates) > 0.25:
@@ -199,9 +208,6 @@ class CalibratedClock(LocalWallClock):
     def utc_now(self):
         return datetime.fromtimestamp(self._timestamp(time.monotonic()), timezone.utc)
 
-    def capture_live(self):
-        return SystemClock.capture(self)
-
     def _checkpoint(self, now):
         if self._recovery_anchor is not None:
             self._checkpoint_saved = self._recovery_anchor.save(
@@ -238,6 +244,7 @@ class CalibratedClock(LocalWallClock):
                 'entry_ready': self.entry_ready(), 'protection_ready': self.protection_ready(),
                 'recovery_anchor_saved': self._checkpoint_saved,
                 'reference_state': self._reference_state,
+                'reference_samples': [] if self._reference is None else list(self._reference.samples),
                 'remaining_correction_seconds': str(remaining),
                 'maximum_convergence_seconds': str(abs(remaining) / .01),
                 'os_clock_changed': False}
@@ -259,6 +266,7 @@ class CalibratedClock(LocalWallClock):
             offset = reference.wall_anchor + age - sample.utc.timestamp()
         return {'reference_status': 'OBSERVED_OK' if self.entry_ready() else self._reference_state,
                 'protection_ready': True, 'recovery_anchor_saved': self._checkpoint_saved,
+                'reference_batch_monotonic_ns': str(round(self._trusted_reference_mono * NS_PER_SECOND)),
                 'reference': {'source': 'PERSISTED_NTP_HOLDOVER' if reference is None else 'APPLICATION_UTC_NTP',
                               'offset_ns': str(round(offset * NS_PER_SECOND)),
                               'estimated_error_ns': str(round(uncertainty * NS_PER_SECOND))},

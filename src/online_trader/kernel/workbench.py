@@ -256,8 +256,12 @@ def workbench_view(kernel, *, snapshot=None):
                 'QUOTE_LEADS_LOCAL_UTC' if age < 0 else
                 None if row['fresh'] else 'QUOTE_STALE')
     if quote_trace is not None:
+        displayed_ns = time.monotonic_ns()
         for row in markets:
             code = row['contract_id']
+            local_wait = quote_trace.market.current_wait_ns(code, displayed_ns)
+            if local_wait is not None:
+                row['local_market_wait_ns'] = str(local_wait)
             projection = {key: row.get(key) for key in ('fresh', 'session_id', 'market_session_active',
                           'source_time_utc', 'source_time_raw', 'source_age_raw_ns', 'quote_time_reason')}
             cache = cache_trace.get(code, {})
@@ -401,7 +405,9 @@ def workbench_view(kernel, *, snapshot=None):
             'exit_reference_price':(cycle.get('nominal_exit') or {}).get('nominal_exit_price'),
             'exit_wait_reason': (None if not exit_pending else 'EXIT_WAITING_FOR_SESSION'
                                  if market.get('market_session_active') is False else 'EXIT_WAITING_FOR_PRICE'
-                                 if not market.get('fresh') else None),
+                                 if not market.get('fresh') or (
+                                     p['contract_id'] in getattr(port, 'waiting_reduction_quotes', ())
+                                     and not kernel.execution.manual_reduction(cycle)) else None),
             'break_even_status':s.get('break_even_status'),'max_favorable_move':s.get('max_favorable_move'),
             'management_state':cycle.get('management_state'),'plan_id':p['plan_id'],'plan_revision':p['plan_revision'],'close_route_review':route_review})
         for order in cycle['orders']:

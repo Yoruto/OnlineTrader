@@ -7,13 +7,20 @@ from pathlib import Path
 from online_trader.contracts.codec import content_hash
 from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
-from online_trader.scheduling.clock import NS_PER_SECOND, quote_timestamp, sdk_deadline, source_age_ns
+from online_trader.gateway.tq_wait import wait_update_slice
+from online_trader.scheduling.clock import NS_PER_SECOND, quote_timestamp, source_age_ns
 from online_trader.gateway.ports import OnlineSimulationPort
 
 
 def number(value):
     if type(value) not in {int,float} or not math.isfinite(value):return None
     return decimal_text(Decimal(str(value)))
+
+
+def quote_book(quote):
+    return {key: number(getattr(quote, key, None)) for key in (
+        'last_price', 'bid_price1', 'ask_price1', 'bid_volume1', 'ask_volume1',
+        'price_tick', 'lower_limit', 'upper_limit', 'volume')}
 
 
 def account_number(value):
@@ -107,20 +114,18 @@ class TqKqPort(OnlineSimulationPort):
 
     def poll_updates(self,seconds=0.1):
         trace = getattr(self, '_quote_trace', None)
-        if trace is None:
-            self.last_poll_updated = self.api.wait_update(deadline=sdk_deadline(seconds))
-        else:
-            started_ns = time.monotonic_ns()
-            updated = None
-            try:
-                updated = self.last_poll_updated = self.api.wait_update(deadline=sdk_deadline(seconds))
-            finally:
-                trace.sdk_wait(started_ns, time.monotonic_ns(), updated)
-        if hasattr(self.clock, 'capture'):
-            sample = self.clock.capture()
-            received = sample.utc, sample.monotonic
-        else:
-            received = datetime.now(timezone.utc), time.monotonic_ns()
+        started_ns = time.monotonic_ns() if trace is not None else None
+        updated = wait_mode = None
+        try:
+            updated, wait_mode = wait_update_slice(self.api, seconds)
+            self.last_poll_updated = updated
+        finally:
+            if trace is not None:
+                trace.sdk_wait(started_ns, time.monotonic_ns(), updated, wait_mode=wait_mode)
+        capture = getattr(self.clock, 'capture_live', None) or getattr(self.clock, 'capture', None)
+        sample = capture() if capture is not None else None
+        received = ((sample.utc, sample.monotonic) if sample is not None
+                    else (datetime.now(timezone.utc), time.monotonic_ns()))
         for key,item in self.api._data.get('notify',{}).items():
             if key in self._known_notifications:continue
             self._known_notifications.add(key);code=item.get('code')
@@ -128,6 +133,7 @@ class TqKqPort(OnlineSimulationPort):
             elif code==2019112902:self.fault=True;self._transport_up=True;self.source_epoch+=1
         if trace is not None:
             trace.sdk_quotes(self.quotes, received[0], self.source_epoch, self.fault)
+            trace.sdk_clock(sample, self.clock)
         return received
 
     def complete(self):return self._transport_up and not self.api._account._get_trade_more_data(self.api._data)
@@ -147,9 +153,15 @@ class TqKqPort(OnlineSimulationPort):
         return ready is None or ready()
 
     def _quote_rejected(self, code, check, reason, **facts):
+        quote = self.quotes.get(code)
+        stamp = getattr(quote, 'datetime', None)
+        self._last_quote_rejection = {
+            'check': check, 'reason': reason, 'source_epoch': self.source_epoch,
+            'source_time_raw': stamp[:64] if isinstance(stamp, str) else None, 'book': quote_book(quote), **facts}
         trace = getattr(self, '_quote_trace', None)
         if trace is not None:
-            trace.native_rejection(code, self.quotes.get(code), self.source_epoch, check, reason, **facts)
+            trace.record('NATIVE_QUOTE_REJECTED', contract_id=code,
+                         raw_time=self._last_quote_rejection['source_time_raw'], **self._last_quote_rejection)
         return False
 
     def fresh(self, code, *, check_age=True, now=None):

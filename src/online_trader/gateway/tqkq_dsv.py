@@ -9,6 +9,7 @@ import time
 from online_trader.configuration.rollover import CHINA_TIME, expiry_date, future_product, rollover_hint
 from online_trader.domain.values import order_price
 from online_trader.errors import TraderError
+from online_trader.gateway.tq_wait import is_pinned_tq_api
 from online_trader.gateway.tqkq import TqKqPort, number
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.scheduling.clock import NS_PER_SECOND, quote_age_quality, quote_timestamp, source_age_ns, utc_text
@@ -179,6 +180,7 @@ class TqKqDsvPort(TqKqPort):
         self._tick_backfill_after={}
         self._tick_backfill_pending=set()
         self._local_order_returns = set()
+        self.waiting_reduction_quotes = set()
         self.minute_chart_serials={}
         self.minute_chart_requested=False
         self.minute_chart_sample_at = None
@@ -349,6 +351,7 @@ class TqKqDsvPort(TqKqPort):
         if self.source_epoch!=epoch:
             self.started_at=self.clock.now();self.subscription_ready_at.clear()
             self._local_order_returns.clear()
+            self.waiting_reduction_quotes.clear()
             self.minute_chart_sample_at = None
             self.minute_chart_cache = {}
             if self._rollover_task is not None:
@@ -357,6 +360,26 @@ class TqKqDsvPort(TqKqPort):
             self._rollover_poll_at = None
             self._rollover_main.clear()
             self._rollover_catalog.clear()
+        trace = getattr(self, '_quote_trace', None)
+        if trace is not None and (trace.live_poll or self.last_poll_updated):
+            pinned = is_pinned_tq_api(self.api)
+            for code, serial in self.tick_serials.items():
+                reason = None
+                supported = pinned and type(serial).__module__ == 'tqsdk.objs_not_entity'
+                try:
+                    ready = supported and self.api.is_serial_ready(serial)
+                except (AttributeError, KeyError, TypeError, ValueError, TraderError):
+                    ready = False
+                if self.source_epoch != epoch:
+                    reason = 'SDK_SOURCE_EPOCH_CHANGED'
+                elif self.fault:
+                    reason = 'SDK_CONNECTION_OR_SYNC_UNPROVED'
+                elif not supported:
+                    reason = 'SDK_SERIAL_CONTRACT_UNVERIFIED'
+                elif not ready:
+                    reason = 'SDK_SERIAL_NOT_READY'
+                trace.sdk_ticks(code, self.source_epoch, serial if ready else None, received[0],
+                                updated=self.last_poll_updated, unavailable=reason)
         return received
 
     def observations(self):
@@ -396,7 +419,17 @@ class TqKqDsvPort(TqKqPort):
                 except TraderError as error:fill['native_day_error']=error.code
         return proved_observations
 
+    def automatic_reduction_quote_ready(self, code):
+        """Reuse the live native-book requirement before preparing an automatic reduction."""
+        ready = self.fresh(code)
+        if ready:
+            self.waiting_reduction_quotes.discard(code)
+        else:
+            self.waiting_reduction_quotes.add(code)
+        return ready
+
     def validate_send(self,request):
+        self._last_quote_rejection = None
         self.check_dispatch_clock(request['effect'])
         value=self.grant.value;kernel=getattr(self,'kernel',None)
         if (self.read_only or self.fault or not self.complete() or kernel is None
@@ -440,9 +473,12 @@ class TqKqDsvPort(TqKqPort):
         else:
             fresh = self.fresh(code) or (direct and self.fresh_manual_reduction(code))
         if not fresh:
+            evidence = self._last_quote_rejection
             self._quote_rejected(code, 'SEND', 'E_NATIVE_QUOTE_NOT_CURRENT', effect=request['effect'],
                                  child_order_id=request['child_order_id'], trading_day=request['trading_day'])
-            raise TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '报单需要当前有效的原生报价。')
+            error = TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '报单需要当前有效的原生报价。')
+            error.quote_evidence = evidence or self._last_quote_rejection
+            raise error
         expected='BUY' if (cycle['plan']['direction']=='LONG')==(order['effect']=='OPEN') else 'SELL'
         if request['direction']!=expected:raise TraderError('E_OWNERSHIP','Native order direction differs from the original cycle')
         position=self.position(request['contract_id'])
@@ -473,7 +509,9 @@ class TqKqDsvPort(TqKqPort):
                                      child_order_id=request['child_order_id'], reference_utc=utc_text(send_now),
                                      accepted_session=facts['event']['session_id'],
                                      current_session=(window['session'] or {}).get('session_id'))
-                raise TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '报单前已离开原报价盘段。')
+                error = TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '报单前已离开原报价盘段。')
+                error.quote_evidence = self._last_quote_rejection
+                raise error
             if kernel.recovery_required:
                 raise TraderError('RECONCILIATION_REQUIRED', '原委托和持仓需要核对。')
             if not kernel.simulation.target_quota(code, request['trading_day'], existing=cycle['decision_key']):
@@ -508,10 +546,18 @@ class TqKqDsvPort(TqKqPort):
         if child in self._issued:raise TraderError('E_DUPLICATE_CONFLICT','A DSV native send cannot be replayed')
         self._issued.add(child)
         self._bindings[child]={key:request[key] for key in ('contract_id','direction','effect','original_qty','limit_price','native_offset')}
+        price = float(Decimal(request['limit_price']))
+        native_id = self.order_id(child)
+        trace = getattr(self, '_quote_trace', None)
+        if trace is not None:
+            trace.record('SDK_INSERT_ORDER', contract_id=request['contract_id'], child_order_id=child,
+                         effect=request['effect'], trading_day=request['trading_day'])
         order = self.api.insert_order(symbol=request['contract_id'],direction=request['direction'],
             offset=request['native_offset'],volume=request['original_qty'],
-            limit_price=float(Decimal(request['limit_price'])),order_id=self.order_id(child),account=self.account)
+            limit_price=price,order_id=native_id,account=self.account)
         self._local_order_returns.add(child)
+        if request['effect'] == 'REDUCE':
+            self.waiting_reduction_quotes.discard(request['contract_id'])
         return order
 
     def tick_records(self,code,*,after_id=None):
@@ -529,7 +575,13 @@ class TqKqDsvPort(TqKqPort):
             return []
         self.subscription_ready_at.setdefault(code,self.clock.now())
         if after_id is not None:
-            serial = serial.loc[serial['id'] >= after_id]
+            if is_pinned_tq_api(self.api) and type(serial).__module__ == 'tqsdk.objs_not_entity':
+                # The pinned SDK puts each native ID into its corresponding
+                # ascending slot, even when the slot's Tick is still missing.
+                # Keep the boundary row so DsvFactFeed can check corrections.
+                serial = serial.iloc[serial['id'].searchsorted(after_id):]
+            else:
+                serial = serial.loc[serial['id'] >= after_id]
         return serial.to_dict('records')
 
     def incremental_tick_records(self, code, after_id):

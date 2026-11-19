@@ -20,7 +20,7 @@ from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.simulation import SimulationSession
 from online_trader.runtime.instance import AccountLock, ClockActivity
 from online_trader.runtime.identity import runtime_identity
-from online_trader.runtime.market_monitor import DsvMarketMonitor, append_latency
+from online_trader.runtime.market_monitor import DsvMarketMonitor
 from online_trader.runtime.quote_trace import QuoteTrace
 from online_trader.scheduling.calendar import TradingCalendar
 from online_trader.scheduling.holdover import ProtectionClockAnchor, legacy_protection_pending
@@ -91,7 +91,8 @@ class DsvSimulationSession(SimulationSession):
         self.monitor = DsvMarketMonitor(monitor_contracts, calendar, diagnostic=monitor_settings['trade']['tick_diag'])
         self._quote_trace = None
         if self.monitor.diagnostic:
-            self._quote_trace = QuoteTrace(self.output / 'market-quote-trace.jsonl', kernel.boot_id)
+            self._quote_trace = QuoteTrace(
+                self.output / 'market-quote-trace.jsonl', kernel.boot_id, calendar, contracts=monitor_contracts)
             self.feed.quote_trace = self._quote_trace
             self.port._quote_trace = self._quote_trace
             kernel._dsv_quote_trace = self._quote_trace
@@ -142,8 +143,9 @@ class DsvSimulationSession(SimulationSession):
         except Exception as error:
             self.entry_log.failed('discover', error, self.emit)
         try:
-            self.comparison = ComparisonRecorder(kernel, output, profile, calendar,
-                                                 dsv_config=dsv_config, dsv_log_dir=dsv_log_dir)
+            self.comparison = ComparisonRecorder(
+                kernel, output, profile, calendar, dsv_config=dsv_config, dsv_log_dir=dsv_log_dir,
+                desktop_archive=entry_point == 'desktop-start' and dsv_config is None and dsv_log_dir is None)
         except Exception as error:
             self._comparison_failed(error)
 
@@ -171,8 +173,10 @@ class DsvSimulationSession(SimulationSession):
             self._comparison_failed(error)
         else:
             if method == 'poll' and self.comparison_error in {
-                    None, 'E_COMPARISON_SETTINGS', 'E_COMPARISON_SETTINGS_UNAVAILABLE', 'E_COMPARISON_LOG_UNAVAILABLE'}:
-                self.comparison_error = self.comparison.profile_warning or self.comparison.log_warning
+                    None, 'E_COMPARISON_SETTINGS', 'E_COMPARISON_SETTINGS_UNAVAILABLE',
+                    'E_COMPARISON_LOG_UNAVAILABLE', 'E_COMPARISON_BACKPRESSURE'}:
+                self.comparison_error = (self.comparison.archive_warning or self.comparison.profile_warning
+                                         or self.comparison.log_warning)
                 if self.comparison_error:
                     self.kernel._dsv_diagnostics['comparison'] = self.comparison_error
                 else:
@@ -250,13 +254,15 @@ class DsvSimulationSession(SimulationSession):
                 self.kernel._dsv_diagnostics['ntp'] = 'NTP_UNAVAILABLE'
 
     def close(self):
-        super().close()
-        self._operation_log('poll')
-        self._operation_log('close')
-        self._comparison('poll')
-        self._comparison('close')
-        if self._quote_trace is not None:
-            self._quote_trace.flush(phase='SESSION_CLOSE', force=True)
+        try:
+            super().close()
+            self._operation_log('poll')
+            self._operation_log('close')
+            self._comparison('poll')
+            self._comparison('close')
+        finally:
+            if self._quote_trace is not None:
+                self._quote_trace.close()
 
     def _trace_tick(self, stage, event, **details):
         if self._quote_trace is not None:
@@ -341,9 +347,17 @@ class DsvSimulationSession(SimulationSession):
             return phase
         if not ready:return phase
         resume=self._day_resume_revision==k._authority_revision
+        stop_generation=k.control.entry_stop_generation
+        if not self.prime(manage_owned=True):
+            self._primed = False
+            return 'DSV_OBSERVATION_REBUILD_DEFERRED'
+        if self.port.fault or self.port.source_epoch != key[1] or self.driver._fault:
+            self._primed = False
+            return phase
         self._managed_day=day;self._calendar_anchor=utc(self.port.clock.now())
-        self.prime(manage_owned=True);self._source_epoch=self.port.source_epoch
-        if resume:self._arm_request_revision=k._authority_revision
+        self._source_epoch=key[1]
+        if resume and stop_generation==k.control.entry_stop_generation:
+            self._arm_request_revision=k._authority_revision
         self._day_resume_revision=None
         return None
 
@@ -367,6 +381,31 @@ class DsvSimulationSession(SimulationSession):
     def prime(self,*,manage_owned=False):
         """Rebuild available history with zero signal execution and no arming."""
         trace = self._quote_trace
+        live_poll = trace.live_poll if trace is not None else False
+        if trace is not None:
+            if live_poll:
+                for code in trace.contracts:
+                    trace.market.incomplete(code)
+            trace.live_poll = False
+        try:
+            self._prime(manage_owned=manage_owned, trace=trace)
+            return True
+        except TraderError as error:
+            if error.code != 'E_DSV_REBUILD_INTERRUPTED' or self.kernel._failed:
+                raise
+            self._rebuild_deferred(error)
+            return False
+        finally:
+            if trace is not None:
+                trace.live_poll = live_poll
+
+    def _rebuild_deferred(self, error):
+        trace = self._quote_trace
+        if trace is not None:
+            trace.record('OBSERVATION_REBUILD_DEFERRED', source_epoch=self.port.source_epoch, reason=str(error))
+        self.status('DSV_OBSERVATION_REBUILD_DEFERRED', armed=self.kernel._armed, reason=error.code)
+
+    def _prime(self, *, manage_owned, trace):
         if trace is not None:
             trace.record('PRIME_START', manage_owned=manage_owned)
             trace.flush(phase='PRIME_START', force=True)
@@ -432,11 +471,10 @@ class DsvSimulationSession(SimulationSession):
             reference_utc = utc(self.port.clock.now())
             closed = {code for code in rebuilt
                       if self.driver.calendar.query(code, reference_utc)['is_trading'] is False}
-            if trace is not None and closed - resting:
-                for code in rebuilt:
-                    if code in closed and code not in resting:
-                        self._trace_tick('PRIME_CONTRACT_RESTING', rebuilt[code], reference_utc=reference_utc,
-                                         reason='QUOTE_OUTSIDE_CURRENT_SESSION')
+            if trace is not None:
+                for code in sorted(closed - resting):
+                    self._trace_tick('PRIME_CONTRACT_RESTING', rebuilt[code], reference_utc=reference_utc,
+                                     reason='QUOTE_OUTSIDE_CURRENT_SESSION')
             resting = closed
             waiting.difference_update(resting)
             for code, event in rebuilt.items():
@@ -464,7 +502,8 @@ class DsvSimulationSession(SimulationSession):
             trace.flush(phase=self.phase, force=True)
 
     def _prime_quote_current(self, event):
-        now = self.port.clock.now()
+        clock = self.port.clock
+        now = clock.utc_now() if hasattr(clock, 'utc_now') else clock.now()
         age = (now - datetime.fromisoformat(event['source_time_utc'])).total_seconds()
         age_limit_ms = self.kernel.max_quote_age_ms
         at = self.driver.calendar.query(event['contract_id'], utc(now))
@@ -504,13 +543,19 @@ class DsvSimulationSession(SimulationSession):
 
     def _prime_path(self,code,events,*,extend=False,preserve_authority=False):
         started = time.monotonic_ns()
-        epoch = events[0]['source_epoch']
+        first = events[0]
+        epoch = first['source_epoch']
         completed = False
 
         def progress():
             self._pump_rebuild_responsibilities()
-            if self.port.source_epoch != epoch:
-                raise TraderError('E_DSV_REBUILD_INTERRUPTED', 'Native source changed during observation rebuild')
+            at = self.driver.calendar.query(code, utc(self.port.clock.now()))
+            session = at['session']
+            if (self.port.fault or self.port.source_epoch != epoch or self.driver._fault
+                    or not at['complete'] or not at['is_trading'] or session is None
+                    or at['trading_day'] != first['trading_day'] or session['session_id'] != first['session_id']):
+                raise TraderError('E_DSV_REBUILD_INTERRUPTED',
+                                  'The native source, clock or active session changed during observation rebuild')
 
         try:
             anchor_key=(code,epoch)
@@ -671,15 +716,15 @@ class DsvSimulationSession(SimulationSession):
             self.kernel._dsv_monitor_rows = monitor_symbols(self.kernel, self.last_decisions)
             self._monitor_at_ns = now
             self._monitor_seq = self.kernel._durable_seq
-        if self.monitor.diagnostic and now - self._latency_at_ns >= 1_000_000_000:
+        if self._quote_trace is not None and now - self._latency_at_ns >= 1_000_000_000:
             diagnostic = self.monitor.diagnostics(now)
             ticks = [tick for tick in diagnostic['ticks'] if int(tick['strategy_end_monotonic_ns']) > self._latency_written_ns]
-            append_latency(self.output/'market-latency.jsonl', diagnostic | {
+            queued = self._quote_trace.enqueue(self.output/'market-latency.jsonl', diagnostic | {
                 'ticks': ticks, 'account_key': self.kernel.account_key, 'kernel_boot_id': self.kernel.boot_id,
                 **self.monitor.latest,
             })
             self._latency_at_ns = now
-            if ticks:
+            if queued and ticks:
                 self._latency_written_ns = int(ticks[-1]['strategy_end_monotonic_ns'])
 
     def _finish_strategy_stop(self, *, _snapshot=None):
@@ -803,6 +848,8 @@ class DsvSimulationSession(SimulationSession):
         path_rebuild_start = self._path_rebuild_ns
         timings = {}
         code, event = None, None
+        if self._quote_trace is not None:
+            self._quote_trace.live_poll = self._primed
         try:
             if isinstance(clock, CalibratedClock):
                 self._poll_clock_diagnostic()
@@ -861,7 +908,10 @@ class DsvSimulationSession(SimulationSession):
                     if day is not None and day != self._entry_resume[1]:
                         self._entry_resume = None
                 self.status(recovery_phase,armed=False)
-                if k.control.strategy_stop_requested():k._dsv_stop_wait = '等待柜台同步及原委托、持仓核对'
+                if k.control.strategy_stop_requested():
+                    k._dsv_stop_wait = ('等待重新建立行情观察'
+                                        if recovery_phase == 'DSV_OBSERVATION_REBUILD_DEFERRED'
+                                        else '等待柜台同步及原委托、持仓核对')
                 return
             if self.port.fault and not self.port.complete():
                 self.owner.tick();k.wait_idle()
@@ -873,9 +923,14 @@ class DsvSimulationSession(SimulationSession):
                 k.wait_idle()
                 self.driver._quotes.clear()
                 self.driver._ages.clear()
-                self.prime()
-                self._source_epoch = self.port.source_epoch
+                epoch = self.port.source_epoch
+                if not self.prime():
+                    return
+                self._source_epoch = epoch
             self.owner.tick();k.wait_idle()
+            if not self._primed:
+                self.prime(manage_owned=True)
+                return
             if self.driver.clock_rebuild_pending:
                 self._utc_resume = None
                 self.prime(manage_owned=True)
@@ -956,6 +1011,9 @@ class DsvSimulationSession(SimulationSession):
             else:self.status('DSV_MANAGING_OWNED' if any(c['lifecycle']!='CLOSED' for c in k._staged.values())
                              else 'DSV_OBSERVING',armed=k._armed)
         except Exception as error:
+            if isinstance(error, TraderError) and error.code == 'E_DSV_REBUILD_INTERRUPTED' and not k._failed:
+                self._rebuild_deferred(error)
+                return
             self.monitor.invalidate(datetime.now(timezone.utc))
             self._monitor_at_ns = 0
             self._entry_resume = None
@@ -1003,9 +1061,12 @@ class DsvSimulationSession(SimulationSession):
                 timings['提交等待（含各阶段内等待）'] = k.commit_wait_ns - commit_wait_start
                 self._operation_log('monitor', self.monitor, loop_start, timings)
                 self._operation_log('poll')
+                archive_start = time.monotonic_ns()
                 self._comparison('poll')
+                timings['对照归档提交'] = time.monotonic_ns() - archive_start
             finally:
                 if self._quote_trace is not None:
+                    self._quote_trace.live_poll = False
                     elapsed_ns = time.monotonic_ns() - loop_start
                     if elapsed_ns >= 100_000_000:
                         self._quote_trace.record('OWNER_LOOP_SLOW', elapsed_ns=elapsed_ns,
@@ -1128,8 +1189,8 @@ def _claim_run_output(output, grant):
     """Claim the output once, including when different accounts start concurrently."""
     records = ('comparison-*', 'run-identity.json', 'strategy-log.jsonl', 'phase-[0-9][0-9][0-9][0-9]*.json',
                'result.json', 'startup-failure.json', 'auto-offsets-starting.json',
-               'auto-offsets-completed.json', 'market-latency.jsonl*', 'workbench-latency-*', 'final-relogin.json',
-               'final-money-report.json')
+               'auto-offsets-completed.json', 'market-latency*.jsonl*', 'market-quote-trace*.jsonl',
+               'workbench-latency-*', 'final-relogin.json', 'final-money-report.json')
     try:
         recovery = output.with_name(output.name + '.operation-log-recovery.json')
         if recovery.exists() or any(next(output.glob(pattern), None) is not None for pattern in records):

@@ -218,8 +218,9 @@ def append_latency(path, row, *, capacity=4 * 1024 * 1024):
     path = Path(path)
     raw = canonical_bytes(row) + b'\n'
     if len(raw) > capacity:
-        return
+        return False
     if path.exists() and path.stat().st_size + len(raw) > capacity:
         path.replace(path.with_suffix('.previous.jsonl'))
     with path.open('ab') as stream:
         stream.write(raw)
+    return True

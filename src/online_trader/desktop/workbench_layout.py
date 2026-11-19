@@ -77,6 +77,7 @@ LOG_PHASES = {
     'DSV_WAITING_CABINET_DAY_SYNC': '柜台快照不完整，等待同步并核对交易日',
     'DSV_RECONNECT_ORIGINAL_EXITS_NEED_RECONCILIATION': '同一交易日重连，等待核对原委托及持仓',
     'DSV_DAY_CHANGE_ORIGINAL_EXITS_NEED_RECONCILIATION': '柜台换日，等待核对原委托及持仓',
+    'DSV_OBSERVATION_REBUILD_DEFERRED': '行情观察重建中断，等待重新核对时钟、盘段和连接',
     'DSV_STOPPING': '已停止开仓，继续保护并等待核对',
     'DSV_STOPPED': '策略已停止',
     'DSV_CLOCK_FAULT': 'Windows 时间待核对，暂停开仓和定时调度',
@@ -378,6 +379,25 @@ def display_value(value):
     return '—' if value is None or value=='' else str(value)
 
 
+def market_age_summary(quotes):
+    quotes = tuple(quotes)
+    active = [quote for quote in quotes if quote.get('market_session_active') is True]
+    if not active:
+        resting = quotes and all(quote.get('quote_time_reason') == 'QUOTE_OUTSIDE_CURRENT_SESSION'
+                                 for quote in quotes)
+        return '休市' if resting else '等待盘段核对'
+    ages = [int(quote['source_age_raw_ns']) for quote in active
+            if quote.get('source_age_raw_ns') is not None
+            and quote.get('quote_time_reason') in (None, 'QUOTE_STALE', 'QUOTE_LEADS_LOCAL_UTC')]
+    valid = [age for age in ages if age >= 0]
+    parts = [f'{max(valid) / 1_000_000_000:.3f} 秒'] if valid else []
+    if any(age < 0 for age in ages):
+        parts.append('源时间领先')
+    if len(ages) < len(active):
+        parts.append('部分报价待核对' if ages else '等待同盘报价')
+    return ' · '.join(parts)
+
+
 def market_quote_states(markets, codes, monitor):
     legacy_resting = (monitor.get('quote_status') == '休市' and not any(
         quote.get('market_session_active') is True or quote.get('fresh') for quote in markets.values()))
@@ -387,6 +407,8 @@ def market_quote_states(markets, codes, monitor):
         reason = quote.get('quote_time_reason')
         if reason == 'QUOTE_OUTSIDE_CURRENT_SESSION':
             states[code] = '休市'
+        elif quote.get('local_market_wait_ns') is not None:
+            states[code] = '本机处理积压'
         elif quote.get('fresh'):
             states[code] = '新鲜'
         elif legacy_resting and reason is None and quote.get('market_session_active') is not True:
@@ -1118,7 +1140,7 @@ class WorkbenchLayout:
                     'QUOTE_UNAVAILABLE': '尚无当前报价',
                     'QUOTE_TIMESTAMP_INVALID': '报价时间格式无效',
                     'QUOTE_SESSION_MISMATCH': '报价属于其他交易时段',
-                    'QUOTE_LEADS_LOCAL_UTC': '源报价时间领先本机',
+                    'QUOTE_LEADS_LOCAL_UTC': '源报价时间领先应用 UTC',
                     'QUOTE_STALE': '当前报价已过时',
                 }.get(quote.get('quote_time_reason'))
                 if time_reason:
@@ -1532,6 +1554,7 @@ class WorkbenchLayout:
         quotes = {item['contract_id']: item for item in (view or {}).get('markets', ())}
         quote_states = market_quote_states(quotes, quotes, config.get('strategy_monitor') or {}).values()
         lagging = sum(state == '行情已滞后' for state in quote_states)
+        backlogged = sum(state == '本机处理积压' for state in quote_states)
         snapshot_age = w.published_snapshot_age() if view else None
         if stale and snapshot_age is not None:
             market_health = f'上次确认 {snapshot_age} 秒前'
@@ -1539,6 +1562,8 @@ class WorkbenchLayout:
             market_health = '待同步'
         elif all(state == '休市' for state in quote_states):
             market_health = '休市'
+        elif backlogged:
+            market_health = f'{backlogged} 个合约处理积压'
         elif lagging:
             market_health = f'{lagging} 个合约滞后'
         elif '等待行情' in quote_states:
@@ -3399,19 +3424,14 @@ class WorkbenchLayout:
             metric.setText(f'{title}   {value if value is not None else "—"}')
 
     def render_strategy_monitor(self, monitor):
-        delay = monitor.get('quote_delay_seconds') if monitor else None
-        if delay is None and monitor:
-            status = monitor['quote_status']
-            value = '—（休市）' if status == '休市' else '—（等待延迟样本）'
-        else:
-            value = display_quote_delay(delay) if monitor else '—'
-        self.home_quote_delay.setText(f'整体行情延迟（抽样）   {value}')
-        self.home_quote_delay.setToolTip('最近一笔有效行情的抽样延迟。各合约的新鲜度见下方合约行情。')
+        view = self.rendered_view or {}
+        markets = {item['contract_id']: item for item in view.get('markets', ())}
+        value = market_age_summary(markets.values()) if monitor and self.market_view_current(view) else '—'
+        self.home_quote_delay.setText(f'盘中源报价年龄   {value}')
+        self.home_quote_delay.setToolTip('取活跃盘段中同盘报价的最大年龄，由应用 UTC 减去源时间。')
         if not monitor:
             return
-        view = self.rendered_view or {}
         armed = view.get('entry_authority') == 'ARMED'
-        markets = {item['contract_id']: item for item in view.get('markets', ())}
         quote_states = market_quote_states(markets, (item['contract_id'] for item in monitor['symbols']), monitor)
         groups = {'ACTIVE': [], 'STOPPED': [], 'PENDING': []}
         for symbol in monitor['symbols']:
@@ -3546,6 +3566,7 @@ class WorkbenchLayout:
             label.setText('\n'.join(lines) or '（无）')
         fresh = sum(status == '新鲜' for status in quote_states.values())
         lagging = [code for code, status in quote_states.items() if status == '行情已滞后']
+        backlogged = [code for code, status in quote_states.items() if status == '本机处理积压']
         resting = sum(status == '休市' for status in quote_states.values())
         if codes and resting == len(codes):
             self.quote_status.setText('合约行情 · 休市')
@@ -3553,6 +3574,8 @@ class WorkbenchLayout:
             details = [f'{fresh} / {len(codes) - resting} 个合约有新鲜报价']
             if lagging:
                 details.append(f'滞后 ({len(lagging)})：{"、".join(lagging)}')
+            if backlogged:
+                details.append(f'本机积压 ({len(backlogged)})：{"、".join(backlogged)}')
             waiting_count = sum(status == '等待行情' for status in quote_states.values())
             if waiting_count:
                 details.append(f'{waiting_count} 个合约等待行情')
