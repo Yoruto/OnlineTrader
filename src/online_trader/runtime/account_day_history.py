@@ -299,9 +299,9 @@ def read_account_days(ledger, account_key, *, from_day, to_day, section='coverag
         raise TraderError('E_STORAGE', 'The selected account has no execution ledger')
     values = {'account_key': identifier(account_key), 'from_day': from_day, 'to_day': to_day,
               'section': section, 'contract': contract}
-    deadline = time.monotonic() + 5
     try:
         with history_database(path, account_key) as db:
+            deadline = time.monotonic() + 5
             db.row_factory = sqlite3.Row
             db.set_progress_handler(lambda: time.monotonic() >= deadline, 2000)
             db.execute('PRAGMA trusted_schema=OFF')

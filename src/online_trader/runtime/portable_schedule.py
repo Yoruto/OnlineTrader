@@ -87,8 +87,14 @@ def schedule_session(store, row, operator, token):
                 trigger = timed_start_trigger(profile, now, on_launch=True)
             first = False
             if trigger is not None:
-                control = store.runtime_control()
-                latest = store.profile()
+                try:
+                    control = store.runtime_control()
+                    latest = store.profile()
+                except TraderError as error:
+                    announced = _announce(announced, 'WAITING_FOR_SCHEDULE_CONFIG',
+                                          account_key=row['account_key'], error_code=error.code)
+                    time.sleep(1)
+                    continue
                 if not control['scheduled_start']['enabled']:
                     announced = _announce(announced, 'SCHEDULE_DISABLED', account_key=row['account_key'],
                                           profile_hash=latest.content_hash)
