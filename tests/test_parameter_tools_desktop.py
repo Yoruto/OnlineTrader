@@ -210,6 +210,7 @@ class ParameterToolsDesktopTests(unittest.TestCase):
         self.windows.append(window)
         window.timer.stop()
         dashboard = window.dashboard
+        saved_profile_hash = dashboard.profile.content_hash
         calculator = dashboard.calculator
         source = self.root / "daily.csv"
         source.write_bytes(daily_csv("DCE.p2701", [100] * 30).encode("utf-8"))
@@ -231,7 +232,7 @@ class ParameterToolsDesktopTests(unittest.TestCase):
         result = window.current_start_profile().to_settings()
         self.assertEqual(result["trade"]["max_volume"], 21)
         self.assertEqual(result["symbols"][1:], edited.to_settings()["symbols"][1:])
-        self.assertEqual(dashboard.profile.content_hash, self.profile.content_hash)
+        self.assertEqual(dashboard.profile.content_hash, saved_profile_hash)
 
     def test_main_rejects_stale_editor_or_calculator_result(self):
         settings = self.settings()
