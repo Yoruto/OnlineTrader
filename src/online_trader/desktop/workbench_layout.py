@@ -23,7 +23,7 @@ from online_trader.configuration.baseline import default_preview_profile
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.files import load_profile, publish_new_bytes
 from online_trader.configuration.rollover import expiry_date, expiry_warning, future_product, preview_rollover
-from online_trader.configuration.symbol_csv import ALIASES, PRODUCT_NAMES
+from online_trader.configuration.symbol_csv import PRODUCT_NAMES, match_contract_catalog
 from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.preferences import workbench_preferences
 from online_trader.desktop.reports import EquityChart
@@ -869,7 +869,8 @@ class WorkbenchLayout:
         from online_trader.desktop.settings import SettingsDialog
         if self.window._settings_dialog is None:
             dialog = SettingsDialog(self.window, baseline_loader=lambda: (
-                self.profile, {'rule_set_id': self.profile_source}))
+                self.profile, {'rule_set_id': self.profile_source}),
+                contract_catalog=self.manual_catalog, contract_catalog_loader=self.load_manual_catalog)
             self.window._settings_dialog = dialog
             dialog.preview_changed.connect(self.render_parameters)
             dialog.templates_changed.connect(self.reload_template_picker)
@@ -1458,6 +1459,8 @@ class WorkbenchLayout:
         self.manual_catalog = []
         self.manual_scoped_codes = ()
         self.manual_catalog_status.clear()
+        if self.window._settings_dialog is not None:
+            self.window._settings_dialog.set_contract_catalog(())
         self.manual_status.setText('等待所选账号同步')
         self.manual_funds.setText('资金未知')
         for label, title in self.fund_metrics.values():
@@ -2003,6 +2006,9 @@ class WorkbenchLayout:
             self.manual_catalog = rows
             self.manual_catalog_status.setText(f'已加载 {len(rows)} 个期货合约' if rows else '行情服务未返回合约')
             self.add_activity(self.manual_catalog_status.text())
+            dialog = self.window._settings_dialog
+            if dialog is not None:
+                dialog.set_contract_catalog(rows)
             self.filter_manual_catalog()
             return
         self.quote_reference = {row['contract_id']:row | {'quote_reference_ready':row['ready']} for row in rows}
@@ -2039,6 +2045,9 @@ class WorkbenchLayout:
                 feedback = '已保留原合约目录' if self.manual_catalog else '仍可选择已配置合约'
                 message = f'合约加载失败 · {feedback}（{code}）'
                 self.manual_catalog_status.setText(message)
+                dialog = self.window._settings_dialog
+                if dialog is not None:
+                    dialog.set_contract_catalog_error(code)
             else:
                 message = f'行情订阅失败 · {code}'
                 self.window.show_home_feedback(message)
@@ -2564,13 +2573,19 @@ class WorkbenchLayout:
 
     def load_manual_catalog(self):
         account = self.window.selected_account
+        dialog = self.window._settings_dialog
         if self.quote_worker is not None:
-            return
+            if dialog is not None:
+                dialog.set_contract_catalog_error('E_BUSY')
+            return False
         if account is None:
             self.manual_catalog_status.setText('请先选择提供行情的模拟账号')
-            return
+            if dialog is not None:
+                dialog.set_contract_catalog_error('E_ACCOUNT')
+            return False
         self.manual_catalog_status.setText('正在加载期货合约…')
         self.start_market_read(account['account_id'],catalog=True)
+        return True
 
     def manual_catalog_edited(self, text):
         self.filter_manual_catalog(text)
@@ -2578,20 +2593,8 @@ class WorkbenchLayout:
     def filter_manual_catalog(self, text=None):
         codes = (self.rendered_view or {}).get('configuration',{}).get('scoped_contracts') or list(self.names)
         selected = self.manual_code.currentText() if text is None else text
-        term = selected.strip().casefold() if text is not None else ''
-        prefix = term.rstrip('0123456789')
-        alias = ALIASES.get(prefix)
-        matches = []
-        for code in dict.fromkeys([*codes,*self.manual_catalog]):
-            product = future_product(code)
-            symbol = '.'.join(product) if product else ''
-            name = PRODUCT_NAMES.get(symbol, '').casefold()
-            suffix = code[len(symbol):] if product else ''
-            if (not term or term in code.casefold() or term in name
-                    or alias == product and product is not None and suffix.endswith(term[len(prefix):])):
-                matches.append(code)
-            if len(matches) >= 100:
-                break
+        catalog = list(dict.fromkeys([*codes,*self.manual_catalog]))
+        matches = catalog[:100] if text is None or not selected.strip() else match_contract_catalog(selected, catalog, limit=100)
         self.manual_code.blockSignals(True)
         self.manual_code.clear()
         self.manual_code.addItems(matches)

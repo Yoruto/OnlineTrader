@@ -140,12 +140,15 @@ class SettingsDialog(QDialog):
     templates_changed = Signal()
     template_directory_changed = Signal(str)
 
-    def __init__(self, parent=None, *, baseline_loader=None):
+    def __init__(self, parent=None, *, baseline_loader=None, contract_catalog=(), contract_catalog_loader=None):
         super().__init__(parent)
         self._baseline, self._manifest = (baseline_loader or _default_baseline)()
         self._profile = self._baseline
         self._template_store = None
         self._template_snapshot = None
+        self._contract_catalog = tuple(dict.fromkeys(contract_catalog or ()))
+        self._contract_catalog_loader = contract_catalog_loader
+        self._symbol_editor = None
         self.setWindowTitle("OnlineTrader · DSV参数中心")
         self.resize(1160, 760)
         layout = QVBoxLayout(self)
@@ -333,11 +336,24 @@ class SettingsDialog(QDialog):
     def _choose_editor(self):
         self.edit_preview()
 
+    def set_contract_catalog(self, contracts):
+        self._contract_catalog = tuple(dict.fromkeys(code for code in (contracts or ()) if isinstance(code, str)))
+        if self._symbol_editor is not None:
+            self._symbol_editor.set_contract_catalog(self._contract_catalog)
+
+    def set_contract_catalog_error(self, code):
+        if self._symbol_editor is not None:
+            self._symbol_editor.set_contract_catalog_error(code)
+
     def edit_preview(self, *, symbol_row=None, add_symbol=False):
         if add_symbol or symbol_row is not None:
             from online_trader.desktop.symbol_editor import SymbolEditorDialog
             dialog = SymbolEditorDialog(self._profile, self if self.isVisible() else self.parentWidget(),
-                                        symbol_row=None if add_symbol else symbol_row)
+                                        symbol_row=None if add_symbol else symbol_row,
+                                        contract_catalog=self._contract_catalog,
+                                        catalog_loader=self._contract_catalog_loader)
+            self._symbol_editor = dialog
+            dialog.start_catalog_load()
         else:
             from online_trader.desktop.editor import ParameterEditorDialog
             dialog = ParameterEditorDialog(self._profile, self)
@@ -345,7 +361,10 @@ class SettingsDialog(QDialog):
             if dialog.exec() == QDialog.Accepted:
                 return self.apply_edited_preview(dialog.result_profile, expected_hash=dialog.base_hash)
             return False
-        finally: dialog.deleteLater()
+        finally:
+            if dialog is self._symbol_editor:
+                self._symbol_editor = None
+            dialog.deleteLater()
 
     def _choose_calculator(self):
         from online_trader.desktop.calculator import OffsetCalculatorDialog
