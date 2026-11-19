@@ -21,7 +21,13 @@ def review_positions(owner, *, snapshot=None):
     owner._validate_snapshot(snapshot)
     rows=[]
     positions={p['contract_id']:p for p in snapshot['positions']}
-    native_positions=port.api.get_position(account=port.account)
+    native_positions = None
+    bucket_fields = {'long_today', 'long_historical', 'short_today', 'short_historical',
+                     'long_reference_price', 'short_reference_price'}
+    if any(not bucket_fields <= set(position) for position in snapshot['positions']):
+        # Compatibility for offline fixtures and older adapters. Production Tq
+        # snapshots carry these bucket facts in the captured account snapshot.
+        native_positions = port.api.get_position(account=port.account)
     cycles_by_code={};orders_by_code={};trades_by_code={}
     order_ids=set()
     codes=set(positions)
@@ -42,16 +48,22 @@ def review_positions(owner, *, snapshot=None):
                for side in ('long','short')}
         difference={side:position[side]-owned[side] for side in owned}
         scoped=code in owner.grant.value['contracts']
-        native=native_positions.get(code)
+        native = native_positions.get(code) if native_positions is not None else None
         orders=sorted(orders_by_code.get(code,[]),key=lambda o:o['order_id'])
         trades=sorted(trades_by_code.get(code,[]),key=lambda t:t['trade_id'])
         occupied=any(c.get('management_state') in {'TAKEN_OVER','TAKEOVER_PENDING'} or
             any(OrderState.from_dict(o).potential_remaining or o['send_state'] in {'UNKNOWN','SEND_POSSIBLE'}
                 for o in c['orders']) for c in active)
-        buckets={side:{'today':getattr(native,'pos_'+side+'_today',0 if not position[side] else None),
-                       'historical':getattr(native,'pos_'+side+'_his',0 if not position[side] else None),
-                       'reference_price':number(getattr(native,'open_price_'+side,None))}
-                 for side in owned}
+        buckets = {}
+        for side in owned:
+            if bucket_fields <= set(position):
+                buckets[side] = {'today': position[side + '_today'],
+                                 'historical': position[side + '_historical'],
+                                 'reference_price': position[side + '_reference_price']}
+            else:
+                buckets[side] = {'today': getattr(native, 'pos_' + side + '_today', 0 if not position[side] else None),
+                                 'historical': getattr(native, 'pos_' + side + '_his', 0 if not position[side] else None),
+                                 'reference_price': number(getattr(native, 'open_price_' + side, None))}
         all_sides_valid=all(
             type(b['today']) is int and type(b['historical']) is int and b['today']>=0 and b['historical']>=0
             and position[side]==b['today']+b['historical']

@@ -45,7 +45,12 @@ class WorkbenchPublication:
     def publish(self, project):
         now = time.monotonic_ns()
         if now < self._next_publication:
-            return
+            return False
+        if self._encoder is not None:
+            with self._pending_lock:
+                if self._pending is not None:
+                    self._next_publication = now + self._interval_ns
+                    return False
         stamp = datetime.now(timezone.utc).isoformat()
         try:
             value = project()
@@ -53,10 +58,14 @@ class WorkbenchPublication:
                 self._encode(*value, now, stamp)
             else:
                 with self._pending_lock:
+                    if self._pending is not None:
+                        return False
                     self._pending = (value, now, stamp)
                     self._ready.set()
+            return True
         except Exception as error:
             self._failure(error)
+            return False
         finally:
             self._next_publication = time.monotonic_ns() + self._interval_ns
 

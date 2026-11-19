@@ -168,29 +168,58 @@ def _seq(value):
 
 
 @contextmanager
+def _history_reader_gate(account_key):
+    """Serialize history readers before probing the exclusive execution-owner lock."""
+    guard = None
+    try:
+        from online_trader.runtime.instance import AccountLock
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                guard = AccountLock('HISTORY-READ:' + account_key)
+                break
+            except TraderError as error:
+                if error.code == 'E_PLATFORM':
+                    break
+                if error.code != 'E_INSTANCE_EXISTS':
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TraderError('E_BUSY', 'Another account history reader is still active') from None
+                time.sleep(.025)
+        yield
+    finally:
+        if guard is not None:
+            guard.close()
+
+
+@contextmanager
 def history_database(path, account_key):
     """Use a side-effect-free cold read without weakening a live WAL reader."""
     lease = None
-    try:
+    with _history_reader_gate(account_key):
         try:
-            from online_trader.runtime.instance import AccountLock
-            lease = AccountLock(account_key)
-        except TraderError:
-            # An active owner, unsupported host or inaccessible global lock must
-            # keep SQLite's normal WAL locking and change detection.
-            lease = None
-        suffix = '?mode=ro'
-        if (lease is not None and not path.with_name(path.name + '-wal').exists()
-                and not path.with_name(path.name + '-shm').exists()):
-            # The account lock prevents an owner starting while this checkpointed
-            # cold ledger is open.  Immutable mode therefore avoids creating empty
-            # WAL/SHM coordination files without racing a legitimate writer.
-            suffix += '&immutable=1'
-        with closing(sqlite3.connect(path.as_uri() + suffix, uri=True, timeout=.5)) as db:
-            yield db
-    finally:
-        if lease is not None:
-            lease.close()
+            try:
+                from online_trader.runtime.instance import AccountLock
+                lease = AccountLock(account_key)
+            except TraderError as error:
+                if error.code not in {'E_INSTANCE_EXISTS', 'E_PLATFORM'}:
+                    raise
+                # A live execution owner keeps SQLite's normal WAL locking. History
+                # readers themselves are serialized above, so reader-reader
+                # contention cannot be misclassified as an execution owner.
+                lease = None
+            suffix = '?mode=ro'
+            if (lease is not None and not path.with_name(path.name + '-wal').exists()
+                    and not path.with_name(path.name + '-shm').exists()):
+                # The account lock prevents an owner starting while this checkpointed
+                # cold ledger is open. Immutable mode avoids creating empty WAL/SHM
+                # coordination files and preserves the source directory byte-for-byte.
+                suffix += '&immutable=1'
+            with closing(sqlite3.connect(path.as_uri() + suffix, uri=True, timeout=.5)) as db:
+                yield db
+        finally:
+            if lease is not None:
+                lease.close()
 
 
 def _coverage(db, params, first, last):
@@ -270,9 +299,9 @@ def read_account_days(ledger, account_key, *, from_day, to_day, section='coverag
         raise TraderError('E_STORAGE', 'The selected account has no execution ledger')
     values = {'account_key': identifier(account_key), 'from_day': from_day, 'to_day': to_day,
               'section': section, 'contract': contract}
-    deadline = time.monotonic() + 5
     try:
         with history_database(path, account_key) as db:
+            deadline = time.monotonic() + 5
             db.row_factory = sqlite3.Row
             db.set_progress_handler(lambda: time.monotonic() >= deadline, 2000)
             db.execute('PRAGMA trusted_schema=OFF')

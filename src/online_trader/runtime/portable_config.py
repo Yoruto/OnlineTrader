@@ -18,6 +18,8 @@ _ACCOUNT_FIELDS = {'id', 'alias', 'provider', 'broker', 'line'}
 _PROVIDERS = {'TQKQ', 'TQ_SIMNOW'}
 _KQ_FIELDS = {'username', 'password'}
 _SIMNOW_FIELDS = {'simnow_username', 'simnow_password', 'kq_username', 'kq_password'}
+_RUNTIME_CONTROL_FILE = 'runtime-control.json'
+_RUNTIME_CONTROL_SCHEMA = 'ONLINE_TRADER_RUNTIME_CONTROL/1'
 
 
 def _read(root, name):
@@ -32,6 +34,20 @@ def _read(root, name):
         return strict_loads(raw.decode('utf-8-sig'))
     except (OSError, ValueError):
         raise TraderError('E_RUNTIME_CONFIG', f'Cannot read a valid {name}') from None
+
+
+def read_runtime_control(root):
+    """Read the hot-reloadable supervisor gate; durable trading facts stay in SQLite."""
+    value = _read(Path(root).resolve(), _RUNTIME_CONTROL_FILE)
+    try:
+        scheduled = value['scheduled_start']
+        if (type(value) is not dict or value.keys() != {'schema_version', 'scheduled_start'}
+                or value['schema_version'] != _RUNTIME_CONTROL_SCHEMA or type(scheduled) is not dict
+                or scheduled.keys() != {'enabled'} or type(scheduled['enabled']) is not bool):
+            raise ValueError()
+    except (KeyError, TypeError, ValueError):
+        raise TraderError('E_RUNTIME_CONFIG', 'The runtime control configuration is invalid') from None
+    return value
 
 
 class _ConfiguredCredentials:
@@ -111,6 +127,9 @@ class PortableAccountStore(AccountStore):
         raise TraderError('E_RUNTIME_CONFIG', 'Edit the runtime account configuration through its local entry')
 
     save_credentials = forget_credentials = initialize_simulation_accounts = change
+
+    def runtime_control(self):
+        return read_runtime_control(self.directory)
 
     def profile(self):
         path = (self.directory / 'OnlineTrader-parameters.json').resolve()

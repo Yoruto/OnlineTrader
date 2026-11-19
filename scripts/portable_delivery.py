@@ -81,12 +81,13 @@ def _runtime_files(directory, kind):
     directory = directory.resolve()
     store = PortableAccountStore(directory)
     store.profile()
+    store.runtime_control()
     operators = operator_records(directory)
     now = datetime.now(timezone.utc)
     bound_accounts = {account for _, accounts, _, expiry in operators.values() if expiry > now for account in accounts}
     if any(row['account_key'] not in bound_accounts for row in store.read()['accounts']):
         raise ValueError('A delivered simulation account lacks a current local operator grant.')
-    names = ['runtime.json', PARAMETERS, 'private/' + DEFAULTS, 'private/operators.json']
+    names = ['runtime.json', 'runtime-control.json', PARAMETERS, 'private/' + DEFAULTS, 'private/operators.json']
     for name in names:
         reject_silver_in_config((directory / name).read_bytes(), name)
     if kind == 'handoff':
@@ -211,7 +212,7 @@ def main():
                                                configured=args.config_directory is not None,
                                                important_members=important or ())
                 print(f'ZIP SHA-256: {archive_sha256}')
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, TraderError) as error:
         print(error, file=sys.stderr)
         return 2
     return 0

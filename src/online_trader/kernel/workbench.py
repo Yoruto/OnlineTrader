@@ -9,7 +9,7 @@ from decimal import Decimal
 from heapq import nsmallest
 import time
 
-from online_trader.contracts.codec import canonical_bytes, strict_loads
+from online_trader.contracts.codec import canonical_bytes
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text
 from online_trader.kernel.projection import projection_batch
@@ -132,7 +132,7 @@ def workbench_view(kernel, *, snapshot=None):
     return _complete_workbench_view(*_capture_workbench_view(kernel, snapshot))
 
 
-def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None):
+def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None, native_fallback=True):
     kernel._check_owner()
     if snapshot is None:
         snapshot = kernel._make_snapshot()
@@ -148,6 +148,8 @@ def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None):
         from online_trader.kernel.external_positions import review_positions
         from online_trader.kernel.native_control import cancel_review
         try:
+            if native_snapshot is None and not native_fallback:
+                raise TraderError('E_ACCOUNT_SYNC', 'A recent native account snapshot is not available')
             native,external_positions=review_positions(kernel.simulation, snapshot=native_snapshot)
             if kernel.simulation.grant.manual_workbench:
                 _,_,native_cancel_review=cancel_review(kernel.simulation, snapshot=native)
@@ -156,11 +158,9 @@ def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None):
     day=native['trading_day'] if native and native['complete'] else None
     symbols={row['code']:row for row in runtime.profile.to_record()['settings']['symbols']} if runtime else {}
     decision_states = {}
-    for row in kernel.ledger.query('SELECT payload_json FROM strategy_proposals WHERE recorded_event_seq<=? ORDER BY recorded_event_seq DESC LIMIT 512',(kernel._durable_seq,)):
-        value=strict_loads(row['payload_json']);state=value.get('state',{})
-        decision_key = state.get('contract_id'), state.get('trading_day')
-        decisions.setdefault(decision_key, value.get('report') or {})
-        decision_states.setdefault(decision_key, state)
+    for decision_key, value in (runtime._decision_views.items() if runtime else ()):
+        decisions[decision_key] = value['report']
+        decision_states[decision_key] = value['state']
     latest={}
     for (code,trading_day),row in sorted((runtime._latest if runtime else {}).items()):
         if day is None or trading_day==day:
@@ -606,7 +606,8 @@ def workbench_publication(kernel):
 
 
 def prepare_workbench_publication(kernel, *, native_snapshot=None):
-    captured = _capture_workbench_view(kernel, kernel._make_snapshot(), native_snapshot=native_snapshot)
+    captured = _capture_workbench_view(kernel, kernel._make_snapshot(), native_snapshot=native_snapshot,
+                                       native_fallback=False)
 
     def complete():
         view = _complete_workbench_view(*captured)

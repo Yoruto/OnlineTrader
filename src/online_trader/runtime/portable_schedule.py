@@ -32,11 +32,15 @@ def _already_started(store, row, request_id):
         raise TraderError('E_STORAGE', 'Cannot check the durable scheduled-start identity') from None
 
 
-def schedule_session(store, row, profile, operator, token):
-    settings = profile.to_record()['settings']
-    if not settings['schedule']['enabled'] and not settings['trade']['auto_start_on_launch']:
-        raise TraderError('E_RUNTIME_CONFIG', 'Enable a startup schedule in the confirmed strategy configuration')
+def _announce(previous, status, **details):
+    value = (status, tuple(sorted(details.items())))
+    if value != previous:
+        print(json.dumps({'status': status, **details}, ensure_ascii=False), flush=True)
+    return value
 
+
+def schedule_session(store, row, operator, token):
+    """Wait for configured start points and reload local controls before every trigger."""
     def authorize():
         actor, capabilities = authenticate_operator(store.directory, row['account_key'], operator, token)
         if 'SCHEDULE_STRATEGY' not in capabilities:
@@ -45,16 +49,64 @@ def schedule_session(store, row, profile, operator, token):
 
     authorize()
     first = True
-    print(json.dumps({'status': 'WAITING_FOR_SCHEDULE', 'account_key': row['account_key']}), flush=True)
+    announced = None
     try:
         while True:
             actor = authorize()
+            try:
+                control = store.runtime_control()
+                profile = store.profile()
+            except TraderError as error:
+                announced = _announce(announced, 'WAITING_FOR_SCHEDULE_CONFIG', account_key=row['account_key'],
+                                      error_code=error.code)
+                first = False
+                time.sleep(1)
+                continue
+
+            settings = profile.to_record()['settings']
+            runtime_enabled = control['scheduled_start']['enabled']
+            profile_enabled = settings['schedule']['enabled'] or settings['trade']['auto_start_on_launch']
+            if not runtime_enabled:
+                announced = _announce(announced, 'SCHEDULE_DISABLED', account_key=row['account_key'],
+                                      profile_hash=profile.content_hash)
+                first = False
+                time.sleep(1)
+                continue
+            if not profile_enabled:
+                announced = _announce(announced, 'WAITING_FOR_PROFILE_SCHEDULE', account_key=row['account_key'],
+                                      profile_hash=profile.content_hash)
+                first = False
+                time.sleep(1)
+                continue
+
+            announced = _announce(announced, 'WAITING_FOR_SCHEDULE', account_key=row['account_key'],
+                                  profile_hash=profile.content_hash)
             now = datetime.now(timezone.utc)
             trigger = timed_start_trigger(profile, now)
             if trigger is None and first:
                 trigger = timed_start_trigger(profile, now, on_launch=True)
             first = False
             if trigger is not None:
+                try:
+                    control = store.runtime_control()
+                    latest = store.profile()
+                except TraderError as error:
+                    announced = _announce(announced, 'WAITING_FOR_SCHEDULE_CONFIG',
+                                          account_key=row['account_key'], error_code=error.code)
+                    time.sleep(1)
+                    continue
+                if not control['scheduled_start']['enabled']:
+                    announced = _announce(announced, 'SCHEDULE_DISABLED', account_key=row['account_key'],
+                                          profile_hash=latest.content_hash)
+                    time.sleep(1)
+                    continue
+                profile = latest
+                if timed_start_trigger(profile, now) != trigger and not (
+                        trigger == 'AUTO_START_ON_LAUNCH' and timed_start_trigger(profile, now, on_launch=True) == trigger):
+                    announced = _announce(announced, 'SCHEDULE_CHANGED_BEFORE_TRIGGER', account_key=row['account_key'],
+                                          profile_hash=profile.content_hash)
+                    time.sleep(1)
+                    continue
                 local_day = now.astimezone(CHINA_TIME).date().isoformat()
                 key = {'account_key': row['account_key'], 'day': local_day, 'trigger': trigger}
                 request_id = 'desktop-runtime-schedule-' + content_hash(key)[:32]

@@ -18,7 +18,8 @@ from online_trader.transport.named_pipe import PipeListener
 from online_trader.runtime.processes import parent_pid
 
 
-_STANDALONE_PUBLICATION_INTERVAL_NS = 500_000_000
+_STANDALONE_WORKBENCH_PUBLICATION_INTERVAL_NS = 750_000_000
+_STANDALONE_ACCOUNT_PUBLICATION_INTERVAL_NS = 2_500_000_000
 
 
 def _id():return uuid.uuid4().hex
@@ -319,7 +320,8 @@ class ControlServer:
         acceptor=threading.Thread(target=self._acceptor,daemon=True);acceptor.start()
         publication = accounts = None
         standalone = self._trusted_client_pid is not None
-        next_publication_ns = 0
+        next_workbench_publication_ns = next_account_publication_ns = 0
+        native_snapshot = None
         try:
             if standalone:
                 from online_trader.runtime.account_publication import AccountPublication
@@ -345,11 +347,14 @@ class ControlServer:
                 if publication is not None and not standalone:
                     self._publish_workbench(publication)
                 if owner_tick is not None:owner_tick()
-                if standalone and time.monotonic_ns() >= next_publication_ns:
-                    native_snapshot = accounts.capture(self.kernel) if accounts is not None else None
-                    if publication is not None:
+                if standalone:
+                    now_ns = time.monotonic_ns()
+                    if accounts is not None and now_ns >= next_account_publication_ns:
+                        native_snapshot = accounts.capture(self.kernel)
+                        next_account_publication_ns = now_ns + _STANDALONE_ACCOUNT_PUBLICATION_INTERVAL_NS
+                    if publication is not None and now_ns >= next_workbench_publication_ns:
                         self._publish_workbench(publication, standalone=True, native_snapshot=native_snapshot)
-                    next_publication_ns = time.monotonic_ns() + _STANDALONE_PUBLICATION_INTERVAL_NS
+                        next_workbench_publication_ns = now_ns + _STANDALONE_WORKBENCH_PUBLICATION_INTERVAL_NS
                 self._sync_streams()
                 self._service_inbound(closing=bool(self._stop.is_set() or (stop_event and stop_event.is_set())))
                 self._flush_receipts()

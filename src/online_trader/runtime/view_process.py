@@ -4,7 +4,10 @@ import os
 import logging
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from functools import partial
+from pathlib import Path
 from threading import BoundedSemaphore, Event, Thread
 
 from online_trader.errors import TraderError
@@ -20,20 +23,62 @@ from online_trader.transport.runtime_view import DAY_HISTORY_FIELDS, PROTOCOL, V
 from online_trader.transport.workbench_snapshot import read_workbench_publication
 
 
+_VIEW_LOG_LIMIT = 4 * 1024 * 1024
+
+
+def _view_log(root):
+    path = Path(root).resolve() / 'logs' / 'runtime-view.log'
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_file() and path.stat().st_size >= _VIEW_LOG_LIMIT:
+            previous = path.with_suffix('.log.1')
+            previous.unlink(missing_ok=True)
+            path.replace(previous)
+    except OSError:
+        pass
+    return path
+
+
+def _supervisor_log(root, message):
+    try:
+        path = _view_log(root)
+        stamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        with path.open('a', encoding='utf-8') as stream:
+            stream.write(f'{stamp} SUPERVISOR {message}\n')
+    except OSError:
+        pass
+
+
 def _start(pipe, account_key, root, ledger):
     program = bundled_cli()
     prefix = [str(program)] if program is not None else [sys.executable, '-m', 'online_trader']
-    return subprocess.Popen([*prefix, 'runtime-view-process', '--pipe', pipe, '--account-key', account_key,
-                             '--root', str(root), '--ledger', str(ledger)],
-        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-        env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1'))
+    log_path = _view_log(root)
+    output = None
+    try:
+        output = log_path.open('ab', buffering=0)
+    except OSError:
+        pass
+    try:
+        process = subprocess.Popen([*prefix, 'runtime-view-process', '--pipe', pipe, '--account-key', account_key,
+                                    '--root', str(root), '--ledger', str(ledger)],
+            stdin=subprocess.PIPE, stdout=output if output is not None else subprocess.DEVNULL,
+            stderr=output if output is not None else subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            env=dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1'))
+    finally:
+        if output is not None:
+            output.close()
+    _supervisor_log(root, f'START pid={process.pid}')
+    return process
 
 
 def _close(process):
     if process is None:
         return
-    process.stdin.close()
+    try:
+        process.stdin.close()
+    except (OSError, ValueError):
+        pass
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
@@ -41,7 +86,11 @@ def _close(process):
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            pass
+            process.kill()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 class ViewProcess:
@@ -60,18 +109,35 @@ class ViewProcess:
 
     def _monitor(self):
         last_error = None
+        started_at = None
+        rapid_failures = 0
+        root = self.args[2]
         try:
             while not self._stopped.is_set():
                 if self.trusted_pid() <= 0:
-                    _close(self._process)
-                    self._process = None
+                    if self._process is not None:
+                        code = self._process.poll()
+                        uptime = 0 if started_at is None else max(0, time.monotonic() - started_at)
+                        _supervisor_log(root, f'EXIT code={code} uptime_ms={int(uptime * 1000)}')
+                        rapid_failures = rapid_failures + 1 if uptime < 10 else 0
+                        _close(self._process)
+                        self._process = None
+                        delay = min(10.0, .5 * (2 ** min(rapid_failures, 5)))
+                        if self._stopped.wait(delay):
+                            break
                     try:
                         self._process = _start(*self.args)
+                        started_at = time.monotonic()
                         last_error = None
                     except OSError as error:
+                        _supervisor_log(root, f'START_FAILED error={type(error).__name__}')
                         if type(error) is not last_error:
                             print(f'E_RUNTIME_VIEW: {type(error).__name__}', file=sys.stderr)
                         last_error = type(error)
+                        rapid_failures = min(rapid_failures + 1, 5)
+                        delay = min(10.0, .5 * (2 ** rapid_failures))
+                        if self._stopped.wait(delay):
+                            break
                 self._stopped.wait(.5)
         finally:
             _close(self._process)

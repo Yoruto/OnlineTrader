@@ -278,13 +278,14 @@ sequenceDiagram
 | 文件 | 内容与归属 |
 | --- | --- |
 | `runtime.json` | 运行目录版本、账户档案与默认账户。各账户以配置名关联私有登录资料，账本路径按原有账户身份规则在运行目录内派生。运行时在账本旁记录已建账身份。 |
+| `runtime-control.json` | 运行级自动化开关。当前 `scheduled_start.enabled` 明确决定无人值守启动器是否允许发起新的定时策略运行；启动器每秒重读该文件和策略参数，修改后无需重启调度进程。 |
 | `private/OnlineTrader-defaults.json` | 为接收方确认的券商与行情账号、口令、线路及连接参数。运行时独占读取，匹配账户档案和现有账本身份后才接通对应适配器。Qt、公开查询和诊断只取得脱敏字段。 |
 | `private/operators.json` | 应用内操作员和受托工具的校验值、角色、授权范围及有效期。通过独立控制入口更新，临时控制会话启动后重新建立。 |
 | `OnlineTrader-parameters.json` | 经确认的初始策略参数和默认设置，用于首次建账和后续预览。接续已有账户时，从执行账本恢复已绑定的策略版本及计划。 |
 | 每账户 SQLite 执行账本 | 沿用选定执行路径的账本，保留委托、成交、在途占量、保护、人工禁开、已生效策略、计划、账户观察、跨日查询事实、业务计数和回执。随目录迁移同一账本，不另带 Runtime 数据库。 |
 | `handoff.json` | 交接时记录格式版本、账号和柜台日、源 owner 状态、账本身份与检查点、配置版本和文件摘要，供目标机预检。 |
 
-独立运行时使用配置和每账户执行账本，去掉独立运行状态库及对 Windows 凭据库的依赖。新账户在首次启动校验配置并取得账户锁后，自动创建账户绑定的 SQLite 执行账本并记录已建账状态，再进入连接流程。初始参数随启动确认记录持久化。生效参数版本由原执行器在核实交易日、行情元数据和交易范围后提交。已有账户先恢复账本，缺失或损坏时报错并等待修复。换机交接入口要求交接清单列出的原账本齐全，避免缺包被误判为新账户。
+独立运行时使用配置和每账户执行账本，去掉独立运行状态库及对 Windows 凭据库的依赖。两者职责不同且共同构成可恢复运行目录：配置保存账户选择、登录资料、策略参数、操作员授权和自动启动意图；原 SQLite 账本保存已经发生并需要恢复或审计的账户观察、委托、成交、持仓责任、命令和策略执行事实。配置不是交易历史，账本也不承担下一次运行的可编辑设置。新账户在首次启动校验配置并取得账户锁后，自动创建账户绑定的 SQLite 执行账本并记录已建账状态，再进入连接流程。初始参数随启动确认记录持久化。生效参数版本由原执行器在核实交易日、行情元数据和交易范围后提交。已有账户先恢复账本，缺失或损坏时报错并等待修复。换机交接入口要求交接清单列出的原账本齐全，避免缺包被误判为新账户。
 
 含登录资料的目录具备登录能力，按含账号口令的制品通过已批准的私有渠道交接。可供自动化工具使用的委托令牌原值按独立授权另行交接，校验值及授权范围随私有配置迁移。工具在目标机使用受保护配置或输入流提交令牌。启动器按目标机环境重建专用文件和进程访问权限，Qt 继续走读侧和草稿接口。
 
@@ -347,6 +348,19 @@ sequenceDiagram
 
 `runtime.json` 使用 `schema_version` 值 `ONLINE_TRADER_RUNTIME/1`、`selected_account` 及 `accounts` 列表，每个账户定义 `id`、`alias`、`provider`、`broker`、`line`。`private/OnlineTrader-defaults.json` 的 `accounts` 对象用配置中相同的 `id` 索引登录资料，`TQKQ` 用 `username` 和 `password`，`TQ_SIMNOW` 用 `simnow_username`、`simnow_password`、`kq_username`、`kq_password`。策略配置用 `OnlineTrader-parameters.json`，格式沿用原 `DsvProfile`。
 
+运行级自动启动配置采用独立文件：
+
+```json
+{
+  "schema_version": "ONLINE_TRADER_RUNTIME_CONTROL/1",
+  "scheduled_start": {
+    "enabled": false
+  }
+}
+```
+
+新交付必须显式携带 `runtime-control.json`；默认建议为 `false`，确认无人值守启动后再改为 `true`。
+
 | 操作 | 实际入口 |
 | --- | --- |
 | 读取快照与订阅 | `runtime status --root <目录>` 与 `runtime watch --root <目录>`。Python 用 `RuntimeViewClient` 取得基线、差量、对齐或账本观察历史。`runtime quotes` 和 `runtime catalog` 使用所选配置独立只读查询行情。`runtime schema` 输出本机接口的版本化 Schema。 |
@@ -355,7 +369,7 @@ sequenceDiagram
 | 工作台 | `online-trader-desktop --runtime-pipe <inspect 返回的 pipe>`。工作台通过推送和 2.5 秒对齐更新，操作按钮生成带账号和版本绑定的草稿。 |
 | 提交及回执 | `runtime command --root <目录> --operator <操作员> --input <命令 JSON>` 或 `runtime receipt --root <目录> --operator <操作员> --command-id <原 ID>`。令牌以无回显提示输入，自动化可显式使用 `--token-stdin`。JSON 提供 `command_id`、`operation`、`scope`、`parameters`，沿用实际内核命令契约。运行时退出后仍可获授权读取已提交的回执。 |
 | 人工权限 | `SET_ENTRY_POLICY` 按来源 `STRATEGY` 或 `MANUAL`、账户或单合约和 `expected_policy_revision` 指定禁开或允许。是否撤已在途开仓余单以请求中的显式选项为准。 |
-| 定时启动 | `runtime schedule --root <目录> --operator <操作员>` 使用明确配置和 `SCHEDULE_STRATEGY` 授权，按原 DSV 交易日历校验。配置中的触发点在独立进程运行，预先建立可去重的计划身份。 |
+| 定时启动 | `runtime schedule --root <目录> --operator <操作员>` 使用明确配置和 `SCHEDULE_STRATEGY` 授权，按原 DSV 交易日历校验。`runtime-control.json` 的 `scheduled_start.enabled` 是运行级总开关；原 `OnlineTrader-parameters.json` 继续提供日/夜盘触发时间与 `auto_start_on_launch`。启动器每秒重读两份配置并在真正创建交易请求前再核对一次；关闭总开关只阻止新的定时启动，不会擅自停止已经运行的策略 owner。 |
 | 历史和交接 | `runtime history --root <目录>` 分页读取原执行账本内已提交的全账户柜台观察。加 `--from-day` 和 `--to-day` 进入跨日模式，Python 对应 `RuntimeViewClient.history_days`。`runtime report --root <目录>` 读取自有逐笔成交和损益。`runtime export-handoff --root <源目录> --output <新目录>` 核对原 owner 已结清且停止后，导出配置、原 SQLite 一致性副本及清单。 |
 | 制品入口 | 源码构建脚本可选 `RuntimeConfigured` 或 `RuntimeHandoff`，用明确的 `-DeliveryConfigDirectory` 输入。一份运行目录生成 ZIP 和便携目录。ZIP 含 `runtime/` 中本次交付的文件，正常启动使用 `OnlineTraderCLI.exe runtime run --root .\runtime`。 |
 
