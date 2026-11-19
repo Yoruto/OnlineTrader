@@ -64,7 +64,7 @@ class OnlineDsvTests(unittest.TestCase):
         self.temp.cleanup()
 
     def start(self,*,trade=None,quantity=5,grant_changes=None,history=True,code='DCE.p2701',max_quote_age_ms=30_000,
-              calendar=None,overnight=None,initial_price=1040):
+              calendar=None,overnight=None,initial_price=1040,native_ticks=None,arm=True):
         self.code=code;self.calendar=calendar or day_calendar(code)
         settings=load_confirmed_baseline()[0].to_settings()
         settings['trade'].update(protect_80_enabled=False,half_close_enabled=True,half_stage2=True,half_breakeven=True,
@@ -82,8 +82,15 @@ class OnlineDsvTests(unittest.TestCase):
                                            calendar=self.calendar,clock=self.clock,emit=lambda event:None)
         if overnight:self.api.tick(code,**overnight)
         if history:self.api.tick(code,at='2026-11-10T01:00:00Z',last=1040)
-        self.api.tick(code,last=initial_price)
-        self.session.prime();self.kernel.simulation.arm();self.kernel.wait_idle()
+        if native_ticks is None:
+            self.api.tick(code,last=initial_price)
+        else:
+            for tick in native_ticks:
+                self.api.tick(code,**tick)
+        self.session.prime()
+        if arm:
+            self.kernel.simulation.arm()
+        self.kernel.wait_idle()
 
     def quote(self,price=1055,*,milliseconds=1000,**values):
         self.clock.advance(milliseconds);self.api.tick(self.code,last=price,**values);self.session.step()

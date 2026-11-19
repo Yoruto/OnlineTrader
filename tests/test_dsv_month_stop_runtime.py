@@ -202,7 +202,7 @@ class MonthRuntimeTests(unittest.TestCase):
         self.row().update(net_loss='40', stop_days=DAYS[:3])
         self.save()
         before = self.runtime._journal.load()
-        with patch.object(self.runtime._journal, 'save', side_effect=sqlite3.OperationalError('disk fixture')):
+        with patch.object(self.runtime._journal, 'save_checkpoint', side_effect=sqlite3.OperationalError('disk fixture')):
             with self.assertRaises(TraderError):
                 self.round()
         self.assertEqual(before, self.runtime._journal.load())

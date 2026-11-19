@@ -109,28 +109,29 @@ class DsvFactFeed:
                     self._trace_batch(code, 'NO_VALID_SERIAL_ROWS', session=session, previous=previous,
                                       incremental=bool(same_path and incremental is not None))
                 continue
-            session=at['session'];start=datetime.fromisoformat(session['open_utc'])
             close=datetime.fromisoformat(session['close_utc'])
-            key=(code,self.port.source_epoch,session['session_id'])
             contiguous=all(b[0]==a[0]+1 for a,b in zip(rows,rows[1:]))
             first_index=next((index for index,row in enumerate(rows) if row[1]>=start),len(rows))
             session_rows=[row for row in rows[first_index:] if row[1]<close]
+            state=resume_states.get((code,at['trading_day'])) if resume_states is not None else None
+            if session_rows and previous is None and contiguous and state is not None:
+                previous=self._resume_anchor(code,session,rows,state,calendar_event)
+            # A changed accepted tick can move outside the session.
+            prior=next((row for row in rows if row[0]==previous),None)
+            if prior is not None:
+                normalized={'native_time_ns':str(native_integer(prior[2]['datetime'],minimum=1))}
+                normalized.update(_tick_prices(prior[2]))
+                original = self._last_native[accepted_key]
+                if normalized != original:
+                    self._trace_batch(code, 'ACCEPTED_NATIVE_TICK_CHANGED', session=session, latest=prior,
+                                      previous=previous, accepted_source_time_ns=original['native_time_ns'],
+                                      observed_source_time_ns=normalized['native_time_ns'])
+                    raise TraderError('E_DUPLICATE_CONFLICT','An accepted native tick identity changed its source facts')
             if not session_rows:
                 self._trace_batch(code, 'SERIAL_OUTSIDE_CURRENT_SESSION', session=session, latest=rows[-1], previous=previous)
                 continue
             boundary_rows=rows[max(0,first_index-1):first_index+len(session_rows)]
             session_contiguous=all(b[0]==a[0]+1 for a,b in zip(boundary_rows,boundary_rows[1:]))
-            accepted_key=(code,self.port.source_epoch)
-            previous=self._accepted.get(accepted_key)
-            state=resume_states.get((code,at['trading_day'])) if resume_states is not None else None
-            if previous is None and contiguous and state is not None:
-                previous=self._resume_anchor(code,session,rows,state,calendar_event)
-            prior=next((row for row in rows if row[0]==previous),None)
-            if prior is not None:
-                normalized={'native_time_ns':str(native_integer(prior[2]['datetime'],minimum=1))}
-                normalized.update(_tick_prices(prior[2]))
-                if normalized!=self._last_native[(code,self.port.source_epoch)]:
-                    raise TraderError('E_DUPLICATE_CONFLICT','An accepted native tick identity changed its source facts')
             pending=[row for row in session_rows if previous is None or row[0]>previous]
             start_ns=(int(start.timestamp())*1_000_000+start.microsecond)*1000
             same_session=previous is not None and int(self._last_native[accepted_key]['native_time_ns'])>=start_ns

@@ -78,12 +78,12 @@ class ExtendedNativeHistoryTests(unittest.TestCase):
     def setUp(self):self.case=fixtures.OnlineDsvTests();self.case.setUp()
     def tearDown(self):self.case.tearDown()
     def test_native_full_window_and_over_4096_history_rebuild_without_entry_replay(self):
-        x=self.case;x.start(history=False)
         from datetime import datetime,timedelta
-        x.api.serials[x.code].rows=[]
+        x=self.case
         first=datetime.fromisoformat('2026-11-10T01:00:00Z')
-        for index in range(4200):x.api.tick(at=(first+timedelta(milliseconds=index*80)).isoformat(),last=1055,index=index)
-        x.kernel.pause();x.kernel.wait_idle();x.session.prime()
+        ticks=({'at': (first + timedelta(microseconds=index*85_500)).isoformat(), 'last': 1055}
+               for index in range(4200))
+        x.start(history=False, native_ticks=ticks, arm=False)
         self.assertFalse(x.kernel._armed);self.assertEqual(x.api.inserted,[])
         self.assertEqual(x.session.feed._accepted[(x.code,x.port.source_epoch)],4199)
     def test_native_time_regression_cannot_fake_a_complete_path(self):

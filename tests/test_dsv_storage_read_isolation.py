@@ -243,7 +243,7 @@ class OwnerReadIsolationTests(unittest.TestCase):
     def test_real_storage_failure_still_prevents_send_and_latches_owner(self):
         s = self.session
         s.command({'id': 'start', 'action': 'START'})
-        with patch.object(s._journal, 'save', side_effect=sqlite3.OperationalError('synthetic disk failure')):
+        with patch.object(s._journal, 'save_checkpoint', side_effect=sqlite3.OperationalError('pre-dispatch disk failure')):
             with self.assertRaises(TraderError) as raised:
                 s.apply_round(frame(1))
         self.assertEqual(raised.exception.code, 'E_DSV_STORE')
