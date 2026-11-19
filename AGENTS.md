@@ -5,7 +5,7 @@ Preserve existing work; do not import V7, vnpy, DSV, their credentials, database
 
 ## 所有软件制品必须随包交付配置
 
-- OnlineTrader 每次出包都必须带齐本次交付所需的配置。安装器、便携包、更新 ZIP、客户专用包和测试包均适用。打包前确认目标设备或接收方使用的配置来源和文件清单。需要预配账户和交易参数时，必须随包带入已确认的 `OnlineTrader-defaults.json` 和 `OnlineTrader-parameters.json`，以及该包所需的启动和更新配置。
+- OnlineTrader 每次出包都必须带齐本次交付所需的配置。安装器、便携包、更新 ZIP、客户专用包和测试包均适用。打包前确认目标设备或接收方使用的配置来源和文件清单。需要预配账户和交易参数时，必须随包带入已确认的 `OnlineTrader-defaults.json` 和 `OnlineTrader-parameters.json`，以及该包所需的启动和更新配置。独立 Trading Runtime 的新交付还必须显式带入 `runtime.json`、`runtime-control.json` 和相应的 `private/operators.json`；不要用缺少自动启动总开关的目录猜测默认行为。
 - 禁止将缺少交付配置的通用包、空配置包或占位配置包作为制品交付。客户包使用为该客户或设备确认的配置。测试包使用能完成指定场景的隔离测试配置。配置缺失、归属不明，或分发渠道无法承载经授权的配置时，停止出包或发布并说明原因。含账户口令的制品只通过获准的私有渠道交付。
 - 正式交付的安装器、便携包和更新 ZIP 禁止随包配置白银。检查品种列表、交易参数、默认策略和自动加载的预设，排除白银主连及上期所全部 `ag` 合约月。发现任何白银配置项时停止交付。
 - 交付前检查最终制品本身。对 ZIP 检查实际归档内容，对安装器在隔离目录安装验证，核对配置文件的路径、有效内容及其与已确认输入的一致性。使用用户实际启动入口验证配置可读取。交付记录写明版本、制品 SHA-256 和配置验证结果，省略口令等秘密。任一检查缺失或失败，该制品不能交付。
@@ -29,6 +29,7 @@ Keep the explicit controller's per-child pre-send durability and the existing cu
 | Path | Entry points and owner | Applicable contract |
 | --- | --- | --- |
 | Legacy, not yet retired | `simulation run`, `dsv run`, `simnow run`, and the ordinary workbench's existing launch route | Preserve the original Kernel owner and that route's recovery contract until approved cutover. |
+| Standalone Trading Runtime | `runtime run`, `runtime schedule`, `runtime command`, attached status/account/history and runtime Workbench | Reuse the original Kernel/SQLite execution owner through portable configuration. Qt and runtime-view are read/control-side processes, not senders. Follow [runtime operations and storage](docs/runtime-operations-and-storage-20261119.md). |
 | Replacement candidate | `dsv replacement-run`, `simnow replacement-run` | `DsvSession` + `ExplicitOrderController` + `Journal` + `DsvSdkAdapter`; share the compatible account lock, not the legacy Kernel sender. See [candidate startup](docs/refactor/dsv-parity-20261114/10-sdk-startup-and-same-day-rollback.md). |
 | Isolated QA | `offline-dsv` and `qa/dsv_parity/` replay tools | DEV/OFFLINE fixtures or locally bounded SDK replay; no real account connection or order authority. |
 
@@ -55,6 +56,14 @@ source or observation evidence.
 One owner controls state and one writer controls SQLite. Commit required facts before send;
 unknown sends reserve capacity and require reconciliation. GUI/strategy lifetime cannot delete
 protection. All exits share one remaining target; cancellation requests do not release quantity.
+
+For the standalone Trading Runtime, treat portable configuration and the original per-account
+SQLite ledger as different but co-required state once an account has been initialized. Configuration
+contains editable future intent (account selection, credentials, strategy parameters, operator grants
+and `runtime-control.json`); the ledger contains durable executed facts and recovery responsibility.
+Do not replace a missing initialized ledger with a fresh database, delete WAL to make a read pass,
+or move SDK/order/protection work out of the single execution owner merely to reduce UI load.
+Display caches and runtime-view logs are disposable; they must never become trading authority.
 
 External statement comparison is read only. Reviewed fee registration is confined to the existing
 ONLINE_SIM/development ledger while the execution owner is closed, all owned cycles are flat/closed

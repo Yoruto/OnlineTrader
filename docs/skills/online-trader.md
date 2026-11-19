@@ -9,6 +9,7 @@ Use the verified OnlineTrader checkout (`E:\online-trader` on the recorded Windo
 | Path | Entry / runtime | Required boundary |
 | --- | --- | --- |
 | Legacy maintenance | `simulation run`, `dsv run`, `simnow run`; ordinary workbench launch until cutover | Maintain its existing Kernel owner and recovery behavior. Do not delete checks simply to unblock a test. |
+| Standalone Trading Runtime | `runtime run`, `runtime schedule`, `runtime command`, runtime Workbench and attached account/history reads | Reuse the original Kernel + per-account SQLite writer with portable configuration. Runtime-view/Qt are disposable read/control-side processes and must never become SDK or order senders. |
 | Replacement candidate | `dsv replacement-run`, `simnow replacement-run`; `DsvSession`, `ExplicitOrderController`, `Journal`, `DsvSdkAdapter` | Use the compatible single-account lock and per-child durability, not the legacy Kernel as a second sender. See `10-sdk-startup-and-same-day-rollback.md`. |
 | Isolated QA | `offline-dsv`, `qa/dsv_parity/` | DEV/OFFLINE inputs and local replay boundaries only. The online adapter remains the sole native-fact input in SDK mode. |
 
@@ -19,6 +20,18 @@ Common to all applicable execution paths: one account controller, one writer, na
 - Use the product's pinned SDK environment for TqKq/SimNow connections. Keep credentials in the current user's vault and bind the provider and account identity before connecting. Use the owner belonging to the selected entry point and a fresh, finite scope for the currently authorized online actions; do not reuse consumed grants.
 - Check the Beijing session, cabinet trading day, exact contract identities, profile, calendar and clock for a new observation. A prior readiness package or successful login is historical after its window ends. Apply the current request's connection and order permissions.
 - A calculator preview, DSV saved parameters, DSV UI readback and the product's actual bound startup profile are separate facts. Compare the correct pair. Preserve the real daily rows, day cutoff and intraday range to reproduce an offset calculation. Re-read the saved configuration before comparing runs, including startup switches.
+
+## Standalone Trading Runtime
+
+Use [the runtime operations and storage guide](../runtime-operations-and-storage-20261119.md) together with the standalone design. Treat these as runtime-specific rules, not as a cutover to the replacement candidate.
+
+- An initialized portable runtime is **configuration + the original per-account SQLite ledger**. `runtime.json`, `runtime-control.json`, `OnlineTrader-parameters.json`, private account data and operator grants describe future operation; `ledger.db` records durable trading facts, effective authority, orders, fills, account observations, commands and recovery responsibility. Do not add a second Runtime database for the same facts.
+- `runtime schedule` is a supervisor, not the strategy loop. It may start a new strategy owner only when `runtime-control.json:scheduled_start.enabled` and the current strategy schedule both permit it. Re-read the files while waiting and immediately before launch. Disabling scheduled start must not stop an already-running owner or its protection.
+- Keep TqSdk update pumping, clock/session checks, strategy decisions, final entry gates, OMS, send/cancel/replace, protection and commit-before-send ownership on the single trading owner. Reduce UI load through bounded copies, committed display caches, slower full-account publication and background encoding; never create another sender thread.
+- Current standalone publication cadence is approximately 750 ms for Workbench/market projection and 2.5 s for full account materialization. These are display cadences, not trade timing guarantees. Compare `OWNER_LOOP_SLOW`, SDK pump intervals and Tick → decision → send P95/P99 when changing them.
+- WAL is part of the durable database view. Never delete `ledger.db-wal` to repair, package or test a ledger. A stopped ledger with no WAL/SHM may use immutable read-only mode while the account startup lock is held; a stopped ledger with WAL/SHM must use normal read-only WAL handling. Serialize cold history readers so another reader is not mistaken for a live execution owner.
+- runtime-view-process is disposable. Its failure must not stop the trading owner. Diagnose it from `runtime/logs/runtime-view.log` and its bounded restart behavior, then reacquire a fresh baseline. Do not restart the trading owner merely because the UI/read process failed.
+- For handoff, use the consistent SQLite backup/export path and carry the matching runtime configuration. A copied live `ledger.db` without its required WAL is evidence-corrupting; a query copy is never authority for a second sender.
 
 ## Frozen DSV parity
 
