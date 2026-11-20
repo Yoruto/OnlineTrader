@@ -51,7 +51,14 @@ def replay(case, output):
         try:
             partial = wait_view(view_client, lambda view: any(c['remaining_quantity'] == 3 for c in view['cycles']), deadline)
             observations['partial_seq'] = partial['checkpoint_event_seq']
-            observations['history'] = view_client.history(limit=5)
+            try:
+                observations['history'] = view_client.history(limit=5)
+            except TraderError as error:
+                # History is a rebuildable broker cache. Its absence or damage
+                # must stay visible without aborting the execution-owner replay.
+                observations['history'] = {
+                    'coverage': 'UNAVAILABLE', 'error_code': error.code, 'message': str(error),
+                }
             account_client = RuntimeAccountClient(pipe, expected_account_key=account)
             while time.monotonic() < deadline:
                 account_view = account_client.read()
@@ -109,7 +116,7 @@ def replay(case, output):
                 case.fill(order['order_id'], case.api.orders[order['order_id']].volume_left, 1055)
         case.quote(milliseconds=20)
 
-    interface = ViewProcess(pipe, account, output, case.path)
+    interface = ViewProcess(pipe, account, output, case.path, output / 'account-history.db')
     observer = Thread(target=observe_and_close, daemon=True)
     try:
         server = ControlServer(case.kernel, pipe, trusted_client_pid=interface.trusted_pid)

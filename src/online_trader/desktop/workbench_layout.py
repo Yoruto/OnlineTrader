@@ -1,5 +1,6 @@
 """Trading workspace. Widgets consume the accepted owner view."""
 from collections import deque
+from collections.abc import Mapping
 import csv
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -1499,6 +1500,21 @@ class WorkbenchLayout:
     def reload_accounts(self):
         picker = self.account_picker
         picker.clear()
+        if self.window._runtime_mode:
+            display = self.window.view.get('account_display') if self.window.view else None
+            if isinstance(display, Mapping):
+                provider = {'TQ_SIMNOW': 'SimNow', 'TQKQ': '快期模拟'}.get(
+                    display.get('provider'), display.get('provider') or '运行时账号')
+                alias = display.get('alias') or '已绑定'
+                masked = display.get('masked_login') or '未提供'
+                picker.addItem(f'{provider} · {alias} · {masked}', self.window.view['account_key'])
+            else:
+                picker.addItem('等待 Runtime 账号投影', None)
+            picker.setEnabled(False)
+            self.account_switch.setEnabled(False)
+            self.window.accounts_button.setEnabled(False)
+            self.window.attach_button.setEnabled(False)
+            return
         store = self.window.store
         state = store.read() if store is not None else None
         rows = state.get('accounts', []) if isinstance(state, dict) else []

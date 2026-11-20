@@ -52,7 +52,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             window.render_view()
             window.dashboard.show_details(window.dashboard.log_tab)
             window.dashboard.log_filter.setCurrentText('工作台')
-            self.assertIn('几何条件不满足', window.dashboard.log_text.toPlainText())
+            self.assertIn('日内振幅超出开仓上限', window.dashboard.log_text.toPlainText())
 
     def test_committed_80_percent_stop_is_separate_from_geometry_and_position(self):
         case = test_online_dsv.OnlineDsvTests()
@@ -100,7 +100,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                                    'risk_ratio':'0.012','opening_orders':6}
         window.dashboard.render(view)
         waiting,stopped,pending = [label.text() for label in window.dashboard.status_labels]
-        self.assertEqual(waiting.count('几何条件不满足，暂不建仓'),3)
+        self.assertEqual(waiting.count('日内振幅超出开仓上限，暂不建仓'),3)
         self.assertIn('DCE.l2701',stopped)
         self.assertIn('浮盈曾达止盈80%',stopped)
         self.assertNotIn('DCE.p2701',stopped)
@@ -131,7 +131,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                 (comparison/'events.jsonl').write_bytes(canonical_bytes({'kind':'DSV_LOG','data':{
                     'source_time_utc':started,'contract_id':'DCE.p2701','kind':'ENTRY_FILTER','reason':'GEOMETRY'}})+b'\n')
                 content = [('提示','棕榈油(DCE.p2701) 振幅超出上限'),('提示','棕榈油(DCE.p2701) 当日高低及触发价'),
-                           ('跳过','棕榈油(DCE.p2701) 当日行情已跑过多头激活位')]
+                           ('跳过','棕榈油(DCE.p2701) 当日行情已越过多头不追价线')]
                 kinds = ['GEOMETRY_BLOCK','TRIGGER_HINT','LONG:NO_CHASE_AFTER_ACT']
                 records = b''.join(canonical_bytes({'observed_at_utc':started,'tag':tag,'message':message,
                     'kind':kind,'trading_day':'2026-11-12','contract_id':'DCE.p2701'})+b'\n'
@@ -144,14 +144,14 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                 window.view = view
                 window.render_view()
                 detail = window.tables['markets'].item(0,window.tables['markets'].columnCount()-1).text()
-                self.assertIn('当日行情已跑过多头激活位',detail)
-                self.assertIn('当日行情已跑过多头激活位',dashboard.status_labels[0].text())
+                self.assertIn('当日行情已越过多头不追价线',detail)
+                self.assertIn('当日行情已越过多头不追价线',dashboard.status_labels[0].text())
                 dashboard.add_activity('本地连接诊断')
                 dashboard.show_details(dashboard.log_tab)
                 dashboard.log_filter.setCurrentText('工作台')
                 self.assertIn('本地连接诊断',dashboard.log_text.toPlainText())
                 self.assertIn('柜台待核对',dashboard.log_text.toPlainText())
-                self.assertNotIn('几何条件不满足',dashboard.log_text.toPlainText())
+                self.assertNotIn('日内振幅超出开仓上限',dashboard.log_text.toPlainText())
                 dashboard.log_filter.setCurrentText('DSV 对照')
                 self.assertEqual(dashboard.visible_log_lines,['[13:30:00] [DSV] DCE.p2701 · ENTRY_FILTER GEOMETRY'])
                 dashboard.log_filter.setCurrentText('执行器')
@@ -441,6 +441,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         window.cancel_manual_children = Mock()
         window.submit_manual = Mock()
         view = test_workbench.view()
+        view['entry_authority'] = 'ARMED'
         view['configuration'].update(scoped_contracts=['DCE.p2701'],manual_workbench=True)
         view['account_metrics'] = {'trading_day':'2026-11-12'}
         view['orders'] = [

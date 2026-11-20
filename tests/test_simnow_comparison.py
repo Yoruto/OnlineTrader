@@ -302,7 +302,7 @@ class SimNowComparisonTests(unittest.TestCase):
         rows = self.read_strategy_log()
         self.assertEqual([row['kind'] for row in rows], ['GEOMETRY_BLOCK', 'TRIGGER_HINT', 'LONG:NO_CHASE_AFTER_ACT'])
         self.assertEqual([row['tag'] for row in rows], ['提示', '提示', '跳过'])
-        self.assertIn('已跑过多头激活位', rows[-1]['message'])
+        self.assertIn('已越过多头不追价线', rows[-1]['message'])
         self.assertTrue(all(row['contract_id'] == x.code and row['trading_day'] == '2026-11-10' for row in rows))
 
         x.quote(price=1080, high=1300, milliseconds=60_000)
@@ -334,7 +334,7 @@ class SimNowComparisonTests(unittest.TestCase):
 
         rows = self.read_strategy_log()
         self.assertEqual([row['kind'] for row in rows], ['GEOMETRY_BLOCK', 'TRIGGER_HINT', 'SHORT:NO_CHASE_AFTER_ACT'])
-        self.assertIn('已跑过空头激活位', rows[-1]['message'])
+        self.assertIn('已越过空头不追价线', rows[-1]['message'])
         self.assertTrue(all(datetime.fromisoformat(row['observed_at_utc']) == x.clock.now() for row in rows))
         decisions = [row['data'] for row in read_records(x.session.comparison.path) if row['kind'] == 'PRODUCT_MARKET_DECISION']
         self.assertEqual([row['event']['last'] for row in decisions[-2:]], ['1080', '1040'])

@@ -10,13 +10,13 @@
 
 便携运行目录使用相对路径配置，不依赖 Windows 凭据库。每次 Runtime 启动创建进程所有的临时执行库，结束后删除，不进行换机交接，也不把旧 `ledger.db` 当成恢复权威。长期保留的是版本默认配置、用户覆盖配置，以及可从期货账户重新下载的交易历史与账户收益缓存。无人值守启动仍由 `runtime-control.json` 明确总开关。公开 CLI/Python 接口支持状态、账户、行情、命令、回执和柜台历史缓存查询。
 
-Trading Workbench 使用受 Windows 本机身份边界约束的独立控制通道，不再在 Qt 中显示操作员 ID 或令牌。Runtime 可以核验连接进程的 Windows 身份，但不能据此证明命令来自真实用户的按钮点击；当前服务端边界还包含 `LocalSystem`。命令继续绑定账号、owner boot 和配置版本，14 项封闭操作白名单、Capability 与交易风险由 Runtime 逐次裁决；命令审计保留脱敏账号、actor、boot 及 peer PID/SID。超时只查询原 `command_id`，不自动重发。CLI、定时任务和受托工具继续使用操作员授权。当前源码候选已把加固后的 CommandBus 接入生产 Workbench，旧直连命令线程已退役，但尚未获得功能测试或真实柜台验收。后续用户级产品测试统一从 Runtime CLI/API/Qt 入口执行；旧工作台直连 Kernel/ControlServer 的回放只保留为 Legacy 或组件回归，不能作为当前产品验收。 [架构收敛与安全改造计划](docs/refactor/runtime-architecture-hardening-plan-20261120.md) · [测试入口迁移与固定数据](docs/refactor/standalone-trading-runtime-test-migration-20261119.md)
+Trading Workbench 使用受 Windows 本机身份边界约束的独立控制通道，不再在 Qt 中显示操作员 ID 或令牌。Runtime 可以核验连接进程的 Windows 身份，但不能据此证明命令来自真实用户的按钮点击；当前服务端边界还包含 `LocalSystem`。命令继续绑定账号、owner boot 和配置版本，14 项封闭操作白名单、Capability 与交易风险由 Runtime 逐次裁决；命令审计保留脱敏账号、actor、boot 及 peer PID/SID。超时只查询原 `command_id`，不自动重发。CLI、定时任务和受托工具继续使用操作员授权。当前源码候选已把加固后的 CommandBus 接入生产 Workbench，旧直连命令线程已退役。后续用户级产品测试统一从 Runtime CLI/API/Qt 入口执行；旧工作台直连 Kernel/ControlServer 的回放只保留为 Legacy 或组件回归，不能作为当前产品验收。 [架构收敛与安全改造计划](docs/refactor/runtime-architecture-hardening-plan-20261120.md) · [测试入口迁移与固定数据](docs/refactor/standalone-trading-runtime-test-migration-20261119.md)
 
-2026-11-20 的源码候选新增异步统一桌面引导和本机 Runtime 单实例锁：先附着，缺失时以 DISARMED 启动；跨电脑不使用本地账本或锁互斥。Runtime 客户端待处理命令只在当前 Workbench 进程内关联，重启后以 Runtime/柜台同步结果为准；参数保存为“版本默认值 + 用户覆盖值”。本次改造尚未获得功能测试、真实柜台或打包验收。[当前权威与单实例设计](docs/refactor/runtime-broker-authority-single-instance-20261120.md)
+2026-11-20 的源码候选新增异步统一桌面引导和本机 Runtime 单实例锁：先附着，缺失时以 DISARMED 启动；跨电脑不使用本地账本或锁互斥。Runtime 客户端待处理命令只在当前 Workbench 进程内关联，重启后以 Runtime/柜台同步结果为准；参数保存为“版本默认值 + 用户覆盖值”。最新独立全量复测的旧候选结果为 `PASS 22 / FAIL 4 / BLOCKED 6 / NOT_RUN 6`；当前源码已针对 schema、历史缓存路由、Qt 账号显示和旧测试合同完成修正，但仅通过编译检查，独立复测、真实柜台和打包验收均为 `NOT_RUN`。[当前权威与单实例设计](docs/refactor/runtime-broker-authority-single-instance-20261120.md) · [复测缺陷修正记录](docs/refactor/runtime-full-retest-remediation-20261120.md)
 
-当前离线 Runtime 定向自动化由独立测试 Agent 执行 69 项，69 PASS、0 FAIL、0 SKIP；范围覆盖已实现的操作员协议、版本化视图、Workbench 直接提交、公共 IPC 账户读取/平仓/回执和受影响回归。可见 Qt 强杀恢复、完整故障矩阵、联网柜台和最终制品仍为 `NOT_RUN`，不能据此报告完整产品通过。
+较早 Runtime 候选的离线定向自动化由独立测试 Agent 执行 69 项，69 PASS、0 FAIL、0 SKIP；范围覆盖当时的操作员协议、版本化视图、Workbench 直接提交、公共 IPC 账户读取/平仓/回执和受影响回归。该结果不适用于本次修正候选，不能据此报告完整产品通过。
 
-[完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [架构收敛与安全改造计划](docs/refactor/runtime-architecture-hardening-plan-20261120.md) · [运维、配置与账本约定](docs/runtime-operations-and-storage-20261119.md) · [测试入口迁移](docs/refactor/standalone-trading-runtime-test-migration-20261119.md) · [实现与验收记录](docs/refactor/standalone-trading-runtime-acceptance-20261119.md) · [账号数据与原账本查询](docs/account-data-sync-design-20261119.md)
+[完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [当前权威与单实例设计](docs/refactor/runtime-broker-authority-single-instance-20261120.md) · [复测缺陷修正记录](docs/refactor/runtime-full-retest-remediation-20261120.md) · [运维、配置与账本约定](docs/runtime-operations-and-storage-20261119.md) · [测试入口迁移](docs/refactor/standalone-trading-runtime-test-migration-20261119.md) · [实现与验收记录](docs/refactor/standalone-trading-runtime-acceptance-20261119.md)
 
 该入口当前只支持已验收的模拟账户范围，不表示 DSV replacement 链已经切换，也不表示真实资金账户或发行制品已验收。当前源码验收状态见[功能清单](docs/功能实现与待办清单_20261110.md)。
 

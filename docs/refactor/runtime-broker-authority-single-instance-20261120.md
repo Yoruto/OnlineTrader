@@ -104,3 +104,7 @@ sequenceDiagram
 6. 旧执行账本仍存在时不触发 handoff 拒绝，也不被新 Runtime 写入。
 7. 历史缓存、配置和临时会话故障的日志可定位到具体阶段和后续状态。
 
+## 10. 当前修正候选状态
+
+2026-11-20 最新独立全量复测对旧候选记录 `PASS 22 / FAIL 4 / BLOCKED 6 / NOT_RUN 6`。当前源码已针对第一失败修正 Workbench schema、历史缓存与执行库路由、Qt 脱敏账号展示，并将旧测试从跨重启 pending/ledger handoff 迁移到本文合同。已执行的新检查仅为 `compileall`，功能、GUI、回放、柜台和打包复测均为 `NOT_RUN`。根因、变更边界和下一次独立复测清单见[全量复测缺陷修正记录](runtime-full-retest-remediation-20261120.md)。
+

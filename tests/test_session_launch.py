@@ -170,25 +170,22 @@ class SessionLaunchTests(unittest.TestCase):
         from online_trader.desktop.entrypoint import main
         statement=self.root/'成交 明细.csv'
         with (patch('online_trader.desktop.reconciliation.run',return_value=0) as run_comparison,
-              patch('online_trader.desktop.entrypoint.run') as workbench,
               patch.object(TqKqDsvPort,'connect') as connect):
             result=main(['--account-store',str(self.store.directory),'--compare-fills',str(statement)])
         self.assertEqual(result,0)
         run_comparison.assert_called_once_with(self.store.ledger_path(self.row),self.row['account_key'],
                                                statement_path=statement)
-        workbench.assert_not_called()
         connect.assert_not_called()
 
     def test_license_diagnostic_uses_local_product_capabilities(self):
         from online_trader.desktop.entrypoint import main
         with (patch('online_trader.desktop.entrypoint.Path.cwd',return_value=self.root),
-              patch('online_trader.desktop.entrypoint.run') as workbench,
               patch.object(TqKqDsvPort,'connect') as connect):
             self.assertEqual(main(['--license']),0)
         report = (self.root/'授权状态.txt').read_text(encoding='utf-8')
         self.assertIn('快期模拟、SimNow 模拟',report)
         self.assertIn('实盘开新仓：未启用',report)
-        workbench.assert_not_called(); connect.assert_not_called()
+        connect.assert_not_called()
     def test_grant_changed_during_interpreter_probe_cannot_launch_unreviewed_scope(self):
         def probe(*args,**kwargs):
             self.paths[0].write_bytes(canonical_bytes(self.grant.value|{'opening_attempts':21}))

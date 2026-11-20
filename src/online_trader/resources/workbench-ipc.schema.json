@@ -235,6 +235,129 @@
                     "configuration": {
                       "type": "object"
                     },
+                    "account_display": {
+                      "type": "object",
+                      "required": ["provider", "masked_login", "alias"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "provider": {"type": "string", "maxLength": 64},
+                        "masked_login": {"type": "string", "maxLength": 256},
+                        "alias": {"type": "string", "maxLength": 256}
+                      }
+                    },
+                    "config_snapshot": {
+                      "type": "object",
+                      "required": [
+                        "schema_version", "account_key", "kernel_boot_id", "config_revision",
+                        "payload_hash", "rule_set_id", "profile_hash", "effective_boundary",
+                        "created_event_seq", "effective_at_utc", "decision_inputs", "integrity", "errors"
+                      ],
+                      "additionalProperties": false,
+                      "properties": {
+                        "schema_version": {"const": "ONLINE_TRADER_CONFIG_SNAPSHOT/1"},
+                        "account_key": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"},
+                        "kernel_boot_id": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"},
+                        "config_revision": {"type": "string", "maxLength": 256},
+                        "payload_hash": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/hash"},
+                        "rule_set_id": {"type": "string", "maxLength": 256},
+                        "profile_hash": {
+                          "oneOf": [
+                            {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/hash"},
+                            {"type": "null"}
+                          ]
+                        },
+                        "effective_boundary": {"type": ["string", "null"], "maxLength": 256},
+                        "created_event_seq": {
+                          "oneOf": [
+                            {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/seq"},
+                            {"type": "null"}
+                          ]
+                        },
+                        "effective_at_utc": {"type": ["string", "null"], "maxLength": 64},
+                        "decision_inputs": {
+                          "type": "object",
+                          "maxProperties": 16,
+                          "additionalProperties": {"type": ["string", "integer", "null"], "maxLength": 256}
+                        },
+                        "integrity": {"enum": ["VERIFIED", "INVALID"]},
+                        "errors": {
+                          "type": "array",
+                          "maxItems": 32,
+                          "items": {"type": "string", "maxLength": 128}
+                        }
+                      }
+                    },
+                    "capabilities": {
+                      "type": "object",
+                      "required": ["revision", "observed_at_utc", "operations"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "revision": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/seq"},
+                        "observed_at_utc": {"type": "string", "maxLength": 64},
+                        "operations": {
+                          "type": "array",
+                          "maxItems": 64,
+                          "items": {
+                            "type": "object",
+                            "required": ["operation", "scope_type", "allowed", "reason"],
+                            "additionalProperties": false,
+                            "properties": {
+                              "operation": {"type": "string", "maxLength": 64},
+                              "scope_type": {"type": "string", "maxLength": 64},
+                              "allowed": {"type": "boolean"},
+                              "reason": {"type": ["string", "null"], "maxLength": 256}
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "diagnostics": {
+                      "type": "array",
+                      "maxItems": 128,
+                      "items": {
+                        "type": "object",
+                        "maxProperties": 20,
+                        "required": [
+                          "diagnostic_version", "code", "reason", "kind", "category", "severity",
+                          "source", "operation", "command_id", "trace_id", "impact_scope",
+                          "recovery_state", "retry_policy", "occurred_at", "context"
+                        ],
+                        "additionalProperties": false,
+                        "properties": {
+                          "diagnostic_version": {"type": "integer", "minimum": 1},
+                          "code": {"type": "string", "maxLength": 64},
+                          "reason": {"type": "string", "maxLength": 256},
+                          "kind": {"type": "string", "maxLength": 64},
+                          "category": {"type": "string", "maxLength": 64},
+                          "severity": {"type": "string", "maxLength": 64},
+                          "source": {"type": "string", "maxLength": 64},
+                          "operation": {"type": ["string", "null"], "maxLength": 64},
+                          "command_id": {"type": ["string", "null"], "maxLength": 256},
+                          "trace_id": {"type": ["string", "null"], "maxLength": 512},
+                          "impact_scope": {"type": "string", "maxLength": 64},
+                          "recovery_state": {"type": "string", "maxLength": 64},
+                          "retry_policy": {"type": "string", "maxLength": 128},
+                          "occurred_at": {"type": ["string", "null"], "maxLength": 64},
+                          "context": {"type": "object", "maxProperties": 16}
+                        }
+                      }
+                    },
+                    "contract_catalog": {
+                      "type": "object",
+                      "required": ["revision", "observed_at_utc", "complete", "source", "contracts"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "revision": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/seq"},
+                        "observed_at_utc": {"type": "string", "maxLength": 64},
+                        "complete": {"type": "boolean"},
+                        "source": {"type": "string", "maxLength": 128},
+                        "contracts": {
+                          "type": "array",
+                          "maxItems": 4096,
+                          "items": {"type": "string", "maxLength": 128}
+                        }
+                      }
+                    },
                     "account_metrics": {
                       "type": "object",
                       "maxProperties": 16

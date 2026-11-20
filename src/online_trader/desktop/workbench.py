@@ -1,4 +1,5 @@
 """Trading workbench over the original owner IPC. Closing is local only."""
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
@@ -318,7 +319,7 @@ class WorkbenchWindow(StatusWindow):
     def display_account(self):
         key = self.view['account_key'] if self.view else self.paired_account_key
         display = self.view.get('account_display') if self.view else None
-        if isinstance(display, dict):
+        if isinstance(display, Mapping):
             provider = {'TQ_SIMNOW': 'SimNow 模拟', 'TQKQ': '快期模拟'}.get(
                 display.get('provider'), display.get('provider'))
             masked = display.get('masked_login')

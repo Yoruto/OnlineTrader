@@ -98,8 +98,8 @@ def _close(process):
 class ViewProcess:
     """Restart the disposable interface while the original execution owner keeps running."""
 
-    def __init__(self, pipe, account_key, root, ledger, history=None):
-        self.args = (pipe, account_key, root, ledger, ledger if history is None else history)
+    def __init__(self, pipe, account_key, root, ledger, history):
+        self.args = (pipe, account_key, root, ledger, history)
         self._stopped = Event()
         self._process = None
         self._thread = Thread(target=self._monitor, daemon=True)

@@ -1,6 +1,14 @@
 # Workbench 命令与并行账本安全修复（2026-11-20）
 
-> 后续架构复核确认：本文最初只描述旧生产 one-shot 命令链的保守修复。2026-11-20 源码候选随后按[架构收敛与安全改造计划](runtime-architecture-hardening-plan-20261120.md)补齐 pending 截断、持久化核验、enqueue 失败、严格回执身份和 Capability 门禁并完成 CommandBus 接管；本次新候选仍未独立测试。
+> 本文下方保留了旧候选的修复记录，其中“pending 持久化”和“执行账本交接”已被 2026-11-20 期货账户权威合同取代，不得作为当前实施依据。当前以 [Runtime CommandBus 进程内合同](runtime-command-bus-contract-20261120.md) 和 [Runtime 柜台权威设计](runtime-broker-authority-single-instance-20261120.md) 为准；本次新候选仍未独立测试。
+
+## 当前替代合同
+
+- Workbench 只在当前进程内保留最多 64 条 pending 关联；不写 `QSettings`，新进程不恢复旧 pending，也不自动重发。
+- Runtime 每次启动创建全新、进程拥有的临时 `ledger.db`；旧执行账本不交接、不阻塞启动、不作为跨设备交易权威。
+- 位置、委托、成交、资金与收益在启动时从期货账户重新同步；可重建的历史/收益缓存与执行账本分离。
+
+## 以下为历史候选记录（已废止）
 
 ## 范围
 

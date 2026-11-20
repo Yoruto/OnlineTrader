@@ -1,5 +1,6 @@
-"""Trading Workbench Runtime controls; Qt uses public command bodies and never stores tokens."""
+"""Trading Workbench delegates Runtime controls to the single CommandBus."""
 
+from types import MappingProxyType
 import os
 from pathlib import Path
 import tempfile
@@ -8,26 +9,11 @@ import unittest
 from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-from PySide6.QtCore import QObject, QSettings, Signal
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from online_trader.desktop.workbench import WorkbenchWindow
-
-
-class RuntimeWatchStub(QObject):
-    updated = Signal(object)
-    observed = Signal(object)
-    unavailable = Signal(str)
-    finished = Signal()
-
-    def __init__(self, pipe, parent):
-        super().__init__(parent)
-        self.pipe = pipe
-
-    def start(self): pass
-    def align(self): pass
-    def isRunning(self): return False
-    def requestInterruption(self): pass
+from online_trader.errors import TraderError
 
 
 def runtime_view():
@@ -52,12 +38,17 @@ class RuntimeWorkbenchTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.settings = QSettings(str(Path(self.temp.name) / 'workbench.ini'), QSettings.IniFormat)
-        self.preferences = patch('online_trader.desktop.workbench.workbench_preferences', return_value=self.settings)
-        self.preferences.start()
-        self.addCleanup(self.preferences.stop)
-        with patch('online_trader.desktop.runtime_watch.RuntimeWatch', RuntimeWatchStub):
-            self.window = WorkbenchWindow('Runtime.Workbench.Test', runtime_view=True)
+        settings = QSettings(str(Path(self.temp.name) / 'workbench.ini'), QSettings.IniFormat)
+        self.preferences = patch(
+            'online_trader.desktop.workbench.workbench_preferences', return_value=settings)
+        self.coordinator_start = patch(
+            'online_trader.desktop.runtime_client.client.RuntimeClientCoordinator.start')
+        self.coordinator_close = patch(
+            'online_trader.desktop.runtime_client.client.RuntimeClientCoordinator.close')
+        for item in (self.preferences, self.coordinator_start, self.coordinator_close):
+            item.start()
+            self.addCleanup(item.stop)
+        self.window = WorkbenchWindow('Runtime.Workbench.Test', runtime_view=True)
         self.addCleanup(self._close)
         self.window._boot = 'boot-runtime-1'
         self.window.view = runtime_view()
@@ -68,91 +59,58 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         self.window.close()
         self.app.processEvents()
 
-    def test_direct_submit_binds_current_runtime_and_persists_no_token(self):
-        self.window._runtime_operator_id = 'desk'
-        self.window._runtime_operator_token = 'secret-' + 'x' * 40
-        self.window._runtime_operator_operations = frozenset({'SET_ENTRY_POLICY'})
-        captured = []
-        with patch.object(self.window, '_start_runtime_request', side_effect=lambda *args: captured.append(args)):
+    def test_submit_delegates_the_current_intent_to_command_bus(self):
+        scope = {'scope_type': 'CONTRACT', 'scope_ids': ['DCE.p2701']}
+        parameters = {'origin': 'STRATEGY', 'enabled': False,
+                      'expected_policy_revision': '0', 'reason': 'runtime test',
+                      'cancel_owned_entry_remainders': False}
+
+        with patch.object(self.window._runtime_command_bus, 'submit', return_value='qt-current') as submit:
+            self.window._start_runtime_submit('SET_ENTRY_POLICY', scope, parameters)
+
+        submit.assert_called_once_with('SET_ENTRY_POLICY', scope, parameters)
+        self.assertEqual(self.window.receipt_identity, {'command_id': 'qt-current'})
+        self.assertIn('qt-current', self.window.home_feedback)
+
+    def test_submit_without_a_current_view_does_not_reach_command_bus(self):
+        self.window.view = None
+
+        with patch.object(self.window._runtime_command_bus, 'submit') as submit:
             self.window._start_runtime_submit(
-                'SET_ENTRY_POLICY', {'scope_type': 'CONTRACT', 'scope_ids': ['DCE.p2701']},
-                {'origin': 'STRATEGY', 'enabled': False, 'expected_policy_revision': '0',
-                 'reason': 'runtime test', 'cancel_owned_entry_remainders': False})
-        self.assertEqual(len(captured), 1)
-        action, operator, token, body = captured[0]
-        self.assertEqual((action, operator), ('submit', 'desk'))
-        self.assertEqual(token, self.window._runtime_operator_token)
-        self.assertEqual(body['binding'], {'account_key': 'DEV:runtime-workbench',
-                                           'kernel_boot_id': 'boot-runtime-1', 'config_revision': '7'})
-        self.assertEqual(body['operation'], 'SET_ENTRY_POLICY')
-        self.assertEqual(self.window.receipt_identity, {'command_id': body['command_id']})
-        persisted = self.settings.value('runtime/pending_receipt', '', str)
-        self.assertIn(body['command_id'], persisted)
-        self.assertNotIn(token, persisted)
+                'MANUAL_CLOSE', {'scope_type': 'CYCLE', 'scope_ids': ['cycle-1']},
+                {'position_cycle_id': 'cycle-1', 'quantity': 1})
 
-    def test_unresolved_command_blocks_any_new_runtime_submission(self):
-        """A timed-out submit cannot be retried with a different command_id."""
-        self.window._runtime_operator_id = 'desk'
-        self.window._runtime_operator_token = 'x' * 40
-        self.window._runtime_operator_operations = frozenset({'MANUAL_CLOSE'})
-        first = {'account_key': self.window.view['account_key'],
-                 'command_id': 'qt-original-unknown', 'operation': 'MANUAL_CLOSE',
-                 'operator': 'desk'}
-        self.settings.setValue('runtime/pending_receipt', __import__('json').dumps(first))
-        self.settings.sync()
-        captured = []
-        with patch.object(self.window, '_start_runtime_request', side_effect=lambda *args: captured.append(args)):
+        submit.assert_not_called()
+        self.assertIn('当前完整 Runtime 状态', self.window.home_feedback)
+
+    def test_command_bus_rejection_is_shown_without_a_receipt_identity(self):
+        with patch.object(
+                self.window._runtime_command_bus, 'submit',
+                side_effect=TraderError('E_CAPABILITY', 'operation unavailable')):
             self.window._start_runtime_submit(
-                'MANUAL_CLOSE', {'scope_type': 'CYCLE', 'scope_ids': ['cycle-2']},
-                {'position_cycle_id': 'cycle-2'})
-        self.assertEqual(captured, [])
-        self.assertEqual(self.window.receipt_identity, {'command_id': first['command_id']})
-        self.assertIn(first['command_id'], self.settings.value('runtime/pending_receipt', '', str))
+                'MANUAL_CLOSE', {'scope_type': 'CYCLE', 'scope_ids': ['cycle-1']},
+                {'position_cycle_id': 'cycle-1', 'quantity': 1})
 
-    def test_unrelated_terminal_receipt_does_not_clear_unknown_command(self):
-        first = {'account_key': self.window.view['account_key'],
-                 'command_id': 'qt-original-unknown', 'operation': 'MANUAL_CLOSE',
-                 'operator': 'desk'}
-        self.settings.setValue('runtime/pending_receipt', __import__('json').dumps(first))
-        self.window._show_receipt({
-            'command_id': 'qt-older-success', 'status': 'SUCCEEDED',
-            'error_code': None, 'reason': 'older command completed',
-        })
-        self.assertIn(first['command_id'], self.settings.value('runtime/pending_receipt', '', str))
-
-    def test_matching_terminal_receipt_clears_pending_guard(self):
-        first = {'account_key': self.window.view['account_key'],
-                 'command_id': 'qt-original-unknown', 'operation': 'MANUAL_CLOSE',
-                 'operator': 'desk'}
-        self.settings.setValue('runtime/pending_receipt', __import__('json').dumps(first))
-        self.window._show_receipt({
-            'command_id': first['command_id'], 'status': 'REJECTED',
-            'error_code': 'E_AUTH', 'reason': 'explicit runtime terminal receipt',
-        })
-        self.assertFalse(self.settings.value('runtime/pending_receipt', '', str))
-
-    def test_locked_operator_prompts_before_creating_a_command(self):
-        pending = []
-        with patch.object(self.window, '_prompt_runtime_operator', side_effect=lambda value: pending.append(value)):
-            self.window._start_runtime_submit('MANUAL_CLOSE', {'scope_type': 'CYCLE', 'scope_ids': ['cycle-1']},
-                                              {'position_cycle_id': 'cycle-1', 'quantity': 1})
-        self.assertEqual(pending[0][0], 'submit')
         self.assertIsNone(self.window.receipt_identity)
+        self.assertIn('E_CAPABILITY', self.window.home_feedback)
 
-    def test_authentication_unlocks_capabilities_but_token_stays_memory_only(self):
-        self.window._runtime_auth_token = 'memory-only-' + 'x' * 32
-        self.window._runtime_pending_action = None
-        self.window._runtime_request_result({'action': 'authenticate', 'value': {
-            'status': 'AUTHENTICATED', 'operator': 'desk', 'actor': 'operator-desk',
-            'account_key': self.window.view['account_key'], 'operations': ['MANUAL_CLOSE'],
-            'expires_at_utc': '2099-01-01T00:00:00Z',
-        }})
-        self.assertEqual(self.window._runtime_operator_id, 'desk')
-        self.assertEqual(self.window._runtime_operator_operations, frozenset({'MANUAL_CLOSE'}))
-        self.assertTrue(self.window._runtime_operator_token.startswith('memory-only-'))
-        self.assertNotIn('memory-only-', self.settings.value('runtime/operator_id', '', str))
-        self.window._clear_runtime_operator()
-        self.assertIsNone(self.window._runtime_operator_token)
+    def test_frozen_runtime_account_display_is_used_by_header_and_picker(self):
+        view = runtime_view()
+        view['account_display'] = MappingProxyType({
+            'provider': 'TQ_SIMNOW', 'alias': '开发模拟', 'masked_login': '12***89',
+        })
+        self.window.view = view
+
+        self.assertEqual(self.window.display_account(), ('SimNow 模拟', '12***89'))
+        self.window.dashboard.reload_accounts()
+        self.assertIn('开发模拟', self.window.dashboard.account_picker.currentText())
+        self.assertFalse(self.window.dashboard.account_picker.isEnabled())
+        self.assertFalse(self.window.accounts_button.isEnabled())
+
+    def test_new_workbench_process_starts_without_legacy_pending_state(self):
+        self.assertEqual(self.window._runtime_client_store.pending, {})
+        self.window._runtime_command_bus.migrate_legacy_pending()
+        self.assertEqual(self.window._runtime_client_store.pending, {})
 
 
 if __name__ == '__main__':

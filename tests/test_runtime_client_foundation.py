@@ -2,8 +2,6 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import os
-from pathlib import Path
-import tempfile
 import threading
 import time
 import unittest
@@ -12,7 +10,7 @@ import uuid
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from PySide6.QtCore import QCoreApplication, QObject, QSettings, Signal
+from PySide6.QtCore import QCoreApplication, QObject, Signal
 
 from online_trader.contracts.validation import validate_message
 from online_trader.desktop.runtime_client.client import CommandBus, RuntimeClientCoordinator
@@ -77,27 +75,10 @@ class CommandSafetyGateTests(unittest.TestCase):
         cls.app = QCoreApplication.instance() or QCoreApplication([])
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.settings_path = Path(self.temp.name) / 'workbench.ini'
-        self.settings = QSettings(str(self.settings_path), QSettings.IniFormat)
-        self.preferences = patch(
-            'online_trader.desktop.runtime_client.client.workbench_preferences',
-            side_effect=lambda: self.settings,
-        )
-        self.preferences.start()
-        self.addCleanup(self.preferences.stop)
         self.store = ClientStateStore()
         self.coordinator = CoordinatorStub()
         self.bus = CommandBus(self.coordinator, self.store)
         self.store.apply(runtime_state('boot-A'), cursor('view-A'), 1)
-        self._authorize(self.bus)
-
-    @staticmethod
-    def _authorize(bus):
-        bus.operator_id = 'desk'
-        bus.token = 'x' * 32
-        bus.operations = frozenset({'MANUAL_CLOSE'})
 
     def _submit_unknown(self):
         command_id = self.bus.submit('MANUAL_CLOSE', SCOPE, {'position_cycle_id': 'cycle-gate-1'})
@@ -109,12 +90,11 @@ class CommandSafetyGateTests(unittest.TestCase):
         return command_id
 
     def _query_request(self, command_id):
-        self._authorize(self.bus)
         self.bus.query(command_id)
         return self.coordinator.commands.requests[-1]
 
-    def test_unknown_command_survives_owner_boot_change_and_client_restart(self):
-        """T-03/T-04/T-11: owner and UI restart retain one original identity."""
+    def test_unknown_command_survives_owner_boot_change_but_not_client_restart(self):
+        """Owner changes preserve the ID only inside the current Workbench process."""
         command_id = self._submit_unknown()
         scope_hash = self.store.pending[command_id].scope_hash
 
@@ -125,18 +105,9 @@ class CommandSafetyGateTests(unittest.TestCase):
         self.assertEqual(pending.reason, 'OWNER_RESTARTED')
         self.assertEqual(pending.account_key, ACCOUNT)
         self.assertEqual(pending.scope_hash, scope_hash)
-        self.assertIsNone(self.bus.token, 'owner restart must require fresh operator authentication')
-
-        self.settings.sync()
-        self.settings = QSettings(str(self.settings_path), QSettings.IniFormat)
         restored_store = ClientStateStore()
-        restored_bus = CommandBus(CoordinatorStub(), restored_store)
-        restored = restored_store.pending[command_id]
-        self.assertEqual(len(restored_store.pending), 1)
-        self.assertEqual(restored.status, PendingCommandStatus.OUTCOME_UNKNOWN)
-        self.assertEqual((restored.account_key, restored.operation, restored.scope_hash),
-                         (ACCOUNT, 'MANUAL_CLOSE', scope_hash))
-        self.assertIsNone(restored_bus.token)
+        CommandBus(CoordinatorStub(), restored_store)
+        self.assertEqual(restored_store.pending, {})
 
     def test_receipt_query_transport_failures_keep_original_command_unknown(self):
         """T-05: a failed observation is not evidence that the command failed."""
@@ -153,9 +124,8 @@ class CommandSafetyGateTests(unittest.TestCase):
                 self.assertEqual(pending.status, PendingCommandStatus.OUTCOME_UNKNOWN)
                 self.assertEqual(pending.reason, code)
                 self.assertNotEqual(pending.status, PendingCommandStatus.REJECTED)
-                self.assertIn(command_id, self.settings.value('runtime/pending_receipts_v2', '', str))
 
-    def test_only_explicit_terminal_receipt_removes_pending_and_persistence(self):
+    def test_only_explicit_terminal_receipt_removes_process_pending(self):
         """T-06: explicit Runtime terminal evidence closes the client responsibility."""
         for status in ('SUCCEEDED', 'REJECTED'):
             with self.subTest(status=status):
@@ -165,14 +135,13 @@ class CommandSafetyGateTests(unittest.TestCase):
                 request = self._query_request(command_id)
                 self.coordinator.command_result.emit(request | {'value': {
                     'command_id': command_id,
+                    'account_key': ACCOUNT,
                     'operation': 'MANUAL_CLOSE',
                     'status': status,
                     'reason': 'terminal evidence',
                 }})
 
                 self.assertNotIn(command_id, self.store.pending)
-                self.settings.sync()
-                self.settings = QSettings(str(self.settings_path), QSettings.IniFormat)
                 restored_store = ClientStateStore()
                 CommandBus(CoordinatorStub(), restored_store)
                 self.assertNotIn(command_id, restored_store.pending)
@@ -183,13 +152,13 @@ class CommandSafetyGateTests(unittest.TestCase):
         request = self._query_request(command_id)
         self.coordinator.command_result.emit(request | {'value': {
             'command_id': command_id,
+            'account_key': ACCOUNT,
             'operation': 'MANUAL_CLOSE',
             'status': 'NEEDS_RECONCILIATION',
             'reason': 'native outcome is not proved',
         }})
 
         self.assertEqual(self.store.pending[command_id].status, PendingCommandStatus.OUTCOME_UNKNOWN)
-        self.assertIn(command_id, self.settings.value('runtime/pending_receipts_v2', '', str))
 
     def test_duplicate_user_intent_is_blocked_without_a_second_command(self):
         """T-08: unresolved same-scope intent cannot create another command ID."""
@@ -213,8 +182,8 @@ class BlockingCommandClient:
         self.calls = []
         self.instances.append(self)
 
-    def request(self, operation, body, *, operator, token):
-        self.calls.append((operation, body, operator, token))
+    def request(self, operation, body):
+        self.calls.append((operation, body))
         self.started.set()
         if not self.closed.wait(10):
             raise TraderError('E_TIMEOUT', 'fake command deadline expired')
@@ -281,7 +250,7 @@ class CoordinatorShutdownGateTests(unittest.TestCase):
         BlockingViewClient.instances.clear()
         BlockingAccountClient.instances.clear()
         self.patches = (
-            patch('online_trader.desktop.runtime_client.client.RuntimeCommandClient', BlockingCommandClient),
+            patch('online_trader.desktop.runtime_client.client.RuntimeWorkbenchClient', BlockingCommandClient),
             patch('online_trader.desktop.runtime_client.client.RuntimeViewClient', BlockingViewClient),
             patch('online_trader.desktop.runtime_client.client.RuntimeAccountClient', BlockingAccountClient),
         )
@@ -306,7 +275,7 @@ class CoordinatorShutdownGateTests(unittest.TestCase):
         coordinator.start()
         coordinator.commands.enqueue({
             'request_id': 'request-close-command', 'action': 'receipt',
-            'body': {'command_id': 'command-close-1'}, 'operator': 'desk', 'token': 'x' * 32,
+            'body': {'command_id': 'command-close-1'},
         })
         self.assertTrue(BlockingViewClient.instances[0].subscription_started.wait(2))
         self.assertTrue(BlockingCommandClient.instances[0].started.wait(2))
@@ -341,10 +310,10 @@ class CoordinatorShutdownGateTests(unittest.TestCase):
         coordinator.start()
         lane = coordinator.commands
         lane.enqueue({'request_id': 'request-first', 'action': 'receipt',
-                      'body': {'command_id': 'command-first'}, 'operator': 'desk', 'token': 'x' * 32})
+                      'body': {'command_id': 'command-first'}})
         self.assertTrue(BlockingCommandClient.instances[0].started.wait(2))
         lane.enqueue({'request_id': 'request-second', 'action': 'submit',
-                      'body': {'command_id': 'command-second'}, 'operator': 'desk', 'token': 'x' * 32})
+                      'body': {'command_id': 'command-second'}})
 
         coordinator.close()
 
