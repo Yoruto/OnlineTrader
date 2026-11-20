@@ -1,0 +1,162 @@
+schema_version: ONLINE_TRADER_ARCHITECTURE_STATUS/1
+reviewed_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+reviewed_on: "2026-11-20"
+rules:
+  identity: path_and_scope
+  conflict_result: CONFLICT_NEEDS_REVIEW
+  statuses: [CURRENT, CANDIDATE, SUPERSEDED, HISTORICAL]
+  note: >-
+    This index routes readers to contracts. Source and the approved owning contract
+    remain authoritative. A dirty worktree or later HEAD requires rechecking affected entries.
+
+documents:
+  - path: AGENTS.md
+    scope: repository/authorization-and-delivery
+    status: CURRENT
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: APPROVED
+      source: APPLICABLE
+      tests: NOT_APPLICABLE
+      product_acceptance: NOT_APPLICABLE
+    notes: Global execution-path, testing, packaging and delivery constraints.
+
+  - path: docs/skills/online-trader.md
+    scope: repository/task-routing
+    status: CURRENT
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: APPROVED
+      source: REVIEWED
+      tests: NOT_APPLICABLE
+      product_acceptance: NOT_APPLICABLE
+    notes: Canonical OnlineTrader skill source; project Skills are short workflow entry points.
+
+  - path: docs/refactor/runtime-broker-authority-single-instance-20261120.md
+    scope: standalone/authority-persistence-and-recovery
+    status: CURRENT
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: APPROVED
+      source: IMPLEMENTED_CANDIDATE
+      tests: INDEPENDENT_RETEST_REQUIRED
+      product_acceptance: NOT_RUN
+    notes: Broker authority, one Runtime per Windows host, process-owned temporary execution store.
+
+  - path: docs/refactor/runtime-command-bus-contract-20261120.md
+    scope: standalone/workbench-command-correlation
+    status: CURRENT
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: APPROVED
+      source: IMPLEMENTED_CANDIDATE
+      tests: INDEPENDENT_RETEST_REQUIRED
+      product_acceptance: NOT_RUN
+    notes: Pending command correlation is process-local and is never handed across Workbench boots.
+
+  - path: docs/refactor/runtime-full-retest-remediation-20261120.md
+    scope: standalone/current-fix-candidate
+    status: CANDIDATE
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: REVIEWED
+      source: IMPLEMENTED_CANDIDATE
+      tests: NOT_RUN_AFTER_FIX
+      product_acceptance: NOT_RUN
+    notes: Current defect remediation and next independent retest scope.
+
+  - path: docs/refactor/runtime-architecture-hardening-plan-20261120.md
+    scope: standalone/architecture-history
+    status: HISTORICAL
+    superseded_by:
+      - docs/refactor/runtime-broker-authority-single-instance-20261120.md
+      - docs/refactor/runtime-command-bus-contract-20261120.md
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: PARTIALLY_SUPERSEDED
+      source: HISTORICAL_BASELINE
+      tests: HISTORICAL_ONLY
+      product_acceptance: NOT_ESTABLISHED
+    notes: Retains useful review history; old per-account ledger and durable pending conclusions are not current Standalone contracts.
+
+  - path: docs/refactor/trading-workbench-client-refactor-20261119.md
+    scope: standalone/workbench-layout-and-client-separation
+    status: CANDIDATE
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: PARTIALLY_CURRENT
+      source: IMPLEMENTED_CANDIDATE
+      tests: INDEPENDENT_RETEST_REQUIRED
+      product_acceptance: NOT_RUN
+    notes: UI and client separation remain useful; use current contracts for persistence and recovery.
+
+  - path: docs/refactor/trading-workbench-client-refactor-20261119.md
+    scope: standalone/workbench-cross-boot-pending
+    status: SUPERSEDED
+    superseded_by:
+      - docs/refactor/runtime-command-bus-contract-20261120.md
+      - docs/refactor/runtime-broker-authority-single-instance-20261120.md
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: SUPERSEDED
+      source: REMOVED_FROM_CURRENT_CONTRACT
+      tests: NOT_APPLICABLE
+      product_acceptance: NOT_APPLICABLE
+    notes: QSettings or registry pending persistence and cross-boot receipt responsibility are retired for Standalone.
+
+  - path: docs/runtime-operations-and-storage-20261119.md
+    scope: standalone/entry-schedule-and-process-operations
+    status: CURRENT
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: CURRENT_WITH_EXPLICIT_OVERRIDE
+      source: IMPLEMENTED_CANDIDATE
+      tests: INDEPENDENT_RETEST_REQUIRED
+      product_acceptance: NOT_RUN
+    notes: Use the top-of-file 2026-11-20 override before the retained historical sections.
+
+  - path: docs/runtime-operations-and-storage-20261119.md
+    scope: standalone/long-lived-ledger-and-device-handoff
+    status: SUPERSEDED
+    superseded_by:
+      - docs/refactor/runtime-broker-authority-single-instance-20261120.md
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: SUPERSEDED
+      source: REMOVED_FROM_CURRENT_CONTRACT
+      tests: NOT_APPLICABLE
+      product_acceptance: NOT_APPLICABLE
+    notes: Old execution ledgers are read-only historical artifacts and never block a new Standalone boot.
+
+  - path: docs/refactor/dsv-parity-20261114/README.md
+    scope: replacement/dsv-parity-index
+    status: CURRENT
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: APPROVED_WITH_RECORDED_DIFFERENCES
+      source: IMPLEMENTED_CANDIDATE
+      tests: USE_DATED_EVIDENCE_ONLY
+      product_acceptance: NOT_INFERRED
+    notes: Entry index for DSV Replacement and isolated replay work only.
+
+  - path: docs/refactor/dsv-parity-20261114/00-evidence-and-decisions.md
+    scope: replacement/approved-behavior-differences
+    status: CURRENT
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: USER_APPROVED_SCOPED_DIFFERENCES
+      source: APPLICABLE
+      tests: USE_DATED_EVIDENCE_ONLY
+      product_acceptance: NOT_INFERRED
+    notes: Approval is limited to recorded differences such as the fixed slow partial-fill behavior.
+
+  - path: docs/ai/ai-development-efficiency-plan-20261120.md
+    scope: development-tools/implementation-plan
+    status: CANDIDATE
+    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    evidence:
+      design: V1_2_REVIEWED
+      source: FIRST_BATCH_IMPLEMENTED_IN_WORKTREE
+      tests: STATIC_VALIDATION_ONLY
+      product_acceptance: NOT_APPLICABLE
+    notes: Architecture index, four reference tasks and two project Skills are the first batch; Serena remains deferred.

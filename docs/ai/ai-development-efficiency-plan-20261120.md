@@ -1,25 +1,27 @@
-# OnlineTrader AI 辅助开发效率优化计划（V1.1）
+# OnlineTrader AI 辅助开发效率优化计划（V1.2）
 
 > 日期：2026-11-20  
-> 文档状态：**实施计划 / 尚未实施**  
+> 文档状态：**实施计划 / 第一批已落地，工具效果待测量**
 > 仓库：[`Yoruto/OnlineTrader`](https://github.com/Yoruto/OnlineTrader)  
-> 本次评审的 main 基线：`539978d23742729f7d5c667f82f04039ba0af518`；新增计划实施时须重新确认 HEAD 与工作区变更。  
+> V1.2 静态核对基线：`8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2`；后续实施仍须重新确认 HEAD 与工作区变更。
 > 目标：提高 Codex、OpenCode、Cline 等 AI 工具定位、理解、修改、审核 OnlineTrader 源码的效率与准确性。  
 > 范围：**仅开发工具、规范、离线静态分析和可选审核交接**；不修改交易业务逻辑、账户连接、启动授权、数据库架构、打包流程或 CI/CD。
 
-## 0. V1.0 → V1.1 修订摘要
+## 0. V1.2 修订摘要
 
-| 评审发现 | V1.1 决定 |
+| 评审发现 | V1.2 决定 |
 | --- | --- |
 | 旧文档可能把长期每账户 Ledger 当成当前 Standalone 的权威 | 按最新柜台权威设计区分 Standalone / Legacy / Replacement，增加文档状态与生效范围 |
-| Serena、Aider Repo Map、自研 Router 职责重叠 | **先验证 Serena**，Context Router 最小化；完整依赖排名 Repo Map 仅在实测需要时开发 |
-| Skills 和配置重复维护 | 首批 4 个 Skills；`AGENTS.md` 保留全局约束；统一内容源、各客户端适配 |
-| 缺少改造前测量 | **阶段 0 先建立基线**，后续逐阶段对照 |
+| 一个文档可能只有部分作用域过期 | `architecture-status.yaml` 以 `path + scope` 标识记录，不用单一文件状态掩盖局部替代 |
+| Serena、Aider Repo Map、自研 Router 职责重叠 | 先完成权威清单与 Skills，再在干净源码副本中验证 Serena；Context Router 继续暂缓 |
+| Skills 和配置重复维护 | `docs/skills/online-trader.md` 保持规范源；首批只建 Runtime/Workbench 与 DSV 两个短入口 |
+| 订单安全不能依赖 Skill 是否触发 | 强制安全不变量继续放在 `AGENTS.md`，不建立可选的 `order-safety-review` |
+| 八个任务无法严谨支撑 95% 准确率 | 先核对 B01/B04/B05/B08 参考答案；用关键误判数和耗时中位数评价，稳定后再扩展 |
 | Python AST 可能遗漏动态依赖 | 影响分析加入 `UNKNOWN / MANUAL_REVIEW_REQUIRED`，不自动证明交易安全 |
 | 多 Agent、Repomix 引入过早 | 放到可选阶段，先证明交接瓶颈 |
-| 开发工具可能越权 | 本机只读优先、隔离工作区、路径排除；不继承运行账号与交易权限 |
+| 忽略规则不是秘密隔离边界 | Serena 只能试点于不含运行数据、凭据和数据库的干净源码副本；不继承运行账号与交易权限 |
 
-本文件是一份新实施计划，不代表任何 PR 已完成、软件已上线、功能测试已通过或新工具已安装。
+第一批已加入文档权威清单、模块边界、四项参考任务和两个项目 Skill。它们不表示软件已上线、功能测试已通过或 Serena 等新工具已安装。
 
 ## 1. 当前架构基线与事实优先级
 
@@ -48,9 +50,9 @@
 
 ### 1.2 文档状态机制
 
-规划维护 `docs/ai/architecture-status.yaml`，记录每份关键文档的：
+当前维护 `docs/ai/architecture-status.yaml`，记录关键文档在具体作用域内的：
 
-- `path`、`scope`、`status`、`superseded_by`（可选）、`verified_at_sha`、`notes`。
+- `path`、`scope`、`status`、`superseded_by`（可选）、`verified_at_sha`、`evidence`、`notes`；记录身份为 `path + scope`。
 - 状态取 `CURRENT`（当前约束）、`CANDIDATE`（待验证实施）、`SUPERSEDED`（已替代）、`HISTORICAL`（历史证据）。
 - **设计批准**、**源码已实现**、**测试已执行**、**产品已验收**为不同维度，不能用单一“完成”状态混淆。
 
@@ -69,30 +71,28 @@
 
 ### 2.2 先测基线，再宣布效率收益
 
-初步候选指标（不是承诺值）：首次定位耗时下降 30%，普通任务首次上下文 token 下降 25%，执行路径选择准确率不低于 95%。在取得基线后再评估阈值。
+初步观察指标（不是承诺值）：首次定位耗时、读取文件数、可取得时的 token、关键执行路径误判和返工次数。四项小样本不使用百分比准确率门槛；先要求零关键路径误判，再观察多轮耗时中位数是否有稳定改善。
 
 记录每个任务的：实际 Git SHA、模型/推理设置、Agent 客户端版本、任务顺序、是否冷缓存、定位耗时、读取文件数、tokens（能测则测；否则标 N/A）、正确路径率、误判与返工、实际工具调用、人工复核意见。相同任务做多轮对照，固定相似环境并交换执行顺序，以降低缓存与熟悉度影响。
 
 ## 3. 阶段 0：架构核对与 Benchmark 基线（所有 PR 的前置条件）
 
-**交付物（计划）：** `docs/ai/README.md`、`architecture-status.yaml`、`module-boundaries.yaml`、`benchmark-tasks.yaml` 与基线报告；不引入新开发服务。
+**第一批交付物（已加入工作区）：** `docs/ai/README.md`、`architecture-status.yaml`、`module-boundaries.yaml`、`benchmark-tasks.yaml` 与静态基线报告；不引入新开发服务。
 
-建议 8 个只读/离线代表任务：
+首批 4 个只读/离线代表任务：
 
 | ID | 场景 | 核查重点 |
 | --- | --- | --- |
 | B01 | 定位 Workbench 某交易按钮到 Runtime 命令提交的调用链 | 符号与跨模块定位 |
-| B02 | 找到本次 Workbench pending / receipt 的处理位置 | 不误用跨 boot 旧设计 |
-| B03 | 定位桌面异步 Bootstrap 与 Owner 生命周期 | Qt 关闭后 Owner 边界 |
 | B04 | 比较临时会话执行库与 `account-history.db` | 当前/历史状态所有权 |
 | B05 | 定位 DSV 策略决策与 SDK 适配调用路径 | 路径与规则隔离 |
-| B06 | 找出 IPC schema、管道认证与 Capability 的依赖 | 跨语言/协议影响 |
-| B07 | 给定一次变更，推荐需要哪些离线验证而不直接运行 | 授权边界 |
 | B08 | 查找被标为 SUPERSEDED 的旧文档并识别新权威 | 知识新旧判定 |
+
+参考答案已经人工静态核对，受控效率测量仍为 `NOT_RUN`。四项出现稳定收益后再增加 B02（pending/receipt）、B03（Bootstrap 生命周期）、B06（IPC/Capability）和 B07（验证授权）。
 
 **阶段 0 Exit Gate：** 任务与正确答案（文件/符号/合同）经人工审核；基线具有可复现实验说明；记录不含账号、Token、订单流水等私有事实。仅以静态检索评价，不开展新的模拟柜台测试。
 
-## 4. PR-01：Serena MCP（优先验证）
+## 4. PR-02：Serena MCP（Skills 后按条件验证）
 
 ### 4.1 职责
 
@@ -100,7 +100,7 @@ Serena 是**可选的开发侧语义导航器**，承担符号索引、定义、
 
 ### 4.2 安装、初始化和版本
 
-在与生产运行环境隔离的开发机器上按 Serena 官方指引执行：
+只能在不含运行配置、凭据、日志、数据库、WAL/SHM 或行情缓存的干净源码 clone/副本中，按 Serena 官方指引执行：
 
 ```powershell
 uv tool install -p 3.13 serena-agent
@@ -117,7 +117,7 @@ serena project create
 
 - 默认先做**只读定位试点**；限制可用工具和代码工作区。禁用不必要的命令执行、文件编辑、远程监听/任意路径访问能力。
 - 注意：MCP 工具层“只读”配置本身不是 OS 安全沙箱。对需要强隔离的情况使用独立权限较低的用户/容器/副本和操作系统文件权限；不要挂载运行账户、凭据目录或真实本地账本。
-- 明确排除 `.venv/`、`output/`、`runtime/logs/`、`runtime/private/`、数据库/WAL/SHM、行情 Tick 缓存、含凭据的配置与构建制品。
+- `.gitignore`、Serena ignore 和项目排除规则只减少普通遍历，不视为秘密隔离边界。试点副本本身不得包含 `.venv/`、`output/`、`runtime/logs/`、`runtime/private/`、数据库/WAL/SHM、行情 Tick 缓存、含凭据的配置与构建制品。
 - 默认使用本地 stdio，不开放可被其他主机访问的服务器。
 - 仅当用户明确授权源码修改时，才允许编辑能力；即便可编辑也不得获得模拟盘连接或报单权限。
 
@@ -130,30 +130,28 @@ serena project create
 
 **回退：** 禁用本机 MCP/Serena 配置，不影响运行源码与发行包。
 
-## 5. PR-02：Agent Skills 与轻量知识入口
+## 5. PR-01：Agent Skills 与轻量知识入口
 
 ### 5.1 单一规范源
 
 保留 `AGENTS.md` 中所有全局安全不变量、默认执行路径与测试/发布授权。只增加简短导航，避免把长篇历史文档重复贴入全部任务上下文。
 
-首批创建以下 4 个专项 Skill：
+首批创建以下 2 个专项 Skill：
 
 | Skill | 触发 | 要求 |
 | --- | --- | --- |
-| `runtime-development` | Runtime/Bootstrap/IPC/状态投影 | 本机单实例、柜台权威、会话临时库、Config 默认值+覆盖 |
-| `workbench-development` | Qt/Client/CommandBus/Capability | GUI 非 Sender、线程生命周期、本会话 pending、服务端逐命令复核 |
+| `runtime-workbench-development` | Runtime/Bootstrap/IPC/配置/历史缓存/Qt/CommandBus | 本机单实例、柜台权威、会话临时库、GUI 非 Sender、本会话 pending |
 | `dsv-parity-review` | DSV 核心/Replacement/SDK 回放 | 冻结基准、原生事实、明确批准差异、对照执行轮次 |
-| `order-safety-review` | 开平仓/撤单/发送异常/风险授权 | 发送前事实、未知结果不能猜测、账户/订单归属、人工审核 |
 
-`ledger-development` 和 `release-review` 暂不独立新增，先由全局规范与现有专项文档覆盖；只有出现多次重复任务、能够减少误判时再扩充。
+订单安全、测试授权和打包约束继续由 `AGENTS.md` 强制提供，不依赖可选 Skill 是否被正确触发。`ledger-development`、`order-safety-review` 和 `release-review` 暂不独立新增；只有出现多次重复任务并能减少误判时再扩充。
 
 ### 5.2 目录与客户端差异
 
-唯一人工维护源拟为 `.agents/skills/<skill-name>/SKILL.md`。Codex 与 OpenCode 可识别这一项目目录；Cline 等工具的具体路径与加载语义在 PR 中按**当前安装版本**实测，必要时提供只读映射或生成的适配副本，不能手工维护两份相互冲突的正文。
+`docs/skills/online-trader.md` 继续作为 OnlineTrader 业务与交付规则的唯一规范源。`.agents/skills/<skill-name>/SKILL.md` 只维护短工作流、触发条件和指向当前合同的路由，不复制或改写完整交易规则。其他客户端的加载路径按当前安装版本实测；必要时生成适配副本，不能建立平行业务权威。
 
 Skill 正文仅包含：触发条件、适用/禁止路径、需要加载的当前合同、常见入口、风险检查、受授权约束的验证建议及退回方法。不复制长篇 AGENTS 或设计文档。
 
-**Exit Gate：** 四类任务能正确载入对应 Skill；默认 Standalone 不误用长期账本/handoff；交易安全约束没有遗漏；跨工具调用得到一致的业务边界。
+**Exit Gate：** 两类任务能正确载入对应 Skill；默认 Standalone 不误用长期账本/handoff；交易安全约束仍由 `AGENTS.md` 覆盖；跨工具调用得到一致的业务边界。
 
 **回退：** 禁用新增 Skills、保留原 `AGENTS.md`。
 
@@ -193,7 +191,7 @@ Context 输出字段：
 
 本地脚本可提供 `syntax`、`structure`、`impact` 的静态建议/检查。项目现有约束规定常规改动只做编译检查，**不得自动增加、修改、执行测试**。定向测试、全量回归、Qt/Named Pipe、SimNow、打包和发布都需要用户对此次任务的明确授权；没有授权时只输出 `SUGGESTED / NOT_RUN`。
 
-**Exit Gate：** B01–B08 中影响分析正确；UNKNOWN 不静默降级；可以退回基础工具；没有自动交易/测试副作用。
+**Exit Gate：** 已启用的 benchmark 任务中影响分析正确；UNKNOWN 不静默降级；可以退回基础工具；没有自动交易/测试副作用。
 
 **回退：** 删除辅助脚本/缓存，不影响生产代码。
 
@@ -216,11 +214,9 @@ Context 输出字段：
 ```text
 OnlineTrader/
 ├── AGENTS.md                        # 全局不变量，保留
-├── .agents/skills/                  # PR-02：四个 Skill 的唯一人工维护源
-│   ├── runtime-development/SKILL.md
-│   ├── workbench-development/SKILL.md
-│   ├── dsv-parity-review/SKILL.md
-│   └── order-safety-review/SKILL.md
+├── .agents/skills/                  # PR-01：短工作流入口；业务规范源仍在 docs/skills
+│   ├── runtime-workbench-development/SKILL.md
+│   └── dsv-parity-review/SKILL.md
 ├── docs/ai/
 │   ├── ai-development-efficiency-plan-20261120.md  # 本文
 │   ├── README.md
@@ -241,9 +237,9 @@ OnlineTrader/
 
 | 阶段 / PR | 交付 | 依赖 | 不包括 |
 | --- | --- | --- | --- |
-| **阶段 0** | 当前架构/文档状态、模块边界、B01–B08 基线 | 无 | 修改交易代码 |
-| **PR-01** | Serena 本机接入文档、安全配置与定位对照 | 阶段 0 | 生产依赖、柜台连接 |
-| **PR-02** | AGENTS 导航 + 四个 Skills + 兼容验证 | 阶段 0；可与 PR-01 独立 | 大规模目录搬迁 |
+| **阶段 0（第一批）** | 当前架构/文档状态、模块边界、B01/B04/B05/B08 参考答案 | 无 | 修改交易代码 |
+| **PR-01（第一批）** | AGENTS 导航 + 两个 Skills + 静态兼容验证 | 阶段 0 | 大规模目录搬迁 |
+| **PR-02** | Serena 干净源码副本接入、安全配置与定位对照 | 阶段 0/PR-01 | 生产依赖、运行目录、柜台连接 |
 | **PR-03** | 仅开发经测量确需的 Context / Impact MVP | PR-01/02 的评估结果 | 完整 Repo Map/RAG |
 | **PR-04（可选）** | 受限 Repomix 与独立审核交接 | 前三阶段存在证实的需求 | 默认多 Agent 并发写入 |
 
@@ -273,17 +269,17 @@ OnlineTrader/
 | Skill 重复 / 客户端加载不同内容 | 唯一规范源、版本化适配、自检实际加载路径 |
 | AST 漏报 IPC/Qt/SQL 影响 | 非 Python 规则 + UNKNOWN + 人工审核 |
 | MCP 能力过宽 | 隔离开发工作区、最小工具/OS 权限，不暴露运行目录 |
-| 工具更新破坏可复现性 | 记录验证版本，升级前比较 B01–B08 |
+| 工具更新破坏可复现性 | 记录验证版本，升级前比较当时已启用的 benchmark 任务 |
 | 增加工具反而变慢 | 用阶段 0 对照，收益不足时删减或停用 |
 | 数据隐私或秘密进入上下文 | 排除规则、脱敏与人工复核，不以自动扫描代替审查 |
 
-维护约定：新路径/新权威决定必须首先更新 `architecture-status.yaml`；新增 Skill 必须证明确实减少重复开发；发布包的配置与交易行为仍服从项目现有授权规则。若源码事实和计划文本冲突，应评审并更新计划，而不是要求 AI 无条件遵循旧计划。
+维护约定：新路径或新权威决定先修改实际合同正文，并在同一变更中更新 `architecture-status.yaml`；状态索引不能成为第二套权威。新增 Skill 必须证明确实减少重复开发；发布包的配置与交易行为仍服从项目现有授权规则。若源码事实和计划文本冲突，应评审并更新计划，而不是要求 AI 无条件遵循旧计划。
 
 ## 12. 实施建议
 
-**先做阶段 0，再做 PR-01 Serena 与 PR-02 Skills；待验证有效后再决定 PR-03。** 该顺序把早期投入集中在最可能有效、风险最低的工作上。
+**先完成阶段 0 与 PR-01 Skills，再在干净源码副本中评估 PR-02 Serena；待验证有效后再决定 PR-03。** Repomix 与多 Agent 继续保持可选。
 
-当前提交仅保存这份实施计划和文档导航，**不表示上述阶段已开始或完成**。
+当前工作区已完成阶段 0 的静态参考答案和 PR-01 的两个 Skill 文件；受控效率测量、真实任务触发率、Serena、Context/Impact、Repomix 和多 Agent 均未执行。
 
 ## 13. 参考资料
 

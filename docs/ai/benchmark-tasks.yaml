@@ -1,0 +1,80 @@
+schema_version: ONLINE_TRADER_AI_BENCHMARK_TASKS/1
+reference_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+reference_reviewed_on: "2026-11-20"
+measurement_status: NOT_RUN
+measurement_note: >-
+  Reference answers were statically reviewed. Controlled timing, token and repeated-run
+  comparisons are deferred until a navigation tool or Skill variant is evaluated.
+
+tasks:
+  - id: B01
+    prompt: Locate the current Standalone Workbench command path from a trading button to the Runtime endpoint.
+    route: STANDALONE
+    expected:
+      source_chain:
+        - src/online_trader/desktop/workbench.py:WorkbenchWindow.send
+        - src/online_trader/desktop/workbench.py:WorkbenchWindow._start_runtime_submit
+        - src/online_trader/desktop/runtime_client/client.py:CommandBus.submit
+        - src/online_trader/desktop/runtime_client/client.py:RuntimeCommandWorker
+        - src/online_trader/runtime/operator_api.py:RuntimeWorkbenchClient.request
+        - src/online_trader/runtime/view_process.py:_serve_command
+      contract:
+        - Workbench checks the current projection and capability before enqueue.
+        - Runtime revalidates each command; the GUI never becomes an SDK sender.
+        - Pending correlation is process-local and cannot be used as cross-boot authority.
+      reject_if:
+        - Uses the retired direct Workbench sender as the current Standalone path.
+        - Claims button state proves server authorization or execution.
+
+  - id: B04
+    prompt: Explain the difference between the Standalone boot execution ledger and account-history.db.
+    route: STANDALONE
+    expected:
+      source_chain:
+        - src/online_trader/runtime/session_storage.py:RuntimeSessionStorage
+        - src/online_trader/runtime/standalone.py:run_session
+        - src/online_trader/runtime/portable_config.py:PortableRuntimeStore.history_path
+        - src/online_trader/runtime/account_history.py
+      contract:
+        - RuntimeSessionStorage creates a temporary ledger.db owned by one boot and cleans it after the boot.
+        - account-history.db is a persistent broker-rebuildable history and return cache.
+        - Neither old execution ledgers nor the history cache exclude another computer using the same account.
+      reject_if:
+        - Treats account-history.db as sender, order owner or position authority.
+        - Requires handoff of a prior Standalone ledger to start a new boot.
+
+  - id: B05
+    prompt: Locate the DSV Replacement decision-to-SDK-send path and its durability boundary.
+    route: REPLACEMENT
+    expected:
+      source_chain:
+        - src/online_trader/dsv_runtime/runner.py:DsvSession.apply_round
+        - src/online_trader/dsv_runtime/controller.py:ExplicitOrderController.plan
+        - src/online_trader/dsv_runtime/controller.py:ExplicitOrderController.dispatch
+        - src/online_trader/dsv_runtime/sdk_adapter.py:DsvSdkAdapter.send
+        - src/online_trader/dsv_storage/journal.py:Journal
+      contract:
+        - DsvSession accepts ordered scoped facts and binds ExplicitOrderController, Journal and DsvSdkAdapter.
+        - Per-child intent is journaled before native insert_order; exceptions inside insert_order are not unsent proof.
+        - The frozen original comparison traces the first differing wait_update round, strategy target, API call and outbound packet.
+      reject_if:
+        - Routes Replacement sends through the legacy Kernel owner.
+        - Treats a local SDK object or replay queue as fill or reconnect proof.
+
+  - id: B08
+    prompt: Identify a superseded Standalone document conclusion and route to the current contract.
+    route: DOCUMENTATION
+    expected:
+      examples:
+        - old: docs/refactor/trading-workbench-client-refactor-20261119.md#cross-boot-pending
+          current: docs/refactor/runtime-command-bus-contract-20261120.md
+          change: QSettings or registry pending persistence is replaced by process-local correlation.
+        - old: docs/runtime-operations-and-storage-20261119.md#long-lived-ledger-and-handoff
+          current: docs/refactor/runtime-broker-authority-single-instance-20261120.md
+          change: A boot uses a temporary execution store and synchronizes broker facts; old ledgers never block startup.
+      contract:
+        - Use architecture-status.yaml by path and scope.
+        - Report CONFLICT / NEEDS_REVIEW if source, current contract and index disagree.
+      reject_if:
+        - Chooses a document solely because it is newer by filename date.
+        - Converts historical test evidence into current candidate acceptance.

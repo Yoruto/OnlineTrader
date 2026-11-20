@@ -1,5 +1,7 @@
 # OnlineTrader Runtime / Workbench 架构收敛与安全改造计划
 
+> **2026-11-20 权威更新：** 本文保留架构评审和旧候选实施历史，不再单独作为当前 Standalone 持久化、恢复或 Workbench pending 的实施依据。当前合同以[本机单实例与柜台权威设计](runtime-broker-authority-single-instance-20261120.md)和[CommandBus 进程内关联合同](runtime-command-bus-contract-20261120.md)为准；本文中每账户长期账本、跨设备 handoff 和 durable pending 的旧结论均已替代。具体作用域状态见[AI 文档状态清单](../ai/architecture-status.yaml)。
+
 > 日期：2026-11-20  
 > 运行源码事实基线：`90f8d0af1c493f9e8c902a2c8589b768149df4c9`（main）
 >

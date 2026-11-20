@@ -1,0 +1,101 @@
+schema_version: ONLINE_TRADER_MODULE_BOUNDARIES/1
+verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+verified_on: "2026-11-20"
+note: Static navigation aid only. Dynamic Qt, IPC and SDK relationships still require source review.
+
+boundaries:
+  - id: standalone-desktop-client
+    route: STANDALONE
+    entries:
+      - src/online_trader/desktop/entrypoint.py
+      - src/online_trader/desktop/runtime_bootstrap.py
+      - src/online_trader/desktop/workbench.py:WorkbenchWindow
+    collaborators:
+      - src/online_trader/desktop/runtime_client/client.py:RuntimeClientCoordinator
+      - src/online_trader/desktop/runtime_client/client.py:CommandBus
+      - src/online_trader/desktop/runtime_client/state.py:ClientStateStore
+    owns:
+      - Qt presentation and drafts
+      - process-local pending command correlation
+      - bounded client I/O workers
+    must_not_own:
+      - SDK order sending
+      - broker position or fill truth
+      - execution-ledger writes
+      - cross-boot command responsibility
+
+  - id: standalone-runtime-owner
+    route: STANDALONE
+    entries:
+      - src/online_trader/runtime/standalone.py:run_session
+      - src/online_trader/runtime/launch.py
+      - src/online_trader/runtime/view_process.py:ViewProcess
+    collaborators:
+      - src/online_trader/runtime/session_storage.py:RuntimeSessionStorage
+      - src/online_trader/runtime/account_history.py
+      - src/online_trader/runtime/operator_api.py
+      - src/online_trader/kernel
+    owns:
+      - one process-owned execution store for the current boot
+      - broker synchronization and current business state
+      - command validation, execution and receipts
+      - SDK/order/protection lifecycle
+    must_not_own:
+      - cross-device locks for the same futures account
+      - durable handoff of a prior boot execution ledger
+
+  - id: standalone-history-cache
+    route: STANDALONE
+    entries:
+      - src/online_trader/runtime/portable_config.py:PortableRuntimeStore.history_path
+      - src/online_trader/runtime/account_history.py
+      - src/online_trader/runtime/account_cache.py
+    owns:
+      - broker-rebuildable history and return cache
+    must_not_own:
+      - order sending
+      - position authority
+      - execution responsibility
+
+  - id: dsv-replacement
+    route: REPLACEMENT
+    entries:
+      - src/online_trader/dsv_runtime/runner.py:DsvSession
+      - src/online_trader/dsv_runtime/runner.py:DsvSession.apply_round
+    collaborators:
+      - src/online_trader/dsv_runtime/controller.py:ExplicitOrderController
+      - src/online_trader/dsv_runtime/sdk_adapter.py:DsvSdkAdapter
+      - src/online_trader/dsv_storage/journal.py:Journal
+      - src/online_trader/dsv_core
+    owns:
+      - replacement ordered facts and strategy state
+      - per-child pre-send durability and UNKNOWN responsibility
+      - explicitly bound SDK adapter behavior
+    must_not_depend_on:
+      - legacy Kernel owner as a second sender
+      - Qt or Workbench state
+      - QA fixture injection in online SDK mode
+
+  - id: legacy-runtime
+    route: LEGACY_EXPLICIT_MAINTENANCE
+    entries:
+      - src/online_trader/kernel
+      - src/online_trader/gateway/tqkq_dsv.py
+      - src/online_trader/ledger/store.py
+    owns:
+      - legacy execution and recovery contract while that route remains supported
+    must_not_be_used_as:
+      - default desktop or package route
+      - implicit source of Replacement entry gates
+
+  - id: isolated-dsv-qa
+    route: ISOLATED_QA
+    entries:
+      - qa/dsv_parity
+      - qa/runtime_replay.py
+      - src/online_trader/dsv_runtime/offline_endpoint.py
+    owns:
+      - frozen fixtures and bounded offline replay
+    must_not_be_used_as:
+      - production online input port
+      - proof of live broker behavior

@@ -3,6 +3,11 @@
 Independent Windows product. G0 source specifications are recorded in docs/spec-source.json.
 Preserve existing work; do not import V7, vnpy, DSV, their credentials, databases or environments.
 
+## AI 开发导航
+
+- 开始 Runtime、Workbench 或 DSV 源码任务时，先按 `docs/ai/architecture-status.yaml` 的 `path + scope` 核对当前合同，再用 `docs/ai/module-boundaries.yaml` 定位实际入口。文档、状态索引与源码冲突时报告 `CONFLICT / NEEDS_REVIEW`，不得静默采用旧结论。
+- `.agents/skills/runtime-workbench-development` 和 `.agents/skills/dsv-parity-review` 是短工作流入口；`docs/skills/online-trader.md` 仍是 OnlineTrader 业务规则的规范源。本文件中的安全、测试与打包约束始终适用，不依赖 Skill 是否触发。
+
 ## 默认启动与交付路径
 
 - 未明确指定执行路径时，OnlineTrader 的启动、重启、用户验收、测试候选和打包默认采用 **Standalone Trading Runtime**。普通用户从 `online-trader-desktop --runtime-root <目录>`（配置便携版直接双击 `OnlineTrader.exe`）进入；统一桌面入口先附着已有 Runtime，缺失时以 `DISARMED` 启动 Owner，再打开同一个 `WorkbenchWindow` / `WorkbenchLayout`。`runtime run`、`runtime schedule` 和 `--runtime-pipe` 保留为运维、无人值守及高级附着入口；不要另建或交付第二套界面。

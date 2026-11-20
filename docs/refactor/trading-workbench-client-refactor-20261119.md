@@ -1,5 +1,7 @@
 # OnlineTrader Trading Workbench（Client）重构设计与实施计划
 
+> **2026-11-20 权威更新：** 本文的 UI、线程和 Client/View 分层仍可作为候选设计参考；其中注册表/QSettings pending 持久化、跨 Workbench boot 查询责任及长期执行账本恢复结论已经失效。当前 Standalone 以[本机单实例与柜台权威设计](runtime-broker-authority-single-instance-20261120.md)和[CommandBus 进程内关联合同](runtime-command-bus-contract-20261120.md)为准。具体作用域状态见[AI 文档状态清单](../ai/architecture-status.yaml)。
+
 > 状态：Phase 1 三项 Integration Gate 已通过独立定向自动化；Phase 2 已开始把账号历史慢查询接入既有 Workbench，状态订阅和交易控制仍未迁移 · 2026-11-19；未打包
 > 范围：Qt/PySide6 客户端及其与 Trading Runtime 的接口适配  
 > 设计基线：`1f0ab648136519e364bf3267c6dab51ffdd76e15`；实施起点：`c891e512ed6559505160cccd80bfd90a40ae5262`
