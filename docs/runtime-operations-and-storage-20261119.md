@@ -1,5 +1,7 @@
 # Trading Runtime 运维、配置与账本约定
 
+> **2026-11-20 规则变更：** 本文关于“原执行账本长期权威、换机交接、handoff、跨重启 pending”的内容已被[本机单实例与柜台权威设计](refactor/runtime-broker-authority-single-instance-20261120.md)替代。当前 Standalone Runtime 每次启动使用临时执行库；同一台电脑只有一个 Runtime，不限制其他电脑使用同一期货账户。长期保留仅包括版本默认配置、用户覆盖配置和可由柜台重建的历史/收益缓存。下文未改写部分仅作为旧候选的历史设计记录，不得用于阻止当前启动。
+
 2026-11-19 · 独立 Trading Runtime 运维说明 · 依赖实现候选 PR #17
 
 本文说明独立 Trading Runtime 的运行目录、自动启动、进程/线程职责、SQLite 长期账本、WAL/SHM、接口进程故障和验收方法。它补充[独立运行时设计](refactor/standalone-trading-runtime-20261119.md)与[账号数据同步设计](account-data-sync-design-20261119.md)，不把候选源码、模拟柜台或最终制品描述成已经发布验收。
@@ -37,7 +39,7 @@ runtime/
 | 是否允许无人值守定时启动 | `runtime-control.json` | 运行级自动化意图；可热读取，不是交易历史。 |
 | 日/夜盘启动时间、`auto_start_on_launch`、策略参数 | `OnlineTrader-parameters.json` | 新启动配置、预览和明确选择的新参数来源。 |
 | 券商/行情登录资料 | `private/OnlineTrader-defaults.json` | 私有登录输入；不能写入公开日志或证据。 |
-| CLI、定时任务和受托工具的令牌摘要、账户和操作授权 | `private/operators.json` | 非界面控制接口认证；Workbench 按当前 Windows 交互用户授权，不读取令牌。 |
+| CLI、定时任务和受托工具的令牌摘要、账户和操作授权 | `private/operators.json` | 非界面控制接口认证；Workbench 不读取令牌，使用受 Windows 本机身份边界约束的独立通道。该边界不证明真实按钮点击。 |
 | 委托、成交、持仓责任、未知发送、保护、已提交命令、账户观察、已生效配置和策略事实 | 原每账户 `ledger.db` | 恢复、审计、历史查询和发送前持久化。 |
 | UI/接口进程诊断 | `logs/` | 可删除/轮转的诊断，不是交易事实。 |
 
@@ -103,7 +105,7 @@ Trading Runtime 的 Owner 主线程仍是唯一的交易决策和 SDK 驱动线�
 - 大帧编码在后台线程完成；已有编码任务积压时不在 Owner 线程不断重复构造新帧。
 - runtime-view-process 负责对外状态、历史、账户读取和操作员接口，可退出并重建。
 
-Trading Workbench 通过 runtime-view-process 的本机交互用户通道直接提交命令。用户点击按钮并完成界面确认即构成该次用户操作，不再输入操作员 ID或令牌；命名管道校验同一 Windows 登录用户，接口继续核对账号、能力、owner boot 和配置版本。超时或断线保留原 `command_id`，只能查询原回执，不能由界面自动生成新 ID重发。CLI、定时任务和受托工具仍走操作员协议。Qt 和 runtime-view-process 仍只是控制/读侧，不因此成为 SDK sender 或账本 writer。
+Trading Workbench 通过 runtime-view-process 的本机控制通道提交命令，不在 Qt 中输入操作员 ID 或令牌。命名管道核验连接进程的 Windows 身份；当前服务端边界包含 Owner SID 与 `LocalSystem`，但这种检查不能证明命令来自真实用户的按钮点击，也不能把 Capability 当成授权票据。接口和原 Runtime Owner 仍逐次核对显式 Workbench allowlist、账号、能力、owner boot、配置版本及交易前置条件。命令日志保留脱敏账号、actor、boot 与 peer PID/SID。超时或断线保留原 `command_id`，只能查询原回执，不能由界面自动生成新 ID 重发；多个显式工作台通过跨进程锁合并本地待核 ID，不能整表覆盖。CLI、定时任务和受托工具仍走操作员协议。Qt 和 runtime-view-process 仍只是控制/读侧，不因此成为 SDK sender 或账本 writer。详细威胁模型与迁移门禁见[架构收敛与安全改造计划](refactor/runtime-architecture-hardening-plan-20261120.md)。
 
 750 ms 和 2.5 s 是当前实现的发布节奏，不是交易 SLA，也不改变报单、撤单、策略或保护轮次。性能评审应观察 `OWNER_LOOP_SLOW`、SDK 泵间隔以及 Tick → 决策 → 发送的 P95/P99。
 

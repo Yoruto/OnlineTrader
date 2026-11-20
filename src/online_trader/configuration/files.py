@@ -57,3 +57,31 @@ def publish_new_bytes(raw, path):
         if temporary is not None:
             try:temporary.unlink()
             except FileNotFoundError:pass
+
+
+def publish_replace_bytes(raw, path):
+    """Atomically replace one validated local configuration file.
+
+    Runtime defaults and user overrides are configuration, not trading facts.
+    The temporary file is flushed on the target volume before replacement so a
+    crash leaves either the old or the complete new document.
+    """
+    target = Path(path)
+    temporary = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=".online-trader-config-", suffix=".tmp",
+                                         dir=target.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+        temporary = None
+        return target
+    except OSError as error:
+        raise TraderError("E_CONFIG_FILE", "Cannot replace the local configuration file") from error
+    finally:
+        if temporary is not None:
+            try:temporary.unlink()
+            except FileNotFoundError:pass

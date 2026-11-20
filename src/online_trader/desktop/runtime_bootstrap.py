@@ -7,7 +7,8 @@ import sys
 import time
 from uuid import uuid4
 
-from PySide6.QtWidgets import QApplication, QProgressDialog
+from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtWidgets import QProgressDialog
 
 from online_trader.contracts.codec import strict_loads
 from online_trader.errors import TraderError
@@ -18,17 +19,16 @@ from online_trader.transport.runtime_view import RuntimeViewClient
 
 _CONNECTION_ERRORS = frozenset({'E_PIPE', 'E_PIPE_CLOSED', 'E_TIMEOUT'})
 _PHASE_LABELS = {
-    'STARTUP_CHECKING': '正在核对账号、账本与启动请求…',
+    'STARTUP_CHECKING': '正在核对本机 Runtime、账号与启动请求…',
     'STARTUP_READING_MARKET': '正在连接行情并核对交易日与合约…',
     'STARTUP_PREPARED': '正在连接模拟柜台并同步账户状态…',
-    'STARTUP_RECOVERING': '正在恢复原持仓与保护责任，新增开仓保持关闭…',
+    'STARTUP_RECOVERING': '正在从柜台同步当前账户状态，新增开仓保持关闭…',
 }
 _FAILURE_HINTS = {
-    'E_RUNTIME_HANDOFF': '检测到同一账号已有另一份桌面执行账本。为避免形成两个交易账本，Runtime 已拒绝启动；请先完成受控的一致性交接。',
     'E_RUNTIME_CONFIG': 'Runtime 配置不完整或格式无效，请核对交付目录中的运行配置。',
-    'E_STORAGE': '执行账本缺失、不可读或身份不完整，Runtime 未启动且没有重建账本。',
-    'E_SCOPE': '账号、provider、账本或启动范围不一致，Runtime 已拒绝启动。',
-    'E_INSTANCE_EXISTS': '该账号已有执行 Owner，但在等待期内没有取得它的工作台接口；请查看原 Runtime 状态，禁止重复启动第二个 Owner。',
+    'E_STORAGE': '本次 Runtime 的临时存储或历史缓存不可用，请查看启动诊断。',
+    'E_SCOPE': '账号、provider、配置或启动范围不一致，Runtime 已拒绝启动。',
+    'E_INSTANCE_EXISTS': '这台电脑已有一个 Runtime，但在等待期内没有取得它的工作台接口；请查看已运行的 Runtime。其他电脑不受此限制。',
     'E_GATEWAY_CONNECT': '模拟账号或行情连接失败，请核对网络与账号配置。',
 }
 _launched_processes = []
@@ -42,8 +42,12 @@ def bundled_runtime_root():
     try:
         from online_trader.update_install import managed_root
         root = managed_root(sys.executable)
-        if root is not None and (root / 'OnlineTrader.exe').is_file():
-            directory = root
+        if root is not None:
+            stable = root / 'runtime'
+            if (stable / 'runtime.json').is_file():
+                return stable
+            if (root / 'OnlineTrader.exe').is_file():
+                directory = root
     except (OSError, ValueError, KeyError, TypeError):
         pass
     candidate = directory / 'runtime'
@@ -177,75 +181,187 @@ def _failure_error(record, diagnostic, stderr_path):
     return TraderError(code, f'{message}\n\n错误码：{code}\n诊断：{evidence}')
 
 
-def ensure_runtime(root, *, account=None, mode='strategy', timeout=90):
-    """Return a ready Runtime pipe, starting one without binding it to Qt lifetime."""
-    runtime_root = Path(root).resolve()
-    store = PortableAccountStore(runtime_root, account)
-    store.profile()
-    store.runtime_control()
-    selected = store.get(store.read()['selected_id'])
-    pipe = store.pipe_name(selected)
+class BootstrapWorker(QThread):
+    """Perform Runtime discovery and bounded startup without blocking Qt."""
 
-    progress = QProgressDialog('', '', 0, 0)
-    progress.setWindowTitle('OnlineTrader · 启动交易服务')
-    progress.setCancelButton(None)
-    progress.setMinimumDuration(0)
-    progress.setLabelText(
-        f"正在读取交易服务权威状态…\n{selected['alias']} · {selected['masked_login']}\n"
-        "已有 Runtime 保留当前权限；新启动保持禁开"
-    )
-    progress.show()
-    QApplication.processEvents()
-    try:
-        if _probe(pipe, selected['account_key']) is not None:
-            return pipe
+    phase_changed = Signal(str, str, str)
+    ready = Signal(str)
+    failed = Signal(object)
+    cancelled = Signal()
 
-        process, stdout_path, stderr_path = _launch_owner(runtime_root, mode, account)
-        deadline = time.monotonic() + timeout
-        run_directory = None
-        exited_at = None
-        instance_failure = None
-        last_phase = None
-        while time.monotonic() < deadline:
-            QApplication.processEvents()
-            value = _probe(pipe, selected['account_key'])
-            if value is not None:
-                return pipe
-            run_directory = run_directory or _run_directory(runtime_root, stdout_path)
-            record, diagnostic = _startup_record(run_directory)
-            if record is not None:
-                phase = record.get('phase') or record.get('status')
-                if phase == 'STARTUP_FAILED':
-                    if record.get('error_code') == 'E_INSTANCE_EXISTS':
-                        instance_failure = (record, diagnostic)
-                        progress.setLabelText(
-                            f"该账号已有执行 Owner，正在等待它的工作台接口…\n"
-                            f"{selected['alias']} · {selected['masked_login']}\n不会启动第二个 Owner"
-                        )
-                        time.sleep(.2)
-                        continue
-                    raise _failure_error(record, diagnostic, stderr_path)
-                if phase != last_phase and phase in _PHASE_LABELS:
-                    last_phase = phase
-                    progress.setLabelText(
-                        f"{_PHASE_LABELS[phase]}\n{selected['alias']} · {selected['masked_login']}\n新增开仓保持关闭"
-                    )
-            exit_code = process.poll()
-            if exit_code is not None:
-                exited_at = exited_at or time.monotonic()
-                # A concurrent launcher may have won the account lock. Its
-                # structured E_INSTANCE_EXISTS record is handled above by
-                # waiting for that original Runtime until the main deadline.
-                if time.monotonic() - exited_at >= 3 and instance_failure is None:
-                    record, diagnostic = _startup_record(run_directory)
-                    raise _failure_error(record, diagnostic, stderr_path)
-            time.sleep(.2)
-        if instance_failure is not None:
-            raise _failure_error(instance_failure[0], instance_failure[1], stderr_path)
-        raise TraderError(
-            'E_RUNTIME_START_TIMEOUT',
-            '等待 Trading Runtime 就绪超时。启动进程可能仍在继续；为避免形成第二个 Owner，未自动重启或终止它。'
-            f'\n\n错误码：E_RUNTIME_START_TIMEOUT\n诊断：{stderr_path}',
-        )
-    finally:
-        progress.close()
+    def __init__(self, root, *, account=None, mode='strategy', timeout=90, parent=None):
+        super().__init__(parent)
+        self.root = Path(root)
+        self.account = account
+        self.mode = mode
+        self.timeout = timeout
+
+    def _phase(self, state, message, selected=None):
+        detail = '' if selected is None else f"{selected['alias']} · {selected['masked_login']}"
+        self.phase_changed.emit(state, message, detail)
+
+    def run(self):
+        try:
+            self._phase('DISCOVERING', '正在读取交易服务权威状态…')
+            runtime_root = self.root.resolve()
+            store = PortableAccountStore(runtime_root, self.account)
+            store.profile()
+            store.runtime_control()
+            selected = store.get(store.read()['selected_id'])
+            pipe = store.pipe_name(selected)
+            if self.isInterruptionRequested():
+                self.cancelled.emit()
+                return
+
+            self._phase('ATTACHING', '正在附着已有 Runtime；不会改变当前权限…', selected)
+            if _probe(pipe, selected['account_key']) is not None:
+                self._phase('READY', '已取得现有 Runtime 基线。', selected)
+                self.ready.emit(pipe)
+                return
+            if self.isInterruptionRequested():
+                self.cancelled.emit()
+                return
+
+            self._phase('LAUNCHING', '未发现可附着 Runtime，正在启动 DISARMED Owner…', selected)
+            process, stdout_path, stderr_path = _launch_owner(runtime_root, self.mode, self.account)
+            deadline = time.monotonic() + self.timeout
+            run_directory = None
+            exited_at = None
+            instance_failure = None
+            last_phase = None
+            self._phase('WAITING_BASELINE', '正在等待 Runtime 建立可归属的状态基线…', selected)
+            while time.monotonic() < deadline:
+                if self.isInterruptionRequested():
+                    self._phase('CANCELLED_UI', '桌面已取消等待；已启动的 Owner 保持独立运行。', selected)
+                    self.cancelled.emit()
+                    return
+                value = _probe(pipe, selected['account_key'])
+                if value is not None:
+                    self._phase('READY', 'Runtime 已就绪，正在打开交易工作台。', selected)
+                    self.ready.emit(pipe)
+                    return
+                run_directory = run_directory or _run_directory(runtime_root, stdout_path)
+                record, diagnostic = _startup_record(run_directory)
+                if record is not None:
+                    phase = record.get('phase') or record.get('status')
+                    if phase == 'STARTUP_FAILED':
+                        if record.get('error_code') == 'E_INSTANCE_EXISTS':
+                            instance_failure = (record, diagnostic)
+                            self._phase(
+                                'WAITING_BASELINE',
+                                '该账号已有执行 Owner，正在等待它的工作台接口；不会启动第二个 Owner…',
+                                selected,
+                            )
+                            self.msleep(200)
+                            continue
+                        raise _failure_error(record, diagnostic, stderr_path)
+                    if phase != last_phase and phase in _PHASE_LABELS:
+                        last_phase = phase
+                        self._phase('WAITING_BASELINE', _PHASE_LABELS[phase], selected)
+                if process.poll() is not None:
+                    exited_at = exited_at or time.monotonic()
+                    # A concurrent launcher may have won the account lock. Its
+                    # E_INSTANCE_EXISTS record keeps this worker on attach-only
+                    # waiting until the original deadline.
+                    if time.monotonic() - exited_at >= 3 and instance_failure is None:
+                        record, diagnostic = _startup_record(run_directory)
+                        raise _failure_error(record, diagnostic, stderr_path)
+                self.msleep(200)
+            if instance_failure is not None:
+                raise _failure_error(instance_failure[0], instance_failure[1], stderr_path)
+            raise TraderError(
+                'E_RUNTIME_START_TIMEOUT',
+                '等待 Trading Runtime 就绪超时。启动进程可能仍在继续；为避免形成第二个 Owner，未自动重启或终止它。'
+                f'\n\n错误码：E_RUNTIME_START_TIMEOUT\n诊断：{stderr_path}',
+            )
+        except Exception as error:
+            failure = error if isinstance(error, TraderError) else TraderError(
+                'E_RUNTIME_START', 'Trading Runtime 启动检查失败，请查看 bootstrap 日志')
+            self.phase_changed.emit('FAILED', str(failure), '')
+            self.failed.emit(failure)
+
+
+class BootstrapController(QObject):
+    """Own the bootstrap UI and worker, but never the Runtime Owner lifetime."""
+
+    ready = Signal(str)
+    failed = Signal(object)
+    cancelled = Signal()
+    state_changed = Signal(str)
+
+    def __init__(self, root, *, account=None, mode='strategy', timeout=90, parent=None):
+        super().__init__(parent)
+        self.progress = QProgressDialog('', '', 0, 0)
+        self.progress.setWindowTitle('OnlineTrader · 启动交易服务')
+        self.progress.setCancelButtonText('取消等待')
+        self.progress.setMinimumDuration(0)
+        self.progress.setAutoClose(False)
+        self.progress.setAutoReset(False)
+        self.worker = BootstrapWorker(
+            root, account=account, mode=mode, timeout=timeout, parent=self)
+        self._terminal = False
+        self._cancel_requested = False
+        self.worker.phase_changed.connect(self._phase_changed)
+        self.worker.ready.connect(self._ready)
+        self.worker.failed.connect(self._failed)
+        self.worker.cancelled.connect(self._cancelled)
+        self.progress.canceled.connect(self.cancel)
+
+    def start(self):
+        if self.worker.isRunning():
+            return
+        self._terminal = False
+        self._cancel_requested = False
+        self.progress.setCancelButtonText('取消等待')
+        self.progress.setLabelText('正在读取交易服务权威状态…\n新启动保持禁开')
+        self.progress.show()
+        self.worker.start()
+
+    def cancel(self):
+        if self._terminal or self._cancel_requested:
+            return
+        self._cancel_requested = True
+        self.progress.setCancelButton(None)
+        self.progress.setLabelText(
+            '正在取消桌面等待…\n已启动的 Runtime Owner 将保持独立运行')
+        if self.worker.isRunning():
+            self.worker.requestInterruption()
+        else:
+            self._cancelled()
+
+    def shutdown(self):
+        if self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.wait()
+        self._terminal = True
+        self.progress.close()
+
+    def _phase_changed(self, state, message, detail):
+        self.state_changed.emit(state)
+        suffix = f'\n{detail}' if detail else ''
+        safety = '' if state in {'READY', 'FAILED', 'CANCELLED_UI'} else '\n新增开仓保持关闭'
+        self.progress.setLabelText(message + suffix + safety)
+
+    def _ready(self, pipe):
+        if self._terminal:
+            return
+        if self._cancel_requested:
+            self._cancelled()
+            return
+        self._terminal = True
+        self.progress.close()
+        self.ready.emit(pipe)
+
+    def _failed(self, error):
+        if self._terminal:
+            return
+        self._terminal = True
+        self.progress.close()
+        self.failed.emit(error)
+
+    def _cancelled(self):
+        if self._terminal:
+            return
+        self._terminal = True
+        self.progress.close()
+        self.cancelled.emit()

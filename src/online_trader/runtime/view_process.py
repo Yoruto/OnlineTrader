@@ -1,6 +1,7 @@
 """Independent local read interface for an original simulation owner."""
 
 import os
+import hashlib
 import logging
 import subprocess
 import sys
@@ -12,8 +13,7 @@ from threading import BoundedSemaphore, Event, Lock, Thread
 import re
 
 from online_trader.errors import TraderError
-from online_trader.runtime.account_day_history import read_account_days
-from online_trader.runtime.account_history import account_history
+from online_trader.runtime.account_cache import read_account_days, recent_history
 from online_trader.runtime.executable import bundled_cli
 from online_trader.runtime.operator_api import OperatorEndpoint, WorkbenchEndpoint
 from online_trader.runtime.operator_api import validate_wire as validate_command
@@ -51,7 +51,7 @@ def _supervisor_log(root, message):
         pass
 
 
-def _start(pipe, account_key, root, ledger):
+def _start(pipe, account_key, root, ledger, history):
     program = bundled_cli()
     prefix = [str(program)] if program is not None else [sys.executable, '-m', 'online_trader']
     log_path = _view_log(root)
@@ -62,7 +62,7 @@ def _start(pipe, account_key, root, ledger):
         pass
     try:
         process = subprocess.Popen([*prefix, 'runtime-view-process', '--pipe', pipe, '--account-key', account_key,
-                                    '--root', str(root), '--ledger', str(ledger)],
+                                    '--root', str(root), '--ledger', str(ledger), '--history', str(history)],
             stdin=subprocess.PIPE, stdout=output if output is not None else subprocess.DEVNULL,
             stderr=output if output is not None else subprocess.DEVNULL,
             creationflags=subprocess.CREATE_NO_WINDOW,
@@ -98,8 +98,8 @@ def _close(process):
 class ViewProcess:
     """Restart the disposable interface while the original execution owner keeps running."""
 
-    def __init__(self, pipe, account_key, root, ledger):
-        self.args = (pipe, account_key, root, ledger)
+    def __init__(self, pipe, account_key, root, ledger, history=None):
+        self.args = (pipe, account_key, root, ledger, ledger if history is None else history)
         self._stopped = Event()
         self._process = None
         self._thread = Thread(target=self._monitor, daemon=True)
@@ -167,7 +167,10 @@ def _runtime_log_page(root, *, before=None, limit=100):
     pattern = re.compile(
         r'^(\S+) (?:SUPERVISOR )?('
         r'START pid=\d+|EXIT code=-?\d+ uptime_ms=\d+|START_FAILED error=[A-Za-z0-9_]+|'
-        r'COMMAND source=(?:WORKBENCH|OPERATOR) request=[A-Za-z0-9._-]+ '
+        r'COMMAND source=(?:WORKBENCH|OPERATOR) '
+        r'(?:peer_pid=\d+ peer_sid=[A-Za-z0-9._-]+ actor_kind=[A-Z_]+ '
+        r'actor=[A-Za-z0-9._-]+ account=[a-f0-9]{16} boot=[A-Za-z0-9._-]+ )?'
+        r'request=[A-Za-z0-9._-]+ '
         r'action=[A-Za-z0-9._-]+ operation=[A-Za-z0-9._-]+ command=[A-Za-z0-9._-]+ '
         r'result=(?:ACCEPTED|REJECTED) code=[A-Za-z0-9._-]+)$')
     rows = []
@@ -242,18 +245,37 @@ def _serve_command(connection, endpoint, root, slots):
             action = _safe_log_token(request.get('operation'))
             operation = _safe_log_token(body.get('operation'))
             command_id = _safe_log_token(body.get('command_id'))
+            binding = body.get('binding') if isinstance(body.get('binding'), dict) else {}
+            actor_kind = 'LOCAL_USER' if endpoint.channel == 'WORKBENCH' else 'DELEGATED_OPERATOR'
+            if endpoint.channel == 'WORKBENCH':
+                actor = 'workbench-user'
+            else:
+                operator = _safe_log_token(request.get('operator'))
+                actor = _safe_log_token('operator-' + operator) if operator != '-' else '-'
+            account = hashlib.sha256(endpoint.account_key.encode('utf-8')).hexdigest()[:16]
+            peer_pid = connection.peer_pid if isinstance(connection.peer_pid, int) else 0
+            peer = (f'peer_pid={max(0, peer_pid)} '
+                    f'peer_sid={_safe_log_token(connection.peer_sid)} '
+                    f'actor_kind={actor_kind} actor={actor} account={account} '
+                    f'boot={_safe_log_token(binding.get("kernel_boot_id"))}')
             try:
                 reply['result'] = endpoint.handle(request)
-                _supervisor_log(root, f'COMMAND source={endpoint.channel} request={_safe_log_token(request.get("request_id"))} '
+                if isinstance(reply['result'], dict):
+                    operation = _safe_log_token(reply['result'].get('operation') or operation)
+                    command_id = _safe_log_token(reply['result'].get('command_id') or command_id)
+                _supervisor_log(root, f'COMMAND source={endpoint.channel} {peer} '
+                                f'request={_safe_log_token(request.get("request_id"))} '
                                 f'action={action} operation={operation} command={command_id} result=ACCEPTED code=-')
             except TraderError as error:
                 reply['error'] = {'code': error.code, 'message': str(error)}
-                _supervisor_log(root, f'COMMAND source={endpoint.channel} request={_safe_log_token(request.get("request_id"))} '
+                _supervisor_log(root, f'COMMAND source={endpoint.channel} {peer} '
+                                f'request={_safe_log_token(request.get("request_id"))} '
                                 f'action={action} operation={operation} command={command_id} '
                                 f'result=REJECTED code={_safe_log_token(error.code)}')
             except (KeyError, TypeError, ValueError, IndexError):
                 reply['error'] = {'code': 'E_SCHEMA', 'message': 'The command could not be validated'}
-                _supervisor_log(root, f'COMMAND source={endpoint.channel} request={_safe_log_token(request.get("request_id"))} '
+                _supervisor_log(root, f'COMMAND source={endpoint.channel} {peer} '
+                                f'request={_safe_log_token(request.get("request_id"))} '
                                 f'action={action} operation={operation} command={command_id} '
                                 'result=REJECTED code=E_SCHEMA')
             connection.send(reply, timeout=.5)
@@ -288,7 +310,7 @@ def _accept(listener, target, subjects, slots, stopped):
         Thread(target=target, args=(connection, *subjects, slots), daemon=True).start()
 
 
-def serve(pipe, account_key, root, ledger):
+def serve(pipe, account_key, root, ledger, history_cache):
     history = ViewHistory()
     stopped = Event()
     command_submission = Lock()
@@ -296,7 +318,7 @@ def serve(pipe, account_key, root, ledger):
     workbench_endpoint = WorkbenchEndpoint(
         pipe, root, ledger, account_key, submission_lock=command_submission)
     account_display = _account_display(root, account_key)
-    history_page = partial(account_history, ledger, account_key)
+    history_page = partial(recent_history, history_cache, account_key)
     runtime_log = partial(_runtime_log_page, root)
     day_history_slots = BoundedSemaphore(2)
     account_value = AccountObservation.waiting(account_key, 'E_ACCOUNT_SOURCE_UNAVAILABLE')
@@ -317,7 +339,7 @@ def serve(pipe, account_key, root, ledger):
         if not day_history_slots.acquire(blocking=False):
             raise TraderError('E_BUSY', 'The account history reader is busy')
         try:
-            return read_account_days(ledger, account_key, **query)
+            return read_account_days(history_cache, account_key, **query)
         finally:
             day_history_slots.release()
 

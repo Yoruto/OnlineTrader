@@ -38,7 +38,7 @@ from online_trader.runtime.strategy_log import BLOCK_MESSAGES, ENTRY_FILTERS
 
 BEIJING = timezone(timedelta(hours=8))
 ENTRY_MESSAGES = {
-    'GEOMETRY_BLOCK': '几何条件不满足，暂不建仓',
+    'GEOMETRY_BLOCK': '日内振幅超出开仓上限',
     'WAITING_FRESH_QUOTE': '等待行情',
     'MARKET_PATH_INCOMPLETE': '行情路径待补齐',
     'OPENING_WAIT': '开盘等待',
@@ -53,8 +53,8 @@ ENTRY_MESSAGES = {
     'SAME_DIRECTION_WITHIN_ONE_SECOND': '同方向报单间隔不足 1 秒',
 }
 ACTIVATION_MESSAGES = {
-    'LONG:NO_CHASE_AFTER_ACT': '当日行情已跑过多头激活位',
-    'SHORT:NO_CHASE_AFTER_ACT': '当日行情已跑过空头激活位',
+    'LONG:NO_CHASE_AFTER_ACT': '当日行情已越过多头不追价线',
+    'SHORT:NO_CHASE_AFTER_ACT': '当日行情已越过空头不追价线',
 }
 QUIET_ENTRY_REASONS = {'CANDLE_OPPORTUNITY_CONSUMED', 'OBSERVATION_ONLY_BACKLOG',
                        'LONG:TRIGGER_NOT_REACHED', 'SHORT:TRIGGER_NOT_REACHED', 'DUPLICATE_MARKET_EVENT'}
@@ -751,6 +751,7 @@ class WorkbenchLayout:
         self.account_history_coverage = []
         self.account_history_pending = set()
         self.account_history_error = None
+        self.parameter_save_buttons = []
 
         original = window.takeCentralWidget()
         for widget in (window.connection_label, window.account_label, window.kernel_label,
@@ -807,6 +808,8 @@ class WorkbenchLayout:
         self.account_tab = self.add_page(self.account_sections, '账户', self.account_page, scroll=True)
         self.add_page(self.account_sections, '系统设置', self.system_page, scroll=True)
         self.add_page(self.account_sections, '品种信息', self.instruments_page, scroll=True)
+        if window.update_controller is not None:
+            self.update_tab = self.add_page(self.account_sections, '软件更新', self.update_page, scroll=True)
         self.render_parameters(self.profile)
         shell.addWidget(self.tabs, 1)
         window.notice_label.setText('未连接 · 等待启动')
@@ -1251,7 +1254,7 @@ class WorkbenchLayout:
             elif view['entry_authority'] != 'ARMED':
                 status = '已停止开仓'
             elif 'GEOMETRY_BLOCK' in reasons:
-                status = '几何条件暂不满足'
+                status = '日内振幅超出开仓上限'
             elif any(reason not in QUIET_ENTRY_REASONS and reason != 'TRIGGER_NOT_REACHED' for reason in reasons):
                 status = '当前条件未满足'
             else:
@@ -1915,8 +1918,9 @@ class WorkbenchLayout:
         if self.window.store is not None and self.paired is None:
             schedule.addWidget(self.timed_start_button)
 
-        fields.addLayout(row(button('参数中心', self.open_parameters),
-                             button('保存参数', self.export_parameters_preview)))
+        strategy_save = button('保存参数', self.export_parameters_preview)
+        self.parameter_save_buttons.append(strategy_save)
+        fields.addLayout(row(button('参数中心', self.open_parameters), strategy_save))
         layout.addStretch()
 
     def symbols_page(self, layout):
@@ -1945,7 +1949,9 @@ class WorkbenchLayout:
                       button('清空列表',lambda:self.remove_selected_symbols(all_symbols=True)),
                       button('参数中心',self.open_parameters),
                       button('换月预览',self.stage_selected_rollover))
-        actions.addWidget(button('保存参数',self.export_parameters_preview))
+        symbol_save = button('保存参数',self.export_parameters_preview)
+        self.parameter_save_buttons.append(symbol_save)
+        actions.addWidget(symbol_save)
         contracts.addLayout(actions)
 
     def render_parameters(self, profile):
@@ -2797,6 +2803,21 @@ class WorkbenchLayout:
         self.manual_owner_controls = owner_controls
         self.update_manual_open_controls()
         self.refresh_manual_selection()
+        self.update_runtime_capabilities()
+
+    def runtime_operation_allowed(self, operation):
+        if self.window._runtime_command_bus is None:
+            return True
+        store = self.window._runtime_client_store
+        return store is not None and store.capability(operation)[0]
+
+    def update_runtime_capabilities(self):
+        view = self.window.view or {}
+        live_parameter_save = bool(view.get('configuration', {}).get('live_parameter_save'))
+        parameter_allowed = (not live_parameter_save
+                             or self.runtime_operation_allowed('SAVE_DSV_PARAMETERS'))
+        for control in self.parameter_save_buttons:
+            control.setEnabled(parameter_allowed)
 
     def update_manual_open_controls(self):
         view = self.window.view
@@ -2804,7 +2825,8 @@ class WorkbenchLayout:
         bound = self.manual_code.currentText() in (config.get('scoped_contracts') or self.names)
         ready = (self.manual_controls_enabled and view is not None
                  and view.get('entry_authority') == 'ARMED'
-                 and config.get('manual_workbench', False) and bound)
+                 and config.get('manual_workbench', False) and bound
+                 and self.runtime_operation_allowed('MANUAL_OPEN'))
         self.submit_button.setEnabled(ready)
         self.latest_button.setEnabled(ready)
         for control in self.quick_sizes:
@@ -2868,21 +2890,28 @@ class WorkbenchLayout:
         available = position['remaining_quantity'] if position else 0
         detail_unavailable = bool(view.get('detail_unavailable'))
         owner_close = detail_unavailable and self.manual_owner_controls
+        close_allowed = self.runtime_operation_allowed('MANUAL_CLOSE')
+        close_all_allowed = self.runtime_operation_allowed('MANUAL_CLOSE_ALL')
+        cancel_allowed = self.runtime_operation_allowed('CANCEL_SELECTED')
+        cancel_account_allowed = self.runtime_operation_allowed('CANCEL_NATIVE_ACCOUNT')
         self.manual_position.setText('当前持仓明细已省略，可向执行器查询。' if detail_unavailable else
                                      f"选中持仓：{position['contract_id']} {available} 手" if position else '选中持仓：无')
         self.manual_close_buttons[None].setText('选择持仓平仓' if detail_unavailable else '全部平仓')
         for qty,control in self.manual_close_buttons.items():
-            control.setEnabled((owner_close and qty is None) or
-                               (self.manual_controls_enabled and available>0 and (qty is None or qty<=available)))
+            control.setEnabled(close_allowed and ((owner_close and qty is None) or
+                               (self.manual_controls_enabled and available>0 and (qty is None or qty<=available))))
         configuration = view.get('configuration',{})
         mode = configuration.get('manual_close_price_mode')
-        self.manual_close_all.setEnabled(mode is not None and (owner_close or (self.manual_controls_enabled and bool(owned))))
+        self.manual_close_all.setEnabled(close_all_allowed and mode is not None
+                                         and (owner_close or (self.manual_controls_enabled and bool(owned))))
         self.manual_close_price_mode.setEnabled(mode is not None and (owner_close or self.manual_controls_enabled))
         selected = self.selected_manual_ids('orders')
         active = {item['child_order_id'] for item in view.get('orders',[]) if item.get('potential_remaining')}
-        self.manual_cancel.setEnabled(self.manual_controls_enabled and bool(selected) and set(selected)<=active)
+        self.manual_cancel.setEnabled(cancel_allowed and self.manual_controls_enabled
+                                      and bool(selected) and set(selected)<=active)
         cancel_review = configuration.get('native_cancel_review') or {}
-        self.manual_cancel_account.setEnabled(self.manual_controls_enabled and bool(cancel_review.get('active_count')))
+        self.manual_cancel_account.setEnabled(cancel_account_allowed and self.manual_controls_enabled
+                                              and bool(cancel_review.get('active_count')))
 
     def close_manual_position(self, quantity):
         if (self.rendered_view or {}).get('detail_unavailable'):
@@ -3512,6 +3541,9 @@ class WorkbenchLayout:
             chart.toggled.connect(lambda visible,k=key:self.settings.setValue(k,visible))
             appearance.addWidget(chart)
         layout.addStretch()
+
+    def update_page(self, layout):
+        self.window.update_controller.build_page(layout)
 
     def fit_current_screen(self):
         window = self.window

@@ -21,3 +21,66 @@
 使用 `-DeliveryMode Configured -DeliveryConfigDirectory <配置目录>`。输入目录必须包含 `OnlineTrader-defaults.json` 和 `OnlineTrader-parameters.json`，前者提供 SimNow 和快期行情的账号口令，后者提供已确认的交易参数。构建前检查输入，构建后核对便携目录中的配置与输入文件一致，同时校验 ZIP 的文件列表、CRC 与关键成员摘要。配置版 ZIP 和安装器名称都以 `-Configured` 标识。公开更新入口拒绝包含默认账号配置的 ZIP。
 
 普通双击配置版工作台首次启动时登记默认账号。已有档案时只为匹配身份补齐缺失的凭据，保留已保存的口令和当前账号选择。配置版含可读取的凭据，应存放和交付在获准的范围内。
+
+## Standalone Trading Runtime 更新接入
+
+默认 Runtime 桌面入口也使用同一套受管理安装根。第一处既有差异是：Legacy 工作台通过 `run(..., update_root=...)` 安装更新菜单，而 `--runtime-root` 分支直接创建 `WorkbenchWindow`，因此没有自动检查、手动入口或更新状态页。Runtime 更新复用现有 GitLab 下载、ZIP 路径限制、大小和 SHA-256 校验、版本目录、启动检查及回退机制，不在 Qt 或 Runtime owner 中新增下载器或第二套安装状态。
+
+```mermaid
+flowchart TD
+    A[受管理启动器选择当前版本] --> B{存在已下载候选?}
+    B -->|否| C[启动当前版本]
+    B -->|是| D[取得安装独占锁]
+    D --> E[取得全部账户锁并只读核对账本]
+    E -->|Runtime 在运行或责任未结清| F[保留候选并启动当前版本]
+    E -->|无持仓、未决委托和 UNKNOWN| G[解包到新版本目录并执行离线启动检查]
+    G -->|失败| H[标记候选失败并保留当前版本]
+    G -->|通过| I[原子切换 active.json]
+    I --> C
+    C --> J[Workbench 后台检查 GitLab]
+    J -->|无更新或网络失败| K[当前版本继续运行]
+    J -->|发现更新| L[下载并校验到 updates/]
+    L --> M[软件更新子页显示待安装]
+```
+
+自动检查和下载运行在 Workbench 的后台线程，不进入交易 owner，不阻塞行情、订单或保护。它只产生安装根下的下载缓存、`pending.json` 和脱敏的 `status.json`。自动流程不会提交 `STOP_DSV_STRATEGY`，也不会为了安装撤单、平仓或终止进程。
+
+用户从「账户与设置 → 软件更新」选择「安全更新并重启」时，顺序如下：
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant W as Workbench
+    participant R as Runtime owner
+    participant L as 稳定启动器
+    participant F as 安装根
+    U->>W: 确认安全更新并重启
+    W->>F: 只读检查待安装候选
+    W->>R: 通过账户锁确认 owner 已退出
+    alt owner 仍运行或账本责任未结清
+        W-->>U: 暂缓安装，提示先停止策略并等待安全退出
+    else 账户已核清
+        W->>W: 关闭工作台并返回更新重启码
+        W->>L: 启动 --restart-update
+        L->>F: 再次取得安装锁和账户锁并复核
+        L->>L: 安装、离线检查、切换或回退
+        L->>W: 打开选定版本
+    end
+```
+
+状态和职责固定如下：
+
+| 状态 | 唯一拥有者 | 约束 |
+| --- | --- | --- |
+| 当前与上一程序版本 | 安装根 `active.json` | 只由稳定启动器在安装独占锁内切换 |
+| 更新来源与渠道 | 安装根 `update-source.json` | Workbench 只读；无此文件时不显示受管理更新入口 |
+| 下载候选 | 安装根 `updates/pending.json` 与校验后的 ZIP | 可在 Runtime 运行时写入，不获得安装权 |
+| 检查状态 | 安装根 `updates/status.json` | 仅用于诊断和界面恢复，不是安装或交易权威事实 |
+| 持仓、委托、UNKNOWN 和恢复责任 | Runtime 的原每账户 SQLite 及唯一 owner | 更新器只读核对，不修改账本、不删除 WAL |
+| 页面显示状态 | Workbench 更新控制器 | 可丢弃重建，不参与交易或安装裁决 |
+
+受管理 Runtime 配置必须位于安装根稳定的 `runtime/`。便携 Runtime 原本就是该布局。安装版后续制品也应把客户 Runtime 配置放在安装根，而不是不可变的 `versions/<版本>/`；若检测到仅版本目录内存在 Runtime 配置，更新保持阻断并提示先完成受控迁移，不能在更新过程中自行移动账本或秘密配置。
+
+失败处理保持 fail-closed：网络或 GitLab 故障不阻止当前版本运行；下载中断可续传；安装锁、账户锁、账本核对或离线检查失败均保留当前版本；新版在工作台就绪期限内失败则回退 `previous`。更新不会清除人工停开、策略日停、账本事实或 Runtime 配置。
+
+实现后的验收至少覆盖：启动自动检查、手动检查、无更新、断网、续传、摘要不符、Runtime 运行中延后、flat 且终态后切换、UNKNOWN 阻断、Qt 关闭但 owner 仍运行、更新后读取同一 Runtime 配置和账本、新版早期失败回退。源码编译不能替代这些 Windows 最终制品场景；未获本次测试和打包授权时统一记录为 `NOT_RUN`。

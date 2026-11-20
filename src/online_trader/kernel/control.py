@@ -225,7 +225,16 @@ class ControlProtocol:
         binding = {"body": body, "digest": digest, "peer_id": peer_id, "result": Future(), "initial_status": "COMMITTED",
             "expected_boot": message["kernel_boot_id"], "metadata": {"operation": body["operation"], "scope": body["scope"]}}
         if operator_actor is not None:
-            binding['metadata']['actor'] = {'kind': 'OPERATOR', 'id': identifier(operator_actor)}
+            actor_id = identifier(operator_actor)
+            if actor_id == 'workbench-user':
+                actor_kind = 'LOCAL_USER'
+            elif actor_id.startswith('operator-'):
+                actor_kind = 'DELEGATED_OPERATOR'
+            else:
+                # Direct legacy Workbench/CLI clients keep their historical
+                # actor kind until the production command-path cutover.
+                actor_kind = 'OPERATOR'
+            binding['metadata']['actor'] = {'kind': actor_kind, 'id': actor_id}
         self.states[cid] = {"body": body, "digest": digest, "future": binding["result"], "metadata": binding["metadata"]}
         self.kernel._command_binding = binding
         try:

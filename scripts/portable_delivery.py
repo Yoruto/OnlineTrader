@@ -16,13 +16,13 @@ from online_trader.accounts import validate_simulation_defaults
 from online_trader.errors import TraderError
 from online_trader.configuration.baseline import APPROVAL_RESOURCE, BASELINE_RESOURCE
 from online_trader.configuration.dsv import DsvProfile
-from online_trader.runtime.handoff import validate_handoff
 from online_trader.runtime.operator_api import operator_records
 from online_trader.runtime.portable_config import PortableAccountStore
 
 
 DEFAULTS = 'OnlineTrader-defaults.json'
 PARAMETERS = 'OnlineTrader-parameters.json'
+PARAMETER_OVERRIDES = 'OnlineTrader-overrides.json'
 EXECUTABLES = ('OnlineTrader.exe', 'OnlineTraderCLI.exe')
 STARTUP_FILES = ('OnlineTrader.ini', 'update-source.json')
 RUNTIME_STARTUP_FILES = ('start-trading-runtime.cmd', 'open-runtime-workbench.ps1')
@@ -88,22 +88,12 @@ def _runtime_files(directory, kind):
     if any(row['account_key'] not in bound_accounts for row in store.read()['accounts']):
         raise ValueError('A delivered simulation account lacks a current local operator grant.')
     names = ['runtime.json', 'runtime-control.json', PARAMETERS, 'private/' + DEFAULTS, 'private/operators.json']
+    if (directory / PARAMETER_OVERRIDES).is_file():
+        names.append(PARAMETER_OVERRIDES)
     for name in names:
         reject_silver_in_config((directory / name).read_bytes(), name)
-    if kind == 'handoff':
-        expected = validate_handoff(store, require_checksums=True)
-        names.append('handoff.json')
-        names.extend(store.ledger_path(row).relative_to(directory).as_posix()
-                     for row in store.read()['accounts'] if row['account_key'] in expected)
-        if not expected:
-            raise ValueError('A handoff delivery requires an original ledger checkpoint.')
-    else:
-        if (directory / 'handoff.json').exists() or (directory / 'handoff-exported.json').exists():
-            raise ValueError('A fresh runtime delivery cannot reuse a handoff.')
-        for row in store.read()['accounts']:
-            ledger = store.ledger_path(row)
-            if ledger.exists() or ledger.with_name('initialized.json').exists():
-                raise ValueError('A fresh runtime delivery must use configuration-only inputs.')
+    if kind != 'fresh':
+        raise ValueError('Runtime delivery no longer accepts execution-ledger handoff state.')
     return names
 
 
@@ -125,7 +115,7 @@ def verify_bundle(bundle, directory, runtime_kind=None):
         if set(names) != set(_runtime_files(runtime, runtime_kind)):
             raise ValueError('The delivered runtime file list differs from the input.')
         if any(digest(directory / name) != digest(runtime / name) for name in names):
-            raise ValueError('A delivered runtime configuration or ledger differs from the authorized input.')
+            raise ValueError('A delivered runtime configuration differs from the authorized input.')
         return (*RUNTIME_STARTUP_FILES, *('runtime/' + name for name in names))
     parameters = [path for path in bundle.rglob('*') if path.name.casefold() == PARAMETERS.casefold()]
     if directory is None:
@@ -185,7 +175,7 @@ def build_archive(bundle, destination, *, configured, output=None, important_mem
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config-directory', type=Path)
-    parser.add_argument('--runtime-kind', choices=('fresh', 'handoff'))
+    parser.add_argument('--runtime-kind', choices=('fresh',))
     parser.add_argument('--bundle', type=Path)
     parser.add_argument('--archive', type=Path)
     parser.add_argument('--output', type=Path)

@@ -1,14 +1,14 @@
 param(
     [Parameter(Mandatory=$true)][string]$Python,
     [Parameter(Mandatory=$true)][string]$Output,
-    [ValidateSet('Generic','Configured','RuntimeConfigured','RuntimeHandoff')][string]$DeliveryMode,
+    [ValidateSet('Generic','Configured','RuntimeConfigured')][string]$DeliveryMode,
     [string]$DeliveryConfigDirectory,
     [string]$Archive
 )
 $ErrorActionPreference = 'Stop'
-if (-not $DeliveryMode) { throw 'Specify -DeliveryMode Generic, Configured, RuntimeConfigured or RuntimeHandoff.' }
+if (-not $DeliveryMode) { throw 'Specify -DeliveryMode Generic, Configured or RuntimeConfigured.' }
 $configuredDelivery = $DeliveryMode -ne 'Generic'
-$runtimeDelivery = $DeliveryMode -in @('RuntimeConfigured', 'RuntimeHandoff')
+$runtimeDelivery = $DeliveryMode -eq 'RuntimeConfigured'
 if ($configuredDelivery -and -not $DeliveryConfigDirectory) {
     throw 'Configured delivery requires an explicitly confirmed -DeliveryConfigDirectory.'
 }
@@ -26,8 +26,7 @@ if ($configuredDelivery) {
     $DeliveryConfigDirectory = (Resolve-Path -LiteralPath $DeliveryConfigDirectory).Path
     $deliveryArguments = @('--config-directory', $DeliveryConfigDirectory)
     if ($runtimeDelivery) {
-        $runtimeKind = if ($DeliveryMode -eq 'RuntimeHandoff') { 'handoff' } else { 'fresh' }
-        $deliveryArguments += @('--runtime-kind', $runtimeKind)
+        $deliveryArguments += @('--runtime-kind', 'fresh')
     }
     & $interpreter -I $deliveryCheck @deliveryArguments
     if ($LASTEXITCODE -ne 0) { throw 'Configured delivery inputs failed validation before building.' }
@@ -41,7 +40,6 @@ $parent = Split-Path -Parent $destination
 if (-not $Archive) {
     $suffix = switch ($DeliveryMode) {
         'RuntimeConfigured' { '-Runtime-Configured' }
-        'RuntimeHandoff' { '-Runtime-Handoff-Configured' }
         'Configured' { '-Configured' }
         default { '' }
     }

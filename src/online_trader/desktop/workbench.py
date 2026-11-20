@@ -7,7 +7,7 @@ from PySide6.QtCore import QEvent,QItemSelectionModel,QSettings,QStandardPaths,Q
 from PySide6.QtWidgets import (QApplication,QLabel,QLineEdit,QPushButton,QTableWidget,
     QTableWidgetItem,QInputDialog,QFileDialog,QMessageBox)
 
-from online_trader.contracts.codec import canonical_bytes, strict_loads
+from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.app import StatusWindow
 from online_trader.desktop.dingtalk import WorkbenchDingTalk
 from online_trader.desktop.notifications import WorkbenchSounds
@@ -118,35 +118,6 @@ class _WorkbenchRequest(QThread):
                 and not any(connection[key] for key in ('fault', 'recovery_required', 'storage_failed', 'clock_fault')))
 
 
-class _RuntimeWorkbenchRequest(QThread):
-    """Submit one explicit UI operation without blocking Qt or the view subscriber."""
-
-    result = Signal(object)
-    failed = Signal(object)
-
-    def __init__(self, pipe, action, body=None, account_key=None):
-        super().__init__()
-        self.pipe, self.action = pipe, action
-        self.body = body or {}
-        self.account_key = account_key
-
-    def run(self):
-        identity = ({'account_key': self.account_key, 'command_id': self.body.get('command_id')}
-                    if self.action in {'submit', 'receipt'} else None)
-        try:
-            from online_trader.runtime.operator_api import RuntimeWorkbenchClient
-            client = RuntimeWorkbenchClient(self.pipe)
-            value = client.request(self.action, self.body)
-            if not self.isInterruptionRequested():
-                self.result.emit({'action': self.action, 'value': value, 'identity': identity})
-        except Exception as error:
-            if not self.isInterruptionRequested():
-                code = getattr(error, 'code', 'E_PIPE' if isinstance(error, OSError) else 'E_INTERNAL')
-                self.failed.emit({'action': self.action, 'code': code,
-                                  'reason': str(error) if isinstance(error, TraderError) else None,
-                                  'identity': identity})
-
-
 TABLES={
  'external_positions':(['合约','方向','柜台手数','自有手数','差额','今仓','昨仓','参考开仓价','可调整','核对异常'],
             ['contract_id','direction','native_quantity','owned_quantity','difference','today','historical','reference_price','eligible','review_error']),
@@ -191,12 +162,13 @@ def display_cell(key,value):
 
 class WorkbenchWindow(StatusWindow):
     def __init__(self,pipe_name,*,store=None,account_id=None,client_factory=StatusClient,paired_launcher=None,
-                 dsv_config=None, use_desktop_dsv=False, autostart=False, notification=None, runtime_view=False):
+                 dsv_config=None, use_desktop_dsv=False, autostart=False, notification=None, runtime_view=False,
+                 update_root=None, update_restart=None):
         super().__init__(pipe_name,client_factory=client_factory)
         self._runtime_mode = runtime_view
-        self._runtime_watch = None
-        self._runtime_query_worker = None
-        self._runtime_command_worker = None
+        self._runtime_client_store = None
+        self._runtime_coordinator = None
+        self._runtime_command_bus = None
         self._runtime_receipt_restored_for = None
         self.store=store;self.selected_account=store.get(account_id) if store is not None and account_id is not None else None
         self.paired_launcher=paired_launcher
@@ -277,6 +249,10 @@ class WorkbenchWindow(StatusWindow):
                 candidate = Path(desktop) / 'trading' / 'config.json'
                 if candidate.parent.is_dir():
                     dsv_config = candidate
+        self.update_controller = None
+        if update_root is not None and update_restart is not None:
+            from online_trader.desktop.update_ui import ManagedUpdateController
+            self.update_controller = ManagedUpdateController(self, update_root, update_restart)
         self.dashboard=WorkbenchLayout(self, dsv_config=dsv_config, require_reviewed_profile=use_desktop_dsv)
         self._tray.restore_geometry()
         self._tray.sync_icon()
@@ -300,21 +276,28 @@ class WorkbenchWindow(StatusWindow):
             QTimer.singleShot(0, self.check_timed_start)
         self._enable_commands(False)
         if runtime_view:
-            from online_trader.desktop.runtime_watch import RuntimeWatch
-            from online_trader.desktop.runtime_client.client import RuntimeQueryWorker
-            query_worker = RuntimeQueryWorker(pipe_name, self)
-            query_worker.result.connect(self._runtime_query_result)
-            query_worker.failed.connect(self._runtime_query_failed)
-            query_worker.finished.connect(self._runtime_query_finished)
-            self._runtime_query_worker = query_worker
-            query_worker.start()
-            watcher = RuntimeWatch(pipe_name, self)
-            watcher.updated.connect(self._runtime_updated)
-            watcher.observed.connect(self._runtime_observed)
-            watcher.unavailable.connect(self._runtime_unavailable)
-            watcher.finished.connect(self._runtime_finished)
-            self._runtime_watch = watcher
-            watcher.start()
+            from online_trader.desktop.runtime_client import (
+                ClientStateStore, CommandBus, RuntimeClientCoordinator)
+            client_store = ClientStateStore(self)
+            coordinator = RuntimeClientCoordinator(pipe_name, client_store, self)
+            command_bus = CommandBus(coordinator, client_store, self)
+            command_bus.migrate_legacy_pending()
+            client_store.runtime_changed.connect(self._runtime_client_state_changed)
+            client_store.connection_changed.connect(self._runtime_client_connection_changed)
+            coordinator.publication_observed.connect(self._runtime_observed)
+            coordinator.query_result.connect(self._runtime_query_result)
+            coordinator.query_failed.connect(self._runtime_query_failed)
+            command_bus.command_changed.connect(self._runtime_command_changed)
+            command_bus.feedback.connect(self.show_home_feedback)
+            self._runtime_client_store = client_store
+            self._runtime_coordinator = coordinator
+            self._runtime_command_bus = command_bus
+            # The first generic disable pass ran before the Runtime command
+            # path existed and therefore preserved the legacy "start without
+            # a view" affordance.  Re-evaluate with the fail-closed Runtime
+            # store before any subscription baseline can arrive.
+            self._enable_commands(False)
+            coordinator.start()
 
     def _read_account_login(self):
         account = self.selected_account
@@ -357,13 +340,14 @@ class WorkbenchWindow(StatusWindow):
 
     def _enable_commands(self,enabled):
         for button in self.command_buttons.values():button.setEnabled(enabled)
-        owner_controls = not self._closing and self._worker is None and self.view is not None
+        owner_controls = (not self._closing and self._worker is None and self.view is not None
+                          and (self._runtime_command_bus is None or enabled))
         for name in ('close', 'flatten', 'cancel', 'cancel_entries', 'reconcile'):
             self.command_buttons[name].setEnabled(owner_controls)
         self.command_buttons['arm'].setEnabled(not self._startup_in_progress and ((enabled and self.view['entry_authority']!='ARMED'
             and not self.view['configuration'].get('stop_cancel_pending')
             and not self.view['configuration'].get('strategy_stop_requested')) or
-            (self.view is None and not self._closing)))
+            (self.view is None and not self._closing and self._runtime_command_bus is None)))
         self.pause_button.setEnabled(self._scheduled_start is not None or (owner_controls and (
             self.view['entry_authority']=='ARMED' or ('cancel_on_stop' in self.view['configuration']
             and not self.view['configuration'].get('strategy_stop_requested')))))
@@ -373,13 +357,41 @@ class WorkbenchWindow(StatusWindow):
                            and self.view['configuration'].get('manual_workbench'))
         for name in ('buy', 'sell'):
             self.command_buttons[name].setEnabled(manual_open)
-        self.command_buttons['receipt'].setEnabled(enabled and self.receipt_identity is not None)
+        receipt_enabled = (not self._closing and self.receipt_identity is not None
+                           and (enabled or self._runtime_command_bus is not None))
+        self.command_buttons['receipt'].setEnabled(receipt_enabled)
+        if self._runtime_command_bus is not None and self.view is not None:
+            operation_by_button = {
+                'arm': 'ARM_ENTRIES',
+                'close': 'MANUAL_CLOSE',
+                'flatten': 'FLATTEN_THEN_STOP',
+                'cancel': 'CANCEL_SELECTED',
+                'cancel_entries': 'CANCEL_OWNED',
+                'buy': 'MANUAL_OPEN',
+                'sell': 'MANUAL_OPEN',
+                'reconcile': 'REQUEST_RECONCILIATION',
+                'adopt': 'ADOPT_EXTERNAL_POSITION',
+                'lot_review': 'ADOPT_EXTERNAL_POSITION',
+                'cancel_account': 'CANCEL_NATIVE_ACCOUNT',
+                'historical_orders': 'REQUEST_RECONCILIATION',
+                'symbol_enable': 'SET_ENTRY_POLICY',
+                'symbol_pause': 'SET_ENTRY_POLICY',
+            }
+            for name, operation in operation_by_button.items():
+                allowed, _ = self._runtime_client_store.capability(operation)
+                self.command_buttons[name].setEnabled(
+                    self.command_buttons[name].isEnabled() and allowed)
+            pause_operation = ('STOP_DSV_STRATEGY' if 'cancel_on_stop' in self.view['configuration']
+                               else 'PAUSE_NEW_ENTRIES')
+            pause_allowed, _ = self._runtime_client_store.capability(pause_operation)
+            self.pause_button.setEnabled(self.pause_button.isEnabled() and pause_allowed)
 
     def _start_job(self,action,args=None):
         if self._closing:return
-        if self._runtime_watch is not None:
+        if self._runtime_command_bus is not None:
             if action == 'refresh':
-                self._runtime_watch.align()
+                if self._runtime_client_store.connection_state.value != 'READY':
+                    self.show_home_feedback('正在等待 Runtime 状态流重新同步。')
             elif action == 'command':
                 self._start_runtime_submit(*args)
             elif action == 'status':
@@ -422,16 +434,63 @@ class WorkbenchWindow(StatusWindow):
         if self._boot is not None and incoming.get('kernel_boot_id') != self._boot:
             self.show_home_feedback('Runtime 已重启，正在重新核对当前状态。')
         self._job_result(result)
-        self._restore_runtime_receipt()
+        self._sync_runtime_pending()
         self.dashboard.ensure_account_history()
-        self._enable_commands(not self._closing and self._runtime_command_worker is None
-                              and not self._stale and not self.view['truncated'])
+        self._enable_commands(not self._closing and not self._stale and not self.view['truncated'])
+
+    def _runtime_client_state_changed(self, state):
+        if self._closing:
+            return
+        stamp = self._runtime_client_store.published_ns
+        value = dict(state) | {
+            'published_ns': stamp,
+            'metadata': {
+                'kernel_boot_id': state['view']['kernel_boot_id'],
+                'received_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+            },
+        }
+        self._runtime_updated({'action': 'refresh', 'value': value})
+
+    def _runtime_client_connection_changed(self, state, reason):
+        if self._closing or state == 'READY':
+            return
+        self._runtime_unavailable(reason or state)
+
+    def _runtime_command_changed(self, pending):
+        if self._closing:
+            return
+        if pending.receipt is not None:
+            receipt = dict(pending.receipt)
+            self.receipt_identity = {key: receipt[key] for key in ('command_id', 'payload_hash') if key in receipt}
+            self._publication_after_ns = time.monotonic_ns()
+            self._show_receipt(receipt)
+            if pending.status.value in {'COMPLETED', 'REJECTED'}:
+                self.receipt_identity = None
+        elif pending.status.value != 'LOCAL_NOT_ENQUEUED':
+            self.receipt_identity = {'command_id': pending.command_id}
+        self._sync_runtime_pending()
+        self._enable_commands(not self._closing and not self._stale and self.view is not None
+                              and not self.view['truncated'])
+
+    def _sync_runtime_pending(self):
+        bus = self._runtime_command_bus
+        if bus is None or self.view is None:
+            return
+        rows = sorted((item for item in bus.store.pending.values()
+                       if item.account_key == self.view['account_key']),
+                      key=lambda item: item.command_id)
+        if rows:
+            current = next((item for item in rows if self.receipt_identity is not None
+                            and item.command_id == self.receipt_identity.get('command_id')), rows[0])
+            self.receipt_identity = {'command_id': current.command_id}
+        elif self.receipt_identity is not None and 'payload_hash' not in self.receipt_identity:
+            self.receipt_identity = None
 
     def enqueue_runtime_history(self, request):
-        worker = self._runtime_query_worker
-        if worker is None or not worker.isRunning() or self._closing:
+        coordinator = self._runtime_coordinator
+        if coordinator is None or self._closing:
             raise TraderError('E_RUNTIME_CONNECTION', 'Runtime history query is unavailable')
-        worker.enqueue(request)
+        coordinator.queries.enqueue(request)
 
     def _runtime_query_result(self, response):
         if not self._closing and response.get('kind') == 'history':
@@ -441,10 +500,6 @@ class WorkbenchWindow(StatusWindow):
         if not self._closing and response.get('kind') == 'history':
             self.dashboard.fail_account_history(response)
 
-    def _runtime_query_finished(self):
-        if self._closing:
-            self.close()
-
     def _runtime_observed(self, stamp):
         if self._closing or self.view is None:
             return
@@ -452,13 +507,13 @@ class WorkbenchWindow(StatusWindow):
         if self._stale and not self.published_snapshot_expired():
             self._stale = False
             self.render_view()
-            self._enable_commands(self._runtime_command_worker is None and not self.view['truncated'])
+            self._enable_commands(not self.view['truncated'])
 
     def _runtime_unavailable(self, code):
         if self._closing:
             return
         # A subscription reconnect must not make a still-current publication
-        # flash between READY and STALE.  RuntimeWatch retries continuously; if
+        # flash between READY and STALE.  The subscription retries continuously; if
         # the outage persists, a later failure will cross MAX_AGE_NS and take
         # the existing fail-closed path below.
         if self.view is not None and not self.published_snapshot_expired():
@@ -467,224 +522,36 @@ class WorkbenchWindow(StatusWindow):
         self._enable_commands(False)
         self.show_home_feedback(f'等待独立运行时同步 · {code}')
 
-    def _runtime_finished(self):
-        if self._closing:
-            self.close()
-
-    def _start_runtime_request(self, action, body):
-        if self._runtime_command_worker is not None:
-            self.show_home_feedback('上一个 Runtime 操作仍在处理。')
-            return
-        account_key = self.view['account_key'] if self.view is not None else None
-        worker = _RuntimeWorkbenchRequest(self.pipe_name, action, body, account_key=account_key)
-        worker.result.connect(self._runtime_request_result)
-        worker.failed.connect(self._runtime_request_failed)
-        worker.finished.connect(self._runtime_request_finished)
-        self._runtime_command_worker = worker
-        self._enable_commands(False)
-        worker.start()
-
     def _start_runtime_submit(self, operation, scope, parameters):
         if self.view is None or self._stale or self.published_snapshot_expired() or self.view['truncated']:
             self.show_home_feedback('请先取得当前完整 Runtime 状态，再提交命令。')
             return
-        # The production Workbench still uses the legacy one-shot command lane.
-        # Until it migrates to CommandBus, conservatively block *all* new
-        # commands for this account while an earlier submission is unresolved.
-        # Never generate a second command_id to retry an unknown submission.
+        bus = self._runtime_command_bus
+        if bus is None:
+            self.show_home_feedback('Runtime CommandBus 尚未就绪；命令未发送。')
+            return
         try:
-            unresolved = self._unresolved_runtime_receipt()
+            command_id = bus.submit(operation, scope, parameters)
         except TraderError as error:
-            self.show_home_feedback(f'无法核对本地未决回执 · {error.code}；禁止新命令。')
-            return
-        if unresolved is not None:
-            original = unresolved['command_id']
-            self.receipt_identity = {'command_id': original}
-            self.show_home_feedback(
-                f'原命令 {original} 仍待明确终态；请查询原回执，禁止生成第二个命令 ID。')
-            self.command_buttons['receipt'].setEnabled(True)
-            return
-        if self._runtime_command_worker is not None:
-            self.show_home_feedback('上一个 Runtime 操作仍在处理。')
-            return
-        command_id = 'qt-' + uuid.uuid4().hex
-        body = {'command_id': command_id, 'operation': operation, 'scope': scope,
-                'parameters': parameters, 'binding': {
-                    'account_key': self.view['account_key'], 'kernel_boot_id': self._boot,
-                    'config_revision': self.view['configuration']['config_revision']}}
-        try:
-            self._persist_runtime_receipt(command_id, operation)
-        except TraderError as error:
-            self.show_home_feedback(f'无法持久化命令身份 · {error.code}；未提交 Runtime 命令。')
+            self.show_home_feedback(f'Runtime 命令未提交 · {error.code} · {error}')
             return
         self.receipt_identity = {'command_id': command_id}
         self.show_home_feedback(f'正在提交 Runtime 命令 · {command_id}')
-        self._start_runtime_request('submit', body)
+        self._enable_commands(False)
 
     def _start_runtime_receipt(self, identity):
         command_id = identity.get('command_id') if isinstance(identity, dict) else None
         if not command_id:
             self.show_home_feedback('没有可查询的 Runtime 命令。')
             return
+        bus = self._runtime_command_bus
+        if bus is None:
+            self.show_home_feedback('Runtime CommandBus 尚未就绪；回执未查询。')
+            return
         try:
-            unresolved = self._unresolved_runtime_receipt()
+            bus.query(command_id)
         except TraderError as error:
-            self.show_home_feedback(f'无法核对本地未决回执 · {error.code}；禁止查询其他命令。')
-            return
-        if unresolved is not None and unresolved['command_id'] != command_id:
-            self.receipt_identity = {'command_id': unresolved['command_id']}
-            self.show_home_feedback(
-                f"原命令 {unresolved['command_id']} 仍待明确终态；禁止用其他回执覆盖其身份。")
-            return
-        self.show_home_feedback(f'正在查询 Runtime 回执 · {command_id}')
-        self._start_runtime_request('receipt', {'command_id': command_id})
-
-    def _runtime_request_result(self, result):
-        action, value = result['action'], result['value']
-        receipt = value
-        identity = result.get('identity')
-        expected_id = identity.get('command_id') if isinstance(identity, dict) else None
-        expected_account = identity.get('account_key') if isinstance(identity, dict) else None
-        current_account = self.view.get('account_key') if self.view is not None else None
-        if (not expected_id or receipt.get('command_id') != expected_id
-                or not expected_account or current_account != expected_account):
-            if expected_id:
-                self.receipt_identity = {'command_id': expected_id}
-            self.show_home_feedback('Runtime 回执身份与原请求不一致；已保留原命令 ID，禁止覆盖。')
-            return
-        try:
-            self._retain_runtime_receipt(
-                expected_id, receipt.get('operation'), expected_account,
-                required=receipt.get('status') not in {'SUCCEEDED', 'FAILED', 'REJECTED', 'SUPERSEDED'},
-            )
-        except TraderError as error:
-            self.receipt_identity = {'command_id': expected_id}
-            self.show_home_feedback(f'无法核对本地未决回执 · {error.code}；已保留原命令 ID。')
-            return
-        self.receipt_identity = {key: receipt[key] for key in ('command_id', 'payload_hash') if key in receipt}
-        self._publication_after_ns = time.monotonic_ns()
-        self._stale = True
-        self._show_receipt(receipt)
-        if self._runtime_watch is not None:
-            self._runtime_watch.align()
-
-    def _runtime_request_failed(self, error):
-        identity = error.get('identity')
-        command_id = identity.get('command_id') if isinstance(identity, dict) else None
-        account_key = identity.get('account_key') if isinstance(identity, dict) else None
-        unknown_submit = (error.get('action') == 'submit' and command_id
-                          and error['code'] in CONNECTION_ERRORS | {'E_INTERNAL'})
-        if unknown_submit:
-            self.receipt_identity = {'command_id': command_id}
-            try:
-                self._retain_runtime_receipt(command_id, None, account_key, required=True)
-            except TraderError as pending_error:
-                message = (f'Runtime 命令结果未知，但无法核对原命令身份 · {pending_error.code}；'
-                           '禁止新命令。')
-            else:
-                message = 'Runtime 命令结果未知，已保留原命令 ID；请查询回执，禁止自动重发。'
-        elif error.get('action') == 'submit' and command_id:
-            try:
-                self._clear_runtime_receipt(command_id, account_key)
-            except TraderError as pending_error:
-                message = (f"Runtime 明确拒绝命令 · {error['code']}，但本地回执状态无法清理 · "
-                           f'{pending_error.code}；禁止新命令。')
-            else:
-                self.receipt_identity = None
-                self.home_issue = ''
-                message = f"Runtime 操作未完成 · {error['code']}"
-        else:
-            message = f"Runtime 操作未完成 · {error['code']}"
-        self.notice_label.setText(message)
-        self.show_home_feedback(message)
-
-    def _runtime_request_finished(self):
-        worker = self.sender()
-        if worker is self._runtime_command_worker:
-            self._runtime_command_worker = None
-        self._enable_commands(not self._closing and not self._stale and self.view is not None
-                              and not self.view['truncated'])
-        if self._closing:
-            QTimer.singleShot(0, self.close)
-
-    @staticmethod
-    def _stored_runtime_receipt():
-        settings = workbench_preferences()
-        raw = settings.value('runtime/pending_receipt', '', str)
-        if not raw:
-            return None
-        try:
-            value = strict_loads(raw)
-        except (ValueError, TypeError):
-            raise TraderError('E_PENDING_COMMAND', 'Local pending receipt metadata is invalid') from None
-        if (not isinstance(value, dict) or not isinstance(value.get('account_key'), str)
-                or not isinstance(value.get('command_id'), str) or not value['command_id']):
-            raise TraderError('E_PENDING_COMMAND', 'Local pending receipt metadata is incomplete')
-        return value
-
-    def _unresolved_runtime_receipt(self):
-        if self.view is None:
-            return None
-        value = self._stored_runtime_receipt()
-        if value is None:
-            return None
-        if value['account_key'] != self.view['account_key']:
-            # The legacy settings slot is process-wide.  Switching accounts
-            # cannot silently overwrite an unresolved receipt for another
-            # account; a per-account registry belongs in the CommandBus cutover.
-            raise TraderError('E_PENDING_COMMAND', 'Another account has an unresolved Runtime command')
-        return value
-
-    def _retain_runtime_receipt(self, command_id, operation, account_key, *, required):
-        value = self._stored_runtime_receipt()
-        if value is not None:
-            if value['account_key'] != account_key or value['command_id'] != command_id:
-                raise TraderError('E_PENDING_COMMAND', 'Another Runtime command identity is already pending')
-            return
-        if not required:
-            return
-        if self.view is None or self.view['account_key'] != account_key:
-            raise TraderError('E_SCOPE', 'The Runtime command belongs to another account view')
-        self._persist_runtime_receipt(command_id, operation)
-
-    def _clear_runtime_receipt(self, command_id, account_key):
-        value = self._stored_runtime_receipt()
-        if value is None:
-            return False
-        if value['account_key'] != account_key or value['command_id'] != command_id:
-            raise TraderError('E_PENDING_COMMAND', 'A different Runtime command identity remains pending')
-        settings = workbench_preferences()
-        settings.remove('runtime/pending_receipt')
-        settings.sync()
-        if settings.status() != QSettings.Status.NoError:
-            raise TraderError('E_STORAGE', 'Cannot durably clear the terminal Runtime command ID')
-        return True
-
-    def _persist_runtime_receipt(self, command_id, operation):
-        if self.view is None:
-            raise TraderError('E_NOT_READY', 'A Runtime account must be selected before submitting')
-        value = {'account_key': self.view['account_key'], 'command_id': command_id,
-                 'operation': operation, 'source': 'WORKBENCH'}
-        settings = workbench_preferences()
-        settings.setValue('runtime/pending_receipt', canonical_bytes(value).decode())
-        settings.sync()
-        if settings.status() != QSettings.Status.NoError:
-            raise TraderError('E_STORAGE', 'Cannot durably preserve the original command ID')
-
-    def _restore_runtime_receipt(self):
-        if self.view is None or self._runtime_receipt_restored_for == self.view['account_key']:
-            return
-        self._runtime_receipt_restored_for = self.view['account_key']
-        raw = workbench_preferences().value('runtime/pending_receipt', '', str)
-        try:
-            value = strict_loads(raw) if raw else None
-        except ValueError:
-            value = None
-        if isinstance(value, dict) and value.get('account_key') == self.view['account_key'] \
-                and isinstance(value.get('command_id'), str):
-            self.receipt_identity = {'command_id': value['command_id']}
-            self.command_buttons['receipt'].setEnabled(True)
-
+            self.show_home_feedback(f'Runtime 回执未查询 · {error.code} · {error}')
     def force_recover_workbench(self):
         if self.paired_launcher is not None or self.store is None or self.selected_account is None:
             self._recovery_feedback('请选择普通工作台的模拟账号。')
@@ -897,22 +764,6 @@ class WorkbenchWindow(StatusWindow):
         self._control_notice=notice
         self.notice_label.setText(notice)
         status = receipt['status']
-        if self._runtime_mode and status in {'SUCCEEDED', 'FAILED', 'REJECTED', 'SUPERSEDED'}:
-            # A terminal receipt for an unrelated, older command must never
-            # erase the currently unresolved command's identity.
-            try:
-                unresolved = self._unresolved_runtime_receipt()
-            except TraderError as error:
-                self.home_issue = '命令已终态，但本地仍有无法核对的未决回执；禁止新命令。'
-                self.home_feedback = f'本地未决回执核对失败 · {error.code}'
-                return
-            if unresolved is not None and unresolved['command_id'] == receipt.get('command_id'):
-                try:
-                    self._clear_runtime_receipt(receipt['command_id'], unresolved['account_key'])
-                except TraderError as error:
-                    self.home_issue = '命令已终态，但本地未决回执清理失败；请先修复设置存储。'
-                    self.home_feedback = f'本地未决回执清理失败 · {error.code}'
-                    return
         self.home_issue = '命令结果待核对，请查看交易详情中的命令回执' if status == 'NEEDS_RECONCILIATION' else ''
         self.home_feedback = f"命令回执 · {receipt['reason']}"
 
@@ -1148,7 +999,7 @@ class WorkbenchWindow(StatusWindow):
                 for j,key in enumerate(TABLES[name][1]):
                     value = row.get(key)
                     label = display_cell(key, value)
-                    item = table.item(i, j) if self._runtime_watch is not None else None
+                    item = table.item(i, j) if self._runtime_mode else None
                     if item is None:
                         item = QTableWidgetItem(label)
                         item.setToolTip(str(value))
@@ -1354,7 +1205,7 @@ class WorkbenchWindow(StatusWindow):
             if not selected:raise TraderError('E_SCOPE','请在行情页选择要启停的品种')
             codes=sorted({self.view['markets'][index]['contract_id'] for index in selected})
             scope={'scope_type':'CONTRACT','scope_ids':codes}
-            if self._runtime_watch is not None:
+            if self._runtime_command_bus is not None:
                 if len(codes) != 1:
                     raise TraderError('E_SCOPE', '请一次确认一个合约的开仓权限')
                 origin = 'MANUAL' if self.view['configuration'].get('manual_workbench') else 'STRATEGY'
@@ -1741,12 +1592,6 @@ class WorkbenchWindow(StatusWindow):
             self._tray.on_minimized()
 
     def closeEvent(self,event):
-        if self._runtime_command_worker is not None and self._runtime_command_worker.isRunning():
-            self._closing = True
-            self.hide()
-            self._runtime_command_worker.requestInterruption()
-            event.ignore()
-            return
         if self._strategy_starter is not None and self._strategy_starter.is_preparing():
             self._closing = True
             self.hide()
@@ -1762,18 +1607,8 @@ class WorkbenchWindow(StatusWindow):
         if not self._closing and self._tray.minimize_on_close():
             event.ignore()
             return
-        if self._runtime_watch is not None and self._runtime_watch.isRunning():
-            self._closing = True
-            self.hide()
-            self._runtime_watch.requestInterruption()
-            event.ignore()
-            return
-        if self._runtime_query_worker is not None and self._runtime_query_worker.isRunning():
-            self._closing = True
-            self.hide()
-            self._runtime_query_worker.shutdown()
-            event.ignore()
-            return
+        if self._runtime_coordinator is not None:
+            self._runtime_coordinator.close()
         if self.monitor_worker is not None and self.monitor_worker.isRunning():
             self._closing = True
             self.hide()
@@ -1796,31 +1631,36 @@ class WorkbenchWindow(StatusWindow):
         self.dashboard.log_timer.stop()
         self.timer.stop();super().closeEvent(event)
 
+    def prepare_update_restart(self):
+        if (self._startup_in_progress or self._worker is not None
+                or (self._runtime_command_bus is not None and self._runtime_command_bus.has_inflight)
+                or (self._strategy_starter is not None and self._strategy_starter.is_preparing())
+                or (self._session_dialog is not None
+                    and getattr(self._session_dialog, 'is_preparing', lambda: False)())):
+            raise TraderError('E_ACCOUNT_BUSY', '请等待当前账户操作结束后再更新')
+
 
 def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None,autostart=False,
         update_root=None, notification=None, runtime_view=False):
     app=QApplication.instance() or QApplication([])
+    restart_for_update = False
+    window = None
+
+    def request_restart():
+        nonlocal restart_for_update
+        window.prepare_update_restart()
+        restart_for_update = True
+        window._tray.close_window()
+
     window=WorkbenchWindow(pipe_name,store=store,account_id=account_id,paired_launcher=paired_launcher,
                            dsv_config=dsv_config,use_desktop_dsv=not runtime_view,autostart=autostart,
-                           notification=notification,runtime_view=runtime_view)
+                           notification=notification,runtime_view=runtime_view,update_root=update_root,
+                           update_restart=request_restart if update_root is not None else None)
     window.setAttribute(Qt.WA_DeleteOnClose)
     window.destroyed.connect(app.quit)
     window.show();QTimer.singleShot(0,window.refresh)
-    restart_for_update = False
-    if update_root is not None:
-        from online_trader.desktop.update_ui import install_update_menu
-        from online_trader.update_install import RESTART_FOR_UPDATE
-
-        def request_restart():
-            nonlocal restart_for_update
-            if (window._startup_in_progress or window._worker is not None
-                    or (window._strategy_starter is not None and window._strategy_starter.is_preparing())
-                    or (window._session_dialog is not None
-                        and getattr(window._session_dialog, 'is_preparing', lambda: False)())):
-                raise TraderError('E_ACCOUNT_BUSY', '请等待当前账户操作结束后再更新')
-            restart_for_update = True
-            window._tray.close_window()
-
-        install_update_menu(window, update_root, request_restart)
     result = app.exec()
-    return RESTART_FOR_UPDATE if restart_for_update else result
+    if restart_for_update:
+        from online_trader.update_install import RESTART_FOR_UPDATE
+        return RESTART_FOR_UPDATE
+    return result

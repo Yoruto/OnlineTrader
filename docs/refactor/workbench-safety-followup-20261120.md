@@ -1,21 +1,23 @@
 # Workbench 命令与并行账本安全修复（2026-11-20）
 
+> 后续架构复核确认：本文最初只描述旧生产 one-shot 命令链的保守修复。2026-11-20 源码候选随后按[架构收敛与安全改造计划](runtime-architecture-hardening-plan-20261120.md)补齐 pending 截断、持久化核验、enqueue 失败、严格回执身份和 Capability 门禁并完成 CommandBus 接管；本次新候选仍未独立测试。
+
 ## 范围
 
 本分支基于 `b9726ae`，不改交易策略、订单路由、Runtime/Kernel 执行事实、SQLite schema、自动启动和柜台配置；不接入真实账户、不主动下单、不启用 CI/CD。修复两项已在生产入口存在的安全缺口：
 
-1. 目前 Runtime Workbench 交易按钮尚未切换到新 `CommandBus`。旧 `_RuntimeOperatorRequest` 在 timeout/unknown 后可能再次发起相同意图并生成不同 `command_id`。
+1. **源码已修复：**Runtime Workbench 交易按钮已切换到加固后的 `CommandBus`，旧 one-shot 命令线程已删除；timeout/unknown 保留原 `command_id`，不自动重发。
 2. Portable Runtime 以前已生成 `ledger.db` 的目录，会绕过“标准桌面账本并行检测”。
 
 ## 行为与边界
 
-- Workbench 在创建新的命令 ID 前读取未决 receipt：存在旧 ID 时不提交任何新 Runtime 命令，提示核对原命令，提供旧 ID；这是对未迁移旧控制入口的**保守安全封锁**，不是宣称已经完成 CommandBus 的正式迁移。
+- Workbench 在创建新的命令 ID 前于跨进程锁内重读 v2 多命令注册表：同账号、同 operation/scope 的旧 ID 未闭合时不提交重复意图，提示查询原命令；每次更新合并其他工作台记录，跨账号记录互不覆盖，锁不可用、注册表损坏或超容量时 fail-closed。
 - 初次写入 ID 后立即执行 `QSettings.sync()`，检查错误后才发送命令。连接或内部错误保留原 ID；Runtime 在入队前明确返回的鉴权、忙碌、schema/scope 等拒绝，按现有 `CommandBus` 合同只清除同账号、同 ID 的 pending，避免把确定未提交误留成永久封锁。回执查询失败、断线和 boot 变化仍不作为原交易命令的终态。
 - Runtime 命令结果必须同时匹配请求时记录的账号和 `command_id`；身份不一致时保留原 pending 并拒绝覆盖。明确终态回执仅可清理**同账号、同 ID** 的 pending，清理也必须通过 `QSettings.sync()`。
-- 旧 Workbench 使用单一 `runtime/pending_receipt` 设置项；如果另一账号仍有 pending，本次宁愿拒绝新命令，也不能覆盖其 ID。后续 Client 迁移需升级成每账号持久化的多命令注册表，并对损坏/超过容量/异常断电失效执行 fail-closed。
+- 旧 `runtime/pending_receipt` 只作为一次性升级输入：先写入并回读核验 v2 多命令注册表，再清理旧键；迁移损坏、冲突或清理失败时保留证据并禁止新命令。
 - Portable Runtime 已有账本且无已验证 handoff 时，启动之前也需对标准 `LOCALAPPDATA/OnlineTrader/accounts/data` 账本进行碰撞检查；若有经检验的另一份原账本则拒绝启动。已验证 handoff 继续允许正常恢复。
 - **尚未解决**：同机两个任意 Portable Runtime 目录间的账本分叉无法由固定标准路径发现；本 PR 不声称实现了全机器唯一的 ledger lineage/registry。既有分叉不得自动合并、覆盖或删除，必须冷停核对后 handoff。
-- 真实 Workbench 的 one-shot 命令线程仍缺主动取消当前管道 I/O 的接口；退出时可能等待超时，不涉及执行 Owner 的继续运行。后续正式 CommandBus 接入需删除旧命令路径，而不是再叠加另一套 sender。
+- **源码已修复：**Coordinator 关闭时先 interruption，再关闭活动 pipe 并等待 worker；旧命令路径未与新 sender 并存。Windows Qt 强杀和活动管道关闭行为尚待独立测试。
 
 ## 验证
 

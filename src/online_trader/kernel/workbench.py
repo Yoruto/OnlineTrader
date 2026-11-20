@@ -9,10 +9,11 @@ from decimal import Decimal
 from heapq import nsmallest
 import time
 
-from online_trader.contracts.codec import canonical_bytes
+from online_trader.contracts.codec import canonical_bytes, content_hash
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text
 from online_trader.kernel.projection import projection_batch
+from online_trader.kernel.workbench_contracts import capability_rows, config_snapshot
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import number
 from online_trader.scheduling.clock import delta_ns, quote_timestamp, source_age_ns, utc_text
@@ -105,7 +106,7 @@ def monitor_symbols(kernel, decisions):
             elif not kernel.control.symbol_entry_enabled(code, committed=True):
                 row['status'] = '品种已手动停用'
             elif 'GEOMETRY_BLOCK' in reasons:
-                row['status'] = '几何条件不满足，暂不建仓'
+                row['status'] = '日内振幅超出开仓上限'
             elif 'OPENING_WAIT' in reasons:
                 row['status'] = '开盘等待'
             elif 'CLOSE_SESSION_NO_OPEN' in reasons and session.get('is_trading'):
@@ -519,49 +520,23 @@ def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None, native_fa
             result['account_metrics']={key:funds.get(key) for key in
                 ('balance','available','margin','risk_ratio','pre_balance','close_profit','position_profit','float_profit','commission')}
             result['account_metrics'].update(trading_day=day,opening_orders=opening_orders)
+    snapshot_contract = config_snapshot(kernel, runtime, scheduler, port, scoped)
+    result['config_snapshot'] = snapshot_contract
+    result['configuration']['config_snapshot_hash'] = content_hash(snapshot_contract)
+    config_verified = snapshot_contract['integrity'] == 'VERIFIED'
+    if not config_verified:
+        result['blocks'].append({'reason_code': 'CONFIG_SNAPSHOT_INVALID', 'active': True})
     # Runtime-side presentation capabilities are explanatory facts, never
     # authorization tickets.  The command handler still performs the final
     # account, boot, revision, authority, market and risk checks for every
     # submission.
-    connected = result['connection']['broker_connected'] and result['connection']['synchronized']
-    healthy = connected and not any(result['connection'][key] for key in
-                                    ('fault', 'storage_failed', 'recovery_required'))
-    manual = bool(result['configuration'].get('manual_workbench'))
-    entry_allowed = healthy and result['entry_authority'] == 'ARMED'
-    capability_rows = {
-        'ARM_ENTRIES': (healthy, None if healthy else 'RUNTIME_NOT_READY'),
-        'PAUSE_NEW_ENTRIES': (not result['connection']['storage_failed'],
-                              None if not result['connection']['storage_failed'] else 'LEDGER_WRITE_FAILED'),
-        'STOP_DSV_STRATEGY': (not result['connection']['storage_failed'],
-                              None if not result['connection']['storage_failed'] else 'LEDGER_WRITE_FAILED'),
-        'SET_ENTRY_POLICY': (not result['connection']['storage_failed'],
-                             None if not result['connection']['storage_failed'] else 'LEDGER_WRITE_FAILED'),
-        'SAVE_DSV_PARAMETERS': (bool(result['configuration'].get('live_parameter_save'))
-                                and not result['connection']['storage_failed'],
-                                None if result['configuration'].get('live_parameter_save')
-                                and not result['connection']['storage_failed'] else
-                                'LEDGER_WRITE_FAILED' if result['connection']['storage_failed']
-                                else 'CONFIG_EDIT_OFFLINE_ONLY'),
-        'MANUAL_OPEN': (manual and entry_allowed,
-                        None if manual and entry_allowed else
-                        'MANUAL_MODE_REQUIRED' if not manual else 'ENTRY_NOT_ALLOWED'),
-        'MANUAL_CLOSE': (connected, None if connected else 'GATEWAY_DISCONNECTED'),
-        'MANUAL_CLOSE_ALL': (connected, None if connected else 'GATEWAY_DISCONNECTED'),
-        'CANCEL_SELECTED': (connected, None if connected else 'GATEWAY_DISCONNECTED'),
-        'CANCEL_OWNED': (connected, None if connected else 'GATEWAY_DISCONNECTED'),
-        'FLATTEN_THEN_STOP': (connected, None if connected else 'GATEWAY_DISCONNECTED'),
-        'CANCEL_NATIVE_ACCOUNT': (connected and bool(result['configuration'].get('native_cancel_review', {}).get('eligible')),
-                                  None if connected and result['configuration'].get('native_cancel_review', {}).get('eligible')
-                                  else 'NATIVE_ACCOUNT_REVIEW_REQUIRED'),
-        'REQUEST_RECONCILIATION': (not result['connection']['storage_failed'],
-                                   None if not result['connection']['storage_failed'] else 'LEDGER_WRITE_FAILED'),
-    }
+    projected_capabilities = capability_rows(result, external_positions, config_verified)
     result['capabilities'] = {
         'revision': result['checkpoint_event_seq'],
         'observed_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
         'operations': [
             {'operation': operation, 'scope_type': 'ACCOUNT', 'allowed': allowed, 'reason': reason}
-            for operation, (allowed, reason) in capability_rows.items()
+            for operation, (allowed, reason) in projected_capabilities.items()
         ],
     }
 
@@ -571,6 +546,7 @@ def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None, native_fa
         'E_ACCOUNT_SYNC': 'OT-CON-1003',
         'E_STORAGE': 'OT-DB-5001',
         'LEDGER_WRITE_FAILED': 'OT-DB-5001',
+        'CONFIG_SNAPSHOT_INVALID': 'OT-CFG-4001',
     }
     diagnostic_rows = []
     for block in result['blocks'][-64:]:

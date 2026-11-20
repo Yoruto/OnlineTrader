@@ -623,11 +623,11 @@ class DsvEntryLog:
             self.geometry_days.add((code, day))
             limit = 2 * opening - stop
             append('GEOMETRY_BLOCK', '提示', f'当日振幅 {high-low:.0f} 点 > 上限 {limit:.0f} 点'
-                   f'（2×开仓偏移{opening} − 止损{stop}）→ 多空触发价交叉，本品种今日不建仓（几何条件，不是故障）')
+                   f'（2×开仓偏移{opening} − 止损{stop}）→ 日内振幅超出开仓限制，当前不建仓（策略规则，非程序故障）')
         signature = (f'{long_trigger:.1f}', f'{short_trigger:.1f}', f'{last:.1f}', geometry)
         if signature != self.last_hint.get(code) and self.due((code, 'TRIGGER_HINT'), now, 60):
             self.last_hint[code] = signature
-            suffix = '（几何条件不满足，暂不建仓）' if geometry else ''
+            suffix = '（日内振幅超出开仓上限，当前不建仓）' if geometry else ''
             append('TRIGGER_HINT', '提示', f'当日 高{high:.0f}/低{low:.0f}（振幅 {high-low:.0f}，开仓偏移 {opening}）'
                    f'→ 多开触发 {long_trigger:.1f} / 空开触发 {short_trigger:.1f}，现价 {last:.1f}{suffix}')
         activation = checks[-1]
@@ -637,8 +637,8 @@ class DsvEntryLog:
             is_long = activation.startswith('LONG:')
             direction, trigger = ('多', long_trigger) if is_long else ('空', short_trigger)
             level = trigger + profit * ratio if is_long else trigger - profit * ratio
-            append(activation, '跳过', f'当日行情已跑过{direction}头激活位（触发 {trigger:.1f} '
-                   f'∓ 止盈×{ratio:.2f} = {level:.1f}），本次不开仓')
+            append(activation, '跳过', f'当日行情已越过{direction}头不追价线（触发 {trigger:.1f} '
+                   f'∓ 止盈×{ratio:.2f} = {level:.1f}），本次跳过开仓')
 
     def filter_message(self, code, day, reason, now, event, symbol, decision, append):
         direction, sep, kind = reason.partition(':')

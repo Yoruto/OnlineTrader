@@ -14,8 +14,9 @@ import time
 import zipfile
 
 from online_trader.accounts import AccountStore
+from online_trader.configuration.files import publish_replace_bytes
 from online_trader.errors import TraderError
-from online_trader.runtime.instance import AccountLock
+from online_trader.runtime.instance import AccountLock, RuntimeLock
 from online_trader.updates import (Candidate, MAX_BUNDLE, SHA256, UpdateError, atomic_json,
                                    extract_bundle, version_key)
 
@@ -61,23 +62,56 @@ def runtime_lease(root, *, exclusive=False):
         kernel.CloseHandle(handle)
 
 
+def _managed_runtime_store(root, current):
+    """Return the stable portable Runtime store without relocating trading state."""
+    from online_trader.runtime.portable_config import PortableAccountStore
+
+    stable = (Path(root).resolve() / 'runtime').resolve()
+    if (stable / 'runtime.json').is_file():
+        return PortableAccountStore(stable)
+    adjacent = (program_directory(root, current) / 'runtime').resolve()
+    if adjacent != stable and (adjacent / 'runtime.json').is_file():
+        raise UpdateError('Runtime 配置仍位于版本目录，暂不自动更新；请先完成受控配置迁移')
+    return None
+
+
+def _account_stores(root):
+    stores = [AccountStore(Path(os.environ['LOCALAPPDATA']) / 'OnlineTrader' / 'accounts')]
+    if root is not None:
+        # Validate the stable Runtime configuration, but never treat archived
+        # or cached Runtime databases as update authority.
+        _managed_runtime_store(root, active_version(root))
+    return stores
+
+
 @contextmanager
-def settled_accounts():
-    store = AccountStore(Path(os.environ['LOCALAPPDATA']) / 'OnlineTrader' / 'accounts')
-    with ExitStack() as locks:
-        locks.enter_context(AccountLock('CATALOGUE:' + str(store.directory).casefold()))
-        rows = store.read()['accounts']
-        known = {store.ledger_path(row).resolve() for row in rows}
-        data = store.directory / 'data'
-        for name in ('ledger.db', 'ledger.db-wal', 'ledger.db-shm', 'ledger.db-journal'):
-            for path in data.rglob(name):
-                ledger = path.with_name('ledger.db').resolve()
-                if ledger not in known or not ledger.is_file():
-                    raise UpdateError('发现未归属或缺少主文件的账本，暂缓安装')
-        for row in rows:
-            locks.enter_context(AccountLock(row['account_key']))
-            store._settled(row, for_update=True)
-        yield
+def settled_accounts(root=None):
+    """Hold every known account identity while proving update-safe ledgers."""
+    try:
+        with ExitStack() as locks:
+            if root is not None:
+                locks.enter_context(RuntimeLock())
+            locked = set()
+            for store in _account_stores(root):
+                locks.enter_context(AccountLock('CATALOGUE:' + str(store.directory).casefold()))
+                rows = store.read()['accounts']
+                known = {store.ledger_path(row).resolve() for row in rows}
+                data = store.directory / 'data'
+                for name in ('ledger.db', 'ledger.db-wal', 'ledger.db-shm', 'ledger.db-journal'):
+                    for path in data.rglob(name):
+                        ledger = path.with_name('ledger.db').resolve()
+                        if ledger not in known or not ledger.is_file():
+                            raise UpdateError('发现未归属或缺少主文件的账本，暂缓安装')
+                for row in rows:
+                    if row['account_key'] not in locked:
+                        locks.enter_context(AccountLock(row['account_key']))
+                        locked.add(row['account_key'])
+                    store._settled(row, for_update=True)
+            yield
+    except TraderError as error:
+        if error.code == 'E_INSTANCE_EXISTS':
+            raise UpdateError('Trading Runtime 仍在运行；请先停止策略并等待账户安全退出') from None
+        raise UpdateError(str(error)) from None
 
 
 def active_version(root):
@@ -132,7 +166,11 @@ def apply_pending(root, current):
         return current
     cache = root / 'updates'
     archive = cache / f'{candidate.version}-{candidate.sha256}.zip'
-    with runtime_lease(root, exclusive=True), settled_accounts():
+    runtime_store = None
+    defaults_path = None
+    defaults_before = None
+    defaults_replaced = False
+    with runtime_lease(root, exclusive=True), settled_accounts(root):
         try:
             with archive.open('rb') as stream:
                 if (archive.stat().st_size != candidate.size
@@ -151,8 +189,21 @@ def apply_pending(root, current):
                         raise UpdateError('目标版本目录已有不同制品')
                 else:
                     staged.rename(target)
+            runtime_store = _managed_runtime_store(root, current)
+            candidate_defaults = target / 'runtime' / 'OnlineTrader-parameters.json'
+            if runtime_store is not None and candidate_defaults.is_file():
+                runtime_store.profile_with_defaults(candidate_defaults)
+                defaults_path = runtime_store.directory / 'OnlineTrader-parameters.json'
+                defaults_before = defaults_path.read_bytes()
+                publish_replace_bytes(candidate_defaults.read_bytes(), defaults_path)
+                defaults_replaced = True
             atomic_json(root / 'active.json', {'version': candidate.version, 'previous': current})
-        except (UpdateError, OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile):
+        except (UpdateError, TraderError, OSError, ValueError, subprocess.SubprocessError, zipfile.BadZipFile):
+            if defaults_replaced:
+                try:
+                    publish_replace_bytes(defaults_before, defaults_path)
+                except TraderError:
+                    raise UpdateError('更新失败，且无法恢复上一版 Runtime 默认配置') from None
             (cache / f'{candidate.version}.failed').touch()
             raise
     return candidate.version
@@ -185,12 +236,17 @@ def launch_managed(root, arguments, *, wait_for_previous=False, portable_version
                 atomic_json(root / 'active.json', {'version': portable_version})
         current = active_version(root)
         deferred = False
+        deferred_reason = ''
         try:
             selected = apply_pending(root, current)
         except (UpdateError, TraderError, OSError, ValueError, KeyError, TypeError,
-                subprocess.SubprocessError, zipfile.BadZipFile):
+                subprocess.SubprocessError, zipfile.BadZipFile) as error:
             selected = current
             deferred = True
+            if isinstance(error, (UpdateError, TraderError)):
+                deferred_reason = str(error).strip()[:512]
+            else:
+                deferred_reason = '安装前检查或版本切换失败，已继续使用当前版本'
         state = json.loads((root / 'active.json').read_text(encoding='utf-8-sig'))
         previous = state.get('previous')
         executable = program_directory(root, selected) / 'OnlineTrader.exe'
@@ -200,13 +256,14 @@ def launch_managed(root, arguments, *, wait_for_previous=False, portable_version
             environment = dict(os.environ, ONLINETRADER_UPDATE_READY=str(ready))
             if deferred:
                 environment['ONLINETRADER_UPDATE_DEFERRED'] = '1'
+                environment['ONLINETRADER_UPDATE_DEFERRED_REASON'] = deferred_reason
             # A frozen bootstrap is a separate PyInstaller application.
             environment['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
             try:
                 with subprocess.Popen([str(executable), *arguments], cwd=executable.parent,
                                       env=environment) as process:
                     if previous:
-                        deadline = time.monotonic() + 60
+                        deadline = time.monotonic() + 120
                         while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
                             time.sleep(0.2)
                         if ready.exists():

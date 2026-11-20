@@ -11,6 +11,7 @@ from online_trader.errors import TraderError
 
 CLOCK_GATE = r"Global\OnlineTrader.ClockMaintenance.Gate.v1"
 CLOCK_OWNERS = r"Global\OnlineTrader.ClockMaintenance.Owners.v1"
+HOST_RUNTIME_KEY = 'HOST:RUNTIME:OWNER:V1'
 
 
 class ClockActivity:
@@ -127,6 +128,31 @@ class AccountLock:
 
     def matches(self,account_key):
         return self._handle is not None and self.account_key==account_key and self.owner_thread==threading.get_ident()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+
+class RuntimeLock:
+    """One Standalone Runtime owner per Windows host.
+
+    Windows named mutexes are machine-local.  Using a constant host key blocks
+    a second Runtime on this computer while deliberately imposing no limit on
+    another computer logging into the same broker account.
+    """
+
+    def __init__(self):
+        self._lock = AccountLock(HOST_RUNTIME_KEY)
+        self.owner_thread = threading.get_ident()
+
+    def matches(self):
+        return self._lock._handle is not None and self.owner_thread == threading.get_ident()
+
+    def close(self):
+        self._lock.close()
 
     def __enter__(self):
         return self

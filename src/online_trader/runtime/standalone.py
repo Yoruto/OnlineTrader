@@ -20,11 +20,6 @@ def run_cli(args):
         print(json.dumps(read_current_account(args.root, account=args.account), ensure_ascii=False))
         return 0
     store = PortableAccountStore(args.root, getattr(args, 'account', None))
-    if args.runtime_action == 'export-handoff':
-        from online_trader.runtime.handoff import export_handoff
-        store.profile()
-        print(json.dumps(export_handoff(store, args.output), ensure_ascii=False))
-        return 0
     selected = store.get(store.read()['selected_id'])
     pipe = store.pipe_name(selected)
     if args.runtime_action == 'account':
@@ -33,13 +28,12 @@ def run_cli(args):
         print(json.dumps(value, ensure_ascii=False))
         return 0 if value['status'] == 'READY' else 2
     if args.runtime_action == 'history':
-        value = _history(args, store.ledger_path(selected), selected['account_key'])
+        value = _history(args, store.history_path(selected), selected['account_key'])
         print(json.dumps(value, ensure_ascii=False))
         return 0
     if args.runtime_action == 'report':
-        from online_trader.reporting import read_report
-        value = read_report(store.ledger_path(selected), selected['account_key'],
-                            checkpoint_event_seq=args.checkpoint_event_seq)
+        from online_trader.runtime.account_cache import broker_report
+        value = broker_report(store.history_path(selected), selected['account_key'])
         print(json.dumps(value, ensure_ascii=False))
         return 0
     if args.runtime_action == 'catalog':
@@ -73,7 +67,8 @@ def run_cli(args):
         return 0
     if args.runtime_action == 'inspect':
         print(json.dumps({'account': selected, 'profile_hash': profile.content_hash,
-                          'pipe': pipe, 'ledger_exists': store.ledger_path(selected).is_file()}, ensure_ascii=False))
+                          'pipe': pipe, 'history_cache_exists': store.history_path(selected).is_file(),
+                          'archived_legacy_ledger_exists': store.ledger_path(selected).is_file()}, ensure_ascii=False))
         return 0
     request = build_start_request(store, selected['account_id'], profile, arm=False, manual=args.mode == 'manual')
     return run_session(store, selected, request, use_profile_file=args.use_profile_file)
@@ -81,11 +76,11 @@ def run_cli(args):
 
 def _history(args, ledger, account_key):
     if all(value is None for value in (args.from_day, args.to_day, args.section, args.contract, args.cursor)):
-        from online_trader.runtime.account_history import account_history
-        return account_history(ledger, account_key, before=args.before, limit=5 if args.limit is None else args.limit)
+        from online_trader.runtime.account_cache import recent_history
+        return recent_history(ledger, account_key, before=args.before, limit=5 if args.limit is None else args.limit)
     if args.before is not None:
         raise TraderError('E_HISTORY_CURSOR', 'Date queries use --cursor for pagination')
-    from online_trader.runtime.account_day_history import read_account_days
+    from online_trader.runtime.account_cache import read_account_days
     return read_account_days(ledger, account_key, from_day=args.from_day, to_day=args.to_day,
                              section=args.section or 'coverage', contract=args.contract, cursor=args.cursor,
                              limit=50 if args.limit is None else args.limit)
@@ -98,15 +93,21 @@ def run_session(store, selected, request, *, use_profile_file=False, check_sched
     output = directory / 'run'
     print(json.dumps({'account_key': selected['account_key'], 'pipe': pipe, 'run': str(output),
                       'entry_authority': 'DISARMED'}, ensure_ascii=False), flush=True)
+    from online_trader.runtime.instance import RuntimeLock
+    from online_trader.runtime.session_storage import RuntimeSessionStorage
     from online_trader.runtime.view_process import ViewProcess
-    process = ViewProcess(pipe, selected['account_key'], store.directory, store.ledger_path(selected))
-    try:
-        result = run_confirmed_start(request_path, output, configured_store=store,
-                                     trusted_control_pid=process.trusted_pid,
-                                     use_portable_profile_file=use_profile_file,
-                                     check_scheduled_authorization=check_scheduled_authorization)
-    finally:
-        process.close()
+    with RuntimeLock(), RuntimeSessionStorage() as session:
+        process = ViewProcess(pipe, selected['account_key'], store.directory, session.ledger,
+                              store.history_path(selected))
+        try:
+            result = run_confirmed_start(request_path, output, configured_store=store,
+                                         trusted_control_pid=process.trusted_pid,
+                                         use_portable_profile_file=use_profile_file,
+                                         check_scheduled_authorization=check_scheduled_authorization,
+                                         execution_ledger=session.ledger,
+                                         history_cache=store.history_path(selected))
+        finally:
+            process.close()
     failure = output / 'startup-failure.json'
     if result and failure.is_file():
         print(json.dumps({'status': 'STARTUP_FAILED', 'diagnostic': str(failure)}, ensure_ascii=False),
@@ -115,12 +116,11 @@ def run_session(store, selected, request, *, use_profile_file=False, check_sched
 
 
 def _operator_request(args, store, selected, pipe):
-    from online_trader.runtime.operator_api import OperatorEndpoint, RuntimeCommandClient
+    from online_trader.runtime.operator_api import RuntimeCommandClient
 
     if args.runtime_action == 'receipt':
-        endpoint = OperatorEndpoint(pipe, store.directory, store.ledger_path(selected), selected['account_key'])
-        result = endpoint.handle({'operation': 'receipt', 'body': {'command_id': args.command_id},
-                                  'operator': args.operator, 'token': _read_token(args)})
+        result = RuntimeCommandClient(pipe).request(
+            'receipt', {'command_id': args.command_id}, operator=args.operator, token=_read_token(args))
     else:
         try:
             with args.input.open('rb') as stream:

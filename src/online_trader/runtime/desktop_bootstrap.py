@@ -44,7 +44,7 @@ ERROR_MESSAGES = {
     'E_DESKTOP_START_REPLAY': '本次启动请求已经执行，请查看原运行状态，避免重复启动。',
     'E_DESKTOP_START_LIMITS': '请在交易参数中设置有效的最大手数和每品种最大报单数。',
     'E_DESKTOP_START_RECOVERY': '该账号有未核清的原运行，请恢复原范围并核对持仓、委托及回报。',
-    'E_INSTANCE_EXISTS': '该账号的策略执行器已在运行，请刷新工作台查看。',
+    'E_INSTANCE_EXISTS': '本机已有相应执行器或 Runtime 在运行，请刷新工作台查看。其他电脑不受本机锁限制。',
     'E_FACT_BARRIER': '该账号有持仓、委托或未知结果需要核对，请先恢复原策略运行。',
     'E_SCOPE': '所选账号或运行范围已变化，请重新确认。',
     'E_CALENDAR_INCOMPLETE': '当前交易日或合约时段未能完整核对，策略尚未启动。',
@@ -55,9 +55,8 @@ ERROR_MESSAGES = {
     'E_STARTUP_METADATA_CLOSE': '行情资料连接未正常关闭，策略启动已停止。',
     'E_DEPENDENCY': '模拟运行组件不可用，请检查已安装的程序环境。',
     'E_CLOCK': '无法取得应用授时，请检查授时网络连接。',
-    'E_RUNTIME_HANDOFF': '检测到同一账号已有另一份桌面执行账本；为避免形成两个交易账本，请先完成受控的一致性交接。',
     'E_RUNTIME_CONFIG': 'Runtime 配置不完整或格式无效，请核对运行目录。',
-    'E_STORAGE': '执行账本缺失、不可读或身份不完整；Runtime 未启动且没有重建账本。',
+    'E_STORAGE': '本次 Runtime 的临时存储不可用；Runtime 未启动。',
 }
 
 
@@ -242,7 +241,7 @@ def _original_scope(store, row):
         raise TraderError('E_DESKTOP_START_RECOVERY', ERROR_MESSAGES['E_DESKTOP_START_RECOVERY']) from None
 
 
-def compile_start_scope(request, store, metadata, *, now=None):
+def compile_start_scope(request, store, metadata, *, now=None, ledger_path=None):
     """Compile supplied native facts; no connection, time guesses, or writes."""
     instant = _now(now)
     source_profile = DsvProfile.from_record(request['profile'])
@@ -296,7 +295,8 @@ def compile_start_scope(request, store, metadata, *, now=None):
         raise TraderError('E_CALENDAR_INCOMPLETE', ERROR_MESSAGES['E_CALENDAR_INCOMPLETE']) from None
     value = {'schema_version': 'SIMNOW_DSV_DESKTOP/1' if row['provider'] == 'TQ_SIMNOW' else 'KQ_DSV_DESKTOP/1',
         'grant_id': request['request_id'], 'account_fingerprint': row['account_key'].split(':')[-1],
-        'ledger_path': str(store.ledger_path(row)), 'contracts': codes, 'trading_day': day,
+        'ledger_path': str(Path(ledger_path).resolve() if ledger_path is not None else store.ledger_path(row)),
+        'contracts': codes, 'trading_day': day,
         'trading_days': [day], 'resume_entries_on_day_change': False,
         'not_before_utc': _stamp(instant), 'not_after_utc': _stamp(end),
         'max_order_quantity': maximum, 'daily_targets_per_contract': targets, 'risk_budget': risk_budget,
@@ -327,7 +327,8 @@ def run_desktop_start(request_path, output, *, now=None):
 
 
 def run_confirmed_start(request_path, output, *, now=None, configured_store=None, trusted_control_pid=None,
-                        use_portable_profile_file=False, check_scheduled_authorization=None):
+                        use_portable_profile_file=False, check_scheduled_authorization=None,
+                        execution_ledger=None, history_cache=None):
     """Run the original owner using the selected desktop or portable account inputs."""
     directory = Path(output).resolve()
     directory.mkdir(parents=True, exist_ok=False)
@@ -351,13 +352,16 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
         with ClockActivity(), AccountLock(row['account_key']) as lease:
             runtime_options = {}
             if configured_store is not None:
-                configured_store.initialize_ledger(row, lease)
-                runtime_options.update(_existing_ledger=True, _trusted_control_pid=trusted_control_pid or -1)
+                if execution_ledger is None or history_cache is None:
+                    raise TraderError('E_SCOPE', 'Standalone Runtime requires session storage and a broker history cache')
+                configured_store.initialize_session_ledger(row, lease, execution_ledger)
+                runtime_options.update(_existing_ledger=False, _trusted_control_pid=trusted_control_pid or -1,
+                                       _history_cache=history_cache, _configured_store=configured_store)
                 if not use_portable_profile_file:
                     source_profile = configured_store.effective_profile(row, source_profile)
                     request.update(profile=source_profile.to_record(), profile_hash=source_profile.content_hash)
-            recovering = request.get('recover_original', False)
-            if not recovering:
+            recovering = request.get('recover_original', False) and configured_store is None
+            if configured_store is None and not recovering:
                 try:
                     _check_existing_ledger(store, row)
                 except TraderError as error:
@@ -403,7 +407,8 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
             if 'scheduled_operator' in request:
                 if check_scheduled_authorization() != request['scheduled_operator']:
                     raise TraderError('E_AUTH', 'The scheduled start operator changed during connection preparation')
-            grant, effective, calendar, details = compile_start_scope(request, store, metadata, now=current)
+            grant, effective, calendar, details = compile_start_scope(
+                request, store, metadata, now=current, ledger_path=execution_ledger)
             for name, record in (('scope.json', grant.value), ('profile.json', effective.to_record()),
                                  ('calendar.json', calendar.to_record()), ('startup-preparation.json', details)):
                 publish_new_bytes(canonical_bytes(record), directory / name)

@@ -5,14 +5,14 @@
 > 设计基线：`1f0ab648136519e364bf3267c6dab51ffdd76e15`；实施起点：`c891e512ed6559505160cccd80bfd90a40ae5262`
 > 本文所列实现状态不代表最终独立复测、模拟柜台交易闭环或最终制品已经通过。
 
-> 2026-11-20 决定：Workbench 按本机当前 Windows 交互用户提交，不再显示操作员或令牌；CLI、调度和受托工具的操作员协议保留。文中旧认证流程作为历史设计保留，实施与后续验收以该决定和 Standalone Runtime 主设计为准。
+> 2026-11-20 实施更新：Workbench 不再显示操作员或令牌，使用受 Windows 本机身份边界约束的通道；该检查不能证明真实按钮点击，当前服务端还允许 `LocalSystem`。CLI、调度和受托工具的操作员协议保留。源码候选已按[架构收敛与安全改造计划](runtime-architecture-hardening-plan-20261120.md)完成 CommandBus 安全整改和生产接管，但尚未获得功能测试或真实柜台验收。
 
-**关联文档：** [独立交易运行时与交易工作台设计](standalone-trading-runtime-20261119.md) · [Runtime 运维、配置与账本](../runtime-operations-and-storage-20261119.md) · [账户数据与历史查询](../account-data-sync-design-20261119.md)
+**关联文档：** [独立交易运行时与交易工作台设计](standalone-trading-runtime-20261119.md) · [架构收敛与安全改造计划](runtime-architecture-hardening-plan-20261120.md) · [Runtime 运维、配置与账本](../runtime-operations-and-storage-20261119.md) · [账户数据与历史查询](../account-data-sync-design-20261119.md)
 
 ### 2026-11-19 源码实施候选
 
 - `online-trader-desktop --runtime-pipe` 与普通 dev 入口共用原 `WorkbenchWindow`/`WorkbenchLayout`；窗口、导航、页面、控件、文案和位置只有一份实现。Runtime 兼容启动器也只委托该窗口，不保留第二套可见页面。
-- 客户端基础层已提供版本化状态 Store、状态订阅/命令/慢查询分离、CommandBus、原命令回执恢复及稳定行 ID 模型；产品入口通过既有 Workbench 的 Runtime view/交互用户通道逐步接入，不以替换 UI 的方式切换。
+- 客户端基础层已提供版本化状态 Store、状态订阅/命令/慢查询分离、CommandBus、原命令回执恢复及稳定行 ID 模型。pending 静默截断、持久化未核验、损坏记录忽略、队列失败状态、回执身份核对和 `--allow-multi` 整表覆盖缺口已在源码中修复；注册表在跨进程锁内重读、合并、写回并核验。Runtime Capability 与封闭 allowlist 已补齐，顶层、人工交易和在线参数控件均消费 Capability，并通过既有 Workbench 单向接管，不替换 UI。
 - 账号历史是首个接入既有 Workbench 的慢查询：只在 `RuntimeQueryWorker` 中分页调用 `history-days`，结果按账号、Owner boot、柜台日和本地 generation 绑定；Qt 不直接打开账本。自有订单/成交与账号观察历史分开展示，资金历史按交易日并入权益曲线。该接入和增量表格刷新本轮仅做源码编译检查，尚未获得新的 GUI/行为验收证据。
 - Runtime 投影新增说明性 Capability、结构化 Diagnostic 和 Owner 已有行情缓存中的合约目录；命令仍由 Runtime 逐次最终校验。
 - 参数草稿必须先通过带账号、boot 和配置版本绑定的 Runtime 预览，再使用原 `SAVE_DSV_PARAMETERS` 命令提交；Qt 不直接写生效配置。
@@ -22,7 +22,7 @@
 
 ### Phase 1 接入结论与门禁
 
-原审核时新 `runtime_client` 基础层尚未接入实际 Workbench。以下三项同时修复并通过独立自动化测试前，禁止把交易控制、状态订阅或慢查询切换到新基础层；门禁通过后，本次仅接入账号历史慢查询，交易控制和状态订阅仍沿用现有路径：
+原审核时新 `runtime_client` 基础层尚未接入实际 Workbench。2026-11-20 源码候选已补齐 pending 容量/损坏/同步、enqueue 未送达状态、账号与 command ID 严格匹配、Capability 完整性和显式 allowlist，并接管状态订阅、交易控制和慢查询。以下旧 Phase 1 结果仍只能作为历史证据，不能替代本次候选的独立测试：
 
 1. 关闭协调器必须主动取消三个 I/O lane 当前持有的 Named Pipe，使阻塞中的 `recv` 立即返回；所有 QThread 必须在其父 QObject 析构前确认结束。
 2. Runtime owner boot 改变时保留全部未决 `command_id`，将其状态降级为 `OUTCOME_UNKNOWN / OWNER_RESTARTED`，持久化后重新认证并查询原回执；boot 改变不是删除未知责任的证据。
@@ -412,7 +412,7 @@ sequenceDiagram
 | 关闭顺序 | 先请求中断，再关闭活动 Pipe，最后等待线程退出；不以固定 `wait(ms)` 超时后继续析构。 |
 | boot 迁移 | 同账号的新 boot 使客户端观察与命令绑定失效，但不使旧账本回执或未知责任失效。 |
 | 查询失败 | 只更新本次查询的诊断原因；pending 保持未知，禁止映射成原命令拒绝。 |
-| 兼容与回退 | 当前 Workbench 使用 RuntimeWatch/本机交互用户通道；门禁失败时不回退操作员提示或直连 Owner，不迁移或改写账本。旧版 pending 记录仍按原 ID恢复为未知。 |
+| 兼容与回退 | 当前 Workbench 使用 `RuntimeClientCoordinator`/本机交互用户通道；门禁失败时不回退操作员提示或直连 Owner，不迁移或改写账本。旧版单槽 pending 先在跨进程锁内写入并核验 v2 注册表，再清理旧键，恢复后仍只按原 ID 查询。 |
 | 诊断点 | 关闭可核对每个 lane 的 finished 状态；boot 变化与查询失败通过 `command_changed`/feedback 暴露原 command_id 和保留原因，内容不得含凭据或完整敏感载荷。 |
 
 可执行验收条件：阻塞 command、history/query 和 subscription 时关闭均能在受控时间内结束全部线程；`SUBMISSION_UNKNOWN` 经 boot 变化及 UI 重建仍保留原 ID；receipt 查询超时、断线、鉴权失败和暂未找到均保留 pending；仅明确终态回执清除；测试不连接账号、不发送交易命令、不构建制品。
@@ -450,4 +450,4 @@ sequenceDiagram
 
 ### 本文设计优先级
 
-**先统一 StateStore 和 CommandBus，再拆交易页面；先证明指令、状态与重连安全，再追求视觉重排和表格性能。** 保留当前简洁白底 Qt Widgets；后续优化 UI 外观不得突破 Runtime 唯一业务权威的边界。
+**路径/权限事实审计、CommandBus 修复、Capability/白名单补齐和生产 Workbench 源码切换已经完成；下一门禁是经授权的指令、状态、关闭与重连独立测试，不是继续扩大重构范围。** 保留当前简洁白底 Qt Widgets；后续优化 UI 外观不得突破 Runtime 唯一业务权威的边界。

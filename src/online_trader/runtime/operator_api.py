@@ -27,6 +27,26 @@ WORKBENCH_PROTOCOL = 'ONLINE_TRADER_RUNTIME_WORKBENCH_COMMAND/1'
 WORKBENCH_ACTOR = 'workbench-user'
 _COMMAND_FIELDS = {'command_id', 'operation', 'scope', 'parameters'}
 
+# Closed set of operations exposed by the local Workbench channel.  Keep this
+# independent from the schema enum: adding a Kernel/operator operation must not
+# silently grant it to every same-SID local process that can reach this pipe.
+WORKBENCH_OPERATIONS = frozenset({
+    'ADOPT_EXTERNAL_POSITION',
+    'ARM_ENTRIES',
+    'CANCEL_NATIVE_ACCOUNT',
+    'CANCEL_OWNED',
+    'CANCEL_SELECTED',
+    'FLATTEN_THEN_STOP',
+    'MANUAL_CLOSE',
+    'MANUAL_CLOSE_ALL',
+    'MANUAL_OPEN',
+    'PAUSE_NEW_ENTRIES',
+    'REQUEST_RECONCILIATION',
+    'SAVE_DSV_PARAMETERS',
+    'SET_ENTRY_POLICY',
+    'STOP_DSV_STRATEGY',
+})
+
 
 @lru_cache(maxsize=1)
 def _operator_capabilities():
@@ -132,9 +152,12 @@ class _AuthorizedEndpoint:
             return None
         command, receipt, event = map(strict_loads, row)
         recorded = event['data'].get('control_metadata', {}).get('metadata', {}).get('actor', {})
+        expected_kind = 'LOCAL_USER' if actor == WORKBENCH_ACTOR else 'DELEGATED_OPERATOR'
+        compatible_actor = (recorded.get('id') == actor
+                            and recorded.get('kind') in {expected_kind, 'OPERATOR'})
         legacy_workbench = (allow_legacy_workbench and command_id.startswith('qt-')
                             and recorded.get('kind') == 'OPERATOR')
-        if ((recorded.get('id') != actor and not legacy_workbench)
+        if ((not compatible_actor and not legacy_workbench)
                 or command['operation'] not in operations):
             raise TraderError('E_AUTH', 'The command belongs to a different command authority')
         return {key: command[key] for key in _COMMAND_FIELDS}, receipt
@@ -175,7 +198,7 @@ class _AuthorizedEndpoint:
                                   allow_legacy_workbench=allow_legacy_workbench)
             if found is None:
                 raise TraderError('E_OWNERSHIP', 'No committed receipt is currently visible for this command ID')
-            return found[1]
+            return found[1] | {'operation': found[0]['operation'], 'account_key': self.account_key}
         if (body.keys() - {'binding'} != _COMMAND_FIELDS or type(body['operation']) is not str
                 or type(body['scope']) is not dict or type(body['parameters']) is not dict):
             raise TraderError('E_SCHEMA', 'Provide the command ID, operation, scope and parameters')
@@ -197,11 +220,12 @@ class _AuthorizedEndpoint:
             if found is not None:
                 if found[0] != {key: body[key] for key in _COMMAND_FIELDS}:
                     raise TraderError('E_DUPLICATE_CONFLICT', 'The command ID has different business content')
-                return found[1]
+                return found[1] | {'operation': found[0]['operation'], 'account_key': self.account_key}
             client = StatusClient(self.pipe, timeout=5, expected_account_key=self.account_key, client_instance_id=actor,
                                   expected_kernel_boot_id=binding['kernel_boot_id'] if binding else None)
-            return client.command(body['operation'], body['scope'], body['parameters'], command_id=command_id,
-                                  expected_config_revision=binding['config_revision'] if binding else None)
+            receipt = client.command(body['operation'], body['scope'], body['parameters'], command_id=command_id,
+                                     expected_config_revision=binding['config_revision'] if binding else None)
+            return receipt | {'operation': body['operation'], 'account_key': self.account_key}
         finally:
             self._submission.release()
 
@@ -230,7 +254,7 @@ class WorkbenchEndpoint(_AuthorizedEndpoint):
 
     def handle(self, request):
         return self.handle_authorized(
-            request, WORKBENCH_ACTOR, _operator_capabilities() - {'SCHEDULE_STRATEGY'},
+            request, WORKBENCH_ACTOR, WORKBENCH_OPERATIONS,
             allow_legacy_workbench=True)
 
 

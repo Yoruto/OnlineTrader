@@ -39,9 +39,9 @@ _STRATEGY_REASONS = {
     'CLOSE_ENTRY_WINDOW': '临近收盘，停止新增开仓',
     'QUOTE_AGE': '行情已超过开仓时效',
     'OFFSETS_UNAVAILABLE': '开仓、止损或止盈偏移无效',
-    'GEOMETRY_BLOCK': '当前日内振幅不满足开仓条件',
+    'GEOMETRY_BLOCK': '日内振幅超出开仓上限',
     'BAR_CONSUMED': '当前分钟的开仓机会已使用',
-    'NO_CHASE_AFTER_ACT': '达到激活幅度后禁止追价',
+    'NO_CHASE_AFTER_ACT': '行情已越过不追价线，本次跳过开仓',
     'HYSTERESIS_NOT_READY': '价格尚未满足触发前的回撤条件',
     'TRIGGER_NOT_REACHED': '行情尚未达到开仓触发价',
     'ACTIVE_SYMBOL_LIMIT': '达到同时持仓品种数上限',
@@ -381,8 +381,8 @@ class OfflineWorkbench(QMainWindow):
         elif reason == 'NO_CHASE_AFTER_ACT' and event.get('activation_price') is not None:
             name = '策略决定'
             direction = {'LONG': '多头', 'SHORT': '空头'}.get(event.get('direction'), '')
-            detail = (f"当日行情已跑过{direction}激活位（触发 {event['trigger_price']}，"
-                      f"激活 {event['activation_price']}），本次不开仓")
+            detail = (f"当日行情已越过{direction}不追价线（触发 {event['trigger_price']}，"
+                      f"线位 {event['activation_price']}），本次跳过开仓")
         elif reason == 'PROTECTED_FLOOR':
             name = '保护线退出'
             detail = (f"理论保护价 {event['nominal_reference_price']}，名义点数 {event['nominal_move']}"

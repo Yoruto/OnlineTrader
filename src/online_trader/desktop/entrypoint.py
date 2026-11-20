@@ -6,6 +6,7 @@ from pathlib import Path
 import os
 import sys
 
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from online_trader import __version__
@@ -75,17 +76,63 @@ def main(argv=None):
     app = QApplication.instance() or QApplication([])
     app.setApplicationName('OnlineTrader')
     try:
+        update_root = None
+        if getattr(sys, 'frozen', False):
+            from online_trader.update_install import managed_root
+            update_root = managed_root(sys.executable)
         runtime_root = args.runtime_root
         if (runtime_root is None and args.simnow_packet is None and args.account_store is None
                 and args.runtime_pipe is None and args.dsv_config is None and args.compare_fills is None):
             from online_trader.desktop.runtime_bootstrap import bundled_runtime_root
             runtime_root = bundled_runtime_root()
         if runtime_root is not None:
-            from online_trader.desktop.runtime_bootstrap import ensure_runtime
-            from online_trader.desktop.workbench import run
+            from online_trader.desktop.runtime_bootstrap import BootstrapController
+            from online_trader.desktop.workbench import WorkbenchWindow
             with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):
-                pipe = ensure_runtime(runtime_root, account=args.runtime_account)
-                return run(pipe, runtime_view=True)
+                bootstrap = BootstrapController(runtime_root, account=args.runtime_account, parent=app)
+                windows = []
+                restart_for_update = False
+                resolved_runtime_root = runtime_root.resolve()
+                runtime_update_root = (update_root if update_root is not None
+                                       and resolved_runtime_root.is_relative_to(update_root.resolve()) else None)
+
+                def runtime_ready(pipe):
+                    window = None
+
+                    def request_restart():
+                        nonlocal restart_for_update
+                        window.prepare_update_restart()
+                        restart_for_update = True
+                        window._tray.close_window()
+
+                    window = WorkbenchWindow(
+                        pipe, runtime_view=True, update_root=runtime_update_root,
+                        update_restart=request_restart if runtime_update_root is not None else None,
+                    )
+                    window.setAttribute(Qt.WA_DeleteOnClose)
+                    window.destroyed.connect(app.quit)
+                    windows.append(window)
+                    app.setQuitOnLastWindowClosed(True)
+                    window.show()
+                    QTimer.singleShot(0, window.refresh)
+
+                def runtime_failed(error):
+                    QMessageBox.critical(None, 'Trading Runtime 未启动',
+                                         f'{error}\n\n错误代码：{error.code}')
+                    app.exit(2)
+
+                app.setQuitOnLastWindowClosed(False)
+                bootstrap.ready.connect(runtime_ready)
+                bootstrap.failed.connect(runtime_failed)
+                bootstrap.cancelled.connect(lambda: app.exit(1))
+                app.aboutToQuit.connect(bootstrap.shutdown)
+                bootstrap.start()
+                result = app.exec()
+                bootstrap.shutdown()
+                if restart_for_update:
+                    from online_trader.update_install import RESTART_FOR_UPDATE
+                    return RESTART_FOR_UPDATE
+                return result
         if args.runtime_account is not None:
             parser.error('--runtime-account requires --runtime-root or an adjacent packaged runtime')
         if args.runtime_pipe is not None:
@@ -118,11 +165,9 @@ def main(argv=None):
                 pipe = store.pipe_name(store.get(account_id)) if account_id is not None else None
             if (getattr(sys, 'frozen', False) and not args.allow_multi
                     and args.account_store is None and args.dsv_config is None):
-                from online_trader.update_install import managed_root
-                root = managed_root(sys.executable)
-                if root is not None:
+                if update_root is not None:
                     return run(pipe, store=store, account_id=account_id,
-                               dsv_config=profile, autostart=args.autostart, update_root=root,
+                               dsv_config=profile, autostart=args.autostart, update_root=update_root,
                                notification=notification)
             return run(pipe, store=store, account_id=account_id, dsv_config=args.dsv_config or profile,
                        autostart=args.autostart, notification=notification)

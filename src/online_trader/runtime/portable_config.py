@@ -1,13 +1,11 @@
 """Machine-independent input for the standalone simulation runtime."""
 
-from contextlib import closing
-import os
+import copy
 from pathlib import Path
-import sqlite3
 
 from online_trader.accounts import AccountStore, account_identity
 from online_trader.configuration.dsv import DsvProfile
-from online_trader.configuration.files import load_profile, publish_new_bytes
+from online_trader.configuration.files import load_profile, publish_new_bytes, publish_replace_bytes
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.domain.values import identifier
 from online_trader.errors import TraderError
@@ -21,6 +19,8 @@ _KQ_FIELDS = {'username', 'password'}
 _SIMNOW_FIELDS = {'simnow_username', 'simnow_password', 'kq_username', 'kq_password'}
 _RUNTIME_CONTROL_FILE = 'runtime-control.json'
 _RUNTIME_CONTROL_SCHEMA = 'ONLINE_TRADER_RUNTIME_CONTROL/1'
+_OVERRIDES_FILE = 'OnlineTrader-overrides.json'
+_OVERRIDES_SCHEMA = 'ONLINE_TRADER_PARAMETER_OVERRIDES/1'
 _DEFAULT_RUNTIME_CONTROL = {
     'schema_version': _RUNTIME_CONTROL_SCHEMA,
     'scheduled_start': {'enabled': False},
@@ -56,7 +56,7 @@ def read_runtime_control(root):
 
 
 def ensure_runtime_control(root):
-    """Create the safe disabled supervisor gate when a handoff source lacks it."""
+    """Create the safe disabled supervisor gate when configuration lacks it."""
     directory = Path(root).resolve()
     path = (directory / _RUNTIME_CONTROL_FILE).resolve()
     if not path.is_relative_to(directory):
@@ -155,7 +155,41 @@ class PortableAccountStore(AccountStore):
         path = (self.directory / 'OnlineTrader-parameters.json').resolve()
         if not path.is_relative_to(self.directory):
             raise TraderError('E_RUNTIME_CONFIG', 'The parameter file must resolve inside the runtime directory')
-        return load_profile(path)
+        return self.profile_with_defaults(path)
+
+    def profile_with_defaults(self, path):
+        """Validate user overrides against an explicit version-default file."""
+        path = Path(path).resolve()
+        baseline = load_profile(path, dsv=True)
+        overrides = self.directory / _OVERRIDES_FILE
+        if not overrides.exists():
+            return baseline
+        value = _read(self.directory, _OVERRIDES_FILE)
+        if (type(value) is not dict or value.keys() != {'schema_version', 'overrides'}
+                or value['schema_version'] != _OVERRIDES_SCHEMA or type(value['overrides']) is not dict):
+            raise TraderError('E_RUNTIME_CONFIG', 'The Runtime parameter overrides are invalid')
+        try:
+            settings = _merge_settings(baseline.to_record()['settings'], value['overrides'])
+            return DsvProfile.from_record({'schema_version': 'DSV_SETTINGS/1', 'settings': settings})
+        except (KeyError, TypeError, ValueError, TraderError):
+            raise TraderError('E_RUNTIME_CONFIG',
+                              'The saved parameter overrides do not apply to this version defaults') from None
+
+    def save_profile(self, profile):
+        """Persist only explicit differences from the current version defaults."""
+        if not isinstance(profile, DsvProfile):
+            raise TraderError('E_RUNTIME_CONFIG', 'Expected validated Runtime parameters')
+        baseline = load_profile(self.directory / 'OnlineTrader-parameters.json', dsv=True)
+        overrides = _settings_diff(baseline.to_record()['settings'], profile.to_record()['settings'])
+        value = {'schema_version': _OVERRIDES_SCHEMA, 'overrides': overrides}
+        publish_replace_bytes(canonical_bytes(value), self.directory / _OVERRIDES_FILE)
+        return value
+
+    def history_path(self, row):
+        base = self.directory / 'data'
+        if row['provider'] == 'TQ_SIMNOW':
+            base = base / 'simnow'
+        return (base / row['account_key'].split(':')[-1] / 'account-history.db').resolve()
 
     def ledger_path(self, row):
         path = super().ledger_path(row).resolve()
@@ -163,82 +197,44 @@ class PortableAccountStore(AccountStore):
             raise TraderError('E_RUNTIME_CONFIG', 'The execution ledger must resolve inside the runtime directory')
         return path
 
-    def initialize_ledger(self, row, lease):
-        """Validate or initialize the original ledger before the first SDK connection."""
-        from online_trader.runtime.handoff import validate_handoff
-
+    def initialize_session_ledger(self, row, lease, path):
+        """Create a fresh process-owned execution store for this Runtime boot."""
         if not lease.matches(row['account_key']):
             raise TraderError('E_INSTANCE_LOCK', 'The original account lock is required to open its ledger')
-        handoff_accounts = validate_handoff(self)
-        path = self.ledger_path(row)
-        marker = path.with_name('initialized.json')
-        identity = {'account_key': row['account_key'], 'environment': row['environment']}
-        if marker.exists() and _read(self.directory, marker.relative_to(self.directory).as_posix()) != identity:
-            raise TraderError('E_SCOPE', 'The initialized ledger marker belongs to a different account')
-        existing = path.is_file()
-        if not existing and (marker.exists() or row['account_key'] in handoff_accounts):
-            raise TraderError('E_STORAGE', 'The existing execution ledger is missing')
-        if path.exists() and not existing:
-            raise TraderError('E_STORAGE', 'The execution ledger path is not a file')
-        # Validate both first-start and previously initialized portable ledgers.
-        # Older builds could have created a parallel portable ledger before this
-        # guard existed; trusting an existing path silently preserves that fork.
-        # A verified handoff is the sole exception because the source desktop
-        # ledger may deliberately remain as a cold historical artifact.
-        if row['account_key'] not in handoff_accounts:
-            self._reject_parallel_desktop_ledger(row, path)
-        with Ledger(path, row['account_key'], environment=row['environment'], broker_identity=row['provider'],
-                    existing_only=existing):
+        target = Path(path).resolve()
+        if target.name != 'ledger.db' or target.exists():
+            raise TraderError('E_STORAGE', 'The Runtime session ledger must be a new ledger.db')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with Ledger(target, row['account_key'], environment=row['environment'], broker_identity=row['provider']):
             pass
-        if not marker.exists():
-            publish_new_bytes(canonical_bytes(identity), marker)
-
-    @staticmethod
-    def _reject_parallel_desktop_ledger(row, target):
-        """Require an explicit handoff instead of silently forking a local account ledger."""
-        local = os.environ.get('LOCALAPPDATA')
-        if not local:
-            return
-        base = Path(local).resolve() / 'OnlineTrader' / 'accounts' / 'data'
-        if row['provider'] == 'TQ_SIMNOW':
-            base = base / 'simnow'
-        source = (base / row['account_key'].split(':')[-1] / 'ledger.db').resolve()
-        if source == target or not source.exists():
-            return
-        if not source.is_file():
-            raise TraderError('E_STORAGE', 'The standard account ledger path is not a file')
-        try:
-            with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
-                db.execute('PRAGMA query_only=ON')
-                db.execute('BEGIN')
-                scope = db.execute('''SELECT account_key, environment, broker_identity, schema_version
-                    FROM ledger_scope''').fetchall()
-        except sqlite3.Error:
-            raise TraderError('E_STORAGE', 'The standard account ledger cannot be validated for handoff') from None
-        expected = (row['account_key'], row['environment'], row['provider'], 1)
-        if scope != [expected]:
-            raise TraderError('E_SCOPE', 'The standard account ledger identity differs from Runtime configuration')
-        raise TraderError(
-            'E_RUNTIME_HANDOFF',
-            'This account already has an initialized desktop ledger; create a consistent Runtime handoff instead of a parallel ledger',
-        )
 
     def effective_profile(self, row, default):
-        """Recover the original owner's committed profile after the ledger identity check."""
-        path = self.ledger_path(row)
-        try:
-            with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=1)) as stream:
-                record = stream.execute('''SELECT config.payload_json, config.payload_hash
-                    FROM authority JOIN config_revisions AS config USING (config_revision)
-                    WHERE authority.singleton = 1''').fetchone()
-            if record is None:
-                return default
-            value = strict_loads(record[0])
-            if value.get('kind') != 'DSV_ONLINE_SIMULATION_EXECUTION':
-                return default
-            profile = DsvProfile.from_record(value['profile'])
-            if content_hash(value) != record[1] or profile.content_hash != value['profile_hash']:
-                raise ValueError()
-            return profile
-        except (sqlite3.Error, ValueError, KeyError, TypeError):
-            raise TraderError('E_RUNTIME_CONFIG', 'The committed execution profile could not be recovered') from None
+        """Configuration files, never a prior execution database, define the next boot."""
+        return self.profile()
+
+
+def _merge_settings(defaults, overrides):
+    if type(defaults) is not dict or type(overrides) is not dict:
+        raise ValueError()
+    result = copy.deepcopy(defaults)
+    for key, value in overrides.items():
+        if key not in defaults:
+            raise ValueError()
+        result[key] = (_merge_settings(defaults[key], value)
+                       if type(defaults[key]) is dict and type(value) is dict else copy.deepcopy(value))
+    return result
+
+
+def _settings_diff(defaults, desired):
+    if type(defaults) is not dict or type(desired) is not dict or defaults.keys() != desired.keys():
+        raise TraderError('E_RUNTIME_CONFIG', 'The saved parameters differ from the version configuration schema')
+    result = {}
+    for key in defaults:
+        before, after = defaults[key], desired[key]
+        if type(before) is dict and type(after) is dict:
+            nested = _settings_diff(before, after)
+            if nested:
+                result[key] = nested
+        elif before != after:
+            result[key] = copy.deepcopy(after)
+    return result

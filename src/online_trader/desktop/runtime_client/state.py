@@ -20,6 +20,7 @@ class ClientConnectionState(StrEnum):
 
 class PendingCommandStatus(StrEnum):
     LOCAL_DRAFT = 'LOCAL_DRAFT'
+    LOCAL_NOT_ENQUEUED = 'LOCAL_NOT_ENQUEUED'
     SUBMITTING = 'SUBMITTING'
     SUBMISSION_UNKNOWN = 'SUBMISSION_UNKNOWN'
     REJECTED = 'REJECTED'

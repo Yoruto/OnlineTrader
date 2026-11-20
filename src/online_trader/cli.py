@@ -70,8 +70,8 @@ def main(argv=None):
     for name, help_text in (('inspect', '脱敏核对配置，不连接账户'), ('run', '独立启动模拟执行器，默认停开'),
                             ('status', '通过独立通信进程查询执行器'), ('watch', '订阅执行器状态的有序变化'),
                             ('account', '只读登录模拟柜台并查询资金、持仓、委托和成交'),
-                            ('history', '读取原账本确认的账户历史观察'),
-                            ('report', '读取执行账本的自有逐笔成交和损益'),
+                            ('history', '读取由柜台快照重建的账户历史缓存'),
+                            ('report', '读取由柜台快照重建的账户收益与成交'),
                             ('quotes', '通过配置的行情身份只读查询合约报价'),
                             ('catalog', '通过配置的行情身份只读查询期货合约目录')):
         command = runtime_actions.add_parser(name, help=help_text)
@@ -83,7 +83,7 @@ def main(argv=None):
             command.add_argument('--mode', choices=('strategy', 'manual'), default='strategy')
             command.add_argument('--use-profile-file', action='store_true', help='本次以明确选定的参数文件建立新范围')
         if name == 'history':
-            from online_trader.runtime.account_day_history import SECTIONS
+            from online_trader.runtime.account_cache import SECTIONS
             command.add_argument('--before', help='上页输出的历史游标')
             command.add_argument('--limit', type=int)
             command.add_argument('--from-day', help='柜台交易日起点 YYYY-MM-DD')
@@ -95,9 +95,6 @@ def main(argv=None):
             command.add_argument('--checkpoint-event-seq', help='读取指定的已提交账本水位')
         if name == 'quotes':
             command.add_argument('--symbol', action='append', help='合约代码，可重复指定，默认使用策略配置品种')
-    handoff = runtime_actions.add_parser('export-handoff', help='停机后导出配置与模拟执行账本的一致性副本')
-    handoff.add_argument('--root', type=Path, required=True)
-    handoff.add_argument('--output', type=Path, required=True)
     schedule = runtime_actions.add_parser('schedule', help='由无界面运行时等待已授权的定时策略启动')
     schedule.add_argument('--root', type=Path, required=True)
     schedule.add_argument('--account')
@@ -118,6 +115,7 @@ def main(argv=None):
     runtime_view.add_argument('--account-key', required=True)
     runtime_view.add_argument('--root', type=Path, required=True)
     runtime_view.add_argument('--ledger', type=Path, required=True)
+    runtime_view.add_argument('--history', type=Path, required=True)
     qpro=commands.add_parser('qpro-history',help='从本机快期专业版查询历史成交，仅用于对照')
     for field in ('company','client-id','start-day','end-day'):qpro.add_argument('--'+field,required=True)
     qpro.add_argument('--port',type=int,default=8815)
@@ -255,7 +253,7 @@ def main(argv=None):
             return run_cli(args)
         if args.action=='runtime-view-process':
             from online_trader.runtime.view_process import serve
-            return serve(args.pipe, args.account_key, args.root, args.ledger)
+            return serve(args.pipe, args.account_key, args.root, args.ledger, args.history)
         if args.action=='qpro-history':
             from online_trader.configuration.files import publish_new_bytes
             from online_trader.gateway.qpro_history import query_trades

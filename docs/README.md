@@ -6,6 +6,12 @@
 
 - [当前功能状态与开放问题](功能实现与待办清单_20261110.md)
 - [Standalone Trading Runtime 设计](refactor/standalone-trading-runtime-20261119.md)
+- [Runtime / Workbench 架构收敛与安全改造计划](refactor/runtime-architecture-hardening-plan-20261120.md)
+  - [执行路径与 Ledger Lineage 事实矩阵](refactor/runtime-execution-ledger-lineage-20261120.md)
+  - [Workbench 本机命令安全合同](refactor/runtime-workbench-security-contract-20261120.md)
+  - [CommandBus 持久化与失败合同](refactor/runtime-command-bus-contract-20261120.md)
+  - [Desktop Bootstrap 与生命周期合同](refactor/runtime-bootstrap-lifecycle-contract-20261120.md)
+  - [ConfigSnapshot 与逻辑通道合同](refactor/runtime-config-snapshot-contract-20261120.md)
 - [Trading Workbench Client/View 重构计划](refactor/trading-workbench-client-refactor-20261119.md)
 - [Runtime 运维、配置与账本](runtime-operations-and-storage-20261119.md)
 - [Runtime 测试入口迁移](refactor/standalone-trading-runtime-test-migration-20261119.md)

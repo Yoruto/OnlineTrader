@@ -28,6 +28,7 @@ from online_trader.scheduling.reference import CalibratedClock, LocalWallClock, 
 from online_trader.scheduling.clock import quote_age_quality, source_age_ns
 from online_trader.runtime.comparison import ComparisonRecorder, verify_dsv_profile
 from online_trader.runtime.strategy_log import DsvEntryLog
+from online_trader.runtime.account_cache import BrokerHistoryWriter
 
 
 class NativeReferenceClock:
@@ -51,7 +52,8 @@ class DsvSimulationSession(SimulationSession):
             self.kernel._dsv_diagnostics['status'] = 'E_SESSION_STATUS_WRITE'
             self._status_signature = None
 
-    def __init__(self,kernel,output,*,profile,calendar,clock=None,emit=None,dsv_config=None,dsv_log_dir=None,entry_point=None):
+    def __init__(self,kernel,output,*,profile,calendar,clock=None,emit=None,dsv_config=None,dsv_log_dir=None,
+                 entry_point=None,history_cache=None,configured_store=None):
         if not getattr(kernel.simulation,'strategy_enabled',False):
             raise TraderError('E_ONLINE_SCOPE','A manual simulation owner cannot activate the DSV runtime')
         if profile.content_hash!=kernel.simulation.grant.value['profile_hash'] or calendar.content_hash!=kernel.simulation.grant.value['calendar_hash']:
@@ -82,7 +84,8 @@ class DsvSimulationSession(SimulationSession):
         self.driver.activate();kernel.wait_idle()
         self.feed=DsvFactFeed(self.port,profile,calendar);self.last_decisions={};self._primed=False
         self.comparison = None
-        self.driver.strategy.on_parameters_saved = self._update_feed_parameters
+        self._configured_store = configured_store
+        self.driver.strategy.on_parameters_saved = self._parameters_saved
         profile = self.driver.strategy.profile
         self._update_feed_parameters(profile)
         scoped = set(self.grant.value['contracts'])
@@ -110,6 +113,13 @@ class DsvSimulationSession(SimulationSession):
         self._latency_written_ns = 0
         self.owner.manual_native_facts=self.feed.facts
         self._last_funds_capture=0
+        self._history_writer = None
+        if history_cache is not None:
+            try:
+                self._history_writer = BrokerHistoryWriter(
+                    history_cache, kernel.account_key, self.grant.provider, on_error=self._history_cache_failed)
+            except Exception as error:
+                self._history_cache_failed(error)
         self._source_epoch=self.port.source_epoch
         self._arm_request_revision=None
         self._entry_resume = None
@@ -154,6 +164,14 @@ class DsvSimulationSession(SimulationSession):
         self.feed._continuation_seconds = self.driver.strategy._continuation_seconds
         if self.comparison is not None:
             self.comparison.update_profile(profile)
+
+    def _parameters_saved(self, profile):
+        if self._configured_store is not None:
+            self._configured_store.save_profile(profile)
+        self._update_feed_parameters(profile)
+
+    def _history_cache_failed(self, error):
+        self.kernel._dsv_diagnostics['account_history_cache'] = getattr(error, 'code', 'E_HISTORY_CACHE_WRITE')
 
     def _register_operation_log(self):
         # This binding uses the original writer to locate the diagnostics
@@ -261,6 +279,8 @@ class DsvSimulationSession(SimulationSession):
             self._comparison('poll')
             self._comparison('close')
         finally:
+            if self._history_writer is not None:
+                self._history_writer.close()
             if self._quote_trace is not None:
                 self._quote_trace.close()
 
@@ -987,7 +1007,10 @@ class DsvSimulationSession(SimulationSession):
                 if late:self._extend_late_path(code,late)
             self.driver.poll();k.wait_idle();self.owner.tick();k.wait_idle()
             if time.monotonic()-self._last_funds_capture>=10:
-                self.owner.capture('ONLINE_DSV_ACCOUNT_REFRESH',{'snapshot':self.port.snapshot()})
+                snapshot = self.port.snapshot()
+                self.owner.capture('ONLINE_DSV_ACCOUNT_REFRESH',{'snapshot':snapshot})
+                if self._history_writer is not None:
+                    self._history_writer.offer(snapshot)
                 self._last_funds_capture=time.monotonic()
             if expired:
                 self._entry_resume = None
@@ -1084,16 +1107,19 @@ class DsvSimulationSession(SimulationSession):
 
 
 def run(scope,credentials,profile_path,calendar_path,output,*,pipe=None,arm=False,dsv_config=None,dsv_log_dir=None,
-        _execution_lock=None,_reference=None,_existing_ledger=False,_trusted_control_pid=None):
+        _execution_lock=None,_reference=None,_existing_ledger=False,_trusted_control_pid=None,
+        _history_cache=None,_configured_store=None):
     """Future explicitly scoped connection path. Offline tests never call it."""
     with ClockActivity():
         return _run(scope, credentials, profile_path, calendar_path, output, pipe=pipe, arm=arm,
                     dsv_config=dsv_config, dsv_log_dir=dsv_log_dir, _execution_lock=_execution_lock,
-                    _reference=_reference, _existing_ledger=_existing_ledger, _trusted_control_pid=_trusted_control_pid)
+                    _reference=_reference, _existing_ledger=_existing_ledger, _trusted_control_pid=_trusted_control_pid,
+                    _history_cache=_history_cache, _configured_store=_configured_store)
 
 
 def _run(scope, credentials, profile_path, calendar_path, output, *, pipe, arm, dsv_config, dsv_log_dir,
-         _execution_lock, _reference, _existing_ledger=False, _trusted_control_pid=None):
+         _execution_lock, _reference, _existing_ledger=False, _trusted_control_pid=None,
+         _history_cache=None, _configured_store=None):
     grant,profile,calendar=load_inputs(scope,profile_path,calendar_path)
     if grant.replacement:
         raise TraderError('E_ONLINE_SCOPE','A replacement grant requires the replacement SDK startup')
@@ -1145,7 +1171,8 @@ def _run(scope, credentials, profile_path, calendar_path, output, *, pipe, arm, 
                 'restored_original_calculation':restored is not None,'existing_plans_changed':False})
         restoring=any(not kernel.simulation.archived_cycle(cycle) for cycle in kernel._staged.values())
         session=DsvSimulationSession(kernel,output,profile=profile,calendar=calendar,dsv_config=dsv_config,
-                                     dsv_log_dir=dsv_log_dir,entry_point='desktop-start' if _execution_lock is not None else None)
+                                     dsv_log_dir=dsv_log_dir,entry_point='desktop-start' if _execution_lock is not None else None,
+                                     history_cache=_history_cache,configured_store=_configured_store)
         session._poll_clock_diagnostic()
         session.prime()
         reference.end_turn()

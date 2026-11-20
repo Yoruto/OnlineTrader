@@ -7,7 +7,7 @@ Preserve existing work; do not import V7, vnpy, DSV, their credentials, database
 
 - 未明确指定执行路径时，OnlineTrader 的启动、重启、用户验收、测试候选和打包默认采用 **Standalone Trading Runtime**。普通用户从 `online-trader-desktop --runtime-root <目录>`（配置便携版直接双击 `OnlineTrader.exe`）进入；统一桌面入口先附着已有 Runtime，缺失时以 `DISARMED` 启动 Owner，再打开同一个 `WorkbenchWindow` / `WorkbenchLayout`。`runtime run`、`runtime schedule` 和 `--runtime-pipe` 保留为运维、无人值守及高级附着入口；不要另建或交付第二套界面。
 - 默认 Runtime 路径不授予账号连接、订单操作、测试或打包权限；这些动作仍按本次用户授权执行。用户明确要求 Legacy 维护、replacement candidate 或 isolated QA 时，才切换相应路径，并在报告中标明。
-- 默认打包目标是可实际运行的 Runtime 完整交付单元，不是仅含普通工作台的 Legacy 包。除通用便携依赖外，按接收方带齐 Runtime 配置、操作员授权和已初始化账户所需的原账本；从最终 ZIP/安装器按双击 `OnlineTrader.exe` 的统一 Runtime 入口独立验收，并另外保留 `runtime run`/`runtime schedule` 与 `--runtime-pipe` 运维入口核对。
+- 默认打包目标是可实际运行的 Runtime 完整交付单元，不是仅含普通工作台的 Legacy 包。除通用便携依赖外，按接收方带齐 Runtime 配置和操作员授权；执行账本不属于交付状态，历史缓存可由期货账户重新下载。从最终 ZIP/安装器按双击 `OnlineTrader.exe` 的统一 Runtime 入口独立验收，并另外保留 `runtime run`/`runtime schedule` 与 `--runtime-pipe` 运维入口核对。
 
 ## 所有软件制品必须随包交付配置
 
@@ -35,7 +35,7 @@ Keep the explicit controller's per-child pre-send durability and the existing cu
 | Path | Entry points and owner | Applicable contract |
 | --- | --- | --- |
 | Legacy, not yet retired; explicit maintenance only | `simulation run`, `dsv run`, `simnow run`, and the ordinary workbench's existing launch route | Preserve the original Kernel owner and that route's recovery contract until approved cutover. Do not select this as the default launch or package path. |
-| Standalone Trading Runtime; default | `online-trader-desktop --runtime-root`, packaged `OnlineTrader.exe`, `runtime run`, `runtime schedule`, `runtime command`, attached status/account/history and runtime Workbench | Unified desktop bootstrap may discover/start a DISARMED Owner but never becomes the sender. Reuse the original Kernel/SQLite execution owner through portable configuration. Qt and runtime-view are read/control-side processes. Follow [runtime operations and storage](docs/runtime-operations-and-storage-20261119.md). |
+| Standalone Trading Runtime; default | `online-trader-desktop --runtime-root`, packaged `OnlineTrader.exe`, `runtime run`, `runtime schedule`, `runtime command`, attached status/account/history and runtime Workbench | One Windows host has at most one Runtime; other hosts are not mutually excluded, including when they use the same futures account. Each boot uses a process-owned temporary Kernel/SQLite execution store and synchronizes current facts from the broker. Qt and runtime-view are read/control-side processes. Follow [the current authority design](docs/refactor/runtime-broker-authority-single-instance-20261120.md). |
 | Replacement candidate | `dsv replacement-run`, `simnow replacement-run` | `DsvSession` + `ExplicitOrderController` + `Journal` + `DsvSdkAdapter`; share the compatible account lock, not the legacy Kernel sender. See [candidate startup](docs/refactor/dsv-parity-20261114/10-sdk-startup-and-same-day-rollback.md). |
 | Isolated QA | `offline-dsv` and `qa/dsv_parity/` replay tools | DEV/OFFLINE fixtures or locally bounded SDK replay; no real account connection or order authority. |
 
@@ -63,13 +63,13 @@ One owner controls state and one writer controls SQLite. Commit required facts b
 unknown sends reserve capacity and require reconciliation. GUI/strategy lifetime cannot delete
 protection. All exits share one remaining target; cancellation requests do not release quantity.
 
-For the standalone Trading Runtime, treat portable configuration and the original per-account
-SQLite ledger as different but co-required state once an account has been initialized. Configuration
-contains editable future intent (account selection, credentials, strategy parameters, operator grants
-and `runtime-control.json`); the ledger contains durable executed facts and recovery responsibility.
-Do not replace a missing initialized ledger with a fresh database, delete WAL to make a read pass,
-or move SDK/order/protection work out of the single execution owner merely to reduce UI load.
-Display caches and runtime-view logs are disposable; they must never become trading authority.
+For the standalone Trading Runtime, the futures account is authoritative for positions, orders,
+trades, funds and returns. Enforce one Runtime per Windows host with a machine-local lock, but do
+not use local files or locks to exclude another computer using the same account. Each boot creates
+a fresh process-owned execution ledger and synchronizes broker facts; it is deleted when that boot
+ends and is never handed off. Persist only version defaults plus user configuration overrides and a
+rebuildable broker-history/return cache. Existing old execution ledgers remain read-only historical
+artifacts and never block startup. Do not move SDK/order/protection work out of the single owner.
 
 External statement comparison is read only. Reviewed fee registration is confined to the existing
 ONLINE_SIM/development ledger while the execution owner is closed, all owned cycles are flat/closed

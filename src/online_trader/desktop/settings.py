@@ -26,7 +26,7 @@ _TRADE_LABELS = {
     "entry_slip_abort": "成交滑点退出", "entry_slip_abort_ratio": "成交滑点退出比例",
     "entry_slip_abort_stop_day": "滑点退出后日停", "half_close_enabled": "半仓减仓",
     "cont_stop_day_stop": "延续开止损后日停", "continuation_entry": "延续开",
-    "continuation_ignore_no_open": "延续开豁免开盘等待", "no_chase_after_act": "跑过激活位后禁开",
+    "continuation_ignore_no_open": "延续开豁免开盘等待", "no_chase_after_act": "行情越过不追价线后禁开",
     "manual_close_day_stop": "人工平仓后日停", "tick_diag": "逐行情诊断",
     "risk_per_trade_ratio": "单笔风险比例", "stale_force_close_seconds": "断流退出参数（秒）",
     "stale_close_day_stop": "断流退出后日停", "aggressive_mode": "激进模式",

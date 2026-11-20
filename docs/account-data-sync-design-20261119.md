@@ -1,5 +1,7 @@
 # OnlineTrader 账号数据同步逻辑设计
 
+> **2026-11-20 规则变更：** 期货账户是资金、持仓、委托、成交、交易历史和收益的权威来源。Standalone Runtime 的执行 SQLite 仅属于本次进程，不跨重启或设备恢复；本地只长期保存可由柜台重新下载的历史/收益缓存。涉及原账本恢复或 handoff 的旧段落由[本机单实例与柜台权威设计](refactor/runtime-broker-authority-single-instance-20261120.md)取代。
+
 2026-11-19 · Trading Runtime 实施说明 · 源码基线 `10b915fa23f33860712ec491a7aa74d015c46203`（dev36，合入 F5 时钟和行情稳定性修改）。
 
 ## 2026-11-19：单账本与 Workbench 历史接入修复
