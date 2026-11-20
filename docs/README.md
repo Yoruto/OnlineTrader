@@ -7,6 +7,7 @@
 - [当前功能状态与开放问题](功能实现与待办清单_20261110.md)
 - [Standalone Trading Runtime 设计](refactor/standalone-trading-runtime-20261119.md)
 - [Trading Workbench Client/View 重构计划](refactor/trading-workbench-client-refactor-20261119.md)
+- [桌面操作习惯与安全退出改造方案（保留当前界面）](refactor/desktop-lifecycle-user-flow-20261120.md)
 - [Runtime 运维、配置与账本](runtime-operations-and-storage-20261119.md)
 - [Runtime 测试入口迁移](refactor/standalone-trading-runtime-test-migration-20261119.md)
 - [账户数据同步与查询](account-data-sync-design-20261119.md)
