@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from online_trader.errors import TraderError
 from online_trader.kernel.server import ControlServer
-from online_trader.runtime.operator_api import RuntimeCommandClient
+from online_trader.runtime.operator_api import RuntimeWorkbenchClient
 from online_trader.runtime.view_process import ViewProcess
 from online_trader.transport.runtime_account import RuntimeAccountClient
 from online_trader.transport.runtime_view import RuntimeViewClient
@@ -39,7 +39,6 @@ def wait_view(client, predicate, deadline):
 def replay(case, output):
     account = case.account_key
     pipe = 'OnlineTrader.RuntimeReplay.' + uuid4().hex
-    operator, token = case.operator({'MANUAL_CLOSE'})
     more_fills = Event()
     stop = Event()
     observations = {}
@@ -81,20 +80,19 @@ def replay(case, output):
                        'binding': {'account_key': holding['account_key'],
                                    'kernel_boot_id': holding['kernel_boot_id'],
                                    'config_revision': holding['configuration']['config_revision']}}
-            client = RuntimeCommandClient(pipe)
-            observations['authentication'] = client.authenticate(operator=operator, token=token)
-            observations['submit'] = client.request('submit', command, operator=operator, token=token)
+            client = RuntimeWorkbenchClient(pipe)
+            observations['control_channel'] = 'SAME_USER_WORKBENCH'
+            observations['submit'] = client.request('submit', command)
             closed = wait_view(view_client, lambda view: any(
                 c['position_cycle_id'] == cycle_id and c['remaining_quantity'] == 0 for c in view['cycles']), deadline)
             observations['close_seq'] = closed['checkpoint_event_seq']
-            observations['receipt'] = client.request(
-                'receipt', {'command_id': 'qa-close-five'}, operator=operator, token=token)
+            observations['receipt'] = client.request('receipt', {'command_id': 'qa-close-five'})
             if observations['receipt']['status'] != 'SUCCEEDED':
                 raise AssertionError('The close did not reach a proved terminal receipt')
-            observations['duplicate'] = client.request('submit', command, operator=operator, token=token)
+            observations['duplicate'] = client.request('submit', command)
             conflict = command | {'parameters': command['parameters'] | {'quantity': 4}}
             try:
-                client.request('submit', conflict, operator=operator, token=token)
+                client.request('submit', conflict)
             except TraderError as error:
                 observations['duplicate_conflict'] = error.code
             if observations.get('duplicate_conflict') != 'E_DUPLICATE_CONFLICT':

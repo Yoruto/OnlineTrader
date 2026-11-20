@@ -26,6 +26,8 @@ class OrderState:
     native_offset: str | None = None
     native_trading_day: str | None = None
     close_route: dict | None = None
+    pricing_quote_id: str | int | None = None
+    pricing_source_epoch: int | None = None
 
     @property
     def potential_remaining(self) -> int:
@@ -41,6 +43,8 @@ class OrderState:
         if self.native_offset is None:value.pop('native_offset')
         if self.native_trading_day is None:value.pop('native_trading_day')
         if self.close_route is None:value.pop('close_route')
+        if self.pricing_quote_id is None:value.pop('pricing_quote_id')
+        if self.pricing_source_epoch is None:value.pop('pricing_source_epoch')
         return value
 
     @classmethod

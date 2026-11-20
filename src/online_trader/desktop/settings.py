@@ -140,7 +140,8 @@ class SettingsDialog(QDialog):
     templates_changed = Signal()
     template_directory_changed = Signal(str)
 
-    def __init__(self, parent=None, *, baseline_loader=None, contract_catalog=(), contract_catalog_loader=None):
+    def __init__(self, parent=None, *, baseline_loader=None, contract_catalog=(), contract_catalog_loader=None,
+                 manual_only=False):
         super().__init__(parent)
         self._baseline, self._manifest = (baseline_loader or _default_baseline)()
         self._profile = self._baseline
@@ -148,6 +149,7 @@ class SettingsDialog(QDialog):
         self._template_snapshot = None
         self._contract_catalog = tuple(dict.fromkeys(contract_catalog or ()))
         self._contract_catalog_loader = contract_catalog_loader
+        self._manual_only = manual_only
         self._symbol_editor = None
         self.setWindowTitle("OnlineTrader · DSV参数中心")
         self.resize(1160, 760)
@@ -252,7 +254,9 @@ class SettingsDialog(QDialog):
             " · 触发价更新：" + _display(t["require_trigger_update"]) +
             " · 延续开豁免等待：" + _display(t["continuation_ignore_no_open"]))
         flat, base = _flatten(current), _flatten(baseline)
-        parameter_paths = sorted(path for path in flat.keys() | base.keys() if not path.startswith("symbols["))
+        parameter_paths = sorted(path for path in flat.keys() | base.keys() if not path.startswith("symbols[")
+                                 and not (self._manual_only and (path.startswith('schedule.')
+                                          or path == 'trade.auto_start_on_launch')))
         self.parameters_table.setRowCount(len(parameter_paths))
         for row, path in enumerate(parameter_paths):
             before, after = base.get(path, _MISSING), flat.get(path, _MISSING)
@@ -356,7 +360,7 @@ class SettingsDialog(QDialog):
             dialog.start_catalog_load()
         else:
             from online_trader.desktop.editor import ParameterEditorDialog
-            dialog = ParameterEditorDialog(self._profile, self)
+            dialog = ParameterEditorDialog(self._profile, self, manual_only=self._manual_only)
         try:
             if dialog.exec() == QDialog.Accepted:
                 return self.apply_edited_preview(dialog.result_profile, expected_hash=dialog.base_hash)

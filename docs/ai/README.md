@@ -7,7 +7,7 @@
 1. 先读仓库根目录 `AGENTS.md`，确定本次授权和默认执行路径。
 2. 在 `architecture-status.yaml` 中按 `path + scope` 查找当前合同；同一文件可以在不同作用域有不同状态。
 3. 用 `module-boundaries.yaml` 定位实际入口和状态所有者，再以当前源码核实。
-4. Runtime、Workbench 或 DSV 任务按需加载 `.agents/skills/` 中的项目 Skill。
+4. Runtime、Workbench 或 DSV 任务按需加载 `.agents/skills/` 中的项目 Skill；Runtime/Workbench 当前总览是 `../refactor/runtime-workbench-current-20261120.md`。
 5. 文档与源码冲突时报告 `CONFLICT / NEEDS_REVIEW`，不能静默选择旧结论。
 
 ## 文件职责

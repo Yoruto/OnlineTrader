@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from online_trader import __version__
 from online_trader.configuration.baseline import default_preview_profile
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.files import load_profile, publish_new_bytes
@@ -97,7 +98,10 @@ CLOCK_PROTECTION_REASONS = {
     'RECONCILIATION_REQUIRED': '持仓及原委托待核对',
     'E_UNKNOWN_SEND': '报单或撤单结果待确认',
     'E_NATIVE_QUOTE_NOT_CURRENT': '等待同盘次有效的原生报价',
-    'E_OWNERSHIP': '柜台持仓、委托或今昨仓待核对',
+    'E_OWNERSHIP': '原订单身份待核对',
+    'E_POSITION_MISMATCH': '柜台持仓与 Runtime 已证持仓不一致',
+    'E_FOREIGN_ACTIVE_ORDER': '当前合约存在外部活动委托',
+    'E_EXIT_ROUTE_CHANGED': '平今平昨或可用持仓桶已变化',
     'E_FACT_BARRIER': '柜台委托及逐笔成交待核对',
 }
 
@@ -155,6 +159,7 @@ QWidget#workspacePage, QScrollArea#workbenchScroll, QTabWidget::pane {
 }
 QFrame#workspaceTop { background: #fafdff; border-bottom: 1px solid #d7e1ef; }
 QLabel#brand { color: #111d30; font-size: 22px; font-weight: 700; padding-right: 10px; }
+QLabel#brandVersion { color: #66778d; font-size: 12px; padding-right: 8px; }
 QLabel#topStatus { font-size: 13px; color: #314057; padding-right: 7px; }
 QLabel#workspaceTitle { font-size: 26px; font-weight: 700; color: #101a2b; padding: 1px 0 5px; }
 
@@ -757,7 +762,7 @@ class WorkbenchLayout:
         original = window.takeCentralWidget()
         for widget in (window.connection_label, window.account_label, window.kernel_label,
                        window.funds_label, window.notice_label, window.cycles, window.refresh_button,
-                       window.pause_button, window.settings_button, window.reports_button):
+                       window.pause_button):
             widget.setParent(window)
         original.deleteLater()
         panel = QWidget()
@@ -912,6 +917,9 @@ class WorkbenchLayout:
         bar.setSpacing(8)
         brand = QLabel('OnlineTrader', objectName='brand')
         bar.addWidget(brand)
+        version = QLabel(f'v{__version__}', objectName='brandVersion')
+        version.setToolTip(f'OnlineTrader {__version__}')
+        bar.addWidget(version)
         self.toolbar_account = QPushButton('账户 · —', objectName='workspaceAccount')
         self.toolbar_account.clicked.connect(self.show_account_settings)
         bar.addWidget(self.toolbar_account)
@@ -953,7 +961,8 @@ class WorkbenchLayout:
         if self.window._settings_dialog is None:
             dialog = SettingsDialog(self.window, baseline_loader=lambda: (
                 self.profile, {'rule_set_id': self.profile_source}),
-                contract_catalog=self.manual_catalog, contract_catalog_loader=self.load_manual_catalog)
+                contract_catalog=self.manual_catalog, contract_catalog_loader=self.load_manual_catalog,
+                manual_only=self.window._runtime_mode)
             self.window._settings_dialog = dialog
             dialog.preview_changed.connect(self.render_parameters)
             dialog.templates_changed.connect(self.reload_template_picker)
@@ -1864,7 +1873,10 @@ class WorkbenchLayout:
                 status = '平仓待成交' if messages and all('待成交' in item for item in messages) else '平仓待确认'
                 if not messages:
                     wait_label = {'EXIT_WAITING_FOR_SESSION': '退出已登记，等待交易时段',
-                                  'EXIT_WAITING_FOR_PRICE': '退出已登记，等待有效报价'}.get(cycle.get('exit_wait_reason'))
+                                  'EXIT_WAITING_FOR_PRICE': '退出已登记，等待有效报价',
+                                  'EXIT_RETRY_SCHEDULED': '退出目标保留，等待安全重报',
+                                  'EXIT_RECONCILING': '退出数量已保留，正在核对原委托',
+                                  'EXIT_MANUAL_INTERVENTION_REQUIRED': '退出目标未完成，需要人工接管核对'}.get(cycle.get('exit_wait_reason'))
                     pending.append(f'{code} {wait_label or status}')
             elif (cycle.get('quality') != 'CONTIGUOUS' or connection.get('recovery_required')
                   or (cycle.get('close_route_review') or {}).get('status') == 'BLOCKED'):
@@ -1917,6 +1929,8 @@ class WorkbenchLayout:
         switches = QGridLayout()
         self.parameter_switches = {}
         for index, (key, label) in enumerate(TRADE_SWITCHES):
+            if self.window._runtime_mode and key == 'auto_start_on_launch':
+                continue
             check = QCheckBox(label)
             check.setChecked(settings['trade'][key])
             check.setAttribute(Qt.WA_TransparentForMouseEvents)
@@ -1924,15 +1938,19 @@ class WorkbenchLayout:
             self.parameter_switches[key] = check
             switches.addWidget(check, index//4, index%4)
         fields.addLayout(switches)
-        schedule = group('DSV 定时参数', fields)
-        data = settings['schedule']
-        self.schedule_enabled = QLabel('启用' if data['enabled'] else '关闭')
-        self.schedule_fields = {key:self.read_value(data[key]) for key in ('night_start_time','day_start_time','catch_up_minutes')}
-        schedule.addLayout(row(self.schedule_enabled,QLabel('夜盘'),self.schedule_fields['night_start_time'],
-            QLabel('日盘'),self.schedule_fields['day_start_time'],QLabel('补启动分钟'),self.schedule_fields['catch_up_minutes']))
-        self.timed_start_button = button('安排定时启动', self.window.arrange_timed_start)
-        if self.window.store is not None and self.paired is None:
-            schedule.addWidget(self.timed_start_button)
+        self.schedule_enabled = None
+        self.schedule_fields = {}
+        self.timed_start_button = None
+        if not self.window._runtime_mode:
+            schedule = group('DSV 定时参数', fields)
+            data = settings['schedule']
+            self.schedule_enabled = QLabel('启用' if data['enabled'] else '关闭')
+            self.schedule_fields = {key:self.read_value(data[key]) for key in ('night_start_time','day_start_time','catch_up_minutes')}
+            schedule.addLayout(row(self.schedule_enabled,QLabel('夜盘'),self.schedule_fields['night_start_time'],
+                QLabel('日盘'),self.schedule_fields['day_start_time'],QLabel('补启动分钟'),self.schedule_fields['catch_up_minutes']))
+            self.timed_start_button = button('安排定时启动', self.window.arrange_timed_start)
+            if self.window.store is not None and self.paired is None:
+                schedule.addWidget(self.timed_start_button)
 
         strategy_save = button('保存参数', self.export_parameters_preview)
         self.parameter_save_buttons.append(strategy_save)
@@ -1990,7 +2008,8 @@ class WorkbenchLayout:
             field.setText(str(settings['trade'][key]))
         for key,check in self.parameter_switches.items():
             check.setChecked(settings['trade'][key])
-        self.schedule_enabled.setText('启用' if settings['schedule']['enabled'] else '关闭')
+        if self.schedule_enabled is not None:
+            self.schedule_enabled.setText('启用' if settings['schedule']['enabled'] else '关闭')
         for key,field in self.schedule_fields.items():
             field.setText(str(settings['schedule'][key]))
         populate(self.symbol_grid,[[s['name'],s['code'],'—','到期日未取到（可不换月）',s.get('code_new') or '—',s['open_offset'],s['stop_offset'],
@@ -3876,8 +3895,18 @@ class WorkbenchLayout:
         for cycle in view['cycles']:
             target = cycle.get('target_remaining_quantity')
             if cycle.get('exit_pending',target is not None and target<cycle['remaining_quantity']):
-                status = ' · 委托已终态，剩余目标待核对' if cycle['position_cycle_id'] in failed_exits else ''
+                responsibility = (cycle.get('exit_responsibility') or {}).get('state')
+                labels = {'WAIT_QUOTE':' · 等待有效报价', 'RETRY_SCHEDULED':' · 等待安全重报',
+                          'BROKER_WORKING':' · 柜台委托处理中', 'RECONCILING':' · 核对原委托中',
+                          'MANUAL_INTERVENTION_REQUIRED':' · 需要人工接管核对'}
+                status = (' · 委托已终态，剩余目标待核对'
+                          if cycle['position_cycle_id'] in failed_exits else labels.get(responsibility, ''))
                 pending.append(f"● {cycle['contract_id']}  剩余 {cycle['remaining_quantity']} 手{status}")
+            intent = cycle.get('entry_intent') or {}
+            if not cycle.get('remaining_quantity') and intent.get('status') in {'ACTIVE','RECONCILING'}:
+                label = ('原开仓意图待柜台核对' if intent['status'] == 'RECONCILING'
+                         else '原开仓意图有效，等待最新合法报价')
+                pending.append(f"● {cycle['contract_id']}  {label}")
         for label, lines in zip(self.status_labels,(waiting,blocked,pending)):
             label.setText('\n'.join(lines) or '（无）')
         fresh = sum(status == '新鲜' for status in quote_states.values())

@@ -5,8 +5,8 @@ from pathlib import Path
 
 from online_trader.accounts import AccountStore, account_identity
 from online_trader.configuration.dsv import DsvProfile
-from online_trader.configuration.files import load_profile, publish_new_bytes, publish_replace_bytes
-from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
+from online_trader.configuration.files import load_profile, publish_replace_bytes
+from online_trader.contracts.codec import content_hash, strict_loads
 from online_trader.domain.values import identifier
 from online_trader.errors import TraderError
 from online_trader.ledger.store import Ledger
@@ -17,14 +17,8 @@ _ACCOUNT_FIELDS = {'id', 'alias', 'provider', 'broker', 'line'}
 _PROVIDERS = {'TQKQ', 'TQ_SIMNOW'}
 _KQ_FIELDS = {'username', 'password'}
 _SIMNOW_FIELDS = {'simnow_username', 'simnow_password', 'kq_username', 'kq_password'}
-_RUNTIME_CONTROL_FILE = 'runtime-control.json'
-_RUNTIME_CONTROL_SCHEMA = 'ONLINE_TRADER_RUNTIME_CONTROL/1'
 _OVERRIDES_FILE = 'OnlineTrader-overrides.json'
 _OVERRIDES_SCHEMA = 'ONLINE_TRADER_PARAMETER_OVERRIDES/1'
-_DEFAULT_RUNTIME_CONTROL = {
-    'schema_version': _RUNTIME_CONTROL_SCHEMA,
-    'scheduled_start': {'enabled': False},
-}
 
 
 def _read(root, name):
@@ -39,35 +33,6 @@ def _read(root, name):
         return strict_loads(raw.decode('utf-8-sig'))
     except (OSError, ValueError):
         raise TraderError('E_RUNTIME_CONFIG', f'Cannot read a valid {name}') from None
-
-
-def read_runtime_control(root):
-    """Read the hot-reloadable supervisor gate; durable trading facts stay in SQLite."""
-    value = _read(Path(root).resolve(), _RUNTIME_CONTROL_FILE)
-    try:
-        scheduled = value['scheduled_start']
-        if (type(value) is not dict or value.keys() != {'schema_version', 'scheduled_start'}
-                or value['schema_version'] != _RUNTIME_CONTROL_SCHEMA or type(scheduled) is not dict
-                or scheduled.keys() != {'enabled'} or type(scheduled['enabled']) is not bool):
-            raise ValueError()
-    except (KeyError, TypeError, ValueError):
-        raise TraderError('E_RUNTIME_CONFIG', 'The runtime control configuration is invalid') from None
-    return value
-
-
-def ensure_runtime_control(root):
-    """Create the safe disabled supervisor gate when configuration lacks it."""
-    directory = Path(root).resolve()
-    path = (directory / _RUNTIME_CONTROL_FILE).resolve()
-    if not path.is_relative_to(directory):
-        raise TraderError('E_RUNTIME_CONFIG', 'runtime-control.json must resolve inside the runtime directory')
-    if not path.exists():
-        try:
-            publish_new_bytes(canonical_bytes(_DEFAULT_RUNTIME_CONTROL), path)
-        except TraderError as error:
-            if error.code != 'E_DUPLICATE_CONFLICT':
-                raise TraderError('E_RUNTIME_CONFIG', 'Cannot create the default runtime control configuration') from None
-    return read_runtime_control(directory)
 
 
 class _ConfiguredCredentials:
@@ -147,9 +112,6 @@ class PortableAccountStore(AccountStore):
         raise TraderError('E_RUNTIME_CONFIG', 'Edit the runtime account configuration through its local entry')
 
     save_credentials = forget_credentials = initialize_simulation_accounts = change
-
-    def runtime_control(self):
-        return read_runtime_control(self.directory)
 
     def profile(self):
         path = (self.directory / 'OnlineTrader-parameters.json').resolve()

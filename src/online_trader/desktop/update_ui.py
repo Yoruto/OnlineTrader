@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 
 from online_trader.errors import TraderError
 from online_trader.runtime.instance import AccountLock
-from online_trader.update_install import active_version, pending_candidate, settled_accounts
+from online_trader.update_install import active_version, pending_candidate, quiescent_installation
 from online_trader.updates import UpdateError, atomic_json, check_and_download
 
 
@@ -47,14 +47,6 @@ class ManagedUpdateController(QObject):
         self.timer = QTimer(self)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self._poll)
-        self.menu = window.menuBar().addMenu('软件更新')
-        self.check_action = self.menu.addAction('检查更新')
-        self.restart_action = self.menu.addAction('安全更新并重启')
-        self.restart_action.setEnabled(False)
-        self.status_action = self.menu.addAction('等待检查')
-        self.status_action.setEnabled(False)
-        self.check_action.triggered.connect(lambda: self.check_now())
-        self.restart_action.triggered.connect(lambda: self.restart_now())
         self._refresh_local_state()
         QTimer.singleShot(0, self.start_on_open)
 
@@ -91,10 +83,7 @@ class ManagedUpdateController(QObject):
         observed = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
         self.state = {'stage': stage, 'message': message, 'current': current,
                       'channel': channel, 'candidate': candidate, 'observed_at_utc': observed}
-        self.status_action.setText(message)
         self.window.statusBar().showMessage(message, 10000)
-        self.check_action.setEnabled(not self.running)
-        self.restart_action.setEnabled(not self.running and self._has_candidate())
         self.changed.emit(self.state.copy())
         if persist:
             try:
@@ -131,8 +120,6 @@ class ManagedUpdateController(QObject):
         if self.running:
             return
         self.running = True
-        self.check_action.setEnabled(False)
-        self.restart_action.setEnabled(False)
         checking = '正在后台检查并下载更新…'
         if self.deferred_notice:
             checking = f'{self.deferred_notice}；{checking}'
@@ -170,7 +157,6 @@ class ManagedUpdateController(QObject):
     def restart_now(self):
         candidate = self._candidate() if self._has_candidate() else None
         if candidate is None:
-            self.restart_action.setEnabled(False)
             return
         answer = QMessageBox.question(
             self.window, '安全更新并重启',
@@ -182,7 +168,7 @@ class ManagedUpdateController(QObject):
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            with settled_accounts(self.root):
+            with quiescent_installation(self.root):
                 self.request_restart()
         except (UpdateError, OSError, ValueError, KeyError, TypeError, TraderError) as error:
             message = str(error) if isinstance(error, (UpdateError, TraderError)) else '无法核对更新前的账户状态'
@@ -232,5 +218,5 @@ class ManagedUpdateController(QObject):
 
 
 def install_update_menu(window, root, request_restart):
-    """Compatibility entry for callers that only need the existing menu."""
+    """Compatibility entry for callers that construct the update controller directly."""
     return ManagedUpdateController(window, root, request_restart)

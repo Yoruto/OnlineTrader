@@ -6,17 +6,19 @@
 
 2026-11-20 的当前设计将普通模拟执行链封装为可脱离 Qt 启动的 **Trading Runtime**。同一台 Windows 电脑最多运行一个 Runtime；不同电脑之间不互斥，同一期货账户可按柜台规则同时登录和交易。运行时由 `Kernel` 和本次启动的临时 SQLite 执行库负责当前会话，启动后从期货账户同步资金、持仓、委托和成交；**Trading Workbench** 与本机接口进程只读取投影并提交命令。
 
-后续未特别指定路径的启动、重启、验收候选和打包统一以 Standalone Trading Runtime 为默认目标。普通用户运行 `online-trader-desktop --runtime-root <目录>`；Runtime 配置便携版直接双击 `OnlineTrader.exe`。统一入口先附着已有 Runtime，缺失时以 `DISARMED` 启动 Owner，取得权威投影后再打开与 dev 完全相同的交易工作台。`runtime run`/`runtime schedule` 与 `--runtime-pipe` 保留为运维、无人值守及高级附着入口。Legacy 普通入口只用于明确点名的旧路径维护；默认路径选择本身不授权连接账号、执行交易、运行测试或生成制品。
+后续未特别指定路径的启动、重启、验收候选和打包统一以 Standalone Trading Runtime 为默认目标。普通用户主动运行 `online-trader-desktop --runtime-root <目录>`；Runtime 配置便携版直接双击 `OnlineTrader.exe`。统一入口先附着已有 Runtime，缺失时以 `DISARMED` 启动 Owner，取得权威投影后再打开与 dev 完全相同的交易工作台。`runtime run` 与 `--runtime-pipe` 仅保留为运维及高级附着入口；CLI 不提供交易命令或无人值守调度。缺少 Runtime 配置时默认入口明确失败，不回落 Legacy。Legacy 只用于明确点名并显式指定入口的旧路径维护；默认路径选择本身不授权连接账号、执行交易、运行测试或生成制品。
 
-便携运行目录使用相对路径配置，不依赖 Windows 凭据库。每次 Runtime 启动创建进程所有的临时执行库，结束后删除，不进行换机交接，也不把旧 `ledger.db` 当成恢复权威。长期保留的是版本默认配置、用户覆盖配置，以及可从期货账户重新下载的交易历史与账户收益缓存。无人值守启动仍由 `runtime-control.json` 明确总开关。公开 CLI/Python 接口支持状态、账户、行情、命令、回执和柜台历史缓存查询。
+便携运行目录使用相对路径配置，不依赖 Windows 凭据库。每次 Runtime 启动创建进程所有的临时执行库，结束后删除，不进行换机交接，也不把旧 `ledger.db` 当成恢复权威。长期保留的是版本默认配置、用户覆盖配置，以及可从期货账户重新下载的交易历史与账户收益缓存。旧 `runtime-control.json`、`private/operators.json` 和 handoff 文件被忽略。公开 CLI/Python 接口只保留状态、账户、行情、历史及诊断读取；交易控制只走同一 Windows 用户的 Workbench 通道。
 
-Trading Workbench 使用受 Windows 本机身份边界约束的独立控制通道，不再在 Qt 中显示操作员 ID 或令牌。Runtime 可以核验连接进程的 Windows 身份，但不能据此证明命令来自真实用户的按钮点击；当前服务端边界还包含 `LocalSystem`。命令继续绑定账号、owner boot 和配置版本，14 项封闭操作白名单、Capability 与交易风险由 Runtime 逐次裁决；命令审计保留脱敏账号、actor、boot 及 peer PID/SID。超时只查询原 `command_id`，不自动重发。CLI、定时任务和受托工具继续使用操作员授权。当前源码候选已把加固后的 CommandBus 接入生产 Workbench，旧直连命令线程已退役。后续用户级产品测试统一从 Runtime CLI/API/Qt 入口执行；旧工作台直连 Kernel/ControlServer 的回放只保留为 Legacy 或组件回归，不能作为当前产品验收。 [架构收敛与安全改造计划](docs/refactor/runtime-architecture-hardening-plan-20261120.md) · [测试入口迁移与固定数据](docs/refactor/standalone-trading-runtime-test-migration-20261119.md)
+Trading Workbench 使用只接受启动用户 SID 的本机控制通道，不显示或读取操作员 ID、令牌，也不接受 `LocalSystem` 作为交互用户。命令继续绑定账号、owner boot 和配置版本，14 项封闭操作白名单、Capability 与交易风险由 Runtime 逐次裁决；命令审计保留脱敏账号、actor、boot 及 peer PID/SID。超时只查询原 `command_id`，不自动重发。当前源码候选已把加固后的 CommandBus 接入生产 Workbench，旧直连命令线程、委托操作员管道和旧 Qt 回执兼容均已退役。后续用户级产品测试统一从 Runtime CLI只读/API只读/Qt入口执行；旧工作台直连 Kernel/ControlServer 的回放只保留为 Legacy 或组件回归，不能作为当前产品验收。 [手动启动收口](docs/refactor/runtime-manual-only-cleanup-20261120.md) · [测试入口迁移与固定数据](docs/refactor/standalone-trading-runtime-test-migration-20261119.md)
 
 2026-11-20 的源码候选新增异步统一桌面引导和本机 Runtime 单实例锁：先附着，缺失时以 DISARMED 启动；跨电脑不使用本地账本或锁互斥。Runtime 客户端待处理命令只在当前 Workbench 进程内关联，重启后以 Runtime/柜台同步结果为准；参数保存为“版本默认值 + 用户覆盖值”。最新独立全量复测的旧候选结果为 `PASS 22 / FAIL 4 / BLOCKED 6 / NOT_RUN 6`；当前源码已针对 schema、历史缓存路由、Qt 账号显示和旧测试合同完成修正，但仅通过编译检查，独立复测、真实柜台和打包验收均为 `NOT_RUN`。[当前权威与单实例设计](docs/refactor/runtime-broker-authority-single-instance-20261120.md) · [复测缺陷修正记录](docs/refactor/runtime-full-retest-remediation-20261120.md)
 
+同日 P0 源码候选已经拆分策略信号、逻辑开仓 Intent、执行定价和 SDK 发送责任：正常行情更新不再要求旧候选报单价完全相等，明确未发送才允许沿原 Intent 重新定价，`UNKNOWN` 继续冻结数量；退出目标在报价变化、柜台拒单和路由变化后保留持续推进责任。该候选仅完成编译检查，自动交易仍被独立故障注入与真实 SimNow 自然开平仓闭环阻断。[P0 行情竞态与退出可靠性修正](docs/refactor/runtime-market-race-entry-exit-remediation-20261120.md)
+
 较早 Runtime 候选的离线定向自动化由独立测试 Agent 执行 69 项，69 PASS、0 FAIL、0 SKIP；范围覆盖当时的操作员协议、版本化视图、Workbench 直接提交、公共 IPC 账户读取/平仓/回执和受影响回归。该结果不适用于本次修正候选，不能据此报告完整产品通过。
 
-[完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [当前权威与单实例设计](docs/refactor/runtime-broker-authority-single-instance-20261120.md) · [复测缺陷修正记录](docs/refactor/runtime-full-retest-remediation-20261120.md) · [运维、配置与账本约定](docs/runtime-operations-and-storage-20261119.md) · [测试入口迁移](docs/refactor/standalone-trading-runtime-test-migration-20261119.md) · [实现与验收记录](docs/refactor/standalone-trading-runtime-acceptance-20261119.md)
+[当前 Workbench 合同总览](docs/refactor/runtime-workbench-current-20261120.md) · [完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [当前权威与单实例设计](docs/refactor/runtime-broker-authority-single-instance-20261120.md) · [复测缺陷修正记录](docs/refactor/runtime-full-retest-remediation-20261120.md) · [运维、配置与账本约定](docs/runtime-operations-and-storage-20261119.md) · [测试入口迁移](docs/refactor/standalone-trading-runtime-test-migration-20261119.md) · [实现与验收记录](docs/refactor/standalone-trading-runtime-acceptance-20261119.md)
 
 该入口当前只支持已验收的模拟账户范围，不表示 DSV replacement 链已经切换，也不表示真实资金账户或发行制品已验收。当前源码验收状态见[功能清单](docs/功能实现与待办清单_20261110.md)。
 
@@ -70,13 +72,13 @@ $env:PYTHONPATH = 'src'
 
 ## Windows 便携发行目录
 
-默认交付为 Runtime 完整便携目录/ZIP，而不是只含普通工作台的 Legacy 包。配置版除 EXE、共享 `_internal` 和必需脚本外，还须按接收方带齐 `runtime.json`、`runtime-control.json`、`OnlineTrader-parameters.json`、获准的私有账户/操作员配置，以及已初始化账户不可缺失的原账本。最终制品从双击 `OnlineTrader.exe` 的统一入口走到 Runtime Owner 与工作台，并另核对高级 `--runtime-pipe` 入口；未明确要求打包时不执行以下构建。
+默认交付为 Runtime 完整便携目录/ZIP，而不是只含普通工作台的 Legacy 包。配置版除 EXE、共享 `_internal` 和必需脚本外，还须按接收方带齐 `runtime.json`、`OnlineTrader-parameters.json` 和私有账户默认配置；不交付操作员授权、自动启动控制或执行账本。最终制品从双击 `OnlineTrader.exe` 的统一入口走到 Runtime Owner 与工作台，并另核对高级 `--runtime-pipe` 入口；未明确要求打包时不执行以下构建。
 
-便携构建须明确选用 `-DeliveryMode Generic` 或 `-DeliveryMode Configured`。同一次构建生成本地可直接启动的便携目录和分发用 ZIP，并输出 ZIP 的 SHA-256。`-Output` 指定便携目录，ZIP 默认生成在同级目录，可用 `-Archive` 指定其他位置。配置版用 `-DeliveryConfigDirectory` 提供已确认的账户和交易参数文件。
+正式便携构建只接受 `-DeliveryMode RuntimeConfigured`，并用 `-DeliveryConfigDirectory` 提供接收方已确认的完整 Runtime 配置。构建前执行快速门禁，正式发行使用干净 PyInstaller 工作目录，随后生成完整目录和 `*-Runtime-Configured.zip`。需要验证真实 EXE、但尚未获准正式出包时，使用 `scripts/build-test-portable.ps1` 生成带配置且显式标记为 `TEST-ONLY` 的目录；它复用受控 PyInstaller 缓存且不生成 ZIP。实现与边界见[测试与便携交付流水线](docs/refactor/testing-and-portable-delivery-pipeline-optimization-20261120.md)。
 
 安装版的 GitLab 更新入口、制品名称和发布步骤见[Windows 安装版与 GitLab 更新](docs/windows-gitlab-updates.md)。
 
-当前源码候选已把受管理更新接入默认 Runtime 工作台：「账户与设置 → 软件更新」显示当前版本、渠道和待安装版本，工作台启动后在后台检查并下载。下载不改变 Runtime 权限，也不停止策略；安装前由稳定启动器取得安装锁和全部账户锁，确认 Runtime 已退出且原账本无持仓、未决委托或 UNKNOWN 后才切换版本。源码仅完成实现与编译检查时，不能据此声称实际更新包、回退或配置保留已经验收。[Runtime 更新合同](docs/windows-gitlab-updates.md#standalone-trading-runtime-更新接入)
+当前源码候选已把受管理更新接入默认 Runtime 工作台：「账户与设置 → 软件更新」显示当前版本、渠道和待安装版本，工作台启动后在后台检查并下载。下载不改变 Runtime 权限，也不停止策略；安装前由稳定启动器取得安装锁、Runtime 单实例锁和已配置账号的本机进程锁，确认相关进程退出后切换版本。更新器不扫描、不解释旧执行账本。源码仅完成实现与编译检查时，不能据此声称实际更新包、回退或配置保留已经验收。[Runtime 更新合同](docs/windows-gitlab-updates.md#standalone-trading-runtime-更新接入)
 
 既有 dev28 发行、目录布局、构建命令及托盘验收见[原发行说明](README.legacy-ddad472.md#windows-便携发行目录)。这些历史制品不能替代新替代链的制品验收；本次 PR 不构建或发布安装包。
 

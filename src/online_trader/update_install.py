@@ -78,15 +78,15 @@ def _managed_runtime_store(root, current):
 def _account_stores(root):
     stores = [AccountStore(Path(os.environ['LOCALAPPDATA']) / 'OnlineTrader' / 'accounts')]
     if root is not None:
-        # Validate the stable Runtime configuration, but never treat archived
-        # or cached Runtime databases as update authority.
-        _managed_runtime_store(root, active_version(root))
+        runtime_store = _managed_runtime_store(root, active_version(root))
+        if runtime_store is not None:
+            stores.append(runtime_store)
     return stores
 
 
 @contextmanager
-def settled_accounts(root=None):
-    """Hold every known account identity while proving update-safe ledgers."""
+def quiescent_installation(root=None):
+    """Hold process and account identities without consulting historical ledgers."""
     try:
         with ExitStack() as locks:
             if root is not None:
@@ -95,18 +95,10 @@ def settled_accounts(root=None):
             for store in _account_stores(root):
                 locks.enter_context(AccountLock('CATALOGUE:' + str(store.directory).casefold()))
                 rows = store.read()['accounts']
-                known = {store.ledger_path(row).resolve() for row in rows}
-                data = store.directory / 'data'
-                for name in ('ledger.db', 'ledger.db-wal', 'ledger.db-shm', 'ledger.db-journal'):
-                    for path in data.rglob(name):
-                        ledger = path.with_name('ledger.db').resolve()
-                        if ledger not in known or not ledger.is_file():
-                            raise UpdateError('发现未归属或缺少主文件的账本，暂缓安装')
                 for row in rows:
                     if row['account_key'] not in locked:
                         locks.enter_context(AccountLock(row['account_key']))
                         locked.add(row['account_key'])
-                    store._settled(row, for_update=True)
             yield
     except TraderError as error:
         if error.code == 'E_INSTANCE_EXISTS':
@@ -170,7 +162,7 @@ def apply_pending(root, current):
     defaults_path = None
     defaults_before = None
     defaults_replaced = False
-    with runtime_lease(root, exclusive=True), settled_accounts(root):
+    with runtime_lease(root, exclusive=True), quiescent_installation(root):
         try:
             with archive.open('rb') as stream:
                 if (archive.stat().st_size != candidate.size

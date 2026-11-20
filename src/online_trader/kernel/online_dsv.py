@@ -115,11 +115,11 @@ class OnlineDsvSimulation(OnlineSimulation):
             raise TraderError('PLAN_APPROVAL_REQUIRED', 'The original plan is outside the current owner')
         return DsvSimulationPlanPermit.issue(plan, grant)
 
-    def consumed(self):
+    def consumed(self, *, existing=None):
         if self.grant.daily_targets_per_contract is not None:
             # The per-contract quota is checked at admission and dispatch.
             return False
-        return self.opening_attempt_count() >= self.grant.value['opening_attempts']
+        return self.opening_attempt_count(existing=existing) >= self.grant.value['opening_attempts']
 
     def can_resume_entries(self, snapshot, *, clock_recovery=False):
         k = self.kernel
@@ -145,21 +145,26 @@ class OnlineDsvSimulation(OnlineSimulation):
             return not any(
                 OrderState.from_dict(order).potential_remaining and
                 (order['effect'] == 'OPEN' or order.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'})
-                for cycle in k._staged.values() for order in cycle['orders'])
+                for cycle in k._staged.values() for order in cycle['orders']) and not any(
+                    (cycle.get('entry_intent') or {}).get('status') in {'ACTIVE', 'RECONCILING'}
+                    for cycle in k._staged.values())
         except TraderError:
             return False
 
     def target_quota(self, contract, day, *, existing=None):
         limit = self.grant.daily_targets_per_contract
         if limit is None:
-            return self.opening_attempt_count() + (existing is None) <= self.grant.value['opening_attempts']
+            return self.opening_attempt_count(existing=existing) + (existing is None) <= self.grant.value['opening_attempts']
         counts = self.kernel.statistics.opening_counts(self.kernel._staged.values(), day, reserve=True, exclude_decision=existing)
         return counts.get(contract, 0) < limit
 
-    def opening_attempt_count(self):
-        # All prepared attempts consume the finite scope, including unknown,
-        # rejected and definitely-unsent children; restart never renews it.
-        return sum(o['effect']=='OPEN' for c in self.kernel._staged.values() if not self.archived_cycle(c) for o in c['orders'])
+    def opening_attempt_count(self, *, existing=None):
+        """Count logical entry targets, not local repricing children."""
+        return sum(
+            1 for cycle in self.kernel._staged.values()
+            if not self.archived_cycle(cycle)
+            and cycle.get('decision_key') != existing
+            and any(order['effect'] == 'OPEN' for order in cycle['orders']))
 
     def arm(self):
         k=self.kernel;scheduler=getattr(k,'_scheduled_runtime',None)
@@ -193,14 +198,28 @@ class OnlineDsvSimulation(OnlineSimulation):
                 (str(self.kernel._config_revision), self.kernel._configuration['payload_hash'])):
             raise TraderError('E_ONLINE_SCOPE','The plan differs from the active strategy parameters')
         code = plan['contract_id']
-        if not manual and entry_kind == 'NORMAL':
+        if not manual:
             facts = runtime._latest.get((code, plan['trading_day']))
+            candidate = (facts or {}).get('candidate') or {}
             side = 'BUY' if plan['direction']=='LONG' else 'SELL'
-            fresh = self.port.fresh_strategy_entry(code, side, facts['event'] if facts is not None else None)
+            signal = {'entry_kind': entry_kind, 'direction': plan['direction'],
+                      'trigger_price': plan['theoretical_entry_price'],
+                      'signal_time_utc': (facts or {}).get('event', {}).get('source_time_utc')}
+            fresh = self.port.current_strategy_entry(
+                code, side, profile=runtime.profile_for_plan(plan), signal=signal)
         else:
             fresh = self.port.fresh(code)
-        if not fresh or self.port.position(code)!={'long':0,'short':0} or self.port.active_orders(code):
-            raise TraderError('E_OWNERSHIP','Strategy entry requires a fresh unoccupied selected contract')
+        if not fresh:
+            evidence = getattr(self.port, '_last_quote_rejection', None)
+            error_code = ('E_ENTRY_SIGNAL_INVALIDATED' if (evidence or {}).get('reason') == 'ENTRY_SIGNAL_CROSSED_BACK'
+                          else 'E_NATIVE_QUOTE_NOT_CURRENT')
+            error = TraderError(error_code,'Strategy entry requires a current legal native quote and a valid signal')
+            error.quote_evidence = evidence
+            raise error
+        if self.port.position(code)!={'long':0,'short':0}:
+            raise TraderError('E_POSITION_MISMATCH','The selected contract is not flat at the broker')
+        if self.port.active_orders(code):
+            raise TraderError('E_FOREIGN_ACTIVE_ORDER','An active broker order blocks a new strategy target')
 
     def manual_entry_facts(self,candidate,quantity,*,exclude_decision=None):
         k=self.kernel;runtime=k._dsv_runtime;code=candidate['contract_id']
@@ -370,10 +389,12 @@ class OnlineDsvSimulation(OnlineSimulation):
     def can_close(self,cycle):
         ex=cycle.get('execution',{});state=cycle['protection'];k=self.kernel
         pending=(not ex.get('entry_stopped') and not cycle.get('cancel_entries') and state.get('target_remaining_qty') is None
-                 and k._armed and cycle['strategy_epoch']==k.active_epoch and not self.consumed()
+                 and k._armed and cycle['strategy_epoch']==k.active_epoch
+                 and not self.consumed(existing=cycle['decision_key'])
                  and self.entry_window(self.port.clock.now())
                  and state['entry_filled_qty']<cycle['plan']['initial_open_quantity']
-                 and any(ex.get('cancel_reasons',{}).get(o['child_order_id']) in {'NEW_QUOTE_PRICE_WORSENED','TARGET_QUANTITY_REDUCED'}
+                 and any(o['send_state'] == 'DEFINITELY_NOT_SENT' or
+                         ex.get('cancel_reasons',{}).get(o['child_order_id']) in {'NEW_QUOTE_PRICE_WORSENED','TARGET_QUANTITY_REDUCED'}
                          for o in cycle['orders'] if o['effect']=='OPEN'))
         return not pending
 

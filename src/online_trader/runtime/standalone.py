@@ -4,7 +4,7 @@ import json
 import sys
 
 from online_trader.configuration.files import publish_new_bytes
-from online_trader.contracts.codec import canonical_bytes, strict_loads
+from online_trader.contracts.codec import canonical_bytes
 from online_trader.errors import TraderError
 from online_trader.runtime.desktop_bootstrap import build_start_request, run_confirmed_start
 from online_trader.runtime.portable_config import PortableAccountStore
@@ -40,8 +40,6 @@ def run_cli(args):
         from online_trader.runtime.startup_metadata import read_contract_catalog
         print(json.dumps(read_contract_catalog(store, selected['account_id']), ensure_ascii=False))
         return 0
-    if args.runtime_action in ('command', 'receipt'):
-        return _operator_request(args, store, selected, pipe)
     if args.runtime_action in ('status', 'watch'):
         from online_trader.transport.runtime_view import RuntimeViewClient
         client = RuntimeViewClient(pipe)
@@ -55,9 +53,6 @@ def run_cli(args):
         except KeyboardInterrupt:
             pass
         return 0
-    if args.runtime_action == 'schedule':
-        from online_trader.runtime.portable_schedule import schedule_session
-        return schedule_session(store, selected, args.operator, _read_token(args))
     profile = store.profile()
     if args.runtime_action == 'quotes':
         from online_trader.runtime.startup_metadata import read_startup_metadata
@@ -86,7 +81,7 @@ def _history(args, ledger, account_key):
                              limit=50 if args.limit is None else args.limit)
 
 
-def run_session(store, selected, request, *, use_profile_file=False, check_scheduled_authorization=None):
+def run_session(store, selected, request, *, use_profile_file=False):
     pipe = store.pipe_name(selected)
     directory = store.directory / 'desktop-starts' / request['request_id']
     request_path = publish_new_bytes(canonical_bytes(request), directory / 'request.json')
@@ -105,7 +100,6 @@ def run_session(store, selected, request, *, use_profile_file=False, check_sched
                 result = run_confirmed_start(request_path, output, configured_store=store,
                                              trusted_control_pid=process.trusted_pid,
                                              use_portable_profile_file=use_profile_file,
-                                             check_scheduled_authorization=check_scheduled_authorization,
                                              execution_ledger=session.ledger,
                                              history_cache=store.history_path(selected))
         finally:
@@ -115,29 +109,3 @@ def run_session(store, selected, request, *, use_profile_file=False, check_sched
         print(json.dumps({'status': 'STARTUP_FAILED', 'diagnostic': str(failure)}, ensure_ascii=False),
               file=sys.stderr)
     return result
-
-
-def _operator_request(args, store, selected, pipe):
-    from online_trader.runtime.operator_api import RuntimeCommandClient
-
-    if args.runtime_action == 'receipt':
-        result = RuntimeCommandClient(pipe).request(
-            'receipt', {'command_id': args.command_id}, operator=args.operator, token=_read_token(args))
-    else:
-        try:
-            with args.input.open('rb') as stream:
-                raw = stream.read(65537)
-            if len(raw) > 65536:
-                raise ValueError()
-            body = strict_loads(raw.decode('utf-8-sig'))
-        except (OSError, ValueError):
-            raise TraderError('E_SCHEMA', 'Cannot read the command JSON file') from None
-        result = RuntimeCommandClient(pipe).request('submit', body, operator=args.operator, token=_read_token(args))
-    print(json.dumps(result, ensure_ascii=False))
-    return 0
-
-
-def _read_token(args):
-    from getpass import getpass
-
-    return sys.stdin.readline(258).rstrip('\r\n') if args.token_stdin else getpass('本机操作令牌 ')

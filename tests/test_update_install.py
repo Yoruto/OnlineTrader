@@ -23,7 +23,7 @@ class UpdateInstallTests(unittest.TestCase):
         self.cache.mkdir()
         atomic_json(self.root / 'update-source.json', {'project_id': 89047383, 'channel': 'preview',
                                                       'portable_version': '0.1.0.dev34'})
-        for name in ('launcher_lock', 'runtime_lease', 'settled_accounts'):
+        for name in ('launcher_lock', 'runtime_lease', 'quiescent_installation'):
             patcher = patch(f'online_trader.update_install.{name}', side_effect=lambda *args, **kw: nullcontext())
             self.addCleanup(patcher.stop)
             patcher.start()
@@ -73,9 +73,10 @@ class UpdateInstallTests(unittest.TestCase):
         self.assertEqual(self.original.read_bytes(), b'original executable')
         self.assertEqual(self.preferences.read_bytes(), b'original preferences')
 
-    def test_unsettled_account_defers_update(self):
+    def test_process_or_account_lock_defers_update(self):
         self.stage_update()
-        with patch('online_trader.update_install.settled_accounts', side_effect=UpdateError('account pending')):
+        with patch('online_trader.update_install.quiescent_installation',
+                   side_effect=UpdateError('installation is active')):
             self.launch()
         self.assertEqual(active_version(self.root), '0.1.0.dev34')
         self.assertFalse((self.cache / '0.1.0.dev35.failed').exists())

@@ -20,7 +20,8 @@ from online_trader.contracts.context import ContextRegistry
 from online_trader.contracts.validation import validate_plan
 from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_value, decimal_text, identifier, order_price, quantity
-from online_trader.errors import TraderError, exception_record
+from online_trader.errors import DefinitelyNotSentError, TraderError, exception_record
+from online_trader.execution.policy import committed_limit_is_safe
 from online_trader.gateway.ports import UnavailablePort, OnlineSimulationPort
 from online_trader.ledger.store import Ledger
 from online_trader.protection import initial_state, reduce_event, ProtectionState
@@ -379,6 +380,9 @@ class Kernel:
             for cycle in self._staged.values():
                 state = cycle["protection"]
                 potential = sum(OrderState.from_dict(o).potential_remaining for o in cycle["orders"] if o["effect"] == "OPEN")
+                if (not potential and (cycle.get('entry_intent') or {}).get('status') == 'ACTIVE'
+                        and state['entry_filled_qty'] < cycle['plan']['initial_open_quantity']):
+                    potential = cycle['plan']['initial_open_quantity'] - state['entry_filled_qty']
                 total += Decimal(cycle["risk_per_lot"]) * (state["owned_qty"] + potential)
         return total
 
@@ -431,7 +435,11 @@ class Kernel:
             if self._exposure() + per_lot * qty > self.budget:
                 raise TraderError("E_RISK", "Insufficient development risk budget")
         state = initial_state(plan,simulation_permit=self.simulation.permit(plan) if self.simulation else None)
-        order = OrderState(_id("child"), _id("intent"), _id("attempt"), "OPEN", qty, limit_price, kernel_boot_id=self.boot_id)
+        candidate = ((_strategy or {}).get('metadata') or {}).get('candidate') or {}
+        order = OrderState(_id("child"), _id("intent"), _id("attempt"), "OPEN", qty, limit_price,
+                           kernel_boot_id=self.boot_id,
+                           pricing_quote_id=candidate.get('native_tick_id') or candidate.get('market_sequence'),
+                           pricing_source_epoch=candidate.get('source_epoch'))
         if getattr(self.simulation,'strategy_enabled',False):
             order.native_offset='OPEN';order.native_trading_day=plan['trading_day']
         cycle = {"position_cycle_id": cycle_id, "plan": copy.deepcopy(plan), "protection": state.to_dict(),
@@ -442,6 +450,17 @@ class Kernel:
                  "entry_origin":"MANUAL" if _strategy is None else "STRATEGY",
                  "strategy_epoch":None if _strategy is None else _strategy["epoch"],
                  "strategy_metadata":copy.deepcopy(_manual if _strategy is None else _strategy["metadata"]),"instrument":instrument}
+        cycle['entry_intent'] = {
+            'intent_id': order.intent_id,
+            'status': 'ACTIVE',
+            'signal': copy.deepcopy(((_strategy or {}).get('metadata') or {}).get('signal')),
+            'local_reprice_count': 0,
+            'sdk_send_count': 0,
+            'last_attempt_id': order.attempt_id,
+            'last_child_order_id': order.child_order_id,
+            'next_action': 'DISPATCH_PREPARED',
+            'invalidation_reason': None,
+        }
         if _manual is not None:cycle['manual_limit_order']=True
         if (_manual is not None and self._command_binding is not None
                 and self._command_binding['metadata'].get('actor') is not None):
@@ -640,13 +659,38 @@ class Kernel:
             "trailing_floor_move":state.get("trailing_floor_move"),"last_observed_event_seq":state.get("last_observed_event_seq"),
             "target_remaining_qty":target,"state_revision":c["revision"],"updated_event_seq":seq}
         self._upsert(conn,"protection_state",protection,["position_cycle_id"])
+        by_intent = {}
+        for item in c['orders']:
+            by_intent.setdefault(item['intent_id'], []).append(item)
         for item in c["orders"]:
             effect = item["effect"]
+            related = by_intent[item['intent_id']]
+            logical = c.get('entry_intent') or {} if effect == 'OPEN' else {}
+            if any(child['send_state'] == 'UNKNOWN' for child in related):
+                intent_status = 'UNKNOWN'
+            elif effect == 'OPEN' and logical.get('status') == 'TERMINATED':
+                intent_status = 'ABORTED'
+            elif (effect == 'OPEN' and all(child['terminal_confirmed'] for child in related)
+                  and state['entry_filled_qty'] >= plan['initial_open_quantity']):
+                intent_status = 'DONE'
+            elif (effect == 'OPEN' and logical.get('status') in {'ACTIVE', 'BROKER_WORKING', 'RECONCILING'}
+                  or any(OrderState.from_dict(child).potential_remaining for child in related)):
+                intent_status = 'ACTIVE'
+            elif all(child['terminal_confirmed'] for child in related):
+                intent_status = 'DONE'
+            else:
+                intent_status = 'ACTIVE'
+            intent_reasons = list(c.get('reasons', []))
+            if effect == 'OPEN':
+                failure = logical.get('last_failure') or {}
+                intent_reasons.extend(failure.get('reason_codes', []))
+                if logical.get('invalidation_reason'):
+                    intent_reasons.append(logical['invalidation_reason'])
             self._upsert(conn,"order_intents",{"intent_id":item["intent_id"],"position_cycle_id":cid,
                 "decision_key":c["decision_key"] if effect=="OPEN" else None,"effect":effect,"origin":c.get("entry_origin","MANUAL") if effect=="OPEN" else "PROTECTION",
                 "requested_qty":plan["initial_open_quantity"] if effect=="OPEN" else None,"desired_remaining_qty":target if effect=="REDUCE" else None,
-                "status":"UNKNOWN" if item["send_state"]=="UNKNOWN" else "DONE" if item["terminal_confirmed"] else "ACTIVE",
-                "reason_codes_json":canonical_bytes(c.get("reasons",[])).decode(),"kernel_epoch":self.kernel_epoch,"strategy_epoch":c.get("strategy_epoch"),
+                "status":intent_status,
+                "reason_codes_json":canonical_bytes(list(dict.fromkeys(intent_reasons))).decode(),"kernel_epoch":self.kernel_epoch,"strategy_epoch":c.get("strategy_epoch"),
                 "state_revision":c["revision"],"created_event_seq":seq,"updated_event_seq":seq},["intent_id"])
             self._upsert(conn,"child_orders",{"child_order_id":item["child_order_id"],"intent_id":item["intent_id"],"ordinal":item.get("ordinal",1),
                 "offset_kind":{'CLOSETODAY':'CLOSE_TODAY'}.get(item.get('native_offset'),item.get('native_offset',"OPEN" if effect=="OPEN" else "CLOSE")),"limit_price":item["limit_price"],"original_qty":item["original_qty"],
@@ -662,7 +706,12 @@ class Kernel:
                     "status":item["cancel_status"],"request_hash":content_hash({"child_order_id":item["child_order_id"]}),"attempt_count":1,
                     "created_event_seq":seq,"updated_event_seq":seq},["cancel_id"])
         opening = next((o for o in c["orders"] if o["effect"]=="OPEN"),None)
-        risk_qty = state["owned_qty"]+sum(OrderState.from_dict(o).potential_remaining for o in c["orders"] if o["effect"]=="OPEN")
+        open_pending = sum(OrderState.from_dict(o).potential_remaining for o in c["orders"] if o["effect"]=="OPEN")
+        logical = c.get('entry_intent') or {}
+        if (not open_pending and logical.get('status') == 'ACTIVE'
+                and state['entry_filled_qty'] < plan['initial_open_quantity']):
+            open_pending = plan['initial_open_quantity'] - state['entry_filled_qty']
+        risk_qty = state["owned_qty"] + open_pending
         with localcontext() as context:
             context.prec = 80
             amount = decimal_text(Decimal(c["risk_per_lot"])*risk_qty)
@@ -768,8 +817,11 @@ class Kernel:
             checks['ORIGINAL_EXIT_QUANTITY']=target is not None and order["original_qty"]<=max(0,cycle["protection"]["owned_qty"]-target-other_pending)
         if self.execution.active(cycle):
             priced=self.execution.price(cycle,order['effect'])
-            checks['EXECUTION_PRICE']=priced['allowed'] and priced['price']==order['limit_price']
-            if not checks['EXECUTION_PRICE']:
+            checks['EXECUTION_PRICE']=bool(priced['allowed'])
+            if checks['EXECUTION_PRICE'] and not committed_limit_is_safe(
+                    self.execution.side(cycle, order['effect']), order['limit_price'], priced['price']):
+                checks['E_QUOTE_REVISION_CHANGED'] = False
+            if not checks['EXECUTION_PRICE'] or checks.get('E_QUOTE_REVISION_CHANGED') is False:
                 review_details['EXECUTION_PRICE'] = {'expected': order['limit_price'],
                     'observed': priced['price'], 'reason_codes': priced['reasons']}
         try:order_price(order["limit_price"],cycle.get("instrument",{}).get("tick_size",self.tick_size))
@@ -788,25 +840,36 @@ class Kernel:
         if trace is not None:
             trace.record('DISPATCH_PRECHECK', contract_id=cycle['plan']['contract_id'],
                          child_order_id=child_id, attempt_id=order['attempt_id'], effect=order['effect'],
-                         reasons=[check for check, passed in checks.items() if not passed])
+                         pricing_quote_id=order.get('pricing_quote_id'),
+                         pricing_source_epoch=order.get('pricing_source_epoch'),
+                         reasons=[check for check, passed in checks.items() if not passed],
+                         review_details=review_details)
         if not all(checks.values()):
             self._entry_gates.pop(order["attempt_id"],None)
             order["send_state"] = "DEFINITELY_NOT_SENT"
             order["terminal_confirmed"] = True
             order["reported_fill_qty"] = order["filled_qty"]
             if getattr(self.simulation, 'strategy_enabled', False):
+                reasons = [check for check, passed in checks.items() if not passed]
                 cycle["last_dispatch_abort"] = {
                     "child_order_id": child_id,
                     "decision_id": (cycle.get("strategy_metadata") or {}).get("decision_id"),
-                    "reasons": [check for check, passed in checks.items() if not passed],
+                    "reasons": reasons,
                     "recheck": gate_result,
                     "checks": checks,
                     "details": review_details,
+                    "pricing_quote_id": order.get('pricing_quote_id'),
+                    "pricing_source_epoch": order.get('pricing_source_epoch'),
+                    "current_quote_id": (gate_result or {}).get('quote_id'),
+                    "current_source_epoch": (gate_result or {}).get('source_epoch'),
                     "expected_authority_revision": (cycle.get("entry_authorization") or {}).get("authority_revision"),
                     "authority_revision": self._authority_revision,
+                    "sdk_boundary": "NOT_ENTERED",
                 }
+                self._update_attempt_responsibility(cycle, order, reasons, review_details)
             cycle["revision"] += 1
-            self._stage_cycle(cycle,"TX_ORDER","SEND_ABORTED",after=(lambda:self._progress_exits(cid)) if order["effect"]=="REDUCE" else None)
+            self._stage_cycle(cycle,"TX_ORDER","SEND_ABORTED",
+                              after=lambda:self._progress_definitely_not_sent(cid, order["effect"]))
             return
         self._dispatched.add(order["attempt_id"])
         self._entry_gates.pop(order["attempt_id"],None)
@@ -814,6 +877,22 @@ class Kernel:
         try:
             self.port.send(request)
             order["send_state"] = "CALL_RETURNED"
+        except DefinitelyNotSentError as error:
+            order.update(send_state="DEFINITELY_NOT_SENT", terminal_confirmed=True,
+                         reported_fill_qty=order["filled_qty"])
+            evidence = {"exception": exception_record(error), "child_order_id": child_id,
+                        "sdk_boundary": "NOT_ENTERED", "gateway_evidence": error.evidence}
+            reasons = [error.code]
+            self._update_attempt_responsibility(cycle, order, reasons, error.evidence or {})
+            if trace is not None:
+                trace.record('DISPATCH_RESULT', contract_id=cycle['plan']['contract_id'],
+                             child_order_id=child_id, attempt_id=order['attempt_id'],
+                             result=order['send_state'], reasons=reasons)
+            cycle["revision"] += 1
+            order["revision"] += 1
+            self._stage_cycle(cycle,"TX_ORDER","SEND_ABORTED",evidence=evidence,
+                              after=lambda:self._progress_definitely_not_sent(cid, order["effect"]))
+            return
         except Exception as error:
             order["send_state"] = "UNKNOWN"
             self._armed = False
@@ -822,6 +901,13 @@ class Kernel:
                 native_quote_review = getattr(error, 'quote_evidence', None)
                 if native_quote_review:
                     evidence["native_quote_review"] = native_quote_review
+        if order['effect'] == 'OPEN':
+            intent = cycle.setdefault('entry_intent', {})
+            intent['sdk_send_count'] = int(intent.get('sdk_send_count', 0)) + 1
+            intent['last_attempt_id'] = order['attempt_id']
+            intent['last_child_order_id'] = order['child_order_id']
+            intent['status'] = 'RECONCILING' if order['send_state'] == 'UNKNOWN' else 'BROKER_WORKING'
+            intent['next_action'] = 'QUERY_ORIGINAL_ORDER' if order['send_state'] == 'UNKNOWN' else 'WAIT_BROKER_FACTS'
         if trace is not None:
             trace.record('DISPATCH_RESULT', contract_id=cycle['plan']['contract_id'],
                          child_order_id=child_id, attempt_id=order['attempt_id'], result=order['send_state'])
@@ -829,6 +915,47 @@ class Kernel:
         order["revision"] += 1
         self._stage_cycle(cycle,"TX_ORDER","SEND_RESULT", evidence=evidence)
         if self.simulation and order['send_state']=='UNKNOWN':self.pause()
+
+    def _update_attempt_responsibility(self, cycle, order, reasons, details):
+        """Retain the logical target after a proved local non-send."""
+        if order['effect'] == 'REDUCE':
+            cycle['exit_responsibility'] = {
+                'state': 'RETRY_SCHEDULED', 'last_child_order_id': order['child_order_id'],
+                'reason_codes': list(reasons), 'next_action': 'REPRICE_FROM_LATEST_QUOTE'}
+            return
+        intent = cycle.setdefault('entry_intent', {})
+        intent.update(last_attempt_id=order['attempt_id'], last_child_order_id=order['child_order_id'],
+                      last_failure={'reason_codes': list(reasons), 'details': copy.deepcopy(details)})
+        terminal = next((reason for reason in reasons if reason in {
+            'E_ENTRY_SIGNAL_INVALIDATED', 'E_ENTRY_PRICE_CAP', 'E_ENTRY_WINDOW_EXPIRED',
+            'ENTRY_RECHECK_SESSION_CHANGED', 'ENTRY_RECHECK_CONFIGURATION_CHANGED'}), None)
+        reconcile = next((reason for reason in reasons if reason in {
+            'E_POSITION_MISMATCH', 'E_FOREIGN_ACTIVE_ORDER', 'E_UNKNOWN_SEND',
+            'RECONCILIATION_REQUIRED'}), None)
+        if terminal:
+            intent.update(status='TERMINATED', next_action='NONE', invalidation_reason=terminal)
+            if cycle.get('execution') is not None:
+                cycle['execution']['entry_stopped'] = True
+        elif reconcile:
+            intent.update(status='RECONCILING', next_action='RECONCILE_BROKER_FACTS')
+            self._armed = False
+            self.contexts.revoke_all(reason=reconcile)
+            self._state_revision += 1
+            self._authority_revision += 1
+            cycle['protection'].update(reconciliation_required=True, block_new=True)
+            self._recovery_pending.add(cycle['position_cycle_id'])
+            self.recovery_required = True
+        else:
+            intent.update(status='ACTIVE', next_action='REPRICE_FROM_LATEST_QUOTE')
+
+    def _progress_definitely_not_sent(self, cycle_id, effect):
+        if effect == 'REDUCE':
+            self._progress_exits(cycle_id)
+            return
+        cycle = self._staged.get(cycle_id)
+        if (cycle and self.execution.active(cycle)
+                and (cycle.get('entry_intent') or {}).get('status') == 'ACTIVE'):
+            self.execution.progress(cycle_id, allow_open=True, allow_retry=True)
 
     def record_fill(self, child_id: str, trade_key: str, qty: int, price: str, *, observed_at_utc=None,
                     trading_day=None,commission=None,estimated_commission=None,native_day_evidence=None,

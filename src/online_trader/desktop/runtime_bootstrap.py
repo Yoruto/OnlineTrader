@@ -215,7 +215,6 @@ class BootstrapWorker(QThread):
             runtime_root = self.root.resolve()
             store = PortableAccountStore(runtime_root, self.account)
             store.profile()
-            store.runtime_control()
             selected = store.get(store.read()['selected_id'])
             pipe = store.pipe_name(selected)
             if self.isInterruptionRequested():

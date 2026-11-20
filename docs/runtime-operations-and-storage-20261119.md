@@ -1,6 +1,6 @@
 # Trading Runtime 运维、配置与账本约定
 
-> **2026-11-20 规则变更：** 本文关于“原执行账本长期权威、换机交接、handoff、跨重启 pending”的内容已被[本机单实例与柜台权威设计](refactor/runtime-broker-authority-single-instance-20261120.md)替代。当前 Standalone Runtime 每次启动使用临时执行库；同一台电脑只有一个 Runtime，不限制其他电脑使用同一期货账户。长期保留仅包括版本默认配置、用户覆盖配置和可由柜台重建的历史/收益缓存。下文未改写部分仅作为旧候选的历史设计记录，不得用于阻止当前启动。
+> **2026-11-20 规则变更：** 本文关于“原执行账本长期权威、换机交接、handoff、跨重启 pending、操作员授权和无人值守调度”的内容已被[本机单实例与柜台权威设计](refactor/runtime-broker-authority-single-instance-20261120.md)及[手动启动收口](refactor/runtime-manual-only-cleanup-20261120.md)替代。当前 Standalone Runtime 每次启动使用临时执行库，只由当前 Windows 用户主动启动并通过 Workbench 控制；同一台电脑只有一个 Runtime，不限制其他电脑使用同一期货账户。长期保留仅包括版本默认配置、用户覆盖配置和可由柜台重建的历史/收益缓存。下文未改写部分仅作为旧候选的历史设计记录，不得用于当前启动、交付或权限判断。
 
 2026-11-19 · 独立 Trading Runtime 运维说明 · 依赖实现候选 PR #17
 

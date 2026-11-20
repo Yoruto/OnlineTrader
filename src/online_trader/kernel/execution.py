@@ -138,6 +138,7 @@ class ExecutionCoordinator:
                     'trading_day':event['trading_day'],'received_ns':str(received)}
         else:cycle['last_quote']=None
         self._contexts(cycle, price_only=_price_only)
+        self._refresh_exit_responsibility(cycle)
         cycle['revision']+=1
         return k._stage_cycle(cycle,'TX_PROTECT','EXECUTION_OBSERVATION',
             after=lambda:self.progress(cid,allow_open=not _price_only,allow_retry=True))
@@ -252,9 +253,11 @@ class ExecutionCoordinator:
         return any(children.get(o['child_order_id'])==request_id and o['terminal_confirmed']
                    and o['filled_qty']<o['original_qty'] for o in cycle['orders'])
 
-    def price(self,cycle,effect,*,manual_mode=None,elapsed_ms=0):
-        ex=cycle['execution'];market=copy.deepcopy(ex['market']);quote=cycle.get('last_quote');k=self.kernel
-        if effect == 'OPEN' and ex.get('ordinary_entry_fresh') is not None:
+    def price(self,cycle,effect,*,manual_mode=None,elapsed_ms=0,market_override=None):
+        ex=cycle['execution'];market=copy.deepcopy(market_override if market_override is not None else ex['market']);quote=cycle.get('last_quote');k=self.kernel
+        if market_override is not None:
+            pass
+        elif effect == 'OPEN' and ex.get('ordinary_entry_fresh') is not None:
             runtime = k._dsv_runtime
             plan = cycle['plan']
             facts = runtime._latest.get((plan['contract_id'], plan['trading_day']))
@@ -289,6 +292,46 @@ class ExecutionCoordinator:
             return True
         ready = getattr(self.kernel.port, 'automatic_reduction_quote_ready', None)
         return ready is None or ready(cycle['plan']['contract_id'])
+
+    def _refresh_exit_responsibility(self, cycle):
+        state = cycle['protection']
+        target = state.get('target_remaining_qty')
+        if target is None:
+            return
+        pending = [OrderState.from_dict(order) for order in cycle['orders'] if order['effect'] == 'REDUCE']
+        unknown = any(order.send_state in {'SEND_POSSIBLE', 'UNKNOWN'} for order in pending)
+        working = any(order.potential_remaining and order.send_state in {'CALL_RETURNED', 'CONFIRMED'}
+                      for order in pending)
+        priced = self.price(cycle, 'REDUCE')
+        if state['owned_qty'] <= target and not unknown and not working:
+            status, action = 'COMPLETE', 'NONE'
+        elif unknown:
+            status, action = 'RECONCILING', 'QUERY_ORIGINAL_ORDER'
+        elif working:
+            status, action = 'BROKER_WORKING', 'WAIT_BROKER_FACTS'
+        elif not priced['allowed']:
+            status = ('MANUAL_INTERVENTION_REQUIRED'
+                      if 'DATA_GAP_EXIT' in state.get('exit_reasons', []) else 'WAIT_QUOTE')
+            action = 'RESTORE_CURRENT_QUOTE' if status == 'WAIT_QUOTE' else 'TAKEOVER_REVIEW'
+        else:
+            status, action = 'PREPARING', 'PREPARE_REDUCTION_CHILD'
+        previous = cycle.get('exit_responsibility') or {}
+        elapsed = cycle['execution']['elapsed_ms']
+        progressed = (previous.get('state') != status
+                      or previous.get('target_remaining_qty') != target
+                      or previous.get('owned_qty') != state['owned_qty'])
+        last_progress = elapsed if progressed else previous.get('last_progress_elapsed_ms', elapsed)
+        cycle['exit_responsibility'] = {
+            'state': status,
+            'since_elapsed_ms': (previous.get('since_elapsed_ms')
+                                 if previous.get('state') == status else elapsed),
+            'last_progress_elapsed_ms': last_progress,
+            'stalled_ms': max(0, elapsed - last_progress),
+            'next_action': action,
+            'reason_codes': priced.get('reasons', []) if not priced['allowed'] else [],
+            'target_remaining_qty': target,
+            'owned_qty': state['owned_qty'],
+        }
 
     def progress(self,cid,*,allow_open=False,allow_retry=False):
         k=self.kernel
@@ -381,10 +424,11 @@ class ExecutionCoordinator:
             reduces=[o for o in cycle['orders'] if o['effect']=='REDUCE']
             relevant=[o for o in reduces if o['child_order_id'] not in manual_children
                       or (manual and manual_children[o['child_order_id']]==manual['request_id'])]
-            blocked=any(o['broker_state']=='REJECTED' or
+            blocked=any((o['broker_state']=='REJECTED' and o['child_order_id'] in manual_children) or
                 (o['terminal_confirmed'] and o['filled_qty']<o['original_qty'] and
                  (o['child_order_id'] in manual_children or
-                  (o['send_state']!='DEFINITELY_NOT_SENT' and o['child_order_id'] not in ex['cancel_reasons']))) for o in relevant)
+                  (o['send_state']!='DEFINITELY_NOT_SENT' and o['broker_state']!='REJECTED'
+                   and o['child_order_id'] not in ex['cancel_reasons']))) for o in relevant)
             blocked=blocked or bool(relevant and relevant[-1]['send_state']=='DEFINITELY_NOT_SENT' and not allow_retry)
             if qty and not blocked:
                 priced=self.price(cycle,'REDUCE')
@@ -394,7 +438,30 @@ class ExecutionCoordinator:
     def _replace(self,cycle,old,action):
         k=self.kernel;qty=action['quantity'];price=action['price'];effect=old['effect']
         if qty<=0:return
-        if effect=='OPEN' and getattr(k.simulation,'strategy_enabled',False) and k.simulation.consumed():return
+        if effect == 'REDUCE' and old.get('broker_state') == 'REJECTED':
+            automatic = set((cycle.get('execution') or {}).get('manual_reduction_children', {}))
+            rejected = 0
+            for item in reversed([row for row in cycle['orders']
+                                  if row['effect'] == 'REDUCE' and row['child_order_id'] not in automatic]):
+                if item.get('broker_state') != 'REJECTED':
+                    break
+                rejected += 1
+            limit = cycle['plan']['execution_policy'].get('max_consecutive_exit_rejections', 3)
+            if rejected >= limit:
+                cycle['exit_responsibility'] = {
+                    'state': 'MANUAL_INTERVENTION_REQUIRED',
+                    'last_child_order_id': old['child_order_id'],
+                    'reason_codes': ['CONSECUTIVE_BROKER_REJECTIONS'],
+                    'rejection_count': rejected,
+                    'next_action': 'TAKEOVER_REVIEW',
+                    'target_remaining_qty': cycle['protection'].get('target_remaining_qty'),
+                    'owned_qty': cycle['protection']['owned_qty'],
+                }
+                cycle['revision'] += 1
+                k._stage_cycle(cycle, 'TX_ORDER', 'EXIT_MANUAL_INTERVENTION_REQUIRED')
+                return
+        if (effect=='OPEN' and getattr(k.simulation,'strategy_enabled',False)
+                and k.simulation.consumed(existing=cycle['decision_key'])):return
         ordinal=max(o.get('ordinal',1) for o in cycle['orders'] if o['intent_id']==old['intent_id'])+1
         order=OrderState(_id('child'),old['intent_id'],_id('attempt'),effect,qty,price,
                         kernel_boot_id=k.boot_id,parent_child_order_id=old['child_order_id'],ordinal=ordinal)
@@ -408,6 +475,15 @@ class ExecutionCoordinator:
                     return
                 if 'recheck' in prepared:
                     review = prepared['recheck']
+                    terminal = next((reason for reason in review['reason_codes'] if reason in {
+                        'E_ENTRY_SIGNAL_INVALIDATED', 'E_ENTRY_PRICE_CAP',
+                        'ENTRY_RECHECK_SESSION_CHANGED', 'ENTRY_RECHECK_CONFIGURATION_CHANGED'}), None)
+                    if terminal:
+                        intent = cycle.setdefault('entry_intent', {})
+                        intent.update(status='TERMINATED', next_action='NONE', invalidation_reason=terminal,
+                                      last_failure={'reason_codes': review['reason_codes'],
+                                                    'details': copy.deepcopy(review.get('details', {}))})
+                        cycle['execution']['entry_stopped'] = True
                     prior = cycle.get('last_replacement_block', {})
                     if prior.get('reason_codes') != review['reason_codes']:
                         cycle['last_replacement_block'] = review
@@ -415,6 +491,9 @@ class ExecutionCoordinator:
                         k._stage_cycle(cycle, 'TX_ORDER', 'REPLACEMENT_BLOCKED')
                     return
                 cycle.pop('last_replacement_block', None)
+                quote_review = prepared.get('quote_review') or {}
+                order.pricing_quote_id = quote_review.get('quote_id')
+                order.pricing_source_epoch = quote_review.get('source_epoch')
                 cycle['entry_authorization']=prepared['authorization'];k._entry_gates[order.attempt_id]=prepared['gate']
             else:
                 ex=cycle['execution'];context=ex.get('context_id')
@@ -427,6 +506,12 @@ class ExecutionCoordinator:
                 k.simulation.entry_attempt_prepared(cycle['position_cycle_id'])
                 cycle['protection'].update(entry_terminal_reconciled=False,reconciled_entry_qty=None)
                 cycle['lifecycle']='HOLDING' if cycle['protection']['owned_qty'] else 'ENTRY_PENDING'
+            intent = cycle.setdefault('entry_intent', {})
+            intent['local_reprice_count'] = int(intent.get('local_reprice_count', 0)) + 1
+            intent['last_attempt_id'] = order.attempt_id
+            intent['last_child_order_id'] = order.child_order_id
+            intent['status'] = 'ACTIVE'
+            intent['next_action'] = 'DISPATCH_PREPARED'
         cycle['orders'].append(order.to_dict());cycle['revision']+=1
         cycle['execution']['last_action']='REPLACE'
         k._stage_cycle(cycle,'TX_INTENT','REPLACEMENT_PREPARED',after=lambda:k._dispatch(cycle['position_cycle_id'],order.child_order_id))

@@ -132,6 +132,7 @@
         "extra_tick_remaining_ms",
         "exchange_limit_remaining_ms",
         "force_retry_ms",
+        "max_consecutive_exit_rejections",
         "passive_ttl_ms",
         "aggr_ttl_ms",
         "market_ttl_ms",
@@ -195,6 +196,9 @@
         },
         "force_retry_ms": {
           "const": 5000
+        },
+        "max_consecutive_exit_rejections": {
+          "const": 3
         },
         "passive_ttl_ms": {
           "const": 90000

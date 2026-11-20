@@ -3,6 +3,8 @@ verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
 verified_on: "2026-11-20"
 note: Static navigation aid only. Dynamic Qt, IPC and SDK relationships still require source review.
 
+current_workbench_contract: docs/refactor/runtime-workbench-current-20261120.md
+
 boundaries:
   - id: standalone-desktop-client
     route: STANDALONE

@@ -85,6 +85,12 @@ def main(argv=None):
                 and args.runtime_pipe is None and args.dsv_config is None and args.compare_fills is None):
             from online_trader.desktop.runtime_bootstrap import bundled_runtime_root
             runtime_root = bundled_runtime_root()
+            if runtime_root is None:
+                raise TraderError(
+                    'E_RUNTIME_CONFIG',
+                    '未找到 Standalone Runtime 配置；默认入口不会回落到旧工作台。'
+                    '请使用带 runtime 目录的完整交付包，Legacy 维护需显式指定旧入口参数。',
+                )
         if runtime_root is not None:
             from online_trader.desktop.runtime_bootstrap import BootstrapController
             from online_trader.desktop.workbench_instance import WorkbenchActivationServer

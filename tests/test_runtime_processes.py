@@ -22,7 +22,7 @@ class RuntimeProcessTests(unittest.TestCase):
         self.assertEqual(value['source'], 'OFFLINE_NATIVE_SHAPED_FACTS')
         self.assertFalse(value['broker_connected'])
         self.assertEqual(value['real_orders_sent'], 0)
-        self.assertEqual(value['observations']['authentication']['status'], 'AUTHENTICATED')
+        self.assertEqual(value['observations']['control_channel'], 'SAME_USER_WORKBENCH')
         self.assertEqual(value['observations']['account']['status'], 'READY')
         self.assertIn('observations', value['observations']['history'])
         self.assertEqual(value['observations']['receipt']['status'], 'SUCCEEDED')

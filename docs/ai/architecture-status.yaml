@@ -10,6 +10,39 @@ rules:
     remain authoritative. A dirty worktree or later HEAD requires rechecking affected entries.
 
 documents:
+  - path: docs/refactor/runtime-workbench-current-20261120.md
+    scope: standalone/workbench-current-overview
+    status: CURRENT
+    verified_at_sha: WORKTREE
+    evidence:
+      design: CONSOLIDATED_FROM_CURRENT_CONTRACTS
+      source: IMPLEMENTED_CANDIDATE
+      tests: NOT_RUN
+      product_acceptance: NOT_RUN
+    notes: Current user entry, state ownership, lifecycle, command, failure, diagnostic and acceptance routing for Runtime Workbench work.
+
+  - path: docs/refactor/testing-and-portable-delivery-pipeline-optimization-20261120.md
+    scope: delivery/testing-and-portable-pipeline
+    status: CANDIDATE
+    verified_at_sha: WORKTREE
+    evidence:
+      design: REVIEWED_WITH_CONFLICTS_RESOLVED
+      source: IMPLEMENTED_CANDIDATE
+      tests: NOT_RUN
+      product_acceptance: NOT_RUN
+    notes: Fast preflight, cached TEST-ONLY freeze and clean configured Runtime delivery pipeline; no Generic deliverable.
+
+  - path: docs/refactor/runtime-manual-only-cleanup-20261120.md
+    scope: standalone/manual-start-and-local-user-control
+    status: CURRENT
+    verified_at_sha: WORKTREE
+    evidence:
+      design: USER_APPROVED
+      source: IMPLEMENTED_CANDIDATE
+      tests: NOT_RUN
+      product_acceptance: NOT_RUN
+    notes: Manual-only product contract; delegated operators, unattended scheduling and Runtime ledger handoff are retired.
+
   - path: AGENTS.md
     scope: repository/authorization-and-delivery
     status: CURRENT
@@ -64,6 +97,17 @@ documents:
       tests: NOT_RUN_AFTER_FIX
       product_acceptance: NOT_RUN
     notes: Current defect remediation and next independent retest scope.
+
+  - path: docs/refactor/runtime-market-race-entry-exit-remediation-20261120.md
+    scope: standalone/entry-intent-pricing-send-boundary-and-exit-responsibility
+    status: CANDIDATE
+    verified_at_sha: WORKTREE
+    evidence:
+      design: REVIEWED_REVISED
+      source: IMPLEMENTED_CANDIDATE
+      tests: NOT_RUN
+      product_acceptance: NOT_RUN
+    notes: P0 candidate separates immutable strategy signal, logical intent, repricing children and the SDK uncertainty boundary; independent fault and SimNow acceptance remain required.
 
   - path: docs/refactor/runtime-architecture-hardening-plan-20261120.md
     scope: standalone/architecture-history

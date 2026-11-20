@@ -10,13 +10,13 @@ Preserve existing work; do not import V7, vnpy, DSV, their credentials, database
 
 ## 默认启动与交付路径
 
-- 未明确指定执行路径时，OnlineTrader 的启动、重启、用户验收、测试候选和打包默认采用 **Standalone Trading Runtime**。普通用户从 `online-trader-desktop --runtime-root <目录>`（配置便携版直接双击 `OnlineTrader.exe`）进入；统一桌面入口先附着已有 Runtime，缺失时以 `DISARMED` 启动 Owner，再打开同一个 `WorkbenchWindow` / `WorkbenchLayout`。`runtime run`、`runtime schedule` 和 `--runtime-pipe` 保留为运维、无人值守及高级附着入口；不要另建或交付第二套界面。
+- 未明确指定执行路径时，OnlineTrader 的启动、重启、用户验收、测试候选和打包默认采用 **Standalone Trading Runtime**。普通用户从 `online-trader-desktop --runtime-root <目录>`（配置便携版直接双击 `OnlineTrader.exe`）主动进入；统一桌面入口先附着已有 Runtime，缺失时以 `DISARMED` 启动 Owner，再打开同一个 `WorkbenchWindow` / `WorkbenchLayout`。`runtime run` 和 `--runtime-pipe` 仅保留为运维及高级附着入口；CLI 不提供交易命令或无人值守调度。不要另建或交付第二套界面。
 - 默认 Runtime 路径不授予账号连接、订单操作、测试或打包权限；这些动作仍按本次用户授权执行。用户明确要求 Legacy 维护、replacement candidate 或 isolated QA 时，才切换相应路径，并在报告中标明。
-- 默认打包目标是可实际运行的 Runtime 完整交付单元，不是仅含普通工作台的 Legacy 包。除通用便携依赖外，按接收方带齐 Runtime 配置和操作员授权；执行账本不属于交付状态，历史缓存可由期货账户重新下载。从最终 ZIP/安装器按双击 `OnlineTrader.exe` 的统一 Runtime 入口独立验收，并另外保留 `runtime run`/`runtime schedule` 与 `--runtime-pipe` 运维入口核对。
+- 默认打包目标是可实际运行的 Runtime 完整交付单元，不是仅含普通工作台的 Legacy 包。除通用便携依赖外，按接收方带齐 Runtime 账户和参数配置；不交付操作员授权、自动启动控制或执行账本，历史缓存可由期货账户重新下载。从最终 ZIP/安装器按双击 `OnlineTrader.exe` 的统一 Runtime 入口独立验收，并另外核对 `runtime run` 与 `--runtime-pipe` 运维入口。
 
 ## 所有软件制品必须随包交付配置
 
-- OnlineTrader 每次出包都必须带齐本次交付所需的配置。安装器、便携包、更新 ZIP、客户专用包和测试包均适用。打包前确认目标设备或接收方使用的配置来源和文件清单。需要预配账户和交易参数时，必须随包带入已确认的 `OnlineTrader-defaults.json` 和 `OnlineTrader-parameters.json`，以及该包所需的启动和更新配置。独立 Trading Runtime 的新交付还必须显式带入 `runtime.json`、`runtime-control.json` 和相应的 `private/operators.json`；不要用缺少自动启动总开关的目录猜测默认行为。
+- OnlineTrader 每次出包都必须带齐本次交付所需的配置。安装器、便携包、更新 ZIP、客户专用包和测试包均适用。打包前确认目标设备或接收方使用的配置来源和文件清单。需要预配账户和交易参数时，必须随包带入已确认的 `OnlineTrader-defaults.json` 和 `OnlineTrader-parameters.json`，以及该包所需的启动和更新配置。独立 Trading Runtime 的新交付必须显式带入 `runtime.json`；`runtime-control.json` 和 `private/operators.json` 是被忽略的旧文件，不得作为新交付依赖。
 - 禁止将缺少交付配置的通用包、空配置包或占位配置包作为制品交付。客户包使用为该客户或设备确认的配置。测试包使用能完成指定场景的隔离测试配置。配置缺失、归属不明，或分发渠道无法承载经授权的配置时，停止出包或发布并说明原因。含账户口令的制品只通过获准的私有渠道交付。
 - 正式交付的安装器、便携包和更新 ZIP 禁止随包配置白银。检查品种列表、交易参数、默认策略和自动加载的预设，排除白银主连及上期所全部 `ag` 合约月。发现任何白银配置项时停止交付。
 - 交付前检查最终制品本身。对 ZIP 检查实际归档内容，对安装器在隔离目录安装验证，核对配置文件的路径、有效内容及其与已确认输入的一致性。使用用户实际启动入口验证配置可读取。交付记录写明版本、制品 SHA-256 和配置验证结果，省略口令等秘密。任一检查缺失或失败，该制品不能交付。
@@ -40,7 +40,7 @@ Keep the explicit controller's per-child pre-send durability and the existing cu
 | Path | Entry points and owner | Applicable contract |
 | --- | --- | --- |
 | Legacy, not yet retired; explicit maintenance only | `simulation run`, `dsv run`, `simnow run`, and the ordinary workbench's existing launch route | Preserve the original Kernel owner and that route's recovery contract until approved cutover. Do not select this as the default launch or package path. |
-| Standalone Trading Runtime; default | `online-trader-desktop --runtime-root`, packaged `OnlineTrader.exe`, `runtime run`, `runtime schedule`, `runtime command`, attached status/account/history and runtime Workbench | One Windows host has at most one Runtime; other hosts are not mutually excluded, including when they use the same futures account. Each boot uses a process-owned temporary Kernel/SQLite execution store and synchronizes current facts from the broker. Qt and runtime-view are read/control-side processes. Follow [the current authority design](docs/refactor/runtime-broker-authority-single-instance-20261120.md). |
+| Standalone Trading Runtime; default | `online-trader-desktop --runtime-root`, packaged `OnlineTrader.exe`, `runtime run`, attached status/account/history and runtime Workbench | One Windows host has at most one Runtime; other hosts are not mutually excluded, including when they use the same futures account. Each boot uses a process-owned temporary Kernel/SQLite execution store and synchronizes current facts from the broker. Qt and runtime-view are read/control-side processes. Only the same-user Workbench channel submits trading controls. Follow [the current authority design](docs/refactor/runtime-broker-authority-single-instance-20261120.md) and [manual-only contract](docs/refactor/runtime-manual-only-cleanup-20261120.md). |
 | Replacement candidate | `dsv replacement-run`, `simnow replacement-run` | `DsvSession` + `ExplicitOrderController` + `Journal` + `DsvSdkAdapter`; share the compatible account lock, not the legacy Kernel sender. See [candidate startup](docs/refactor/dsv-parity-20261114/10-sdk-startup-and-same-day-rollback.md). |
 | Isolated QA | `offline-dsv` and `qa/dsv_parity/` replay tools | DEV/OFFLINE fixtures or locally bounded SDK replay; no real account connection or order authority. |
 

@@ -199,6 +199,11 @@ def decide_order_action(order, desired_price, *, can_increase, remaining_quantit
         if not needed:
             return outcome("DONE", "TARGET_ALREADY_COVERED")
         if order.get("broker_state") == "REJECTED":
+            if order["effect"] == "REDUCE" and desired is not None:
+                # A proved broker rejection is terminal for this child, not for
+                # the common exit target.  Close routing and price are rebuilt
+                # before a replacement is committed.
+                return outcome("REPLACE", "BROKER_REJECTED_TERMINAL", amount=needed)
             return outcome("STOP", "UNEXPECTED_ORDER_TERMINAL")
         reusable = order.get("send_state") == "DEFINITELY_NOT_SENT" or (
             order.get("broker_state") == "CANCELLED" and reprice_cancelled)
@@ -222,3 +227,17 @@ def decide_order_action(order, desired_price, *, can_increase, remaining_quantit
     if (side == "BUY" and desired > old) or (side == "SELL" and desired < old):
         return outcome("CANCEL", "NEW_QUOTE_PRICE_WORSENED")
     return outcome("WAIT", "PRICE_EQUAL_OR_IMPROVED")
+
+
+def committed_limit_is_safe(side, committed_price, current_policy_price):
+    """Whether a committed limit remains inside the latest policy boundary.
+
+    A newer quote need not reproduce the old candidate.  A buy limit remains
+    safe when the latest policy would pay no more than that limit; the sell
+    relation is symmetric.  A worse price must be represented by a new durable
+    child, never by mutating the committed child.
+    """
+    side = _side(side)
+    committed = decimal_value(committed_price, positive=True)
+    current = decimal_value(current_policy_price, positive=True)
+    return current <= committed if side == "BUY" else current >= committed

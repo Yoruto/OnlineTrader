@@ -400,6 +400,11 @@ class DsvStrategyRuntime:
                 if order["send_state"]=="UNKNOWN":account["unknown_orders"]=True
                 if order["effect"]=="OPEN":
                     local_remaining+=OrderState.from_dict(order).potential_remaining
+            if cycle['decision_key'] == counted_target:
+                local_remaining = 0
+            elif (not local_remaining and (cycle.get('entry_intent') or {}).get('status') == 'ACTIVE'
+                    and cycle['protection']['entry_filled_qty'] < cycle['plan']['initial_open_quantity']):
+                local_remaining = cycle['plan']['initial_open_quantity'] - cycle['protection']['entry_filled_qty']
             uncovered=0 if cycle['position_cycle_id'] in covered else cycle['protection']['owned_qty']
             if local_remaining or uncovered:
                 amount=cycle.get('strategy_metadata') or {}
@@ -553,16 +558,47 @@ class DsvStrategyRuntime:
             return result
         current = self._evaluate_entry(pre_state, facts["event"], facts.get("stop_result"),
                                        exclude_decision=original["decision_key"])
-        keys = ("direction", "theoretical_price", "limit_price", "decision_key", "profile_hash", "entry_kind")
+        # A signal identity is stable while its execution price is deliberately
+        # allowed to follow the latest legal book.  Requiring limit_price to be
+        # reproduced here turns ordinary quote movement into a lost signal.
+        keys = ("direction", "theoretical_price", "decision_key", "profile_hash", "entry_kind")
+        if original.get('entry_kind') == 'NORMAL':
+            keys += ('candle_key',)
         expected = {key: original[key] for key in keys}
         observed = [{key: candidate[key] for key in keys} for candidate in current["candidates"]]
         if expected not in observed:
-            return result | {"allowed": False, "reason_codes": ["ENTRY_RECHECK_CANDIDATE_CHANGED", *current["reasons"]],
-                             "details": {"expected": expected, "observed": observed}}
+            return result | {"allowed": False, "reason_codes": ["E_ENTRY_SIGNAL_INVALIDATED", *current["reasons"]],
+                             "details": {"expected_signal": expected, "observed_signals": observed,
+                                         "original_limit_price": original["limit_price"]}}
         candidate = current["candidates"][observed.index(expected)]
         risk = self._risk(candidate, facts, exclude_decision=original["decision_key"],
                           previous_attempt=pre_state.get("last_ordinary_attempt"))
-        return self._quantity_recheck(result, risk, quantity)
+        checked = self._quantity_recheck(result, risk, quantity)
+        checked["details"] = checked.get("details", {}) | {
+            "original_limit_price": original["limit_price"],
+            "current_limit_price": candidate["limit_price"],
+            "signal_identity": expected,
+        }
+        return checked
+
+    def _signal_contract(self, candidate, event):
+        trade = self.profile.to_record()['settings']['trade']
+        ratio = Decimal(trade['chase_slip_ratio'] if candidate['entry_near_open'] else trade['entry_slip_ratio'])
+        distance = max(Decimal(1), Decimal(round(Decimal(candidate['open_offset']) * ratio)))
+        trigger = Decimal(candidate['theoretical_price'])
+        cap = trigger + distance if candidate['direction'] == 'LONG' else trigger - distance
+        timing = event.get('session_policy') or {}
+        return {
+            'entry_kind': candidate['entry_kind'],
+            'direction': candidate['direction'],
+            'trigger_price': candidate['theoretical_price'],
+            'price_cap': decimal_text(cap),
+            'signal_time_utc': candidate['source_time_utc'],
+            'signal_valid_until_utc': timing.get('entry_close_utc') or event['session_close_utc'],
+            'session_id': candidate['session_id'],
+            'candle_key': candidate['candle_key'],
+            'strategy_revision': candidate['profile_hash'],
+        }
 
     def _evaluate_entry(self,state,event,stops,*,exclude_decision=None,decision_time=None,resuming=False):
         if self.online and decision_time is None:
@@ -632,6 +668,26 @@ class DsvStrategyRuntime:
             result = self._instrument_recheck(result, facts["instrument"], cycle.get("instrument", {}))
             if not result["allowed"]:
                 return result
+            event = facts['event']
+            signal = (cycle.get('entry_intent') or {}).get('signal') or {}
+            if signal.get('entry_kind') == 'NORMAL':
+                identity = {key: event[key] for key in ('account_key', 'contract_id', 'trading_day', 'candle_id')}
+                current_candle = 'candle-' + content_hash(identity)
+                last, trigger = Decimal(event['last']), Decimal(signal['trigger_price'])
+                trigger_valid = last >= trigger if signal['direction'] == 'LONG' else last <= trigger
+                if current_candle != signal.get('candle_key') or not trigger_valid:
+                    return result | {'allowed': False, 'reason_codes': ['E_ENTRY_SIGNAL_INVALIDATED'],
+                                     'details': {'expected_candle': signal.get('candle_key'),
+                                                 'observed_candle': current_candle,
+                                                 'trigger_price': signal['trigger_price'],
+                                                 'observed_last': event['last']}}
+            cap = signal.get('price_cap')
+            if cap is not None:
+                within = (Decimal(order.limit_price) <= Decimal(cap) if signal['direction'] == 'LONG'
+                          else Decimal(order.limit_price) >= Decimal(cap))
+                if not within:
+                    return result | {'allowed': False, 'reason_codes': ['E_ENTRY_PRICE_CAP'],
+                                     'details': {'price_cap': cap, 'observed_limit_price': order.limit_price}}
             risk = self._risk(candidate | {"limit_price": order.limit_price}, facts,
                               exclude_attempt=order.attempt_id, counted_target=cycle["decision_key"],
                               profile=self.profile_for_plan(cycle['plan']))
@@ -640,11 +696,18 @@ class DsvStrategyRuntime:
         review = ready()
         if not review["allowed"]:
             return {"recheck": review}
+        previous = next((item for item in reversed(cycle['orders']) if item['effect'] == 'OPEN'), None)
+        if previous is not None and previous.get('pricing_quote_id') == review.get('quote_id'):
+            return {'recheck': review | {'allowed': False,
+                    'reason_codes': ['E_QUOTE_REVISION_UNCHANGED'],
+                    'details': {'quote_id': review.get('quote_id'),
+                                'source_epoch': review.get('source_epoch')}}}
         peer='dsv-owner-'+str(self.epoch)
         context=k.contexts.issue(peer,'ENTRY_PROPOSAL','DSV_ENTRY',cycle['plan']['contract_id'],
             kernel_epoch=str(k.kernel_epoch),strategy_epoch=str(self.epoch),revisions=k.revisions,issued_event_seq=str(k._durable_seq))
         return {'authorization':{'context_id':context['context_id'],'peer_id':peer,'authority_revision':k._authority_revision,
-                                'purpose':'ENTRY_PROPOSAL','operation':'DSV_ENTRY'},'gate':ready}
+                                 'purpose':'ENTRY_PROPOSAL','operation':'DSV_ENTRY'},'gate':ready,
+                'quote_review': review}
 
     def rebuild_observation(self,events,*,evidence_id=None,extend=False,_preserve_authority=False,_resume_anchor=None,
                             _progress=None,_enrich=None,_evidence_prefix=None):
@@ -956,6 +1019,7 @@ class DsvStrategyRuntime:
                     report["checks"] = {"strategy": "PASSED", "owner": "PASSED", "risk": "PASSED"}
                     persisted["report"]=copy.deepcopy(report)
                     hook={"epoch":self.epoch,"money_account":money_account,"metadata":{"profile_hash":self.profile.content_hash,"candidate":candidate,
+                        "signal":self._signal_contract(candidate, event),
                         "strategy_state":state,"stop_result":stop_result,"margin_per_lot":risk["metrics"]["margin_per_lot"],
                         "instrument":copy.deepcopy(instrument),"decision_id":decision_id},"report":report,
                         "gate":lambda frozen=copy.deepcopy(instrument):self._final_gate(candidate,previous,risk["quantity"],frozen),"mutate":mutate,"accepted":accepted}
@@ -965,11 +1029,18 @@ class DsvStrategyRuntime:
                     try:
                         child=k.admit_entry(plan,candidate["decision_key"],candidate["limit_price"],context_id=context["context_id"],
                             peer_id="dsv-owner-"+str(self.epoch),_strategy=hook)
-                    except TraderError:
+                    except TraderError as error:
                         if 'last_ordinary_attempt' in previous:
                             state['last_ordinary_attempt']=previous['last_ordinary_attempt']
                         else:
                             state.pop('last_ordinary_attempt',None)
+                        if error.code == 'E_NATIVE_QUOTE_NOT_CURRENT':
+                            # Admission has not created an intent.  A temporary
+                            # native-book race therefore cannot consume the
+                            # minute opportunity; a later strategy observation
+                            # must evaluate it again from the prior consumption
+                            # boundary.
+                            state['last_signal_bar'] = previous['last_signal_bar']
                         raise
                     report["child_order_id"]=child
                     return result

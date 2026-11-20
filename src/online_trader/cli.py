@@ -95,21 +95,6 @@ def main(argv=None):
             command.add_argument('--checkpoint-event-seq', help='读取指定的已提交账本水位')
         if name == 'quotes':
             command.add_argument('--symbol', action='append', help='合约代码，可重复指定，默认使用策略配置品种')
-    schedule = runtime_actions.add_parser('schedule', help='由无界面运行时等待已授权的定时策略启动')
-    schedule.add_argument('--root', type=Path, required=True)
-    schedule.add_argument('--account')
-    schedule.add_argument('--operator', required=True)
-    schedule.add_argument('--token-stdin', action='store_true')
-    for name in ('command', 'receipt'):
-        command = runtime_actions.add_parser(name, help='提交获授权的模拟命令' if name == 'command' else '查询原命令回执')
-        command.add_argument('--root', type=Path, required=True)
-        command.add_argument('--account')
-        command.add_argument('--operator', required=True)
-        command.add_argument('--token-stdin', action='store_true', help='从标准输入读取操作令牌')
-        if name == 'command':
-            command.add_argument('--input', type=Path, required=True)
-        else:
-            command.add_argument('--command-id', required=True)
     runtime_view = commands.add_parser('runtime-view-process', help=argparse.SUPPRESS)
     runtime_view.add_argument('--pipe', required=True)
     runtime_view.add_argument('--account-key', required=True)

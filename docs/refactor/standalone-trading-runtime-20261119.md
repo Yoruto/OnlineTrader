@@ -1,5 +1,7 @@
 # OnlineTrader 独立交易运行时与交易工作台设计
 
+> **2026-11-20 当前覆盖：** 本文中的委托操作员、CLI交易命令、无人值守调度、长期执行账本和 handoff 设计已退役。当前产品只允许同一 Windows 用户通过 Workbench 控制主动启动的 Runtime；每次 boot 使用临时执行库。以[手动启动收口](runtime-manual-only-cleanup-20261120.md)和[柜台权威设计](runtime-broker-authority-single-instance-20261120.md)为准，以下未改写段落保留为历史演进记录。
+
 2026-11-19 · 实施设计 · 源码基线 `10b915fa23f33860712ec491a7aa74d015c46203`（dev36）
 
 当前实现状态：Trading Runtime、便携配置、原账本、操作员接口、只读接口进程、差量视图、附着账户读取、跨日历史、交接导出及 Workbench 本机身份通道均已进入源码。实际 SimNow 模拟账号的历史证据覆盖无 Qt 策略成交、人工开平、持仓中强杀 Qt、附着账户读取和最终结清；跨日历史完成过 Windows 独立离线复测。2026-11-20 源码候选已完成封闭 Workbench allowlist、Capability 补齐、CommandBus pending 加固和生产接管、异步 Bootstrap 及 ConfigSnapshot 投影；当前身份检查仍不能证明真实按钮点击，本次候选也尚未独立测试，不能沿用此前候选结果。真实资金账户和最终发行制品同样不在完成口径。

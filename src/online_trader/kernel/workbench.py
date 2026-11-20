@@ -363,8 +363,9 @@ def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None, native_fa
             failed=any(order['terminal_confirmed'] and order['filled_qty']<order['original_qty'] and
                 (order['broker_state']=='REJECTED' or (order['broker_state']=='CANCELLED' and not order['cancel_status']
                  and order['child_order_id'] not in cancellations)) for order in reductions
-                if order['child_order_id'] not in manual_children or
+                if order['child_order_id'] in manual_children and
                 (manual and manual_children[order['child_order_id']]==manual['request_id']))
+            failed = failed or (cycle.get('exit_responsibility') or {}).get('state') == 'MANUAL_INTERVENTION_REQUIRED'
             if failed and s['owned_qty']-target>reserved:
                 exit_blocks.append({'reason_code':'EXIT_REDUCTION_TERMINAL_UNFILLED','active':True,
                                     'contract_id':p['contract_id'],'position_cycle_id':cid})
@@ -393,6 +394,13 @@ def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None, native_fa
                 margin=number(getattr(broker_position,'margin',None))
             floating=number(getattr(broker_position,'float_profit_'+side,None))
         fees=position_fees.get(cid,[])
+        responsibility = cycle.get('exit_responsibility') or {}
+        responsibility_wait = {
+            'WAIT_QUOTE': 'EXIT_WAITING_FOR_PRICE',
+            'RETRY_SCHEDULED': 'EXIT_RETRY_SCHEDULED',
+            'RECONCILING': 'EXIT_RECONCILING',
+            'MANUAL_INTERVENTION_REQUIRED': 'EXIT_MANUAL_INTERVENTION_REQUIRED',
+        }.get(responsibility.get('state'))
         cycles.append({'position_cycle_id':cid,'contract_id':p['contract_id'],'direction':p['direction'],
             'trading_day':p['trading_day'],'lifecycle':cycle['lifecycle'],'remaining_quantity':s['owned_qty'],
             'target_remaining_quantity':target,'mode':s['mode'],'quality':s['quality'],'exit_pending':bool(exit_pending),
@@ -404,11 +412,13 @@ def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None, native_fa
             'phase1_status':s.get('phase1_status'),'phase2_status':s.get('phase2_status'),
             'phase1_target':s.get('phase1_target'),'phase2_target':s.get('phase2_target'),
             'initial_open_confirmation':copy.deepcopy(cycle.get('initial_open_confirmation')),
+            'entry_intent':copy.deepcopy(cycle.get('entry_intent')),
+            'exit_responsibility':copy.deepcopy(cycle.get('exit_responsibility')),
             'entry_tag':(cycle.get('strategy_metadata') or {}).get('candidate',{}).get('entry_kind'),
             'exit_reasons':copy.deepcopy(s.get('exit_reasons',[])),
             'exit_reason':(cycle.get('nominal_exit') or {}).get('exit_reason'),
             'exit_reference_price':(cycle.get('nominal_exit') or {}).get('nominal_exit_price'),
-            'exit_wait_reason': (None if not exit_pending else 'EXIT_WAITING_FOR_SESSION'
+            'exit_wait_reason': (None if not exit_pending else responsibility_wait or 'EXIT_WAITING_FOR_SESSION'
                                  if market.get('market_session_active') is False else 'EXIT_WAITING_FOR_PRICE'
                                  if not market.get('fresh') or (
                                      p['contract_id'] in getattr(port, 'waiting_reduction_quotes', ())
@@ -420,7 +430,8 @@ def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None, native_fa
             broker_order=broker_orders.get(native_id)
             native_time=getattr(broker_order,'insert_date_time',None)
             orders.append({key:order.get(key) for key in ('child_order_id','intent_id','attempt_id','effect','original_qty','filled_qty',
-                'limit_price','native_offset','native_trading_day','send_state','broker_state','cancel_status','terminal_confirmed','reported_fill_qty')}
+                'limit_price','native_offset','native_trading_day','send_state','broker_state','cancel_status','terminal_confirmed','reported_fill_qty',
+                'pricing_quote_id','pricing_source_epoch')}
                 |{'native_order_id':native_id,'direction':p['direction'],
                   'source_time_ns':str(native_time) if type(native_time) is int and native_time>0 else None,
                   'native_message':str(getattr(broker_order,'last_msg',''))[:200] if broker_order is not None else None,

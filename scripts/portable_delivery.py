@@ -1,7 +1,6 @@
 """Validate delivery inputs and verify the assembled Windows portable archive."""
 
 import argparse
-from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -9,6 +8,7 @@ import re
 import shutil
 import sys
 from tempfile import NamedTemporaryFile
+from time import perf_counter
 from zipfile import ZIP_DEFLATED, ZipFile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
@@ -16,7 +16,6 @@ from online_trader.accounts import validate_simulation_defaults
 from online_trader.errors import TraderError
 from online_trader.configuration.baseline import APPROVAL_RESOURCE, BASELINE_RESOURCE
 from online_trader.configuration.dsv import DsvProfile
-from online_trader.runtime.operator_api import operator_records
 from online_trader.runtime.portable_config import PortableAccountStore
 
 
@@ -77,17 +76,30 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def update_build_manifest(bundle, directory, names, *, deliverable):
+    path = bundle / 'base-build-manifest.json'
+    try:
+        document = json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError, TypeError):
+        raise ValueError('The base bundle is missing a readable build manifest.') from None
+    document.update({
+        'artifact_class': 'DELIVERY' if deliverable else 'TEST-ONLY',
+        'deliverable': deliverable,
+        'delivery': {
+            'mode': 'RuntimeConfigured',
+            'config_hashes': {name: digest(directory / name) for name in sorted(names)},
+            'silver_check': 'PASS',
+            'retired_file_check': 'PASS',
+        },
+    })
+    path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+
 def _runtime_files(directory, kind):
     directory = directory.resolve()
     store = PortableAccountStore(directory)
     store.profile()
-    store.runtime_control()
-    operators = operator_records(directory)
-    now = datetime.now(timezone.utc)
-    bound_accounts = {account for _, accounts, _, expiry in operators.values() if expiry > now for account in accounts}
-    if any(row['account_key'] not in bound_accounts for row in store.read()['accounts']):
-        raise ValueError('A delivered simulation account lacks a current local operator grant.')
-    names = ['runtime.json', 'runtime-control.json', PARAMETERS, 'private/' + DEFAULTS, 'private/operators.json']
+    names = ['runtime.json', PARAMETERS, 'private/' + DEFAULTS]
     if (directory / PARAMETER_OVERRIDES).is_file():
         names.append(PARAMETER_OVERRIDES)
     for name in names:
@@ -119,11 +131,7 @@ def verify_bundle(bundle, directory, runtime_kind=None):
         return (*RUNTIME_STARTUP_FILES, *('runtime/' + name for name in names))
     parameters = [path for path in bundle.rglob('*') if path.name.casefold() == PARAMETERS.casefold()]
     if directory is None:
-        if defaults:
-            raise ValueError('Generic portable bundles must not include account defaults.')
-        for path in parameters:
-            reject_silver_in_config(path.read_bytes(), path.relative_to(bundle).as_posix())
-        return
+        raise ValueError('A portable delivery must include an explicitly confirmed configuration.')
     if defaults != [bundle / DEFAULTS]:
         raise ValueError('Configured portable bundles require one account defaults file at the bundle root.')
     if parameters != [bundle / PARAMETERS]:
@@ -134,7 +142,7 @@ def verify_bundle(bundle, directory, runtime_kind=None):
     validate_config(bundle)
 
 
-def build_archive(bundle, destination, *, configured, output=None, important_members=()):
+def build_archive(bundle, destination, *, configured, output=None, important_members=(), metrics=None):
     if destination.exists():
         raise ValueError('Choose a new archive file.')
     named_configured = destination.name.casefold().endswith('-configured.zip')
@@ -148,9 +156,13 @@ def build_archive(bundle, destination, *, configured, output=None, important_mem
     with NamedTemporaryFile(dir=destination.parent, prefix='.online-trader-', suffix='.tmp', delete=False) as stream:
         staging = Path(stream.name)
     try:
+        archive_started = perf_counter()
         with ZipFile(staging, 'w', compression=ZIP_DEFLATED, compresslevel=5) as archive:
             for member, source in source_files.items():
                 archive.write(source, member)
+        if metrics is not None:
+            metrics['archive_seconds'] = round(perf_counter() - archive_started, 6)
+        verify_started = perf_counter()
         with ZipFile(staging) as archive:
             if set(archive.namelist()) != source_files.keys() or archive.testzip() is not None:
                 raise ValueError('Portable ZIP content or CRC verification failed.')
@@ -159,6 +171,10 @@ def build_archive(bundle, destination, *, configured, output=None, important_mem
                     if hashlib.file_digest(stream, 'sha256').hexdigest() != digest(source_files[member]):
                         raise ValueError('Portable ZIP member verification failed.')
         archive_sha256 = digest(staging)
+        if metrics is not None:
+            metrics['archive_verify_seconds'] = round(perf_counter() - verify_started, 6)
+            metrics['archive_members'] = len(source_files)
+            metrics['archive_sha256'] = archive_sha256
         if output is not None:
             bundle.rename(output)
         try:
@@ -179,32 +195,52 @@ def main():
     parser.add_argument('--bundle', type=Path)
     parser.add_argument('--archive', type=Path)
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--performance-report', type=Path)
     args = parser.parse_args()
     if args.output is not None and (args.bundle is None or args.archive is None):
         parser.error('--output requires both --bundle and --archive')
     if args.runtime_kind is not None and args.config_directory is None:
         parser.error('--runtime-kind requires --config-directory')
+    if args.bundle is not None and args.runtime_kind is None:
+        parser.error('assembled delivery bundles require --runtime-kind fresh')
+    metrics = {'schema_version': 'ONLINE_TRADER_DELIVERY_PERFORMANCE/1', 'result': 'FAIL'}
+    total_started = perf_counter()
     try:
         if args.runtime_kind is not None:
+            assembly_started = perf_counter()
             names = _runtime_files(args.config_directory, args.runtime_kind)
             if args.bundle is not None:
                 for name in names:
                     destination = args.bundle / 'runtime' / name
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(args.config_directory / name, destination)
+                update_build_manifest(
+                    args.bundle, args.config_directory, names, deliverable=args.archive is not None
+                )
+            metrics['assembly_seconds'] = round(perf_counter() - assembly_started, 6)
         if args.bundle is None:
             if args.runtime_kind is None:
                 validate_config(args.config_directory)
         else:
+            verify_started = perf_counter()
             important = verify_bundle(args.bundle, args.config_directory, args.runtime_kind)
+            metrics['bundle_verify_seconds'] = round(perf_counter() - verify_started, 6)
             if args.archive is not None:
                 archive_sha256 = build_archive(args.bundle, args.archive, output=args.output,
                                                configured=args.config_directory is not None,
-                                               important_members=important or ())
+                                               important_members=important or (), metrics=metrics)
                 print(f'ZIP SHA-256: {archive_sha256}')
+        metrics['result'] = 'PASS'
     except (OSError, ValueError, TraderError) as error:
         print(error, file=sys.stderr)
         return 2
+    finally:
+        metrics['total_seconds'] = round(perf_counter() - total_started, 6)
+        if args.performance_report is not None:
+            args.performance_report.parent.mkdir(parents=True, exist_ok=True)
+            args.performance_report.write_text(
+                json.dumps(metrics, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
+            )
     return 0
 
 

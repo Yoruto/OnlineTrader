@@ -212,7 +212,7 @@ class PipeConnection:
         self._validator = validator
         try:
             self.peer_pid, self.peer_sid = _peer(handle, server_side)
-            allowed = {allowed_sid, "S-1-5-18"} if server_side else {allowed_sid}
+            allowed = {allowed_sid}
             if self.peer_sid not in allowed or (expected_peer_pid is not None and self.peer_pid != expected_peer_pid):
                 raise TraderError("E_AUTH", "Pipe peer identity does not match the registered instance")
         except Exception:

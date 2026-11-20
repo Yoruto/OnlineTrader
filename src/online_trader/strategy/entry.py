@@ -427,6 +427,7 @@ class DsvEntryStrategy:
                 "stop_distance": decimal_text(stop), "take_profit_distance": decimal_text(take),
                 "entry_near_open": near_open, "open_offset": decimal_text(opening),
                 "decision_key": decision_key, "candle_key": candle_key, "source_epoch": event["source_epoch"],
-                "market_sequence": event["sequence"], "source_time_utc": event["source_time_utc"],
+                "market_sequence": event["sequence"], "native_tick_id": event.get("native_tick_id"),
+                "source_time_utc": event["source_time_utc"],
                 "session_id": event["session_id"], "profile_hash": self.profile.content_hash, "entry_kind": entry_kind,
                 "decision_time_utc": decided_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")}

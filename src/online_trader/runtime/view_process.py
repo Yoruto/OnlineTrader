@@ -15,9 +15,7 @@ import re
 from online_trader.errors import TraderError
 from online_trader.runtime.account_cache import read_account_days, recent_history
 from online_trader.runtime.executable import bundled_cli
-from online_trader.runtime.operator_api import OperatorEndpoint, WorkbenchEndpoint
-from online_trader.runtime.operator_api import validate_wire as validate_command
-from online_trader.runtime.operator_api import validate_workbench_wire
+from online_trader.runtime.operator_api import WorkbenchEndpoint, validate_workbench_wire
 from online_trader.transport.named_pipe import PipeListener
 from online_trader.transport.runtime_account import AccountObservation, read_observation
 from online_trader.transport.runtime_account import validate_wire as validate_account
@@ -246,12 +244,8 @@ def _serve_command(connection, endpoint, root, slots):
             operation = _safe_log_token(body.get('operation'))
             command_id = _safe_log_token(body.get('command_id'))
             binding = body.get('binding') if isinstance(body.get('binding'), dict) else {}
-            actor_kind = 'LOCAL_USER' if endpoint.channel == 'WORKBENCH' else 'DELEGATED_OPERATOR'
-            if endpoint.channel == 'WORKBENCH':
-                actor = 'workbench-user'
-            else:
-                operator = _safe_log_token(request.get('operator'))
-                actor = _safe_log_token('operator-' + operator) if operator != '-' else '-'
+            actor_kind = 'LOCAL_USER'
+            actor = 'workbench-user'
             account = hashlib.sha256(endpoint.account_key.encode('utf-8')).hexdigest()[:16]
             peer_pid = connection.peer_pid if isinstance(connection.peer_pid, int) else 0
             peer = (f'peer_pid={max(0, peer_pid)} '
@@ -314,7 +308,6 @@ def serve(pipe, account_key, root, ledger, history_cache):
     history = ViewHistory()
     stopped = Event()
     command_submission = Lock()
-    endpoint = OperatorEndpoint(pipe, root, ledger, account_key, submission_lock=command_submission)
     workbench_endpoint = WorkbenchEndpoint(
         pipe, root, ledger, account_key, submission_lock=command_submission)
     account_display = _account_display(root, account_key)
@@ -362,11 +355,8 @@ def serve(pipe, account_key, root, ledger, history_cache):
     Thread(target=read_owner, daemon=True).start()
     accounts = None
     try:
-        with (PipeListener(pipe + '.control', validator=validate_command) as commands,
-              PipeListener(pipe + '.workbench-control', validator=validate_workbench_wire) as workbench_commands,
+        with (PipeListener(pipe + '.workbench-control', validator=validate_workbench_wire) as workbench_commands,
               PipeListener(pipe + '.view', validator=validate_wire) as views):
-            Thread(target=_accept, args=(commands, _serve_command, (endpoint, root), BoundedSemaphore(4), stopped),
-                   daemon=True).start()
             Thread(target=_accept, args=(workbench_commands, _serve_command, (workbench_endpoint, root),
                                          BoundedSemaphore(4), stopped),
                    daemon=True).start()

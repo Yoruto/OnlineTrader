@@ -72,3 +72,16 @@ class TraderError(ValueError):
     def __init__(self, code: str, message: str = "Request refused") -> None:
         self.code = code
         super().__init__(message)
+
+
+class DefinitelyNotSentError(TraderError):
+    """A gateway refusal that is proved to precede the SDK order call.
+
+    This type is intentionally internal.  The owner may prepare another child
+    only after the refusal itself has been committed; ordinary exceptions at or
+    beyond the SDK boundary remain UNKNOWN.
+    """
+
+    def __init__(self, code: str, message: str = "Order was not sent", *, evidence=None) -> None:
+        super().__init__(code, message)
+        self.evidence = evidence

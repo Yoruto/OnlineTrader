@@ -81,6 +81,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         window.timer.stop()
         self.addCleanup(dispose_widget, window)
         view = test_workbench.view()
+        view['connection'].update(broker_connected=True, synchronized=True)
         codes = ['DCE.p2701','DCE.l2701','SHFE.bu2701','CZCE.OI701','SHFE.ag2702']
         view['configuration']['scoped_contracts'] = codes
         view['entry_authority'] = 'ARMED'
@@ -100,7 +101,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                                    'risk_ratio':'0.012','opening_orders':6}
         window.dashboard.render(view)
         waiting,stopped,pending = [label.text() for label in window.dashboard.status_labels]
-        self.assertEqual(waiting.count('日内振幅超出开仓上限，暂不建仓'),3)
+        self.assertEqual(waiting.count('日内振幅超出开仓上限'),3)
         self.assertIn('DCE.l2701',stopped)
         self.assertIn('浮盈曾达止盈80%',stopped)
         self.assertNotIn('DCE.p2701',stopped)

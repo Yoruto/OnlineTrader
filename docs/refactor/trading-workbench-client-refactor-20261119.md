@@ -1,13 +1,13 @@
 # OnlineTrader Trading Workbench（Client）重构设计与实施计划
 
-> **2026-11-20 权威更新：** 本文的 UI、线程和 Client/View 分层仍可作为候选设计参考；其中注册表/QSettings pending 持久化、跨 Workbench boot 查询责任及长期执行账本恢复结论已经失效。当前 Standalone 以[本机单实例与柜台权威设计](runtime-broker-authority-single-instance-20261120.md)和[CommandBus 进程内关联合同](runtime-command-bus-contract-20261120.md)为准。具体作用域状态见[AI 文档状态清单](../ai/architecture-status.yaml)。
+> **2026-11-20 权威更新：** 本文是分阶段设计与历史证据，不是当前总合同。当前入口、用户流程、状态所有权、生命周期和诊断路由以[当前 Workbench 合同总览](runtime-workbench-current-20261120.md)为准，并由[本机单实例与柜台权威设计](runtime-broker-authority-single-instance-20261120.md)和[CommandBus 进程内关联合同](runtime-command-bus-contract-20261120.md)分别持有细节。本文的注册表/QSettings pending 持久化、跨 Workbench boot 查询责任、长期执行账本恢复、操作员令牌、委托工具交易和无人值守调度结论均已失效。具体作用域状态见[AI 文档状态清单](../ai/architecture-status.yaml)。
 
 > 状态：Phase 1 三项 Integration Gate 已通过独立定向自动化；Phase 2 已开始把账号历史慢查询接入既有 Workbench，状态订阅和交易控制仍未迁移 · 2026-11-19；未打包
 > 范围：Qt/PySide6 客户端及其与 Trading Runtime 的接口适配  
 > 设计基线：`1f0ab648136519e364bf3267c6dab51ffdd76e15`；实施起点：`c891e512ed6559505160cccd80bfd90a40ae5262`
 > 本文所列实现状态不代表最终独立复测、模拟柜台交易闭环或最终制品已经通过。
 
-> 2026-11-20 实施更新：Workbench 不再显示操作员或令牌，使用受 Windows 本机身份边界约束的通道；该检查不能证明真实按钮点击，当前服务端还允许 `LocalSystem`。CLI、调度和受托工具的操作员协议保留。源码候选已按[架构收敛与安全改造计划](runtime-architecture-hardening-plan-20261120.md)完成 CommandBus 安全整改和生产接管，但尚未获得功能测试或真实柜台验收。
+> 2026-11-20 实施更新：Workbench 不再显示操作员或令牌，只接受启动 Runtime 的 Windows 交互用户 SID，并拒绝其他 SID（包括 `LocalSystem`）。CLI/API/受托工具只读，无调度交易入口。源码候选已完成 CommandBus 生产接管，但尚未获得当前合同下的功能测试或真实柜台验收。
 
 **关联文档：** [独立交易运行时与交易工作台设计](standalone-trading-runtime-20261119.md) · [架构收敛与安全改造计划](runtime-architecture-hardening-plan-20261120.md) · [Runtime 运维、配置与账本](../runtime-operations-and-storage-20261119.md) · [账户数据与历史查询](../account-data-sync-design-20261119.md)
 

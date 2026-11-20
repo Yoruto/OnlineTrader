@@ -75,6 +75,9 @@ class CommandSafetyGateTests(unittest.TestCase):
         cls.app = QCoreApplication.instance() or QCoreApplication([])
 
     def setUp(self):
+        self._reset_bus()
+
+    def _reset_bus(self):
         self.store = ClientStateStore()
         self.coordinator = CoordinatorStub()
         self.bus = CommandBus(self.coordinator, self.store)
@@ -113,8 +116,10 @@ class CommandSafetyGateTests(unittest.TestCase):
         """T-05: a failed observation is not evidence that the command failed."""
         for code in ('E_TIMEOUT', 'E_PIPE_CLOSED', 'E_OWNERSHIP'):
             with self.subTest(code=code):
-                self.store.pending.clear()
-                self.coordinator.commands.requests.clear()
+                # Each subtest represents a fresh Workbench process. Clearing
+                # only the projected store would leave the process-local
+                # registry responsible for the prior unknown command.
+                self._reset_bus()
                 command_id = self._submit_unknown()
                 request = self._query_request(command_id)
 

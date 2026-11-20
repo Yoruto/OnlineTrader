@@ -116,8 +116,7 @@ def _limits(profile):
     return maximum, per_contract
 
 
-def build_start_request(store, account_id, profile, *, arm=True, now=None, timed_trigger=None, manual=False,
-                        scheduled_operator=None):
+def build_start_request(store, account_id, profile, *, arm=True, now=None, timed_trigger=None, manual=False):
     """Called after the user's start confirmation. Never connects or reads secrets."""
     if not isinstance(profile, DsvProfile) or type(arm) is not bool:
         raise TraderError('E_DESKTOP_START_REQUEST', 'Expected a business profile and explicit startup intent')
@@ -134,10 +133,6 @@ def build_start_request(store, account_id, profile, *, arm=True, now=None, timed
         'arm': arm, 'confirmed': True}
     if timed_trigger is not None:
         request['timed_trigger'] = timed_trigger
-    if scheduled_operator is not None:
-        if timed_trigger is None:
-            raise TraderError('E_DESKTOP_START_REQUEST', 'Scheduled operator identity requires a timed request')
-        request['scheduled_operator'] = identifier(scheduled_operator)
     if manual:
         request['manual'] = True
     return request
@@ -149,7 +144,7 @@ def _request(path, instant=None):
             raw = stream.read(MAX_REQUEST_BYTES + 1)
         value = strict_loads(raw)
         if (len(raw) > MAX_REQUEST_BYTES or type(value) is not dict
-                or set(value) - {'timed_trigger', 'recover_original', 'manual', 'scheduled_operator'} != _REQUEST_KEYS):
+                or set(value) - {'timed_trigger', 'recover_original', 'manual'} != _REQUEST_KEYS):
             raise ValueError()
         if value['schema_version'] != REQUEST_SCHEMA or value['confirmed'] is not True or type(value['arm']) is not bool:
             raise ValueError()
@@ -162,10 +157,6 @@ def _request(path, instant=None):
             raise ValueError()
         if 'manual' in value and (value['manual'] is not True or value['arm'] or 'timed_trigger' in value):
             raise ValueError()
-        if 'scheduled_operator' in value:
-            if 'timed_trigger' not in value or not value['arm']:
-                raise ValueError()
-            identifier(value['scheduled_operator'])
         directory = Path(value['account_store'])
         if not directory.is_absolute():
             raise ValueError()
@@ -327,7 +318,7 @@ def run_desktop_start(request_path, output, *, now=None):
 
 
 def run_confirmed_start(request_path, output, *, now=None, configured_store=None, trusted_control_pid=None,
-                        use_portable_profile_file=False, check_scheduled_authorization=None,
+                        use_portable_profile_file=False,
                         execution_ledger=None, history_cache=None):
     """Run the original owner using the selected desktop or portable account inputs."""
     directory = Path(output).resolve()
@@ -336,9 +327,6 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
         request, source_profile = _request(request_path, now)
         if 'manual' in request and configured_store is None:
             raise TraderError('E_AUTH', 'Standalone configuration is required for this manual startup request')
-        if 'scheduled_operator' in request and (configured_store is None or check_scheduled_authorization is None
-                or check_scheduled_authorization() != request['scheduled_operator']):
-            raise TraderError('E_AUTH', 'The scheduled start requires its original operator capability')
         store = configured_store if configured_store is not None else AccountStore(request['account_store'])
         if store.directory != Path(request['account_store']).resolve():
             raise TraderError('E_SCOPE', 'The confirmed start belongs to another account directory')
@@ -404,9 +392,6 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
             if trigger and trigger != timed_start_trigger(source_profile, _utc(request['created_at_utc']),
                     on_launch=trigger=='AUTO_START_ON_LAUNCH', metadata=metadata):
                 raise TraderError('E_CALENDAR_INCOMPLETE', '定时启动未找到匹配的当前或临近交易时段。')
-            if 'scheduled_operator' in request:
-                if check_scheduled_authorization() != request['scheduled_operator']:
-                    raise TraderError('E_AUTH', 'The scheduled start operator changed during connection preparation')
             grant, effective, calendar, details = compile_start_scope(
                 request, store, metadata, now=current, ledger_path=execution_ledger)
             for name, record in (('scope.json', grant.value), ('profile.json', effective.to_record()),

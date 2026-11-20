@@ -8,7 +8,8 @@ import time
 
 from online_trader.configuration.rollover import CHINA_TIME, expiry_date, future_product, rollover_hint
 from online_trader.domain.values import order_price
-from online_trader.errors import TraderError
+from online_trader.errors import DefinitelyNotSentError, TraderError
+from online_trader.execution.policy import committed_limit_is_safe, select_price
 from online_trader.gateway.tq_wait import is_pinned_tq_api
 from online_trader.gateway.tqkq import TqKqPort, number
 from online_trader.online_scope import DsvSimulationGrant
@@ -163,6 +164,44 @@ class TqKqDsvPort(TqKqPort):
         except (TraderError, KeyError, AttributeError, TypeError, ValueError) as error:
             return self._quote_rejected(code, 'OPEN', 'UNUSABLE_ENTRY_QUOTE', side=side,
                                         native_tick_id=event.get('native_tick_id'),
+                                        error_code=getattr(error, 'code', type(error).__name__))
+
+    def current_strategy_entry(self, code, side, *, profile=None, signal=None):
+        """Validate the latest native book without requiring an older tick identity.
+
+        The strategy signal is immutable, but the native book is expected to
+        advance while the owner commits an intent.  Ordinary breakout signals
+        additionally retain their trigger-side predicate; a quote that crossed
+        back through the trigger is not made executable merely because it is
+        newer or cheaper.
+        """
+        try:
+            quote = self.quotes[code]
+            stamp = quote_timestamp(quote.datetime, CHINA_TIME)
+            event = {
+                'contract_id': code,
+                'source_time_utc': stamp.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                'last': number(quote.last_price),
+                'bid1': number(quote.bid_price1),
+                'ask1': number(quote.ask_price1),
+                'tick_size': number(quote.price_tick),
+                'native_tick_id': None,
+            }
+            if not self.fresh_strategy_entry(code, side, event, profile=profile):
+                return False
+            signal = signal or {}
+            if signal.get('entry_kind') == 'NORMAL':
+                trigger = Decimal(signal['trigger_price'])
+                last = Decimal(event['last'])
+                valid = last >= trigger if signal['direction'] == 'LONG' else last <= trigger
+                if not valid:
+                    return self._quote_rejected(
+                        code, 'OPEN', 'ENTRY_SIGNAL_CROSSED_BACK', side=side,
+                        trigger_price=str(trigger), current_last=event['last'],
+                        signal_time_utc=signal.get('signal_time_utc'))
+            return True
+        except (TraderError, KeyError, AttributeError, TypeError, ValueError) as error:
+            return self._quote_rejected(code, 'OPEN', 'UNUSABLE_CURRENT_ENTRY_QUOTE', side=side,
                                         error_code=getattr(error, 'code', type(error).__name__))
 
     def __init__(self,api,account,grant,clock):
@@ -467,16 +506,36 @@ class TqKqDsvPort(TqKqPort):
             # original orders again, excluding just this unsent durable child.
             kernel.simulation.verify_clock_protection(cycle, snapshot, exclude_child=request['child_order_id'])
             fresh = True
-        elif request['effect']=='OPEN' and candidate.get('entry_kind')=='NORMAL' and cycle['entry_origin']=='STRATEGY':
-            fresh = self.fresh_strategy_entry(code, request['direction'], facts['event'] if facts is not None else None,
-                                              profile=runtime.profile_for_plan(cycle['plan']) if runtime else None)
+        elif request['effect']=='OPEN' and cycle['entry_origin']=='STRATEGY':
+            intent = cycle.get('entry_intent') or {}
+            signal = intent.get('signal') or {
+                'entry_kind': candidate.get('entry_kind'), 'direction': candidate.get('direction'),
+                'trigger_price': candidate.get('theoretical_price'),
+                'signal_time_utc': candidate.get('source_time_utc')}
+            fresh = self.current_strategy_entry(code, request['direction'],
+                profile=runtime.profile_for_plan(cycle['plan']) if runtime else None, signal=signal)
+            if fresh and signal.get('entry_kind') != 'NORMAL':
+                current = quote_timestamp(self.quotes[code].datetime, CHINA_TIME)
+                accepted = None if facts is None else datetime.fromisoformat(facts['event']['source_time_utc'])
+                if accepted is None or current != accepted:
+                    fresh = self._quote_rejected(
+                        code, 'SEND', 'QUOTE_REVISION_CHANGED', effect=request['effect'],
+                        child_order_id=request['child_order_id'],
+                        accepted_time_utc=None if accepted is None else accepted.isoformat(),
+                        current_time_utc=current.isoformat())
         else:
             fresh = self.fresh(code) or (direct and self.fresh_manual_reduction(code))
         if not fresh:
             evidence = self._last_quote_rejection
-            self._quote_rejected(code, 'SEND', 'E_NATIVE_QUOTE_NOT_CURRENT', effect=request['effect'],
-                                 child_order_id=request['child_order_id'], trading_day=request['trading_day'])
-            error = TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '报单需要当前有效的原生报价。')
+            predicate = (evidence or {}).get('reason')
+            error_code = ({'ENTRY_SIGNAL_CROSSED_BACK': 'E_ENTRY_SIGNAL_INVALIDATED',
+                           'QUOTE_REVISION_CHANGED': 'E_QUOTE_REVISION_CHANGED'}.get(
+                               predicate, 'E_NATIVE_QUOTE_NOT_CURRENT'))
+            if evidence is None:
+                self._quote_rejected(code, 'SEND', error_code, effect=request['effect'],
+                                     child_order_id=request['child_order_id'], trading_day=request['trading_day'])
+                evidence = self._last_quote_rejection
+            error = TraderError(error_code, '报单前原生行情未满足当前信号与执行合同。')
             error.quote_evidence = evidence or self._last_quote_rejection
             raise error
         expected='BUY' if (cycle['plan']['direction']=='LONG')==(order['effect']=='OPEN') else 'SELL'
@@ -484,19 +543,16 @@ class TqKqDsvPort(TqKqPort):
         position=self.position(request['contract_id'])
         owned={side:sum(c['protection']['owned_qty'] for c in kernel._staged.values()
                        if c['plan']['contract_id']==request['contract_id'] and c['plan']['direction']==side.upper()) for side in ('long','short')}
-        if position!=owned:raise TraderError('E_OWNERSHIP','External position changes block this native send')
+        if position!=owned:raise TraderError('E_POSITION_MISMATCH','External position changes block this native send')
         owned_ids={self.order_id(o['child_order_id']) for c in kernel._staged.values() for o in c['orders']}
         if any(o['order_id'] not in owned_ids for o in snapshot['orders']
                if o['contract_id']==request['contract_id'] and o['status']=='ALIVE'):
-            raise TraderError('E_OWNERSHIP','An active foreign order blocks native execution on the selected contract')
+            raise TraderError('E_FOREIGN_ACTIVE_ORDER','An active foreign order blocks native execution on the selected contract')
         if request['effect']=='OPEN':
             if (cycle['entry_origin']=='MANUAL')!=self.grant.manual_workbench:
                 raise TraderError('E_GATEWAY_SCOPE','Native opening origin differs from the finite scope')
             if not self.entry_clock_ready():
                 raise TraderError('E_CLOCK','A valid Windows wall clock is required immediately before native opening send')
-            current=quote_timestamp(self.quotes[request['contract_id']].datetime, CHINA_TIME)
-            if facts is None or current!=datetime.fromisoformat(facts['event']['source_time_utc']):
-                raise TraderError('E_GATEWAY_SCOPE','The entry proposal does not reflect the latest native quote')
             if cycle.get('manual_limit_order'):
                 kernel.simulation.manual_entry_facts(cycle['strategy_metadata']['candidate'],request['original_qty'],
                     exclude_decision=cycle['decision_key'])
@@ -510,6 +566,45 @@ class TqKqDsvPort(TqKqPort):
                                      accepted_session=facts['event']['session_id'],
                                      current_session=(window['session'] or {}).get('session_id'))
                 error = TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '报单前已离开原报价盘段。')
+                error.quote_evidence = self._last_quote_rejection
+                raise error
+            q = self.quotes[code]
+            market = {
+                'complete': True, 'fresh': True, 'is_trading': True, 'quality': 'CONTIGUOUS',
+                'last': number(q.last_price), 'bid1': number(q.bid_price1), 'ask1': number(q.ask_price1),
+                'tick_size': number(q.price_tick), 'lower_limit': number(q.lower_limit),
+                'upper_limit': number(q.upper_limit),
+            }
+            if cycle.get('manual_limit_order'):
+                priced = {'allowed': True, 'price': request['limit_price'], 'mode': 'MANUAL', 'reasons': []}
+            elif kernel.execution.active(cycle):
+                priced = kernel.execution.price(cycle, 'OPEN', market_override=market)
+            else:
+                plan_policy = cycle['plan']['execution_policy']
+                signal = (cycle.get('entry_intent') or {}).get('signal') or {}
+                side = request['direction']
+                if candidate.get('entry_near_open'):
+                    contexts = {}
+                elif plan_policy.get('passive_entry_first'):
+                    contexts = {'PASSIVE': {'side': side, 'age_ms': 0,
+                                            'level': cycle['plan']['theoretical_entry_price']}}
+                else:
+                    contexts = {'CAP': {'side': side, 'age_ms': 0,
+                                        'cap': signal.get('price_cap', request['limit_price'])}}
+                priced = select_price(side, market, contexts=contexts)
+            if not priced['allowed']:
+                self._quote_rejected(code, 'SEND', 'CURRENT_EXECUTION_PRICE_UNAVAILABLE',
+                                     effect='OPEN', child_order_id=request['child_order_id'],
+                                     reason_codes=priced['reasons'])
+                error = TraderError('E_NATIVE_QUOTE_NOT_CURRENT', '当前原生盘口不能形成合法执行价。')
+                error.quote_evidence = self._last_quote_rejection
+                raise error
+            if not committed_limit_is_safe(request['direction'], request['limit_price'], priced['price']):
+                self._quote_rejected(code, 'SEND', 'QUOTE_REVISION_CHANGED', effect='OPEN',
+                                     child_order_id=request['child_order_id'],
+                                     committed_limit_price=request['limit_price'],
+                                     current_policy_price=priced['price'], price_mode=priced['mode'])
+                error = TraderError('E_QUOTE_REVISION_CHANGED', '当前执行政策需要新的持久化限价。')
                 error.quote_evidence = self._last_quote_rejection
                 raise error
             if kernel.recovery_required:
@@ -536,13 +631,21 @@ class TqKqDsvPort(TqKqPort):
                     or saved is None or saved.get('position_cycle_id')!=cycle['position_cycle_id']
                     or saved.get('trading_day')!=review['current_day'] or saved.get('native_offset')!=request['native_offset']
                     or saved.get('quantity')!=request['original_qty']):
-                raise TraderError('E_OWNERSHIP','Native close no longer matches its committed cycle and unreserved bucket')
+                raise TraderError('E_EXIT_ROUTE_CHANGED','Native close no longer matches its committed cycle and unreserved bucket')
         q=self.quotes[request['contract_id']];price=Decimal(request['limit_price']);tick=Decimal(str(q.price_tick))
         if price%tick or not Decimal(str(q.lower_limit))<=price<=Decimal(str(q.upper_limit)):
             raise TraderError('E_PRICE_ALIGNMENT','DSV native order price is not a legal exchange tick')
 
     def send(self,request):
-        self.validate_send(request);child=request['child_order_id']
+        try:
+            self.validate_send(request)
+        except TraderError as error:
+            evidence = {'predicate_code': error.code,
+                        'quote_evidence': getattr(error, 'quote_evidence', None) or self._last_quote_rejection}
+            refused = DefinitelyNotSentError(error.code, str(error), evidence=evidence)
+            refused.quote_evidence = evidence['quote_evidence']
+            raise refused from error
+        child=request['child_order_id']
         if child in self._issued:raise TraderError('E_DUPLICATE_CONFLICT','A DSV native send cannot be replayed')
         self._issued.add(child)
         self._bindings[child]={key:request[key] for key in ('contract_id','direction','effect','original_qty','limit_price','native_offset')}

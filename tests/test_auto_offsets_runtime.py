@@ -244,7 +244,7 @@ class AutoOffsetRuntimeTests(unittest.TestCase):
             (self.root/(name+'.json')).write_bytes(canonical_bytes(value))
         captured=[]
         class Server:
-            def __init__(self,kernel,pipe):captured.append(kernel)
+            def __init__(self,kernel,pipe,**_kwargs):captured.append(kernel)
             def serve(self,stop,**kwargs):stop.set()
         with (patch('online_trader.runtime.dsv_simulation.Thread'),
               patch.object(SimNowDsvPort,'connect',return_value=self.port) as connect,

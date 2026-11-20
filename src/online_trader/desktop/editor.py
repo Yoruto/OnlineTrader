@@ -10,7 +10,7 @@ from online_trader.desktop.symbol_editor import SymbolEditorDialog, fit_dialog
 
 
 class ParameterEditorDialog(QDialog):
-    def __init__(self, profile, parent=None):
+    def __init__(self, profile, parent=None, *, manual_only=False):
         super().__init__(parent)
         self.base_profile, self.result_profile = profile, None
         self.base_hash = profile.content_hash
@@ -23,10 +23,18 @@ class ParameterEditorDialog(QDialog):
         self.search = QLineEdit(); self.search.setPlaceholderText("筛选参数名称"); layout.addWidget(self.search)
         self.tabs = QTabWidget(); self.tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored); layout.addWidget(self.tabs, 1)
         values = form_values(profile)
-        for section, title in (("trade", "交易与风控"), ("auto_offset", "偏移计算设置"), ("schedule", "定时设置")):
+        self._original_values = values
+        sections = (("trade", "交易与风控"), ("auto_offset", "偏移计算设置"))
+        if not manual_only:
+            sections += (("schedule", "定时设置"),)
+        self._section_tabs = {}
+        for section, title in sections:
+            self._section_tabs[section] = self.tabs.count()
             scroll = QScrollArea(); scroll.setWidgetResizable(True)
             body = QWidget(); form = QFormLayout(body)
             for key, value in sorted(values[section].items()):
+                if manual_only and section == 'trade' and key == 'auto_start_on_launch':
+                    continue
                 path = section + "." + key
                 label = (_TRADE_LABELS if section == "trade" else _OTHER_LABELS).get(key, key)
                 if section == "auto_offset": label = {"formula": "偏移候选公式", "ceiling": "当日振幅上限比例（非负）", "floor": "开仓下限比例（非负）", "coef": "品种系数表（按品种名）"}[key]
@@ -67,7 +75,7 @@ class ParameterEditorDialog(QDialog):
         for widget in (self.add_button, self.edit_symbol_button, self.remove_button): controls.addWidget(widget)
         controls.addStretch(); symbols_layout.addLayout(controls)
         batch = QHBoxLayout(); batch.addWidget(self.batch_field); batch.addWidget(self.batch_value, 1); batch.addWidget(self.batch_button)
-        symbols_layout.addLayout(batch); self.tabs.addTab(symbols_body, "品种与批量编辑")
+        symbols_layout.addLayout(batch); self.symbols_tab_index = self.tabs.count(); self.tabs.addTab(symbols_body, "品种与批量编辑")
         buttons = QHBoxLayout(); buttons.addStretch()
         self.apply_button = QPushButton("校验并更新预览"); self.cancel_button = QPushButton("取消编辑")
         buttons.addWidget(self.apply_button); buttons.addWidget(self.cancel_button); layout.addLayout(buttons)
@@ -81,7 +89,7 @@ class ParameterEditorDialog(QDialog):
         for form, row, label in self._form_rows: form.setRowVisible(row, text.casefold() in label.casefold())
 
     def values(self):
-        result = {section: {} for section in ("trade", "auto_offset", "schedule")}
+        result = {section: dict(self._original_values[section]) for section in ("trade", "auto_offset", "schedule")}
         for path, widget in self.fields.items():
             section, key = path.split(".", 1)
             result[section][key] = (widget.isChecked() if isinstance(widget, QCheckBox) else
@@ -100,13 +108,13 @@ class ParameterEditorDialog(QDialog):
         if match:
             row = int(match[1]); field = match[2]
             label = f"品种第{row + 1}行 · {_OTHER_LABELS.get(field, '参数')}"
-            self.tabs.setCurrentIndex(3)
+            self.tabs.setCurrentIndex(self.symbols_tab_index)
             self.symbols_table.setCurrentCell(row, FIELDS.index(field) if field in FIELDS else 0)
         self.error_label.setText(f"参数未通过校验：{label}。请核对范围、单位和格式；本次编辑仍保留，参数中心预览未改变。")
         widget = self.fields.get(error.path)
         if widget is not None:
             self.search.clear()
-            self.tabs.setCurrentIndex(("trade", "auto_offset", "schedule").index(error.path.split(".")[0]))
+            self.tabs.setCurrentIndex(self._section_tabs[error.path.split(".")[0]])
             widget.setFocus()
             self.tabs.currentWidget().ensureWidgetVisible(widget)
         return False
