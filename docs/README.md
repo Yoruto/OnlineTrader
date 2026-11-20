@@ -4,6 +4,8 @@
 
 ## 当前开发入口
 
+- [AI 辅助开发效率优化实施计划 V1.1](ai/ai-development-efficiency-plan-20261120.md)（待实施，先测基线）
+
 - [当前功能状态与开放问题](功能实现与待办清单_20261110.md)
 - [Standalone Trading Runtime 设计](refactor/standalone-trading-runtime-20261119.md)
 - [Runtime / Workbench 架构收敛与安全改造计划](refactor/runtime-architecture-hardening-plan-20261120.md)
