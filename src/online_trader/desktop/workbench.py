@@ -124,15 +124,16 @@ class _RuntimeOperatorRequest(QThread):
     result = Signal(object)
     failed = Signal(object)
 
-    def __init__(self, pipe, action, operator, token, body=None):
+    def __init__(self, pipe, action, operator, token, body=None, account_key=None):
         super().__init__()
         self.pipe, self.action = pipe, action
         self.operator, self.token = operator, token
         self.body = body or {}
+        self.account_key = account_key
 
     def run(self):
-        identity = ({'command_id': self.body.get('command_id')} if self.action == 'submit'
-                    else {'command_id': self.body.get('command_id')} if self.action == 'receipt' else None)
+        identity = ({'account_key': self.account_key, 'command_id': self.body.get('command_id')}
+                    if self.action in {'submit', 'receipt'} else None)
         try:
             from online_trader.runtime.operator_api import RuntimeCommandClient
             client = RuntimeCommandClient(self.pipe)
@@ -517,7 +518,9 @@ class WorkbenchWindow(StatusWindow):
         if self._runtime_command_worker is not None:
             self.show_home_feedback('上一个 Runtime 操作仍在处理。')
             return
-        worker = _RuntimeOperatorRequest(self.pipe_name, action, operator, token, body)
+        account_key = self.view['account_key'] if self.view is not None else None
+        worker = _RuntimeOperatorRequest(
+            self.pipe_name, action, operator, token, body, account_key=account_key)
         worker.result.connect(self._runtime_request_result)
         worker.failed.connect(self._runtime_request_failed)
         worker.finished.connect(self._runtime_request_finished)
@@ -529,6 +532,22 @@ class WorkbenchWindow(StatusWindow):
     def _start_runtime_submit(self, operation, scope, parameters):
         if self.view is None or self._stale or self.published_snapshot_expired() or self.view['truncated']:
             self.show_home_feedback('请先取得当前完整 Runtime 状态，再提交命令。')
+            return
+        # The production Workbench still uses the legacy one-shot command lane.
+        # Until it migrates to CommandBus, conservatively block *all* new
+        # commands for this account while an earlier submission is unresolved.
+        # Never generate a second command_id to retry an unknown submission.
+        try:
+            unresolved = self._unresolved_runtime_receipt()
+        except TraderError as error:
+            self.show_home_feedback(f'无法核对本地未决回执 · {error.code}；禁止新命令。')
+            return
+        if unresolved is not None:
+            original = unresolved['command_id']
+            self.receipt_identity = {'command_id': original}
+            self.show_home_feedback(
+                f'原命令 {original} 仍待明确终态；请查询原回执，禁止生成第二个命令 ID。')
+            self.command_buttons['receipt'].setEnabled(True)
             return
         if self._runtime_command_worker is not None:
             self.show_home_feedback('上一个 Runtime 操作仍在处理。')
@@ -544,8 +563,12 @@ class WorkbenchWindow(StatusWindow):
                 'parameters': parameters, 'binding': {
                     'account_key': self.view['account_key'], 'kernel_boot_id': self._boot,
                     'config_revision': self.view['configuration']['config_revision']}}
+        try:
+            self._persist_runtime_receipt(command_id, operation)
+        except TraderError as error:
+            self.show_home_feedback(f'无法持久化命令身份 · {error.code}；未提交 Runtime 命令。')
+            return
         self.receipt_identity = {'command_id': command_id}
-        self._persist_runtime_receipt(command_id, operation)
         self.show_home_feedback(f'正在提交 Runtime 命令 · {command_id}')
         self._start_runtime_request('submit', self._runtime_operator_id, self._runtime_operator_token, body)
 
@@ -553,6 +576,16 @@ class WorkbenchWindow(StatusWindow):
         command_id = identity.get('command_id') if isinstance(identity, dict) else None
         if not command_id:
             self.show_home_feedback('没有可查询的 Runtime 命令。')
+            return
+        try:
+            unresolved = self._unresolved_runtime_receipt()
+        except TraderError as error:
+            self.show_home_feedback(f'无法核对本地未决回执 · {error.code}；禁止查询其他命令。')
+            return
+        if unresolved is not None and unresolved['command_id'] != command_id:
+            self.receipt_identity = {'command_id': unresolved['command_id']}
+            self.show_home_feedback(
+                f"原命令 {unresolved['command_id']} 仍待明确终态；禁止用其他回执覆盖其身份。")
             return
         if self._runtime_operator_token is None:
             self._prompt_runtime_operator(('receipt', {'command_id': command_id}))
@@ -578,8 +611,26 @@ class WorkbenchWindow(StatusWindow):
             self._runtime_after_finish, self._runtime_pending_action = self._runtime_pending_action, None
             return
         receipt = value
+        identity = result.get('identity')
+        expected_id = identity.get('command_id') if isinstance(identity, dict) else None
+        expected_account = identity.get('account_key') if isinstance(identity, dict) else None
+        current_account = self.view.get('account_key') if self.view is not None else None
+        if (not expected_id or receipt.get('command_id') != expected_id
+                or not expected_account or current_account != expected_account):
+            if expected_id:
+                self.receipt_identity = {'command_id': expected_id}
+            self.show_home_feedback('Runtime 回执身份与原请求不一致；已保留原命令 ID，禁止覆盖。')
+            return
+        try:
+            self._retain_runtime_receipt(
+                expected_id, receipt.get('operation'), expected_account,
+                required=receipt.get('status') not in {'SUCCEEDED', 'FAILED', 'REJECTED', 'SUPERSEDED'},
+            )
+        except TraderError as error:
+            self.receipt_identity = {'command_id': expected_id}
+            self.show_home_feedback(f'无法核对本地未决回执 · {error.code}；已保留原命令 ID。')
+            return
         self.receipt_identity = {key: receipt[key] for key in ('command_id', 'payload_hash') if key in receipt}
-        self._persist_runtime_receipt(receipt['command_id'], receipt.get('operation'))
         self._publication_after_ns = time.monotonic_ns()
         self._stale = True
         self._show_receipt(receipt)
@@ -591,10 +642,29 @@ class WorkbenchWindow(StatusWindow):
             self._clear_runtime_operator()
         self._runtime_auth_token = None
         identity = error.get('identity')
-        if identity and identity.get('command_id') and error['code'] in CONNECTION_ERRORS | {'E_INTERNAL'}:
-            self.receipt_identity = identity
-            self._persist_runtime_receipt(identity['command_id'], None)
-            message = 'Runtime 命令结果未知，已保留原命令 ID；请查询回执，禁止自动重发。'
+        command_id = identity.get('command_id') if isinstance(identity, dict) else None
+        account_key = identity.get('account_key') if isinstance(identity, dict) else None
+        unknown_submit = (error.get('action') == 'submit' and command_id
+                          and error['code'] in CONNECTION_ERRORS | {'E_INTERNAL'})
+        if unknown_submit:
+            self.receipt_identity = {'command_id': command_id}
+            try:
+                self._retain_runtime_receipt(command_id, None, account_key, required=True)
+            except TraderError as pending_error:
+                message = (f'Runtime 命令结果未知，但无法核对原命令身份 · {pending_error.code}；'
+                           '禁止新命令。')
+            else:
+                message = 'Runtime 命令结果未知，已保留原命令 ID；请查询回执，禁止自动重发。'
+        elif error.get('action') == 'submit' and command_id:
+            try:
+                self._clear_runtime_receipt(command_id, account_key)
+            except TraderError as pending_error:
+                message = (f"Runtime 明确拒绝命令 · {error['code']}，但本地回执状态无法清理 · "
+                           f'{pending_error.code}；禁止新命令。')
+            else:
+                self.receipt_identity = None
+                self.home_issue = ''
+                message = f"Runtime 操作未完成 · {error['code']}"
         else:
             message = f"Runtime 操作未完成 · {error['code']}"
         self.notice_label.setText(message)
@@ -627,12 +697,69 @@ class WorkbenchWindow(StatusWindow):
         if message:
             self.show_home_feedback(message)
 
+    @staticmethod
+    def _stored_runtime_receipt():
+        settings = workbench_preferences()
+        raw = settings.value('runtime/pending_receipt', '', str)
+        if not raw:
+            return None
+        try:
+            value = strict_loads(raw)
+        except (ValueError, TypeError):
+            raise TraderError('E_PENDING_COMMAND', 'Local pending receipt metadata is invalid') from None
+        if (not isinstance(value, dict) or not isinstance(value.get('account_key'), str)
+                or not isinstance(value.get('command_id'), str) or not value['command_id']):
+            raise TraderError('E_PENDING_COMMAND', 'Local pending receipt metadata is incomplete')
+        return value
+
+    def _unresolved_runtime_receipt(self):
+        if self.view is None:
+            return None
+        value = self._stored_runtime_receipt()
+        if value is None:
+            return None
+        if value['account_key'] != self.view['account_key']:
+            # The legacy settings slot is process-wide.  Switching accounts
+            # cannot silently overwrite an unresolved receipt for another
+            # account; a per-account registry belongs in the CommandBus cutover.
+            raise TraderError('E_PENDING_COMMAND', 'Another account has an unresolved Runtime command')
+        return value
+
+    def _retain_runtime_receipt(self, command_id, operation, account_key, *, required):
+        value = self._stored_runtime_receipt()
+        if value is not None:
+            if value['account_key'] != account_key or value['command_id'] != command_id:
+                raise TraderError('E_PENDING_COMMAND', 'Another Runtime command identity is already pending')
+            return
+        if not required:
+            return
+        if self.view is None or self.view['account_key'] != account_key:
+            raise TraderError('E_SCOPE', 'The Runtime command belongs to another account view')
+        self._persist_runtime_receipt(command_id, operation)
+
+    def _clear_runtime_receipt(self, command_id, account_key):
+        value = self._stored_runtime_receipt()
+        if value is None:
+            return False
+        if value['account_key'] != account_key or value['command_id'] != command_id:
+            raise TraderError('E_PENDING_COMMAND', 'A different Runtime command identity remains pending')
+        settings = workbench_preferences()
+        settings.remove('runtime/pending_receipt')
+        settings.sync()
+        if settings.status() != QSettings.Status.NoError:
+            raise TraderError('E_STORAGE', 'Cannot durably clear the terminal Runtime command ID')
+        return True
+
     def _persist_runtime_receipt(self, command_id, operation):
         if self.view is None:
-            return
+            raise TraderError('E_NOT_READY', 'A Runtime account must be selected before submitting')
         value = {'account_key': self.view['account_key'], 'command_id': command_id,
                  'operation': operation, 'operator': self._runtime_operator_id}
-        workbench_preferences().setValue('runtime/pending_receipt', canonical_bytes(value).decode())
+        settings = workbench_preferences()
+        settings.setValue('runtime/pending_receipt', canonical_bytes(value).decode())
+        settings.sync()
+        if settings.status() != QSettings.Status.NoError:
+            raise TraderError('E_STORAGE', 'Cannot durably preserve the original command ID')
 
     def _restore_runtime_receipt(self):
         if self.view is None or self._runtime_receipt_restored_for == self.view['account_key']:
@@ -861,7 +988,21 @@ class WorkbenchWindow(StatusWindow):
         self.notice_label.setText(notice)
         status = receipt['status']
         if self._runtime_mode and status in {'SUCCEEDED', 'FAILED', 'REJECTED', 'SUPERSEDED'}:
-            workbench_preferences().remove('runtime/pending_receipt')
+            # A terminal receipt for an unrelated, older command must never
+            # erase the currently unresolved command's identity.
+            try:
+                unresolved = self._unresolved_runtime_receipt()
+            except TraderError as error:
+                self.home_issue = '命令已终态，但本地仍有无法核对的未决回执；禁止新命令。'
+                self.home_feedback = f'本地未决回执核对失败 · {error.code}'
+                return
+            if unresolved is not None and unresolved['command_id'] == receipt.get('command_id'):
+                try:
+                    self._clear_runtime_receipt(receipt['command_id'], unresolved['account_key'])
+                except TraderError as error:
+                    self.home_issue = '命令已终态，但本地未决回执清理失败；请先修复设置存储。'
+                    self.home_feedback = f'本地未决回执清理失败 · {error.code}'
+                    return
         self.home_issue = '命令结果待核对，请查看交易详情中的命令回执' if status == 'NEEDS_RECONCILIATION' else ''
         self.home_feedback = f"命令回执 · {receipt['reason']}"
 

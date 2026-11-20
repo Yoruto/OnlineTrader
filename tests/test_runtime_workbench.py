@@ -90,6 +90,47 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         self.assertIn(body['command_id'], persisted)
         self.assertNotIn(token, persisted)
 
+    def test_unresolved_command_blocks_any_new_runtime_submission(self):
+        """A timed-out submit cannot be retried with a different command_id."""
+        self.window._runtime_operator_id = 'desk'
+        self.window._runtime_operator_token = 'x' * 40
+        self.window._runtime_operator_operations = frozenset({'MANUAL_CLOSE'})
+        first = {'account_key': self.window.view['account_key'],
+                 'command_id': 'qt-original-unknown', 'operation': 'MANUAL_CLOSE',
+                 'operator': 'desk'}
+        self.settings.setValue('runtime/pending_receipt', __import__('json').dumps(first))
+        self.settings.sync()
+        captured = []
+        with patch.object(self.window, '_start_runtime_request', side_effect=lambda *args: captured.append(args)):
+            self.window._start_runtime_submit(
+                'MANUAL_CLOSE', {'scope_type': 'CYCLE', 'scope_ids': ['cycle-2']},
+                {'position_cycle_id': 'cycle-2'})
+        self.assertEqual(captured, [])
+        self.assertEqual(self.window.receipt_identity, {'command_id': first['command_id']})
+        self.assertIn(first['command_id'], self.settings.value('runtime/pending_receipt', '', str))
+
+    def test_unrelated_terminal_receipt_does_not_clear_unknown_command(self):
+        first = {'account_key': self.window.view['account_key'],
+                 'command_id': 'qt-original-unknown', 'operation': 'MANUAL_CLOSE',
+                 'operator': 'desk'}
+        self.settings.setValue('runtime/pending_receipt', __import__('json').dumps(first))
+        self.window._show_receipt({
+            'command_id': 'qt-older-success', 'status': 'SUCCEEDED',
+            'error_code': None, 'reason': 'older command completed',
+        })
+        self.assertIn(first['command_id'], self.settings.value('runtime/pending_receipt', '', str))
+
+    def test_matching_terminal_receipt_clears_pending_guard(self):
+        first = {'account_key': self.window.view['account_key'],
+                 'command_id': 'qt-original-unknown', 'operation': 'MANUAL_CLOSE',
+                 'operator': 'desk'}
+        self.settings.setValue('runtime/pending_receipt', __import__('json').dumps(first))
+        self.window._show_receipt({
+            'command_id': first['command_id'], 'status': 'REJECTED',
+            'error_code': 'E_AUTH', 'reason': 'explicit runtime terminal receipt',
+        })
+        self.assertFalse(self.settings.value('runtime/pending_receipt', '', str))
+
     def test_locked_operator_prompts_before_creating_a_command(self):
         pending = []
         with patch.object(self.window, '_prompt_runtime_operator', side_effect=lambda value: pending.append(value)):
