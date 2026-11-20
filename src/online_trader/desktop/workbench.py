@@ -661,7 +661,12 @@ class WorkbenchWindow(StatusWindow):
         if (not isinstance(value, dict) or not isinstance(value.get('account_key'), str)
                 or not isinstance(value.get('command_id'), str) or not value['command_id']):
             raise TraderError('E_PENDING_COMMAND', 'Local pending receipt metadata is incomplete')
-        return value if value['account_key'] == self.view['account_key'] else None
+        if value['account_key'] != self.view['account_key']:
+            # The legacy settings slot is process-wide.  Switching accounts
+            # cannot silently overwrite an unresolved receipt for another
+            # account; a per-account registry belongs in the CommandBus cutover.
+            raise TraderError('E_PENDING_COMMAND', 'Another account has an unresolved Runtime command')
+        return value
 
     def _persist_runtime_receipt(self, command_id, operation):
         if self.view is None:
