@@ -2,7 +2,7 @@
 
 2026-11-19 · 实施设计 · 源码基线 `10b915fa23f33860712ec491a7aa74d015c46203`（dev36）
 
-当前实现状态：Trading Runtime、便携配置、原账本、操作员接口、只读接口进程、差量视图、2.5 秒对齐、附着账户读取、跨日历史、交接导出及 Workbench 直接操作员命令均已进入源码。实际 SimNow 模拟账号的历史证据覆盖无 Qt 策略成交、人工开平、持仓中强杀 Qt、附着账户读取和最终结清；跨日历史完成 Windows 独立离线复测。当前 Workbench 直接提交候选的独立离线结果另记，真实资金账户和最终发行制品不在本轮完成口径。
+当前实现状态：Trading Runtime、便携配置、原账本、操作员接口、只读接口进程、差量视图、2.5 秒对齐、附着账户读取、跨日历史、交接导出及 Workbench 本机交互用户命令均已进入源码。实际 SimNow 模拟账号的历史证据覆盖无 Qt 策略成交、人工开平、持仓中强杀 Qt、附着账户读取和最终结清；跨日历史完成 Windows 独立离线复测。2026-11-20 新 Workbench 通道尚未独立验收，不能沿用此前操作员界面候选的结果；真实资金账户和最终发行制品也不在完成口径。
 
 实现提交、候选源码树、独立测试计数、脱敏报告摘要及未完成范围见[实现与验收记录](standalone-trading-runtime-acceptance-20261119.md)。
 
@@ -29,6 +29,96 @@
 | 现有订阅协议支持分片、顺序和续传，投影范围以账户、保护周期、订单、阻断为主。账户同步另有全账户采集及原账本历史查询设计。 | 复用分帧、校验和续传机制。新增含盘口行情、账户事实及操作权限的版本化业务投影，对接同一个原生事实采集点和原账本查询合同。工作台的周期对齐固定为 2.5 秒。 [现有订阅](../../src/online_trader/transport/subscription.py#L168) · [投影](../../src/online_trader/kernel/projection.py#L4) · [账户数据同步设计](../account-data-sync-design-20261119.md) |
 | 现有账户档案与交易授权限定快期模拟和 SimNow。SimNow 虽使用 `TqAccount`，适配器绑定的是 `simnow`。 | 增加独立实盘账户类型和适配能力，以指定真实期货公司接口、权限和柜台事实为验收依据。 [账户档案](../../src/online_trader/accounts.py#L171) · [SimNow 适配](../../src/online_trader/gateway/simnow.py#L71) |
 
+### 2.1 2026-11-20 统一桌面启动入口评审
+
+#### 问题、证据与约束
+
+当前 `online-trader-desktop --runtime-pipe` 会持续附着 Runtime，但不会启动 Runtime。便携目录另外提供 `start-trading-runtime.cmd` 和 `open-runtime-workbench.ps1`，导致普通用户必须理解并依次运行 Owner 与 Qt。Runtime 启动失败时，附着型工作台只能看到管道超时，并回退显示“未选择”，无法区分“未配置账号”“Runtime 未运行”和“Runtime 启动被账本交接门禁拒绝”。
+
+统一入口必须同时保留以下约束：
+
+- Runtime 仍是唯一 SDK owner 和账本 writer；桌面引导层只编排进程，不取得交易权限。
+- 打开工作台可以启动已配置的 Runtime，但 Runtime 必须以 `DISARMED` 建立；启动本身不等于启用策略或允许新增开仓。
+- 已有 Runtime 优先附着；并发桌面启动不能产生第二个 sender，最终仍由原账户锁裁决。
+- 不自动复制、重建、删除或迁移账本。`E_RUNTIME_HANDOFF`、账本缺失、身份不符和未知发送责任必须原样阻止启动。
+- Qt 关闭、崩溃或引导等待超时不得终止已经取得责任的 Runtime。
+
+#### 用户流程
+
+```mermaid
+flowchart TD
+    A[用户打开 OnlineTrader] --> B[读取相邻或显式 runtime 根目录]
+    B -->|配置无效| X[显示配置错误与处理建议并退出]
+    B --> C[按配置派生账号与本机管道]
+    C --> D{Runtime 投影可读取?}
+    D -->|是| H[打开同一 WorkbenchWindow]
+    D -->|否| E[以 DISARMED 模式启动 Runtime Owner]
+    E --> F{取得权威 Runtime 投影?}
+    F -->|是| H
+    F -->|启动失败| Y[显示真实错误码、诊断文件与处理建议]
+    F -->|等待超时| Z[说明 Runtime 可能仍在启动; 不杀 Owner]
+    H --> I[用户通过界面按钮决定是否启用策略或报单]
+```
+
+#### 时序与所有权
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant L as Desktop Bootstrap
+    participant V as runtime-view-process
+    participant R as Trading Runtime
+    participant W as WorkbenchWindow
+    U->>L: 打开 OnlineTrader
+    L->>V: 读取当前权威投影
+    alt 已有 Runtime
+        V-->>L: BASELINE
+    else Runtime 不存在
+        V--xL: E_TIMEOUT / E_PIPE
+        L->>R: runtime run --root ... --mode strategy
+        Note over L,R: 子进程独立; entry_authority=DISARMED
+        R->>R: 账户锁、账本身份、恢复与连接门禁
+        R->>V: 发布版本化投影
+        V-->>L: BASELINE
+    end
+    L->>W: 仅传入已核实的 pipe
+    W->>V: 订阅、查询、命令回执
+    U->>W: 明确解锁或交易操作
+    W->>V: 带账号/boot/配置版本的命令
+    V->>R: 原 Runtime 最终鉴权与裁决
+```
+
+桌面引导层不读取 SDK、不打开账本、不生成交易命令。它可以读取便携配置中的脱敏账号展示字段，并只把它用于启动进度；WorkBench 的账户、连接、资金、持仓、订单和权限仍只接受 Runtime 投影。引导层探测成功的条件是取得合法的非 `UNAVAILABLE` Runtime 基线，而不是仅发现进程或管道名。
+
+#### 接口、状态与失败合同
+
+| 项目 | 合同 |
+| --- | --- |
+| 普通桌面入口 | `online-trader-desktop --runtime-root <目录> [--runtime-account <ID>]`；Runtime 配置版的冻结 `OnlineTrader.exe` 在没有其他入口参数时自动选择相邻 `runtime/`。 |
+| 高级附着入口 | `--runtime-pipe <pipe>` 保持只附着，不隐式寻找配置或启动 Owner。 |
+| 运维入口 | `runtime run`、`runtime schedule`、`runtime status` 保持兼容；无人值守调度不依赖 Qt。 |
+| 启动模式 | 统一桌面入口启动策略作用域，但 `entry_authority` 固定为 `DISARMED`；F5/操作员命令仍是独立授权步骤。 |
+| 并发与重试 | 先附着后启动；启动后轮询权威投影。竞争启动由账户锁拒绝，若另一 Owner 已就绪则附着该 Owner。不得因超时自动重复创建第二个启动请求。 |
+| 失败 | 读取本次启动进程的结构化首行与 `startup-failure.json`。界面显示具体错误码、影响和诊断路径；不得把 `E_RUNTIME_HANDOFF` 降级成网络错误。 |
+| 生命周期 | 引导子进程不绑定 Qt 生命周期。Qt 退出不发送停止 Runtime 的命令，也不删除锁、WAL 或运行目录。 |
+
+#### 兼容、回退与诊断
+
+- 未携带 `runtime/` 的普通/Legacy 配置包保持原入口；只有显式 `--runtime-root` 或冻结目录存在有效相邻 `runtime/runtime.json` 时进入统一 Runtime 引导。
+- 若统一入口有回归，运维可直接使用原 `runtime run` + `--runtime-pipe` 两步入口；不需要改变账本或配置格式。
+- 每次桌面引导在 `runtime/logs/desktop-bootstrap/` 写独立 stdout/stderr 文件，文件名包含启动关联 ID。日志不得包含密码或操作员令牌。
+- `E_RUNTIME_HANDOFF` 明确提示“同账号已有另一份桌面账本，需要受控一致性交接”，不自动创建 handoff；`E_INSTANCE_LOCK` 先继续观察既有 Runtime，只有最终仍无权威投影才作为失败显示。
+
+#### 可执行验收条件
+
+1. 已运行 Runtime：双击统一入口只附着，不创建第二个 Owner；账号身份来自 Runtime 投影。
+2. 未运行且配置/账本合法：统一入口启动 DISARMED Runtime，取得基线后打开原 `WorkbenchWindow/WorkbenchLayout`。
+3. `E_RUNTIME_HANDOFF`、账本缺失或身份不符：不打开伪连接工作台，不改账本，显示具体错误码、处理建议和诊断文件。
+4. 两个统一入口并发启动：最多一个 Owner；两个界面如允许存在均附着同一 boot，默认桌面单实例仍生效。
+5. 关闭或强杀 Qt 后，已经启动的 Runtime、持仓责任与保护继续；重新打开统一入口可再次附着。
+6. Runtime 配置便携目录从 `OnlineTrader.exe` 单一入口完成上述流程；直接 `--runtime-pipe`、`runtime run` 和 `runtime schedule` 保持兼容。
+7. 启动等待超时不杀 Owner、不重发交易命令；后续状态可从关联日志、Runtime 启动目录和公开 `runtime status` 反查。
+
 ## 3. 进程、状态归属和故障边界
 
 ```mermaid
@@ -52,7 +142,7 @@ flowchart LR
 | 策略实例、实际生效参数、人工权限、委托占量、保护、回执、启停计划 | 交易运行时持有。恢复所需事实写入所选路径的账本。一个环境下同一规范账户只允许一个发送者和一个账本 writer。 |
 | 对外业务投影、订阅和增量窗口 | 本机接口进程管理可重建副本。按账户、权限和查询范围导出必要字段，使用有界缓存和历史分页。 |
 | 账号历史 | 按账号同步设计由后台归档。通过独立已确认水位标明覆盖、缺口和来源。执行账本以自己的原生关联认定所有权和恢复责任。 |
-| 选中项、筛选、滚动、页面布局、未提交操作及非秘密待核命令身份 | Qt 自己管理，重连和页面切换使用本地模型。操作员令牌只驻留当前 Qt 进程。 |
+| 选中项、筛选、滚动、页面布局、未提交操作及非秘密待核命令身份 | Qt 自己管理，重连和页面切换使用本地模型。Workbench 不持有操作员令牌。 |
 
 - **执行隔离。** 接口进程和 Qt 都是可重启进程。运行时先取得账户锁，独立持有 SDK、计时和账本。运行时从现有 SDK 读数和账本提交点送出有界、不可变的变化，队列满时以常量开销标记读侧断档。接口进程基于稳定检查点异步重建。未落入账本的行情或连接状态使用独立最新值，必要的重建批次分段交接。连接、编码、分块、历史查询、逐连接队列和发送都在执行进程外。停止慢订阅即可释放资源。
 - **控制隔离。** 公开消息在接口进程完成分帧、大小检查和初步校验。耗时的配置准备、预览和查询在读侧完成，带相关版本提交最终操作。运行时只接收类型明确且有界的命令，在既有 owner 顺序中完成最终授权、状态变化及原路径所需的 SDK 和账本操作。限制单调用方并发、总队列和每轮命令派发预算，预算耗尽后继续 SDK 与保护轮次。增量、快照重建和客户端等待都无权在执行循环中请求全账本扫描。成交、保护、SDK 推进和紧急人工控制有保留的处理机会。
@@ -181,7 +271,19 @@ sequenceDiagram
 - 权限由交易运行时持久化，并写入操作者、范围、旧值、新值、版本和生效序号。账号级和细粒度限制各有版本。策略决策入口和每次实际交 SDK 前都检查最新有效权限，覆盖第一次报单及追价重报。禁开经 owner 顺序处理并持久化后才回「已生效」。旧版本下已经触发但尚未交给 SDK 的开仓被阻断或按预发送记录结案，重新允许时按新行情重新评估。回执和日志指明生效版本与命中的限制。
 - 禁开回执分别给出「已停止新提交」和「此前委托的柜台核对状态」。此前已进入 SDK 队列的订单仍可能出现在下一轮发送及成交中，回执列出仍在途的开仓委托。原生撤单、迟到成交和保护仍经 owner 继续处理。接口可选择组合执行「禁开并撤存量开仓单」，继承同一路径已经确认的余单处理规则。人工平仓、策略退出和持仓保护共用同一剩余目标与占量，避免多条来源为同一仓位重复平仓。
 - 现有 Qt 的品种停用会同时限制人工和策略开仓，并请求撤自有开仓余单。兼容入口保留这个组合行为。新增的「仅禁策略开仓」走细化后的权限合同。迁移将旧禁开映射为原合约的两类禁开，保留已认领的撤单和保护责任。 [现有品种开关](../../src/online_trader/kernel/control.py#L283) · [Qt 停用操作](../../src/online_trader/desktop/workbench.py#L971) · [现有发送前校验](../../src/online_trader/kernel/engine.py#L701)
-- 最终工作台使用读权限和 Runtime 操作员能力。首次操作时输入操作员 ID和令牌，令牌只驻留当前 Qt 进程；每次命令仍由接口进程按账号、能力和有效期重新鉴权。确认时展示准确的账户、合约、动作、价量和范围，提交绑定 owner boot 与配置版本。超时保留原命令 ID并只查回执，不自动重发。CLI 和受托工具继续使用同一协议。私有应用配置只保存令牌校验值、授权范围和有效期；实际受理及结果写入对应账户账本。 [管道访问控制基础](../../src/online_trader/transport/named_pipe.py#L276)
+- 最终工作台把用户在界面按钮上的明确操作视为交互用户授权，不展示或询问操作员 ID/令牌。工作台命令走独立的本机交互通道；命名管道仍以当前 Windows 登录用户 SID 限制本机访问，接口进程把来源记录为 `workbench-user`，并继续校验账号、owner boot、配置版本、命令能力和幂等身份。确认时展示准确的账户、合约、动作、价量和范围，超时保留原命令 ID并只查回执，不自动重发。CLI、定时任务和受托工具不是界面按钮操作，继续使用操作员授权协议。 [管道访问控制基础](../../src/online_trader/transport/named_pipe.py#L276)
+
+### Workbench 交互用户通道评审结论（2026-11-20）
+
+用户流程固定为：取得完整 Runtime 基线 → 用户在工作台选择动作并完成现有确认 → Qt 生成唯一 `command_id` 及账号/boot/配置绑定 → `*.workbench-control` 接口校验同一 Windows 登录用户和允许的界面操作 → 原 Runtime Owner 按原命令合同执行并写入原账本 → Qt 展示回执并重新对齐权威视图。策略自动判断、保护和自动交易仍由 Runtime Owner 内部执行，不经过 Workbench 通道。
+
+故障流程保持 fail-closed：状态陈旧、账号/boot/配置变更或不支持的操作在发送前或接口端拒绝；连接超时保留原命令 ID并只允许查询原回执；Runtime 或接口重启后工作台无需重新输入身份，但必须重新取得完整基线；不同 Windows 用户和远程客户端由命名管道 ACL/对端 SID 校验拒绝。旧 Runtime 没有交互通道时，工作台报告接口版本不兼容，不回退到操作员提示或直连 Owner。
+
+状态与数据归属不变：Qt 只保存非秘密的待核命令身份，接口不建立交易状态，账本仍由唯一 Runtime Owner 写入。已受理命令的账本 `actor.id` 固定为 `workbench-user`；CLI/调度/受托工具仍记录各自经认证的操作员身份。历史 Qt 命令的原回执允许在同账号下按原 `qt-*` 命令 ID只读查询，避免升级后丢失未知结果；不得借此重放命令。
+
+兼容和回退：保留原 `*.control` 操作员协议、`private/operators.json`、CLI 和调度入口；只把 Qt 工作台切到新协议。回退旧版前无需迁移账本，但旧版 Qt 仍需要其原操作员配置。诊断记录通道、请求动作、命令 ID和接受/拒绝错误码，不记录账号口令、操作员令牌或完整敏感载荷。
+
+本次可执行验收条件为：界面不出现操作员/令牌控件或提示；每个既有按钮仍生成一次绑定命令；同用户本机通道可达，其他 SID 拒绝；错误、超时和重启保留原命令 ID；CLI/调度操作员协议不变；策略内部执行不依赖 Workbench。未经单独测试授权，本次只执行源码编译检查，以上行为验收留待独立测试。
 
 ## 6. 开放接口
 
@@ -280,14 +382,14 @@ sequenceDiagram
 | `runtime.json` | 运行目录版本、账户档案与默认账户。各账户以配置名关联私有登录资料，账本路径按原有账户身份规则在运行目录内派生。运行时在账本旁记录已建账身份。 |
 | `runtime-control.json` | 运行级自动化开关。当前 `scheduled_start.enabled` 明确决定无人值守启动器是否允许发起新的定时策略运行；启动器每秒重读该文件和策略参数，修改后无需重启调度进程。 |
 | `private/OnlineTrader-defaults.json` | 为接收方确认的券商与行情账号、口令、线路及连接参数。运行时独占读取，匹配账户档案和现有账本身份后才接通对应适配器。Qt、公开查询和诊断只取得脱敏字段。 |
-| `private/operators.json` | 应用内操作员和受托工具的校验值、角色、授权范围及有效期。通过独立控制入口更新，临时控制会话启动后重新建立。 |
+| `private/operators.json` | CLI、定时任务和受托工具的校验值、角色、授权范围及有效期。Workbench 本机交互通道不读取此文件。 |
 | `OnlineTrader-parameters.json` | 经确认的初始策略参数和默认设置，用于首次建账和后续预览。接续已有账户时，从执行账本恢复已绑定的策略版本及计划。 |
 | 每账户 SQLite 执行账本 | 沿用选定执行路径的账本，保留委托、成交、在途占量、保护、人工禁开、已生效策略、计划、账户观察、跨日查询事实、业务计数和回执。随目录迁移同一账本，不另带 Runtime 数据库。 |
 | `handoff.json` | 交接时记录格式版本、账号和柜台日、源 owner 状态、账本身份与检查点、配置版本和文件摘要，供目标机预检。 |
 
 独立运行时使用配置和每账户执行账本，去掉独立运行状态库及对 Windows 凭据库的依赖。两者职责不同且共同构成可恢复运行目录：配置保存账户选择、登录资料、策略参数、操作员授权和自动启动意图；原 SQLite 账本保存已经发生并需要恢复或审计的账户观察、委托、成交、持仓责任、命令和策略执行事实。配置不是交易历史，账本也不承担下一次运行的可编辑设置。新账户在首次启动校验配置并取得账户锁后，自动创建账户绑定的 SQLite 执行账本并记录已建账状态，再进入连接流程。初始参数随启动确认记录持久化。生效参数版本由原执行器在核实交易日、行情元数据和交易范围后提交。已有账户先恢复账本，缺失或损坏时报错并等待修复。换机交接入口要求交接清单列出的原账本齐全，避免缺包被误判为新账户。
 
-含登录资料的目录具备登录能力，按含账号口令的制品通过已批准的私有渠道交接。操作员或自动化工具的令牌原值按独立授权另行交接，校验值及授权范围随私有配置迁移。工具使用受保护配置或输入流提交令牌；Qt 只把输入令牌保存在当前进程内并通过 Runtime 控制协议直接提交。启动器按目标机环境重建专用文件和进程访问权限。
+含登录资料的目录具备登录能力，按含账号口令的制品通过已批准的私有渠道交接。CLI、调度或自动化工具的令牌原值按独立授权另行交接，校验值及授权范围随私有配置迁移。工具使用受保护配置或输入流提交令牌；Qt 通过同一 Windows 登录用户限定的 Workbench 通道提交，不接触这些令牌。启动器按目标机环境重建专用文件和进程访问权限。
 
 ### 8.2 换机接续与旧版本兼容
 
@@ -314,7 +416,7 @@ sequenceDiagram
 | --- | --- |
 | A. 定合同与基线 | 确认账户、交易指令、人工权限与生命周期合同。锁定普通入口现网行为、日志和代表性验证样本，确认实际启动的第一处差异。 |
 | B. 独立运行入口 | 以原 `Kernel` 作为执行 owner。拆开登录、同步、策略启停和定时计划，采用可移植配置以及现有的每账户 SQLite 执行账本。原路径已支持的操作由新 CLI/API 接入同一 owner，完成离线回放、无 Qt 模拟闭环、干净机首次建账与换机接续。保留原安全条件和账本恢复合同。 |
-| C. 读侧与 Qt 切换 | 接入独立本机接口进程、推送和 2.5 秒对齐。Qt 使用同一 Runtime 操作员协议直接提交，令牌仅驻留界面进程，服务端每次重验。完成冻结、进程退出、过载与重连验收。旧工作台协议只保留为 Legacy 兼容出口，不再是当前产品验收入口。 |
+| C. 读侧与 Qt 切换 | 接入独立本机接口进程、推送和 2.5 秒对齐。Qt 使用独立的同一 Windows 用户 Workbench 通道直接提交，不展示操作员或令牌；CLI、调度和受托工具仍由服务端逐次鉴权。完成冻结、进程退出、过载与重连验收。旧工作台协议只保留为 Legacy 兼容出口，不再是当前产品验收入口。 |
 | D. 实盘接入 | 为指定期货公司、席位与真实账号实现、核对连接和原生事实，按只读、人工交易、策略交易分别验收。交付的能力与授权范围由所选适配器和原生证据决定。 |
 | E. 候选执行链切换 | 作为单独的行为迁移。候选当前尚缺标准人工开仓等能力，填补公开合同并经独立验证后，才按项目的同账户冷切换流程迁移。 [候选操作](../../src/online_trader/dsv_runtime/runner.py#L1197) · [候选启动及回滚](dsv-parity-20261114/10-sdk-startup-and-same-day-rollback.md) |
 
@@ -366,12 +468,12 @@ sequenceDiagram
 | 读取快照与订阅 | `runtime status --root <目录>` 与 `runtime watch --root <目录>`。Python 用 `RuntimeViewClient` 取得基线、差量、对齐或账本观察历史。`runtime quotes` 和 `runtime catalog` 使用所选配置独立只读查询行情。`runtime schema` 输出本机接口的版本化 Schema。 |
 | 只读柜台登录 | 执行器未运行时，`runtime account --root <目录> [--account <配置 ID>]` 读取当前资金、持仓、委托和成交。Python 使用 `online_trader.runtime.account_query.read_current_account(root, account=...)`。返回 `ONLINE_TRADER_ACCOUNT_OBSERVATION/1`，`trading_day` 留空，原生当前截面通过 `coverage` 表明。 |
 | 运行中的账户 | `runtime account --attached --root <目录> [--account <配置 ID>]` 读取当前执行器接收的全账户截面。Python 使用 `online_trader.transport.runtime_account.RuntimeAccountClient(pipe, expected_account_key=...).read()`。 |
-| 工作台 | `online-trader-desktop --runtime-pipe <inspect 返回的 pipe>`。工作台通过推送和 2.5 秒对齐更新；首次操作时解锁 Runtime 操作员，按钮直接提交带账号、owner boot 和配置版本绑定的命令。令牌不落盘，超时保留原 ID查回执。 |
+| 工作台 | 普通用户运行 `online-trader-desktop --runtime-root <目录>`；Runtime 配置便携版双击 `OnlineTrader.exe`。统一入口先附着、缺失时启动 DISARMED Owner，取得权威基线后打开工作台。`--runtime-pipe <pipe>` 保留为只附着入口。工作台通过推送和 2.5 秒对齐更新；按钮确认后通过本机同一 Windows 用户通道直接提交带账号、owner boot 和配置版本绑定的命令，不要求操作员 ID或令牌。超时保留原 ID查回执。 |
 | 提交及回执 | `runtime command --root <目录> --operator <操作员> --input <命令 JSON>` 或 `runtime receipt --root <目录> --operator <操作员> --command-id <原 ID>`。令牌以无回显提示输入，自动化可显式使用 `--token-stdin`。JSON 提供 `command_id`、`operation`、`scope`、`parameters`，沿用实际内核命令契约。运行时退出后仍可获授权读取已提交的回执。 |
 | 人工权限 | `SET_ENTRY_POLICY` 按来源 `STRATEGY` 或 `MANUAL`、账户或单合约和 `expected_policy_revision` 指定禁开或允许。是否撤已在途开仓余单以请求中的显式选项为准。 |
 | 定时启动 | `runtime schedule --root <目录> --operator <操作员>` 使用明确配置和 `SCHEDULE_STRATEGY` 授权，按原 DSV 交易日历校验。`runtime-control.json` 的 `scheduled_start.enabled` 是运行级总开关；原 `OnlineTrader-parameters.json` 继续提供日/夜盘触发时间与 `auto_start_on_launch`。启动器每秒重读两份配置并在真正创建交易请求前再核对一次；关闭总开关只阻止新的定时启动，不会擅自停止已经运行的策略 owner。 |
 | 历史和交接 | `runtime history --root <目录>` 分页读取原执行账本内已提交的全账户柜台观察。加 `--from-day` 和 `--to-day` 进入跨日模式，Python 对应 `RuntimeViewClient.history_days`。`runtime report --root <目录>` 读取自有逐笔成交和损益。`runtime export-handoff --root <源目录> --output <新目录>` 核对原 owner 已结清且停止后，导出配置、原 SQLite 一致性副本及清单。 |
-| 制品入口 | 源码构建脚本可选 `RuntimeConfigured` 或 `RuntimeHandoff`，用明确的 `-DeliveryConfigDirectory` 输入。一份运行目录生成 ZIP 和便携目录。ZIP 含 `runtime/` 中本次交付的文件，正常启动使用 `OnlineTraderCLI.exe runtime run --root .\runtime`。 |
+| 制品入口 | 源码构建脚本可选 `RuntimeConfigured` 或 `RuntimeHandoff`，用明确的 `-DeliveryConfigDirectory` 输入。一份运行目录生成 ZIP 和便携目录。ZIP 含 `runtime/` 中本次交付的文件，普通用户双击 `OnlineTrader.exe`；程序自动识别相邻 `runtime/` 并执行统一引导。`OnlineTraderCLI.exe runtime run --root .\runtime` 保留为无界面运维入口。 |
 
 `private/operators.json` 使用 `schema_version` 值 `ONLINE_TRADER_OPERATORS/1`，`operators` 数组配置 `id`、`token_sha256`、`account_keys`、`operations` 和 `expires_at_utc`。交付目录保存随机令牌的 SHA-256 和作用域，操作员令牌原值通过独立授权交接。回复和诊断保持脱敏。
 

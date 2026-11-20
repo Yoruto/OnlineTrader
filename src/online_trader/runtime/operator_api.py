@@ -23,6 +23,8 @@ from online_trader.transport.status_client import StatusClient
 
 
 PROTOCOL = 'ONLINE_TRADER_RUNTIME_COMMAND/1'
+WORKBENCH_PROTOCOL = 'ONLINE_TRADER_RUNTIME_WORKBENCH_COMMAND/1'
+WORKBENCH_ACTOR = 'workbench-user'
 _COMMAND_FIELDS = {'command_id', 'operation', 'scope', 'parameters'}
 
 
@@ -49,6 +51,22 @@ def validate_wire(message):
     identifier(message['operator'])
     if type(message['token']) is not str or not 32 <= len(message['token']) <= 256:
         raise TraderError('E_AUTH', 'A valid delegated operator token is required')
+
+
+def validate_workbench_wire(message):
+    if type(message) is not dict or message.get('protocol') != WORKBENCH_PROTOCOL:
+        raise TraderError('E_SCHEMA', 'Invalid Runtime Workbench command frame')
+    identifier(message.get('request_id'))
+    if message.keys() == {'protocol', 'request_id', 'result'}:
+        return
+    if message.keys() == {'protocol', 'request_id', 'error'}:
+        if type(message['error']) is not dict or type(message['error'].get('code')) is not str:
+            raise TraderError('E_SCHEMA', 'Invalid Runtime Workbench command error')
+        return
+    if message.keys() != {'protocol', 'request_id', 'operation', 'body'}:
+        raise TraderError('E_SCHEMA', 'Invalid Runtime Workbench command request')
+    if message['operation'] not in ('submit', 'receipt', 'preview-config') or type(message['body']) is not dict:
+        raise TraderError('E_SCHEMA', 'Unknown Runtime Workbench command operation')
 
 
 def operator_records(root):
@@ -92,12 +110,12 @@ def authenticate_operator(root, account_key, operator_id, token):
         raise TraderError('E_AUTH', 'The operator token or its account grant is invalid') from None
 
 
-class OperatorEndpoint:
-    def __init__(self, pipe, root, ledger, account_key):
+class _AuthorizedEndpoint:
+    def __init__(self, pipe, root, ledger, account_key, *, submission_lock=None):
         self.pipe, self.root, self.ledger, self.account_key = pipe, Path(root), Path(ledger), account_key
-        self._submission = Lock()
+        self._submission = submission_lock if submission_lock is not None else Lock()
 
-    def _receipt(self, command_id, actor, operations):
+    def _receipt(self, command_id, actor, operations, *, allow_legacy_workbench=False):
         if not self.ledger.is_file():
             return None
         try:
@@ -114,23 +132,18 @@ class OperatorEndpoint:
             return None
         command, receipt, event = map(strict_loads, row)
         recorded = event['data'].get('control_metadata', {}).get('metadata', {}).get('actor', {})
-        if recorded.get('id') != actor or command['operation'] not in operations:
-            raise TraderError('E_AUTH', 'The command belongs to a different operator or grant')
+        legacy_workbench = (allow_legacy_workbench and command_id.startswith('qt-')
+                            and recorded.get('kind') == 'OPERATOR')
+        if ((recorded.get('id') != actor and not legacy_workbench)
+                or command['operation'] not in operations):
+            raise TraderError('E_AUTH', 'The command belongs to a different command authority')
         return {key: command[key] for key in _COMMAND_FIELDS}, receipt
 
-    def handle(self, request):
-        actor, operations, expiry = authenticate_operator(
-            self.root, self.account_key, request['operator'], request['token'])
+    def handle_authorized(self, request, actor, operations, *, allow_legacy_workbench=False):
         body = request['body']
-        if request['operation'] == 'authenticate':
-            if body:
-                raise TraderError('E_SCHEMA', 'Operator authentication does not accept a command body')
-            return {'status': 'AUTHENTICATED', 'operator': request['operator'], 'actor': actor,
-                    'account_key': self.account_key, 'operations': sorted(operations),
-                    'expires_at_utc': expiry.isoformat().replace('+00:00', 'Z')}
         if request['operation'] == 'preview-config':
             if 'SAVE_DSV_PARAMETERS' not in operations:
-                raise TraderError('E_AUTH', 'The operator cannot preview an effective parameter change')
+                raise TraderError('E_AUTH', 'This command channel cannot preview an effective parameter change')
             if body.keys() != {'profile', 'binding'} or type(body['binding']) is not dict:
                 raise TraderError('E_SCHEMA', 'Provide a profile and its Runtime binding')
             binding = body['binding']
@@ -158,7 +171,8 @@ class OperatorEndpoint:
         if request['operation'] == 'receipt':
             if body.keys() != {'command_id'}:
                 raise TraderError('E_SCHEMA', 'Provide only the original command ID to query its receipt')
-            found = self._receipt(command_id, actor, operations)
+            found = self._receipt(command_id, actor, operations,
+                                  allow_legacy_workbench=allow_legacy_workbench)
             if found is None:
                 raise TraderError('E_OWNERSHIP', 'No committed receipt is currently visible for this command ID')
             return found[1]
@@ -168,17 +182,18 @@ class OperatorEndpoint:
         binding = body.get('binding')
         if 'binding' in body:
             if type(binding) is not dict or binding.keys() != {'account_key', 'kernel_boot_id', 'config_revision'}:
-                raise TraderError('E_SCHEMA', 'The operator draft has an invalid account and configuration binding')
+                raise TraderError('E_SCHEMA', 'The command draft has an invalid account and configuration binding')
             if binding['account_key'] != self.account_key:
-                raise TraderError('E_SCOPE', 'The operator draft belongs to another account')
+                raise TraderError('E_SCOPE', 'The command draft belongs to another account')
             identifier(binding['kernel_boot_id'])
             sequence(binding['config_revision'], positive=True)
         if body['operation'] not in operations:
-            raise TraderError('E_AUTH', 'The operator does not hold this command capability')
+            raise TraderError('E_AUTH', 'This command channel does not hold the requested capability')
         if not self._submission.acquire(blocking=False):
             raise TraderError('E_BUSY', 'The command was not enqueued because the interface is busy')
         try:
-            found = self._receipt(command_id, actor, operations)
+            found = self._receipt(command_id, actor, operations,
+                                  allow_legacy_workbench=allow_legacy_workbench)
             if found is not None:
                 if found[0] != {key: body[key] for key in _COMMAND_FIELDS}:
                     raise TraderError('E_DUPLICATE_CONFLICT', 'The command ID has different business content')
@@ -189,6 +204,34 @@ class OperatorEndpoint:
                                   expected_config_revision=binding['config_revision'] if binding else None)
         finally:
             self._submission.release()
+
+
+class OperatorEndpoint(_AuthorizedEndpoint):
+    protocol = PROTOCOL
+    channel = 'OPERATOR'
+
+    def handle(self, request):
+        actor, operations, expiry = authenticate_operator(
+            self.root, self.account_key, request['operator'], request['token'])
+        if request['operation'] == 'authenticate':
+            if request['body']:
+                raise TraderError('E_SCHEMA', 'Operator authentication does not accept a command body')
+            return {'status': 'AUTHENTICATED', 'operator': request['operator'], 'actor': actor,
+                    'account_key': self.account_key, 'operations': sorted(operations),
+                    'expires_at_utc': expiry.isoformat().replace('+00:00', 'Z')}
+        return self.handle_authorized(request, actor, operations)
+
+
+class WorkbenchEndpoint(_AuthorizedEndpoint):
+    """Authorize explicit Qt button commands at the local Windows-user boundary."""
+
+    protocol = WORKBENCH_PROTOCOL
+    channel = 'WORKBENCH'
+
+    def handle(self, request):
+        return self.handle_authorized(
+            request, WORKBENCH_ACTOR, _operator_capabilities() - {'SCHEDULE_STRATEGY'},
+            allow_legacy_workbench=True)
 
 
 class RuntimeCommandClient(CancellablePipeClient):
@@ -211,3 +254,22 @@ class RuntimeCommandClient(CancellablePipeClient):
 
     def authenticate(self, *, operator, token):
         return self.request('authenticate', {}, operator=operator, token=token)
+
+
+class RuntimeWorkbenchClient(CancellablePipeClient):
+    def __init__(self, pipe):
+        super().__init__()
+        self.pipe = pipe + '.workbench-control'
+
+    def request(self, operation, body):
+        request_id = 'request-' + uuid4().hex
+        request = {'protocol': WORKBENCH_PROTOCOL, 'request_id': request_id,
+                   'operation': operation, 'body': body}
+        with self.open_connection(self.pipe, timeout=2, validator=validate_workbench_wire) as connection:
+            connection.send(request, timeout=2)
+            response = connection.recv(timeout=8)
+        if response['request_id'] != request_id:
+            raise TraderError('E_SCOPE', 'The Workbench command response has a different request identity')
+        if error := response.get('error'):
+            raise TraderError(error['code'], error.get('message', 'The Runtime refused the Workbench command'))
+        return response['result']

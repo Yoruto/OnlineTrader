@@ -51,6 +51,9 @@ def main(argv=None):
     source.add_argument('--simnow-packet', type=Path)
     source.add_argument('--account-store', type=Path)
     source.add_argument('--runtime-pipe', help='通过独立接口附着交易运行时')
+    source.add_argument('--runtime-root', type=Path,
+                        help='从便携配置附着或启动交易运行时，再打开同一工作台')
+    parser.add_argument('--runtime-account', help='runtime.json 中要启动的账户 ID')
     parser.add_argument('--dsv-config', type=Path, help='读取原 DSV 已保存的业务参数')
     parser.add_argument('--allow-multi', action='store_true', help='允许打开多个工作台窗口')
     parser.add_argument('--autostart', action='store_true', help='打开工作台并显示守护启动反馈')
@@ -72,6 +75,19 @@ def main(argv=None):
     app = QApplication.instance() or QApplication([])
     app.setApplicationName('OnlineTrader')
     try:
+        runtime_root = args.runtime_root
+        if (runtime_root is None and args.simnow_packet is None and args.account_store is None
+                and args.runtime_pipe is None and args.dsv_config is None and args.compare_fills is None):
+            from online_trader.desktop.runtime_bootstrap import bundled_runtime_root
+            runtime_root = bundled_runtime_root()
+        if runtime_root is not None:
+            from online_trader.desktop.runtime_bootstrap import ensure_runtime
+            from online_trader.desktop.workbench import run
+            with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):
+                pipe = ensure_runtime(runtime_root, account=args.runtime_account)
+                return run(pipe, runtime_view=True)
+        if args.runtime_account is not None:
+            parser.error('--runtime-account requires --runtime-root or an adjacent packaged runtime')
         if args.runtime_pipe is not None:
             with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):
                 # Runtime attachment deliberately reuses the established dev

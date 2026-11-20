@@ -6,7 +6,7 @@
 
 ## 默认产品入口
 
-后续未明确指定路径的 OnlineTrader 启动、重启、验收候选和打包均默认指 Standalone Trading Runtime。执行 Owner 使用 `runtime run` 或受 `runtime-control.json` 约束的 `runtime schedule`；用户从 `online-trader-desktop --runtime-pipe` 进入与 dev 共用的 `WorkbenchWindow` / `WorkbenchLayout`。普通 Legacy 工作台不作为默认启动或交付入口，只在用户明确要求旧路径维护时使用。
+后续未明确指定路径的 OnlineTrader 启动、重启、验收候选和打包均默认指 Standalone Trading Runtime。普通用户从 `online-trader-desktop --runtime-root <目录>` 进入；Runtime 配置便携版直接双击 `OnlineTrader.exe`，统一入口会先附着已有 Runtime，缺失时启动 `DISARMED` Owner，取得权威投影后再打开与 dev 共用的 `WorkbenchWindow` / `WorkbenchLayout`。`runtime run`、受 `runtime-control.json` 约束的 `runtime schedule` 与 `--runtime-pipe` 保留为运维、无人值守及高级附着入口。普通 Legacy 工作台不作为默认启动或交付入口，只在用户明确要求旧路径维护时使用。
 
 该默认只决定目标架构，不扩大当次权限：账号连接、测试、订单操作和打包仍分别需要用户授权。打包时交付并验收 Runtime 完整目录/ZIP，配置、操作员授权与已初始化账户原账本均按接收方核对；禁止用能够打开但缺少 Runtime 配置或账本的普通工作台包替代。
 
@@ -37,7 +37,7 @@ runtime/
 | 是否允许无人值守定时启动 | `runtime-control.json` | 运行级自动化意图；可热读取，不是交易历史。 |
 | 日/夜盘启动时间、`auto_start_on_launch`、策略参数 | `OnlineTrader-parameters.json` | 新启动配置、预览和明确选择的新参数来源。 |
 | 券商/行情登录资料 | `private/OnlineTrader-defaults.json` | 私有登录输入；不能写入公开日志或证据。 |
-| 操作员令牌摘要、账户和操作授权 | `private/operators.json` | 本机控制接口认证。 |
+| CLI、定时任务和受托工具的令牌摘要、账户和操作授权 | `private/operators.json` | 非界面控制接口认证；Workbench 按当前 Windows 交互用户授权，不读取令牌。 |
 | 委托、成交、持仓责任、未知发送、保护、已提交命令、账户观察、已生效配置和策略事实 | 原每账户 `ledger.db` | 恢复、审计、历史查询和发送前持久化。 |
 | UI/接口进程诊断 | `logs/` | 可删除/轮转的诊断，不是交易事实。 |
 
@@ -103,7 +103,7 @@ Trading Runtime 的 Owner 主线程仍是唯一的交易决策和 SDK 驱动线�
 - 大帧编码在后台线程完成；已有编码任务积压时不在 Owner 线程不断重复构造新帧。
 - runtime-view-process 负责对外状态、历史、账户读取和操作员接口，可退出并重建。
 
-Trading Workbench 通过 runtime-view-process 的操作员协议直接提交命令。首次操作时输入操作员 ID和令牌，令牌只驻留当前 Qt 进程；接口对每条命令重新核对账号、能力和有效期。提交绑定当前账号、owner boot 和配置版本。超时或断线保留原 `command_id`，只能查询原回执，不能由界面自动生成新 ID重发。Qt 和 runtime-view-process 仍只是控制/读侧，不因此成为 SDK sender 或账本 writer。
+Trading Workbench 通过 runtime-view-process 的本机交互用户通道直接提交命令。用户点击按钮并完成界面确认即构成该次用户操作，不再输入操作员 ID或令牌；命名管道校验同一 Windows 登录用户，接口继续核对账号、能力、owner boot 和配置版本。超时或断线保留原 `command_id`，只能查询原回执，不能由界面自动生成新 ID重发。CLI、定时任务和受托工具仍走操作员协议。Qt 和 runtime-view-process 仍只是控制/读侧，不因此成为 SDK sender 或账本 writer。
 
 750 ms 和 2.5 s 是当前实现的发布节奏，不是交易 SLA，也不改变报单、撤单、策略或保护轮次。性能评审应观察 `OWNER_LOOP_SLOW`、SDK 泵间隔以及 Tick → 决策 → 发送的 P95/P99。
 
@@ -199,7 +199,7 @@ runtime/logs/runtime-view.log.1
 
 ### Runtime 测试入口
 
-- 后续用户级产品测试从 Runtime CLI/API、`RuntimeViewClient`、`RuntimeCommandClient` 或 `online-trader-desktop --runtime-pipe` 执行。
+- 后续用户级产品测试从统一 `online-trader-desktop --runtime-root`/配置版 `OnlineTrader.exe` 入口执行；Runtime CLI/API、`RuntimeViewClient`、`RuntimeCommandClient` 和 `--runtime-pipe` 用于对应的运维或接口范围。
 - 旧工作台或 QA 直接持有 Kernel/ControlServer 的回放只保留为 Legacy 或组件不变量测试，不能作为 Runtime 产品验收。
 - 纯离线事实只进入 `qa/` 中不随 wheel 发布的宿主，生产 `runtime run` 不增加 QA 注入开关。
 - 固定边界、退役入口和离线证据范围见[测试入口迁移](refactor/standalone-trading-runtime-test-migration-20261119.md)。

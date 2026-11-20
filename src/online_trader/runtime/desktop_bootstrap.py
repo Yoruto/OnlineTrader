@@ -55,6 +55,9 @@ ERROR_MESSAGES = {
     'E_STARTUP_METADATA_CLOSE': '行情资料连接未正常关闭，策略启动已停止。',
     'E_DEPENDENCY': '模拟运行组件不可用，请检查已安装的程序环境。',
     'E_CLOCK': '无法取得应用授时，请检查授时网络连接。',
+    'E_RUNTIME_HANDOFF': '检测到同一账号已有另一份桌面执行账本；为避免形成两个交易账本，请先完成受控的一致性交接。',
+    'E_RUNTIME_CONFIG': 'Runtime 配置不完整或格式无效，请核对运行目录。',
+    'E_STORAGE': '执行账本缺失、不可读或身份不完整；Runtime 未启动且没有重建账本。',
 }
 
 

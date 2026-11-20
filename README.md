@@ -6,13 +6,13 @@
 
 2026-11-19 已将普通模拟执行链封装为可脱离 Qt 启动的 **Trading Runtime**。运行时继续由原 `Kernel`、原策略规则和原每账户 SQLite 账本负责登录、行情、策略、人工命令、开平仓、保护与恢复；**Trading Workbench** 和本机接口进程只读取版本化投影并提交命令。界面卡死或退出不会释放运行时的持仓和保护责任。
 
-后续未特别指定路径的启动、重启、验收候选和打包统一以 Standalone Trading Runtime 为默认目标：Owner 从 `runtime run`/`runtime schedule` 启动，用户界面通过 `online-trader-desktop --runtime-pipe` 附着，并继续使用与 dev 完全相同的交易工作台界面。Legacy 普通入口只用于明确点名的旧路径维护；默认路径选择本身不授权连接账号、执行交易、运行测试或生成制品。
+后续未特别指定路径的启动、重启、验收候选和打包统一以 Standalone Trading Runtime 为默认目标。普通用户运行 `online-trader-desktop --runtime-root <目录>`；Runtime 配置便携版直接双击 `OnlineTrader.exe`。统一入口先附着已有 Runtime，缺失时以 `DISARMED` 启动 Owner，取得权威投影后再打开与 dev 完全相同的交易工作台。`runtime run`/`runtime schedule` 与 `--runtime-pipe` 保留为运维、无人值守及高级附着入口。Legacy 普通入口只用于明确点名的旧路径维护；默认路径选择本身不授权连接账号、执行交易、运行测试或生成制品。
 
 便携运行目录使用相对路径配置，不依赖 Windows 凭据库，也不新增 `runtime.sqlite3`。全新目录首次启动自动建立原执行账本；换机交接携带配置和原账本的一致性副本。已经启动过的账户以“运行配置 + 原每账户 SQLite 执行账本”共同构成可恢复状态：配置描述下一次如何运行，账本保存已经发生并需恢复或审计的交易事实。无人值守启动另由 `runtime-control.json` 明确总开关。人工与策略开仓权限分别持久化，人工禁开可否决策略新增，原平仓和保护路径保持可用。公开 CLI/Python 接口支持状态、账户、行情、命令、回执、跨日历史和交接导出。
 
-Trading Workbench 通过 Runtime 操作员接口直接提交命令：令牌只驻留当前界面进程，每次命令由 Runtime 重新鉴权；命令绑定账号、owner boot 和配置版本。超时只查询原 `command_id`，不自动重发。后续用户级产品测试统一从 Runtime CLI/API/Qt 入口执行；旧工作台直连 Kernel/ControlServer 的回放只保留为 Legacy 或组件回归，不能作为当前产品验收。 [测试入口迁移与固定数据](docs/refactor/standalone-trading-runtime-test-migration-20261119.md)
+Trading Workbench 把界面按钮上的明确操作视为当前 Windows 用户操作，不再要求操作员 ID或令牌。命令通过仅限本机同一登录用户的独立 Workbench 通道提交，并绑定账号、owner boot 和配置版本；超时只查询原 `command_id`，不自动重发。CLI、定时任务和受托工具继续使用操作员授权。后续用户级产品测试统一从 Runtime CLI/API/Qt 入口执行；旧工作台直连 Kernel/ControlServer 的回放只保留为 Legacy 或组件回归，不能作为当前产品验收。 [测试入口迁移与固定数据](docs/refactor/standalone-trading-runtime-test-migration-20261119.md)
 
-2026-11-19 的源码实施候选扩展了 Runtime 客户端状态、回执、Capability、结构化诊断、合约目录、参数预览及脱敏日志合同。按用户要求，`online-trader-desktop --runtime-pipe` 与普通 dev 工作台共用同一个 `WorkbenchWindow/WorkbenchLayout`；Runtime 只替换状态、命令和查询通道，不另建一套界面。真实 TQKQ 只读验收已覆盖界面对照、状态流、Qt 生命周期和零交易副作用；最新禁用态与账户标识修复仍需独立复测。未打包。[客户端重构设计与实施状态](docs/refactor/trading-workbench-client-refactor-20261119.md)
+2026-11-20 的源码候选新增统一桌面引导：先附着、缺失时启动 DISARMED Runtime、失败时展示真实错误码与诊断路径，不自动 handoff 或启用开仓。`--runtime-pipe` 继续只附着。该改动尚未进行功能测试或打包验收。此前 Runtime 客户端状态、回执、Capability、结构化诊断、合约目录、参数预览及脱敏日志合同继续复用同一个 `WorkbenchWindow/WorkbenchLayout`；Runtime 只替换状态、命令和查询通道，不另建一套界面。[统一启动评审](docs/refactor/standalone-trading-runtime-20261119.md#21-2026-11-20-统一桌面启动入口评审) · [客户端重构设计与实施状态](docs/refactor/trading-workbench-client-refactor-20261119.md)
 
 当前离线 Runtime 定向自动化由独立测试 Agent 执行 69 项，69 PASS、0 FAIL、0 SKIP；范围覆盖已实现的操作员协议、版本化视图、Workbench 直接提交、公共 IPC 账户读取/平仓/回执和受影响回归。可见 Qt 强杀恢复、完整故障矩阵、联网柜台和最终制品仍为 `NOT_RUN`，不能据此报告完整产品通过。
 
@@ -70,7 +70,7 @@ $env:PYTHONPATH = 'src'
 
 ## Windows 便携发行目录
 
-默认交付为 Runtime 完整便携目录/ZIP，而不是只含普通工作台的 Legacy 包。配置版除 EXE、共享 `_internal` 和必需脚本外，还须按接收方带齐 `runtime.json`、`runtime-control.json`、`OnlineTrader-parameters.json`、获准的私有账户/操作员配置，以及已初始化账户不可缺失的原账本。最终制品从 Runtime Owner 到 `--runtime-pipe` 工作台走实际入口独立验收；未明确要求打包时不执行以下构建。
+默认交付为 Runtime 完整便携目录/ZIP，而不是只含普通工作台的 Legacy 包。配置版除 EXE、共享 `_internal` 和必需脚本外，还须按接收方带齐 `runtime.json`、`runtime-control.json`、`OnlineTrader-parameters.json`、获准的私有账户/操作员配置，以及已初始化账户不可缺失的原账本。最终制品从双击 `OnlineTrader.exe` 的统一入口走到 Runtime Owner 与工作台，并另核对高级 `--runtime-pipe` 入口；未明确要求打包时不执行以下构建。
 
 便携构建须明确选用 `-DeliveryMode Generic` 或 `-DeliveryMode Configured`。同一次构建生成本地可直接启动的便携目录和分发用 ZIP，并输出 ZIP 的 SHA-256。`-Output` 指定便携目录，ZIP 默认生成在同级目录，可用 `-Archive` 指定其他位置。配置版用 `-DeliveryConfigDirectory` 提供已确认的账户和交易参数文件。
 

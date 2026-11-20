@@ -3042,8 +3042,8 @@ class WorkbenchLayout:
         self.log_event_detail.setText(f'发生时间    {time_text}\n级别    {severity}\n合约    {contract}\n\n{summary}')
 
     def receipts_page(self, layout):
-        layout.addLayout(row(self.buttons['receipt'], self.buttons['operator_lock'],
-                             self.buttons['order_archive'], self.buttons['historical_orders']))
+        layout.addLayout(row(self.buttons['receipt'], self.buttons['order_archive'],
+                             self.buttons['historical_orders']))
         layout.addWidget(self.tables['commands'], 1)
 
     def copy_log(self):

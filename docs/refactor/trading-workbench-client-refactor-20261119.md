@@ -5,12 +5,14 @@
 > 设计基线：`1f0ab648136519e364bf3267c6dab51ffdd76e15`；实施起点：`c891e512ed6559505160cccd80bfd90a40ae5262`
 > 本文所列实现状态不代表最终独立复测、模拟柜台交易闭环或最终制品已经通过。
 
+> 2026-11-20 决定：Workbench 按本机当前 Windows 交互用户提交，不再显示操作员或令牌；CLI、调度和受托工具的操作员协议保留。文中旧认证流程作为历史设计保留，实施与后续验收以该决定和 Standalone Runtime 主设计为准。
+
 **关联文档：** [独立交易运行时与交易工作台设计](standalone-trading-runtime-20261119.md) · [Runtime 运维、配置与账本](../runtime-operations-and-storage-20261119.md) · [账户数据与历史查询](../account-data-sync-design-20261119.md)
 
 ### 2026-11-19 源码实施候选
 
 - `online-trader-desktop --runtime-pipe` 与普通 dev 入口共用原 `WorkbenchWindow`/`WorkbenchLayout`；窗口、导航、页面、控件、文案和位置只有一份实现。Runtime 兼容启动器也只委托该窗口，不保留第二套可见页面。
-- 客户端基础层已提供版本化状态 Store、状态订阅/命令/慢查询分离、CommandBus、原命令回执恢复及稳定行 ID 模型；产品入口通过既有 Workbench 的 Runtime view/操作员适配逐步接入，不以替换 UI 的方式切换。
+- 客户端基础层已提供版本化状态 Store、状态订阅/命令/慢查询分离、CommandBus、原命令回执恢复及稳定行 ID 模型；产品入口通过既有 Workbench 的 Runtime view/交互用户通道逐步接入，不以替换 UI 的方式切换。
 - 账号历史是首个接入既有 Workbench 的慢查询：只在 `RuntimeQueryWorker` 中分页调用 `history-days`，结果按账号、Owner boot、柜台日和本地 generation 绑定；Qt 不直接打开账本。自有订单/成交与账号观察历史分开展示，资金历史按交易日并入权益曲线。该接入和增量表格刷新本轮仅做源码编译检查，尚未获得新的 GUI/行为验收证据。
 - Runtime 投影新增说明性 Capability、结构化 Diagnostic 和 Owner 已有行情缓存中的合约目录；命令仍由 Runtime 逐次最终校验。
 - 参数草稿必须先通过带账号、boot 和配置版本绑定的 Runtime 预览，再使用原 `SAVE_DSV_PARAMETERS` 命令提交；Qt 不直接写生效配置。
@@ -373,7 +375,7 @@ flowchart TD
     B[新 Snapshot 的 boot 改变] --> K[保留原 pending command_id]
     K --> U[标记 OUTCOME_UNKNOWN / OWNER_RESTARTED]
     U --> S[同步客户端持久化]
-    S --> A[清除旧认证并要求重新认证]
+    S --> A[重新取得完整 Runtime 基线]
     A --> Q[仅查询原 command_id]
     Q -->|明确终态| T[清除 pending]
     Q -->|查询失败或无明确终态| U
@@ -393,7 +395,7 @@ sequenceDiagram
     UI->>UI: wait complete, then destroy QObject
     RT-->>Store: baseline(boot-B)
     Store->>Store: keep command-A, mark OUTCOME_UNKNOWN
-    Store->>Store: persist + lock operator
+    Store->>Store: persist + require fresh baseline
     UI->>RT: receipt(command-A)
     alt terminal receipt
         RT-->>Store: SUCCEEDED / FAILED / REJECTED / SUPERSEDED
@@ -408,10 +410,10 @@ sequenceDiagram
 | --- | --- |
 | 状态所有者 | Runtime 账本拥有命令事实；客户端只持久化待查询的原 ID、账号和操作提示，不创造终态。 |
 | 关闭顺序 | 先请求中断，再关闭活动 Pipe，最后等待线程退出；不以固定 `wait(ms)` 超时后继续析构。 |
-| boot 迁移 | 同账号的新 boot 使客户端观察与认证失效，但不使旧账本回执或未知责任失效。 |
+| boot 迁移 | 同账号的新 boot 使客户端观察与命令绑定失效，但不使旧账本回执或未知责任失效。 |
 | 查询失败 | 只更新本次查询的诊断原因；pending 保持未知，禁止映射成原命令拒绝。 |
-| 兼容与回退 | 当前 Workbench 仍使用原 RuntimeWatch/操作员适配；门禁失败时继续不接入新基础层，不迁移或改写账本。旧版 pending 记录仍按原 ID 恢复为未知。 |
-| 诊断点 | 关闭可核对每个 lane 的 finished 状态；boot 变化与查询失败通过 `command_changed`/feedback 暴露原 command_id 和保留原因，内容不得含令牌。 |
+| 兼容与回退 | 当前 Workbench 使用 RuntimeWatch/本机交互用户通道；门禁失败时不回退操作员提示或直连 Owner，不迁移或改写账本。旧版 pending 记录仍按原 ID恢复为未知。 |
+| 诊断点 | 关闭可核对每个 lane 的 finished 状态；boot 变化与查询失败通过 `command_changed`/feedback 暴露原 command_id 和保留原因，内容不得含凭据或完整敏感载荷。 |
 
 可执行验收条件：阻塞 command、history/query 和 subscription 时关闭均能在受控时间内结束全部线程；`SUBMISSION_UNKNOWN` 经 boot 变化及 UI 重建仍保留原 ID；receipt 查询超时、断线、鉴权失败和暂未找到均保留 pending；仅明确终态回执清除；测试不连接账号、不发送交易命令、不构建制品。
 

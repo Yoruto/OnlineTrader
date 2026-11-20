@@ -5,9 +5,9 @@ Preserve existing work; do not import V7, vnpy, DSV, their credentials, database
 
 ## 默认启动与交付路径
 
-- 未明确指定执行路径时，OnlineTrader 的启动、重启、用户验收、测试候选和打包默认采用 **Standalone Trading Runtime**：执行 Owner 使用 `runtime run` 或 `runtime schedule`，桌面界面使用 `online-trader-desktop --runtime-pipe` 附着 Runtime。Runtime Workbench 与 dev 共用同一个 `WorkbenchWindow` / `WorkbenchLayout`；不要另建或交付第二套界面。
+- 未明确指定执行路径时，OnlineTrader 的启动、重启、用户验收、测试候选和打包默认采用 **Standalone Trading Runtime**。普通用户从 `online-trader-desktop --runtime-root <目录>`（配置便携版直接双击 `OnlineTrader.exe`）进入；统一桌面入口先附着已有 Runtime，缺失时以 `DISARMED` 启动 Owner，再打开同一个 `WorkbenchWindow` / `WorkbenchLayout`。`runtime run`、`runtime schedule` 和 `--runtime-pipe` 保留为运维、无人值守及高级附着入口；不要另建或交付第二套界面。
 - 默认 Runtime 路径不授予账号连接、订单操作、测试或打包权限；这些动作仍按本次用户授权执行。用户明确要求 Legacy 维护、replacement candidate 或 isolated QA 时，才切换相应路径，并在报告中标明。
-- 默认打包目标是可实际运行的 Runtime 完整交付单元，不是仅含普通工作台的 Legacy 包。除通用便携依赖外，按接收方带齐 Runtime 配置、操作员授权和已初始化账户所需的原账本；从最终 ZIP/安装器按 `runtime run`/`runtime schedule` → `--runtime-pipe` 实际入口独立验收。
+- 默认打包目标是可实际运行的 Runtime 完整交付单元，不是仅含普通工作台的 Legacy 包。除通用便携依赖外，按接收方带齐 Runtime 配置、操作员授权和已初始化账户所需的原账本；从最终 ZIP/安装器按双击 `OnlineTrader.exe` 的统一 Runtime 入口独立验收，并另外保留 `runtime run`/`runtime schedule` 与 `--runtime-pipe` 运维入口核对。
 
 ## 所有软件制品必须随包交付配置
 
@@ -35,7 +35,7 @@ Keep the explicit controller's per-child pre-send durability and the existing cu
 | Path | Entry points and owner | Applicable contract |
 | --- | --- | --- |
 | Legacy, not yet retired; explicit maintenance only | `simulation run`, `dsv run`, `simnow run`, and the ordinary workbench's existing launch route | Preserve the original Kernel owner and that route's recovery contract until approved cutover. Do not select this as the default launch or package path. |
-| Standalone Trading Runtime; default | `runtime run`, `runtime schedule`, `runtime command`, attached status/account/history and runtime Workbench | Reuse the original Kernel/SQLite execution owner through portable configuration. Qt and runtime-view are read/control-side processes, not senders. Follow [runtime operations and storage](docs/runtime-operations-and-storage-20261119.md). |
+| Standalone Trading Runtime; default | `online-trader-desktop --runtime-root`, packaged `OnlineTrader.exe`, `runtime run`, `runtime schedule`, `runtime command`, attached status/account/history and runtime Workbench | Unified desktop bootstrap may discover/start a DISARMED Owner but never becomes the sender. Reuse the original Kernel/SQLite execution owner through portable configuration. Qt and runtime-view are read/control-side processes. Follow [runtime operations and storage](docs/runtime-operations-and-storage-20261119.md). |
 | Replacement candidate | `dsv replacement-run`, `simnow replacement-run` | `DsvSession` + `ExplicitOrderController` + `Journal` + `DsvSdkAdapter`; share the compatible account lock, not the legacy Kernel sender. See [candidate startup](docs/refactor/dsv-parity-20261114/10-sdk-startup-and-same-day-rollback.md). |
 | Isolated QA | `offline-dsv` and `qa/dsv_parity/` replay tools | DEV/OFFLINE fixtures or locally bounded SDK replay; no real account connection or order authority. |
 

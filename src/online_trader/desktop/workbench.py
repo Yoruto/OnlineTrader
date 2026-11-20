@@ -118,16 +118,15 @@ class _WorkbenchRequest(QThread):
                 and not any(connection[key] for key in ('fault', 'recovery_required', 'storage_failed', 'clock_fault')))
 
 
-class _RuntimeOperatorRequest(QThread):
-    """Submit one authenticated Runtime operation without blocking Qt or the view subscriber."""
+class _RuntimeWorkbenchRequest(QThread):
+    """Submit one explicit UI operation without blocking Qt or the view subscriber."""
 
     result = Signal(object)
     failed = Signal(object)
 
-    def __init__(self, pipe, action, operator, token, body=None, account_key=None):
+    def __init__(self, pipe, action, body=None, account_key=None):
         super().__init__()
         self.pipe, self.action = pipe, action
-        self.operator, self.token = operator, token
         self.body = body or {}
         self.account_key = account_key
 
@@ -135,12 +134,9 @@ class _RuntimeOperatorRequest(QThread):
         identity = ({'account_key': self.account_key, 'command_id': self.body.get('command_id')}
                     if self.action in {'submit', 'receipt'} else None)
         try:
-            from online_trader.runtime.operator_api import RuntimeCommandClient
-            client = RuntimeCommandClient(self.pipe)
-            if self.action == 'authenticate':
-                value = client.authenticate(operator=self.operator, token=self.token)
-            else:
-                value = client.request(self.action, self.body, operator=self.operator, token=self.token)
+            from online_trader.runtime.operator_api import RuntimeWorkbenchClient
+            client = RuntimeWorkbenchClient(self.pipe)
+            value = client.request(self.action, self.body)
             if not self.isInterruptionRequested():
                 self.result.emit({'action': self.action, 'value': value, 'identity': identity})
         except Exception as error:
@@ -149,8 +145,6 @@ class _RuntimeOperatorRequest(QThread):
                 self.failed.emit({'action': self.action, 'code': code,
                                   'reason': str(error) if isinstance(error, TraderError) else None,
                                   'identity': identity})
-        finally:
-            self.token = None
 
 
 TABLES={
@@ -203,12 +197,6 @@ class WorkbenchWindow(StatusWindow):
         self._runtime_watch = None
         self._runtime_query_worker = None
         self._runtime_command_worker = None
-        self._runtime_operator_id = None
-        self._runtime_operator_token = None
-        self._runtime_auth_token = None
-        self._runtime_operator_operations = frozenset()
-        self._runtime_pending_action = None
-        self._runtime_after_finish = None
         self._runtime_receipt_restored_for = None
         self.store=store;self.selected_account=store.get(account_id) if store is not None and account_id is not None else None
         self.paired_launcher=paired_launcher
@@ -273,7 +261,6 @@ class WorkbenchWindow(StatusWindow):
             ('order_archive','查询原单留档',self.query_order_archive),
             ('symbol_enable','启用品种新增',lambda:self.set_symbol_entries(True)),
             ('symbol_pause','停用品种新增',lambda:self.set_symbol_entries(False)),
-             ('operator_lock','解锁操作员',self.toggle_runtime_operator),
         ):
             button=QPushButton(text)
             button.clicked.connect(callback)
@@ -291,7 +278,6 @@ class WorkbenchWindow(StatusWindow):
                 if candidate.parent.is_dir():
                     dsv_config = candidate
         self.dashboard=WorkbenchLayout(self, dsv_config=dsv_config, require_reviewed_profile=use_desktop_dsv)
-        self.command_buttons['operator_lock'].setVisible(runtime_view)
         self._tray.restore_geometry()
         self._tray.sync_icon()
         self.timer=QTimer(self);self.timer.setInterval(2500);self.timer.timeout.connect(self.refresh);self.timer.start()
@@ -434,7 +420,7 @@ class WorkbenchWindow(StatusWindow):
     def _runtime_updated(self, result):
         incoming = result.get('value', {}).get('view', {})
         if self._boot is not None and incoming.get('kernel_boot_id') != self._boot:
-            self._clear_runtime_operator('Runtime 已重启，请重新解锁操作员。')
+            self.show_home_feedback('Runtime 已重启，正在重新核对当前状态。')
         self._job_result(result)
         self._restore_runtime_receipt()
         self.dashboard.ensure_account_history()
@@ -485,48 +471,17 @@ class WorkbenchWindow(StatusWindow):
         if self._closing:
             self.close()
 
-    def toggle_runtime_operator(self):
-        if not self._runtime_mode:
-            return
-        if self._runtime_operator_token is not None:
-            self._clear_runtime_operator('操作员已锁定。')
-            return
-        self._prompt_runtime_operator()
-
-    def _prompt_runtime_operator(self, pending=None):
-        if self._runtime_command_worker is not None:
-            self.show_home_feedback('操作员请求仍在处理。')
-            return
-        settings = workbench_preferences()
-        default = settings.value('runtime/operator_id', '', str)
-        operator, accepted = QInputDialog.getText(self, '解锁 Runtime 操作员', '操作员 ID', text=default)
-        if not accepted:
-            return
-        operator = operator.strip()
-        token, accepted = QInputDialog.getText(
-            self, '解锁 Runtime 操作员', '操作令牌', echo=QLineEdit.EchoMode.Password)
-        if not accepted:
-            return
-        if not operator or not 32 <= len(token) <= 256:
-            self.show_home_feedback('操作员 ID 或令牌格式无效。')
-            return
-        self._runtime_pending_action = pending
-        self._runtime_auth_token = token
-        self._start_runtime_request('authenticate', operator, token, {})
-
-    def _start_runtime_request(self, action, operator, token, body):
+    def _start_runtime_request(self, action, body):
         if self._runtime_command_worker is not None:
             self.show_home_feedback('上一个 Runtime 操作仍在处理。')
             return
         account_key = self.view['account_key'] if self.view is not None else None
-        worker = _RuntimeOperatorRequest(
-            self.pipe_name, action, operator, token, body, account_key=account_key)
+        worker = _RuntimeWorkbenchRequest(self.pipe_name, action, body, account_key=account_key)
         worker.result.connect(self._runtime_request_result)
         worker.failed.connect(self._runtime_request_failed)
         worker.finished.connect(self._runtime_request_finished)
         self._runtime_command_worker = worker
         self._enable_commands(False)
-        self.command_buttons['operator_lock'].setEnabled(False)
         worker.start()
 
     def _start_runtime_submit(self, operation, scope, parameters):
@@ -552,12 +507,6 @@ class WorkbenchWindow(StatusWindow):
         if self._runtime_command_worker is not None:
             self.show_home_feedback('上一个 Runtime 操作仍在处理。')
             return
-        if self._runtime_operator_token is None:
-            self._prompt_runtime_operator(('submit', (operation, scope, parameters)))
-            return
-        if operation not in self._runtime_operator_operations:
-            self.show_home_feedback(f'当前操作员没有 {operation} 权限。')
-            return
         command_id = 'qt-' + uuid.uuid4().hex
         body = {'command_id': command_id, 'operation': operation, 'scope': scope,
                 'parameters': parameters, 'binding': {
@@ -570,7 +519,7 @@ class WorkbenchWindow(StatusWindow):
             return
         self.receipt_identity = {'command_id': command_id}
         self.show_home_feedback(f'正在提交 Runtime 命令 · {command_id}')
-        self._start_runtime_request('submit', self._runtime_operator_id, self._runtime_operator_token, body)
+        self._start_runtime_request('submit', body)
 
     def _start_runtime_receipt(self, identity):
         command_id = identity.get('command_id') if isinstance(identity, dict) else None
@@ -587,29 +536,11 @@ class WorkbenchWindow(StatusWindow):
             self.show_home_feedback(
                 f"原命令 {unresolved['command_id']} 仍待明确终态；禁止用其他回执覆盖其身份。")
             return
-        if self._runtime_operator_token is None:
-            self._prompt_runtime_operator(('receipt', {'command_id': command_id}))
-            return
         self.show_home_feedback(f'正在查询 Runtime 回执 · {command_id}')
-        self._start_runtime_request('receipt', self._runtime_operator_id, self._runtime_operator_token,
-                                    {'command_id': command_id})
+        self._start_runtime_request('receipt', {'command_id': command_id})
 
     def _runtime_request_result(self, result):
         action, value = result['action'], result['value']
-        if action == 'authenticate':
-            if self.view is None or value['account_key'] != self.view['account_key']:
-                self._clear_runtime_operator()
-                self.show_home_feedback('操作员授权账号与当前 Runtime 不一致。')
-                return
-            self._runtime_operator_id = value['operator']
-            self._runtime_operator_operations = frozenset(value['operations'])
-            # The token remains only in this process; every command is authenticated again by Runtime.
-            self._runtime_operator_token, self._runtime_auth_token = self._runtime_auth_token, None
-            workbench_preferences().setValue('runtime/operator_id', value['operator'])
-            self.command_buttons['operator_lock'].setText('锁定操作员')
-            self.show_home_feedback(f"操作员已解锁 · {value['operator']} · 有效至 {value['expires_at_utc']}")
-            self._runtime_after_finish, self._runtime_pending_action = self._runtime_pending_action, None
-            return
         receipt = value
         identity = result.get('identity')
         expected_id = identity.get('command_id') if isinstance(identity, dict) else None
@@ -638,9 +569,6 @@ class WorkbenchWindow(StatusWindow):
             self._runtime_watch.align()
 
     def _runtime_request_failed(self, error):
-        if error['code'] == 'E_AUTH':
-            self._clear_runtime_operator()
-        self._runtime_auth_token = None
         identity = error.get('identity')
         command_id = identity.get('command_id') if isinstance(identity, dict) else None
         account_key = identity.get('account_key') if isinstance(identity, dict) else None
@@ -674,28 +602,10 @@ class WorkbenchWindow(StatusWindow):
         worker = self.sender()
         if worker is self._runtime_command_worker:
             self._runtime_command_worker = None
-        self.command_buttons['operator_lock'].setEnabled(True)
         self._enable_commands(not self._closing and not self._stale and self.view is not None
                               and not self.view['truncated'])
-        pending, self._runtime_after_finish = self._runtime_after_finish, None
-        if pending is not None and not self._closing:
-            kind, payload = pending
-            if kind == 'submit':
-                QTimer.singleShot(0, lambda: self._start_runtime_submit(*payload))
-            else:
-                QTimer.singleShot(0, lambda: self._start_runtime_receipt(payload))
         if self._closing:
             QTimer.singleShot(0, self.close)
-
-    def _clear_runtime_operator(self, message=None):
-        self._runtime_operator_id = None
-        self._runtime_operator_token = None
-        self._runtime_auth_token = None
-        self._runtime_operator_operations = frozenset()
-        self._runtime_pending_action = None
-        self.command_buttons['operator_lock'].setText('解锁操作员')
-        if message:
-            self.show_home_feedback(message)
 
     @staticmethod
     def _stored_runtime_receipt():
@@ -754,7 +664,7 @@ class WorkbenchWindow(StatusWindow):
         if self.view is None:
             raise TraderError('E_NOT_READY', 'A Runtime account must be selected before submitting')
         value = {'account_key': self.view['account_key'], 'command_id': command_id,
-                 'operation': operation, 'operator': self._runtime_operator_id}
+                 'operation': operation, 'source': 'WORKBENCH'}
         settings = workbench_preferences()
         settings.setValue('runtime/pending_receipt', canonical_bytes(value).decode())
         settings.sync()
@@ -1831,8 +1741,6 @@ class WorkbenchWindow(StatusWindow):
             self._tray.on_minimized()
 
     def closeEvent(self,event):
-        if self._runtime_mode:
-            self._clear_runtime_operator()
         if self._runtime_command_worker is not None and self._runtime_command_worker.isRunning():
             self._closing = True
             self.hide()

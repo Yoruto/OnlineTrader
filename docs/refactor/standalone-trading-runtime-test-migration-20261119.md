@@ -1,5 +1,7 @@
 # Trading Runtime 测试入口迁移与固定数据
 
+> 2026-11-20 更新：Runtime Workbench 已改为“界面按钮即当前 Windows 交互用户操作”的独立本机通道，不再要求操作员 ID或令牌。下文 2026-11-19 的操作员界面用例和结果只保留为历史证据，不能验收新通道；CLI、调度和受托工具的操作员协议不变。
+
 2026-11-19 · 当前任务：后续用户级产品测试统一从 Trading Runtime 公共入口执行。
 
 ## 决定
@@ -10,16 +12,16 @@ Runtime 产品测试从以下入口执行：
 
 - Qt：`online-trader-desktop --runtime-pipe <pipe>`。
 - 状态：`RuntimeViewClient`、`runtime status` 和 `runtime watch`。
-- 控制：工作台或 `RuntimeCommandClient` 经 `ONLINE_TRADER_RUNTIME_COMMAND/1` 鉴权后提交。
+- 控制：工作台经 `ONLINE_TRADER_RUNTIME_WORKBENCH_COMMAND/1` 本机同用户通道提交；CLI、调度和受托工具经 `RuntimeCommandClient` 与 `ONLINE_TRADER_RUNTIME_COMMAND/1` 鉴权后提交。
 - 账户与历史：Runtime account、history 和 report 公共入口。
 
 纯离线不能冒充真实 `runtime run`。生产入口固定连接所选 SDK，不增加测试事实注入参数。离线事实只进入 `qa/` 中不随 wheel 发布的宿主；测试者仍只从 Runtime 公共客户端和 Qt 操作。
 
 ## Runtime Workbench 控制合同
 
-Runtime Workbench 可以直接提交命令。首次操作或手动解锁时输入操作员 ID 和令牌；接口返回账号、能力及有效期。令牌只保留在当前 Qt 进程内，每次命令仍由 Runtime 重新鉴权。账号或 owner boot 改变、鉴权失败、手动锁定或窗口退出时清除令牌。
+Runtime Workbench 可以直接提交命令。用户点击按钮并完成既有界面确认即构成交互用户操作，Qt 不再输入或保存操作员 ID和令牌；接口以本机同一 Windows 用户边界受理，并继续核对账号、能力、owner boot 和配置版本。账号或 owner boot 改变时重新取得完整基线后才能提交。
 
-提交体绑定当前 `account_key`、`kernel_boot_id` 和 `config_revision`。一个用户确认生成一个 `command_id`。连接超时或回复丢失时保留该 ID，只允许查询原回执，禁止自动重发。工作台只持久化账号、操作员 ID、命令 ID和操作类型等非秘密待核信息，令牌不写 QSettings、日志或证据。
+提交体绑定当前 `account_key`、`kernel_boot_id` 和 `config_revision`。一个用户确认生成一个 `command_id`。连接超时或回复丢失时保留该 ID，只允许查询原回执，禁止自动重发。工作台只持久化账号、命令 ID、操作类型和来源等非秘密待核信息。
 
 ## 固定测试数据
 

@@ -1,5 +1,7 @@
 # Trading Runtime 实现与验收记录
 
+> 2026-11-20 变更说明：Workbench 已去除操作员 ID/令牌交互，改用同一 Windows 交互用户限定的独立命令通道。本记录中的 Workbench 操作员鉴权结果属于旧候选，不能作为新通道的验收证据；其余 Runtime/账本证据按原范围保留。
+
 2026-11-19 · 实现提交 `489d7344ae66b34cb08651124982c757b899f651` · 基线 `10b915fa23f33860712ec491a7aa74d015c46203`
 
 当前提交把普通模拟执行链封装为可脱离 Qt 启动的 Trading Runtime。它继续使用原 `Kernel`、原策略规则、原账户排他锁和原每账户 SQLite writer。接口进程和 Trading Workbench 只消费发布副本及提交命令，不能取得 SDK 或账本 writer 所有权。

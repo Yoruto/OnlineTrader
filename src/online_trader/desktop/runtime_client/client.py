@@ -10,7 +10,7 @@ from PySide6.QtCore import QObject, QThread, Signal
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.desktop.preferences import workbench_preferences
 from online_trader.errors import TraderError
-from online_trader.runtime.operator_api import RuntimeCommandClient
+from online_trader.runtime.operator_api import RuntimeWorkbenchClient
 from online_trader.transport.runtime_account import RuntimeAccountClient
 from online_trader.transport.runtime_view import RuntimeViewClient, ViewReplica
 from online_trader.desktop.runtime_client.state import PendingCommandState, PendingCommandStatus
@@ -64,7 +64,7 @@ class RuntimeCommandWorker(QThread):
 
     def __init__(self, pipe, parent=None):
         super().__init__(parent)
-        self.client = RuntimeCommandClient(pipe)
+        self.client = RuntimeWorkbenchClient(pipe)
         self.queue = Queue(maxsize=32)
 
     def enqueue(self, request):
@@ -82,8 +82,7 @@ class RuntimeCommandWorker(QThread):
             if request is None or self.isInterruptionRequested():
                 return
             try:
-                value = self.client.request(request['action'], request['body'], operator=request['operator'],
-                                            token=request['token'])
+                value = self.client.request(request['action'], request['body'])
                 self.result.emit(request | {'value': value})
             except TraderError as error:
                 if self.isInterruptionRequested():
@@ -191,7 +190,6 @@ class RuntimeClientCoordinator(QObject):
 
 
 class CommandBus(QObject):
-    authentication_changed = Signal(bool, str)
     command_changed = Signal(object)
     feedback = Signal(str)
     config_previewed = Signal(object)
@@ -202,38 +200,16 @@ class CommandBus(QObject):
     def __init__(self, coordinator, store, parent=None):
         super().__init__(parent)
         self.coordinator, self.store = coordinator, store
-        self.operator_id = None
-        self.token = None
-        self.operations = frozenset()
-        self.expiry = None
         self._requests = {}
         coordinator.command_result.connect(self._result)
         coordinator.command_failed.connect(self._failed)
         store.owner_boot_changed.connect(self._owner_boot_changed)
         self._restore_pending()
 
-    def authenticate(self, operator, token):
-        if not operator or not isinstance(token, str) or not 32 <= len(token) <= 256:
-            raise TraderError('E_AUTH', '操作员 ID 或令牌格式无效')
-        request_id = 'client-' + uuid4().hex
-        self._requests[request_id] = {'kind': 'authenticate', 'operator': operator, 'token': token}
-        self.coordinator.commands.enqueue({'request_id': request_id, 'action': 'authenticate', 'body': {},
-                                           'operator': operator, 'token': token})
-        self.feedback.emit('正在核对 Runtime 操作员授权。')
-
-    def lock(self):
-        self.operator_id = self.token = self.expiry = None
-        self.operations = frozenset()
-        self.authentication_changed.emit(False, '')
-
     def submit(self, operation, scope, parameters):
         view = self.store.view
         if view is None or self.store.connection_state.value != 'READY':
             raise TraderError('E_NOT_READY', '请先取得当前完整 Runtime 状态')
-        if self.token is None or self.operator_id is None:
-            raise TraderError('E_AUTH', '请先解锁 Runtime 操作员')
-        if operation not in self.operations:
-            raise TraderError('E_AUTH', f'当前操作员没有 {operation} 权限')
         allowed, reason = self.store.capability(operation)
         if not allowed:
             raise TraderError('E_CAPABILITY', reason or '当前 Runtime 不允许此操作')
@@ -258,31 +234,23 @@ class CommandBus(QObject):
                                       'scope_hash': scope_hash}
         self._persist_pending()
         self.command_changed.emit(pending)
-        self.coordinator.commands.enqueue({'request_id': request_id, 'action': 'submit', 'body': body,
-                                           'operator': self.operator_id, 'token': self.token})
+        self.coordinator.commands.enqueue({'request_id': request_id, 'action': 'submit', 'body': body})
         return command_id
 
     def preview_config(self, profile):
         view = self.store.view
         if view is None or self.store.connection_state.value != 'READY':
             raise TraderError('E_NOT_READY', '请先取得当前完整 Runtime 状态')
-        if self.token is None or self.operator_id is None:
-            raise TraderError('E_AUTH', '请先解锁 Runtime 操作员')
-        if 'SAVE_DSV_PARAMETERS' not in self.operations:
-            raise TraderError('E_AUTH', '当前操作员没有参数修改权限')
         request_id = 'client-' + uuid4().hex
         body = {'profile': profile.to_record(), 'binding': {
             'account_key': view['account_key'], 'kernel_boot_id': view['kernel_boot_id'],
             'config_revision': view['configuration']['config_revision']}}
         self._requests[request_id] = {'kind': 'preview-config', 'profile_hash': profile.content_hash,
                                       'account_key': view['account_key']}
-        self.coordinator.commands.enqueue({'request_id': request_id, 'action': 'preview-config', 'body': body,
-                                           'operator': self.operator_id, 'token': self.token})
+        self.coordinator.commands.enqueue({'request_id': request_id, 'action': 'preview-config', 'body': body})
         self.feedback.emit('正在由 Runtime 预览并校验参数草稿。')
 
     def query(self, command_id):
-        if self.token is None or self.operator_id is None:
-            raise TraderError('E_AUTH', '请先解锁 Runtime 操作员')
         prior = self.store.pending.get(command_id)
         request_id = 'client-' + uuid4().hex
         self._requests[request_id] = {'kind': 'receipt', 'command_id': command_id,
@@ -290,27 +258,12 @@ class CommandBus(QObject):
                                       'operation': prior.operation if prior else '',
                                       'scope_hash': prior.scope_hash if prior else None}
         self.coordinator.commands.enqueue({'request_id': request_id, 'action': 'receipt',
-                                           'body': {'command_id': command_id},
-                                           'operator': self.operator_id, 'token': self.token})
+                                           'body': {'command_id': command_id}})
         self.feedback.emit(f'正在查询原命令 {command_id}。')
 
     def _result(self, response):
         request = self._requests.pop(response['request_id'], {})
         value = response['value']
-        if request.get('kind') == 'authenticate':
-            view = self.store.view
-            if view is None or value.get('account_key') != view['account_key']:
-                self.lock()
-                self.feedback.emit('操作员授权账号与当前 Runtime 不一致。')
-                return
-            self.operator_id = value['operator']
-            self.token = request['token']
-            self.operations = frozenset(value['operations'])
-            self.expiry = value['expires_at_utc']
-            workbench_preferences().setValue('runtime/operator_id', self.operator_id)
-            self.authentication_changed.emit(True, self.operator_id)
-            self.feedback.emit(f'操作员已解锁 · {self.operator_id}')
-            return
         if request.get('kind') == 'preview-config':
             if value.get('profile_hash') != request.get('profile_hash'):
                 self.feedback.emit('Runtime 参数预览哈希与本地草稿不一致。')
@@ -338,8 +291,6 @@ class CommandBus(QObject):
 
     def _failed(self, response):
         request = self._requests.pop(response['request_id'], {})
-        if response['code'] == 'E_AUTH':
-            self.lock()
         command_id = request.get('command_id')
         if command_id:
             prior = self.store.pending.get(command_id)
@@ -394,7 +345,6 @@ class CommandBus(QObject):
             pass
 
     def _owner_boot_changed(self, previous_boot, current_boot):
-        self.lock()
         changed = []
         for command_id, pending in tuple(self.store.pending.items()):
             value = replace(pending, status=PendingCommandStatus.OUTCOME_UNKNOWN,
@@ -407,7 +357,7 @@ class CommandBus(QObject):
         if changed:
             self.feedback.emit(
                 f'Runtime Owner 已从 {previous_boot} 切换到 {current_boot}；'
-                f'已保留 {len(changed)} 个原命令 ID，重新认证后请查询回执。')
+                f'已保留 {len(changed)} 个原命令 ID，重新同步后请查询回执。')
 
 
 def _freeze_receipt(value):

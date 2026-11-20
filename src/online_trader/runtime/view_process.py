@@ -8,15 +8,16 @@ import time
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from threading import BoundedSemaphore, Event, Thread
+from threading import BoundedSemaphore, Event, Lock, Thread
 import re
 
 from online_trader.errors import TraderError
 from online_trader.runtime.account_day_history import read_account_days
 from online_trader.runtime.account_history import account_history
 from online_trader.runtime.executable import bundled_cli
-from online_trader.runtime.operator_api import PROTOCOL as COMMAND_PROTOCOL, OperatorEndpoint
+from online_trader.runtime.operator_api import OperatorEndpoint, WorkbenchEndpoint
 from online_trader.runtime.operator_api import validate_wire as validate_command
+from online_trader.runtime.operator_api import validate_workbench_wire
 from online_trader.transport.named_pipe import PipeListener
 from online_trader.transport.runtime_account import AccountObservation, read_observation
 from online_trader.transport.runtime_account import validate_wire as validate_account
@@ -163,7 +164,12 @@ def _runtime_log_page(root, *, before=None, limit=100):
     lines = raw.decode('utf-8', errors='replace').splitlines()[-10_000:]
     end = len(lines) if before is None else min(int(before), len(lines))
     start = max(0, end - limit)
-    pattern = re.compile(r'^(\S+) SUPERVISOR (START pid=\d+|EXIT code=-?\d+ uptime_ms=\d+|START_FAILED error=[A-Za-z0-9_]+)$')
+    pattern = re.compile(
+        r'^(\S+) (?:SUPERVISOR )?('
+        r'START pid=\d+|EXIT code=-?\d+ uptime_ms=\d+|START_FAILED error=[A-Za-z0-9_]+|'
+        r'COMMAND source=(?:WORKBENCH|OPERATOR) request=[A-Za-z0-9._-]+ '
+        r'action=[A-Za-z0-9._-]+ operation=[A-Za-z0-9._-]+ command=[A-Za-z0-9._-]+ '
+        r'result=(?:ACCEPTED|REJECTED) code=[A-Za-z0-9._-]+)$')
     rows = []
     for index, line in enumerate(lines[start:end], start=start):
         match = pattern.fullmatch(line)
@@ -222,17 +228,34 @@ def _serve_peer(connection, history, history_page, day_history, runtime_log, sto
         slots.release()
 
 
-def _serve_command(connection, endpoint, slots):
+def _safe_log_token(value):
+    value = value if isinstance(value, str) else '-'
+    return value if re.fullmatch(r'[A-Za-z0-9._-]{1,128}', value) else '-'
+
+
+def _serve_command(connection, endpoint, root, slots):
     try:
         with connection:
             request = connection.recv(timeout=1)
-            reply = {'protocol': COMMAND_PROTOCOL, 'request_id': request['request_id']}
+            reply = {'protocol': endpoint.protocol, 'request_id': request['request_id']}
+            body = request.get('body', {})
+            action = _safe_log_token(request.get('operation'))
+            operation = _safe_log_token(body.get('operation'))
+            command_id = _safe_log_token(body.get('command_id'))
             try:
                 reply['result'] = endpoint.handle(request)
+                _supervisor_log(root, f'COMMAND source={endpoint.channel} request={_safe_log_token(request.get("request_id"))} '
+                                f'action={action} operation={operation} command={command_id} result=ACCEPTED code=-')
             except TraderError as error:
                 reply['error'] = {'code': error.code, 'message': str(error)}
+                _supervisor_log(root, f'COMMAND source={endpoint.channel} request={_safe_log_token(request.get("request_id"))} '
+                                f'action={action} operation={operation} command={command_id} '
+                                f'result=REJECTED code={_safe_log_token(error.code)}')
             except (KeyError, TypeError, ValueError, IndexError):
                 reply['error'] = {'code': 'E_SCHEMA', 'message': 'The command could not be validated'}
+                _supervisor_log(root, f'COMMAND source={endpoint.channel} request={_safe_log_token(request.get("request_id"))} '
+                                f'action={action} operation={operation} command={command_id} '
+                                'result=REJECTED code=E_SCHEMA')
             connection.send(reply, timeout=.5)
     except (OSError, TraderError, KeyError):
         pass
@@ -268,7 +291,10 @@ def _accept(listener, target, subjects, slots, stopped):
 def serve(pipe, account_key, root, ledger):
     history = ViewHistory()
     stopped = Event()
-    endpoint = OperatorEndpoint(pipe, root, ledger, account_key)
+    command_submission = Lock()
+    endpoint = OperatorEndpoint(pipe, root, ledger, account_key, submission_lock=command_submission)
+    workbench_endpoint = WorkbenchEndpoint(
+        pipe, root, ledger, account_key, submission_lock=command_submission)
     account_display = _account_display(root, account_key)
     history_page = partial(account_history, ledger, account_key)
     runtime_log = partial(_runtime_log_page, root)
@@ -315,8 +341,12 @@ def serve(pipe, account_key, root, ledger):
     accounts = None
     try:
         with (PipeListener(pipe + '.control', validator=validate_command) as commands,
+              PipeListener(pipe + '.workbench-control', validator=validate_workbench_wire) as workbench_commands,
               PipeListener(pipe + '.view', validator=validate_wire) as views):
-            Thread(target=_accept, args=(commands, _serve_command, (endpoint,), BoundedSemaphore(4), stopped),
+            Thread(target=_accept, args=(commands, _serve_command, (endpoint, root), BoundedSemaphore(4), stopped),
+                   daemon=True).start()
+            Thread(target=_accept, args=(workbench_commands, _serve_command, (workbench_endpoint, root),
+                                         BoundedSemaphore(4), stopped),
                    daemon=True).start()
             try:
                 accounts = PipeListener(pipe + '.account', validator=validate_account)
