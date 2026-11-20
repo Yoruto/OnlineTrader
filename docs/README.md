@@ -17,7 +17,7 @@
 - [Runtime 运维、配置与账本](runtime-operations-and-storage-20261119.md)
 - [Runtime 测试入口迁移](refactor/standalone-trading-runtime-test-migration-20261119.md)
 - [账户数据同步与查询](account-data-sync-design-20261119.md)
-- [运行架构、用户配置、SQLite 与账户历史自动补齐设计 V1.0](refactor/runtime-config-ledger-account-sync-design-20261120.md)
+- [运行架构与账户历史同步旧草案（已废止）](refactor/runtime-config-ledger-account-sync-design-20261120.md)
 - [Windows 安装与更新](windows-gitlab-updates.md)
 
 ## DSV 对齐与替代候选
