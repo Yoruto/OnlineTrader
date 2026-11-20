@@ -180,7 +180,12 @@ class PortableAccountStore(AccountStore):
             raise TraderError('E_STORAGE', 'The existing execution ledger is missing')
         if path.exists() and not existing:
             raise TraderError('E_STORAGE', 'The execution ledger path is not a file')
-        if not existing:
+        # Validate both first-start and previously initialized portable ledgers.
+        # Older builds could have created a parallel portable ledger before this
+        # guard existed; trusting an existing path silently preserves that fork.
+        # A verified handoff is the sole exception because the source desktop
+        # ledger may deliberately remain as a cold historical artifact.
+        if row['account_key'] not in handoff_accounts:
             self._reject_parallel_desktop_ledger(row, path)
         with Ledger(path, row['account_key'], environment=row['environment'], broker_identity=row['provider'],
                     existing_only=existing):
