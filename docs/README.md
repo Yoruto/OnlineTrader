@@ -13,6 +13,7 @@
   - [Desktop Bootstrap 与生命周期合同](refactor/runtime-bootstrap-lifecycle-contract-20261120.md)
   - [ConfigSnapshot 与逻辑通道合同](refactor/runtime-config-snapshot-contract-20261120.md)
 - [Trading Workbench Client/View 重构计划](refactor/trading-workbench-client-refactor-20261119.md)
+- [桌面操作习惯与安全退出改造方案（保留当前界面）](refactor/desktop-lifecycle-user-flow-20261120.md)
 - [Runtime 运维、配置与账本](runtime-operations-and-storage-20261119.md)
 - [Runtime 测试入口迁移](refactor/standalone-trading-runtime-test-migration-20261119.md)
 - [账户数据同步与查询](account-data-sync-design-20261119.md)
