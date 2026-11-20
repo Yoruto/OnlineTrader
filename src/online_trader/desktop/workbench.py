@@ -1642,7 +1642,7 @@ class WorkbenchWindow(StatusWindow):
 
 
 def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None,autostart=False,
-        update_root=None, notification=None, runtime_view=False):
+        update_root=None, notification=None, runtime_view=False, activation_server=None):
     app=QApplication.instance() or QApplication([])
     restart_for_update = False
     window = None
@@ -1659,6 +1659,8 @@ def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=N
                            update_restart=request_restart if update_root is not None else None)
     window.setAttribute(Qt.WA_DeleteOnClose)
     window.destroyed.connect(app.quit)
+    if activation_server is not None:
+        activation_server.activation_requested.connect(window._tray.show_window)
     window.show();QTimer.singleShot(0,window.refresh)
     result = app.exec()
     if restart_for_update:

@@ -96,7 +96,7 @@ sequenceDiagram
 
 本次仅授权实现和编译检查；下列行为测试保持 `NOT_RUN`，待另行授权后由独立测试 Agent 执行：
 
-1. 同机重复启动只附着一个 Runtime；不同账号也不能启动第二个 Runtime。
+1. 同机重复启动只附着一个 Runtime；不同账号也不能启动第二个 Runtime。Standalone 桌面同时只允许一个 Workbench 附着该 Runtime；再次运行 `OnlineTrader.exe` 只唤醒/前置现有 Workbench，不创建第二个面板。若 Runtime 已存在而 Workbench 不存在，EXE 验证本机发现记录与 Runtime baseline 后打开唯一 Workbench；若 Runtime 不存在，才走正常的 `DISARMED` 启动流程。
 2. 两台电脑同账号可以同时连接、分别下单，并看到一致的账号级柜台状态。
 3. 删除本机历史缓存后可重新同步，不影响柜台持仓和订单。
 4. Runtime 异常退出后不恢复旧本地周期；重启从柜台完整同步且保持 `DISARMED`。

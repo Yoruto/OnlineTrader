@@ -94,18 +94,20 @@ def run_session(store, selected, request, *, use_profile_file=False, check_sched
     print(json.dumps({'account_key': selected['account_key'], 'pipe': pipe, 'run': str(output),
                       'entry_authority': 'DISARMED'}, ensure_ascii=False), flush=True)
     from online_trader.runtime.instance import RuntimeLock
+    from online_trader.runtime.instance_registry import RuntimeInstanceRegistration
     from online_trader.runtime.session_storage import RuntimeSessionStorage
     from online_trader.runtime.view_process import ViewProcess
     with RuntimeLock(), RuntimeSessionStorage() as session:
         process = ViewProcess(pipe, selected['account_key'], store.directory, session.ledger,
                               store.history_path(selected))
         try:
-            result = run_confirmed_start(request_path, output, configured_store=store,
-                                         trusted_control_pid=process.trusted_pid,
-                                         use_portable_profile_file=use_profile_file,
-                                         check_scheduled_authorization=check_scheduled_authorization,
-                                         execution_ledger=session.ledger,
-                                         history_cache=store.history_path(selected))
+            with RuntimeInstanceRegistration(store, selected, pipe):
+                result = run_confirmed_start(request_path, output, configured_store=store,
+                                             trusted_control_pid=process.trusted_pid,
+                                             use_portable_profile_file=use_profile_file,
+                                             check_scheduled_authorization=check_scheduled_authorization,
+                                             execution_ledger=session.ledger,
+                                             history_cache=store.history_path(selected))
         finally:
             process.close()
     failure = output / 'startup-failure.json'

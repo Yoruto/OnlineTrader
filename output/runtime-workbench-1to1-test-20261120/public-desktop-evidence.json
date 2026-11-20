@@ -1,0 +1,30 @@
+{
+  "schema_version": "ONLINE_TRADER_PUBLIC_DESKTOP_1TO1_EVIDENCE/1",
+  "entry": "online_trader.desktop.entrypoint.main --runtime-root",
+  "runtime_fixture": {
+    "source": "isolated native-pipe Runtime-view fixture",
+    "broker_connected": false,
+    "orders_sent": 0,
+    "account_key": "DEV:independent-runtime-a",
+    "kernel_boot_id": "boot-independent-runtime-a",
+    "entry_authority": "DISARMED"
+  },
+  "existing_runtime_then_duplicate_exe": {
+    "runtime_run_processes": 0,
+    "workbench_python_processes_before_duplicate": 2,
+    "duplicate_exit_code": 0,
+    "workbench_python_processes_after_duplicate": 2,
+    "activation_raise_observed": true
+  },
+  "delayed_runtime_then_duplicate_exe": {
+    "baseline_delay_seconds": 6,
+    "workbench_python_processes_before_duplicate": 2,
+    "duplicate_exit_code": 0,
+    "workbench_python_processes_after_ready": 2,
+    "runtime_run_processes": 0,
+    "verified_pipe": "IndependentTest.DelayedRuntimeA",
+    "activation_raise_observed": true
+  },
+  "process_count_note": "Each Python application appears as a venv launcher plus the actual interpreter; unchanged counts prove no second Workbench application remained.",
+  "cleanup": "All isolated host, view and Workbench processes were terminated; remaining test processes: 0"
+}

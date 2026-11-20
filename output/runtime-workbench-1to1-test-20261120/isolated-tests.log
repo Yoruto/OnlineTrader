@@ -1,0 +1,22 @@
+test_absent_runtime_launches_once_then_attaches_verified_instance (__main__.RuntimeWorkbenchContractTests.test_absent_runtime_launches_once_then_attaches_verified_instance) ... ok
+test_existing_runtime_for_other_selected_account_attaches_without_launch (__main__.RuntimeWorkbenchContractTests.test_existing_runtime_for_other_selected_account_attaches_without_launch) ... ok
+test_registry_is_a_hint_and_requires_probe (__main__.RuntimeWorkbenchContractTests.test_registry_is_a_hint_and_requires_probe) ... ok
+test_registry_lifecycle_does_not_delete_a_newer_instance (__main__.RuntimeWorkbenchContractTests.test_registry_lifecycle_does_not_delete_a_newer_instance) ... ok
+test_runtime_mutex_reports_one_owner (__main__.RuntimeWorkbenchContractTests.test_runtime_mutex_reports_one_owner) ... ok
+test_runtime_pipe_rejects_allow_multi_from_public_entry (__main__.RuntimeWorkbenchContractTests.test_runtime_pipe_rejects_allow_multi_from_public_entry) ... ok
+test_runtime_root_rejects_allow_multi_from_public_entry (__main__.RuntimeWorkbenchContractTests.test_runtime_root_rejects_allow_multi_from_public_entry) ... ok
+test_show_workbench_is_the_only_accepted_activation (__main__.RuntimeWorkbenchContractTests.test_show_workbench_is_the_only_accepted_activation) ... ok
+test_starting_runtime_is_waited_for_without_second_launch (__main__.RuntimeWorkbenchContractTests.test_starting_runtime_is_waited_for_without_second_launch) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 1.812s
+
+OK
+Traceback (most recent call last):
+  File "E:\online-trader\src\online_trader\desktop\workbench_instance.py", line 37, in <lambda>
+    socket.disconnected.connect(lambda current=socket: self._discard(current))
+                                                       ~~~~~~~~~~~~~^^^^^^^^^
+  File "E:\online-trader\src\online_trader\desktop\workbench_instance.py", line 50, in _discard
+    socket.deleteLater()
+    ~~~~~~~~~~~~~~~~~~^^
+RuntimeError: Internal C++ object (PySide6.QtNetwork.QLocalSocket) already deleted.

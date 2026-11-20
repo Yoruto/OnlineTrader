@@ -159,3 +159,15 @@ class RuntimeLock:
 
     def __exit__(self, *_):
         self.close()
+
+
+def runtime_owner_exists():
+    """Return whether the host Runtime mutex is currently owned."""
+    try:
+        probe = RuntimeLock()
+    except TraderError as error:
+        if error.code == 'E_INSTANCE_EXISTS':
+            return True
+        raise
+    probe.close()
+    return False

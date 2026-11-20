@@ -1,0 +1,31 @@
+{
+  "schema_version": "ONLINE_TRADER_D01_RETEST/1",
+  "tested_at": "2026-11-20T18:54:41+08:00",
+  "head": "8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2",
+  "related_tracked_diff_sha256": "953a81350e7ebbbe5ab11d5c22093670daa79e5f7ce61fc1d21cf8ffb04aaea2",
+  "workbench_instance_sha256": "95feb92cb497c16d28b727c7cefb817a2a17ff399209c0c2e8146a19404f2540",
+  "isolated_retest": {
+    "pass": 10,
+    "fail": 0,
+    "covered": [
+      "SHOW_WORKBENCH",
+      "invalid payload",
+      "client disconnect",
+      "server close",
+      "QObject deferred destruction"
+    ],
+    "qlocalsocket_already_deleted_observed": false
+  },
+  "public_desktop_duplicate": {
+    "entry": "online_trader.desktop.entrypoint --runtime-pipe",
+    "process_count_before": 2,
+    "duplicate_exit_code": 0,
+    "process_count_after": 2,
+    "activation_raise_observed": true,
+    "qlocalsocket_already_deleted_observed": false
+  },
+  "broker_connected": false,
+  "account_login_repeated": false,
+  "orders_sent": 0,
+  "result": "PASS"
+}

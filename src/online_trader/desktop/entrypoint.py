@@ -87,8 +87,13 @@ def main(argv=None):
             runtime_root = bundled_runtime_root()
         if runtime_root is not None:
             from online_trader.desktop.runtime_bootstrap import BootstrapController
+            from online_trader.desktop.workbench_instance import WorkbenchActivationServer
             from online_trader.desktop.workbench import WorkbenchWindow
-            with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):
+            if args.allow_multi:
+                parser.error('--allow-multi is not supported by the Standalone Runtime Workbench')
+            with AccountLock('DESKTOP:ONLINE-TRADER'):
+                activation = WorkbenchActivationServer(app)
+                activation.listen()
                 bootstrap = BootstrapController(runtime_root, account=args.runtime_account, parent=app)
                 windows = []
                 restart_for_update = False
@@ -121,7 +126,16 @@ def main(argv=None):
                                          f'{error}\n\n错误代码：{error.code}')
                     app.exit(2)
 
+                def activate_workbench():
+                    if windows:
+                        windows[0]._tray.show_window()
+                    else:
+                        bootstrap.progress.show()
+                        bootstrap.progress.raise_()
+                        bootstrap.progress.activateWindow()
+
                 app.setQuitOnLastWindowClosed(False)
+                activation.activation_requested.connect(activate_workbench)
                 bootstrap.ready.connect(runtime_ready)
                 bootstrap.failed.connect(runtime_failed)
                 bootstrap.cancelled.connect(lambda: app.exit(1))
@@ -136,12 +150,17 @@ def main(argv=None):
         if args.runtime_account is not None:
             parser.error('--runtime-account requires --runtime-root or an adjacent packaged runtime')
         if args.runtime_pipe is not None:
-            with (nullcontext() if args.allow_multi else AccountLock('DESKTOP:ONLINE-TRADER')):
+            if args.allow_multi:
+                parser.error('--allow-multi is not supported by the Standalone Runtime Workbench')
+            from online_trader.desktop.workbench_instance import WorkbenchActivationServer
+            with AccountLock('DESKTOP:ONLINE-TRADER'):
+                activation = WorkbenchActivationServer(app)
+                activation.listen()
                 # Runtime attachment deliberately reuses the established dev
                 # WorkbenchWindow/WorkbenchLayout.  Only the state and command
                 # transport changes; users keep the exact same interface.
                 from online_trader.desktop.workbench import run
-                return run(args.runtime_pipe, runtime_view=True)
+                return run(args.runtime_pipe, runtime_view=True, activation_server=activation)
         from online_trader.desktop.workbench import run
         if args.simnow_packet is not None:
             launcher = SessionLauncher.for_simnow(args.simnow_packet)
@@ -172,6 +191,10 @@ def main(argv=None):
             return run(pipe, store=store, account_id=account_id, dsv_config=args.dsv_config or profile,
                        autostart=args.autostart, notification=notification)
     except (TraderError, OSError) as error:
+        if isinstance(error, TraderError) and error.code == 'E_INSTANCE_EXISTS':
+            from online_trader.desktop.workbench_instance import request_existing_workbench
+            if request_existing_workbench():
+                return 0
         if isinstance(error, TraderError) and error.code == 'E_INSTANCE_EXISTS' and args.autostart:
             return 0
         QMessageBox.critical(None, 'OnlineTrader 启动失败', str(error))

@@ -1,6 +1,14 @@
 # Runtime Desktop Bootstrap 与生命周期合同
 
-> 状态：PR-D 编码合同（2026-11-20）。本改动只移动桌面等待方式，不改变 Owner、账本、账号锁或默认 `DISARMED` 语义。
+> 状态：PR-D 编码合同（2026-11-20）。每台 Windows 电脑只有一个 Standalone Runtime，并且只有一个 Workbench 附着它。本改动不改变 Owner、账本或默认 `DISARMED` 语义。
+
+## 1:1 桌面合同
+
+- `OnlineTrader.exe` 先取得本机唯一 Workbench 锁；第二个 EXE 只能通过同一 Windows 用户的 `SHOW_WORKBENCH` 通道恢复/前置现有窗口。该通道不接受交易命令。
+- Runtime 持有原本的全机互斥锁，并发布脱敏发现记录。发现记录只是提示，Desktop 必须用其中的 pipe 与 account key 取得可归属 baseline 后才能附着；残留文件、PID 或账号显示都不是所有权证明。
+- 已有 Runtime、没有 Workbench：打开唯一 Workbench 并附着该 Runtime，不再启动 Owner。
+- 没有 Runtime：按原正常流程启动一个 `DISARMED` Owner，baseline 成功后打开唯一 Workbench。
+- `--runtime-pipe` 仍是高级附着入口，但同样遵守 Workbench 单实例；Standalone 路径不接受 `--allow-multi`。
 
 ## 状态机
 
@@ -35,8 +43,8 @@ Qt 主线程只创建/更新进度窗口、打开 Workbench 和显示最终错�
 
 ```text
 Desktop -> worker: start
-worker -> portable config: resolve account + pipe
-worker -> runtime-view: read baseline
+worker -> Runtime discovery: read bounded same-user hint
+worker -> runtime-view: verify hinted pipe + account baseline
 runtime-view --> worker: matching account baseline
 worker --> Desktop: READY(pipe)
 Desktop -> WorkbenchWindow: open existing Runtime
@@ -55,11 +63,11 @@ worker --> Desktop: READY(pipe)
 
 ### 启动竞争和 UI 取消
 
-`E_INSTANCE_EXISTS` 只证明另一个 Owner/启动者赢得互斥；worker 等待它的 baseline 到主 deadline。进度框提供“取消等待”；UI 取消请求 worker interruption，禁止重复取消，worker 返回 `CANCELLED_UI`；不对 subprocess 调用 terminate/kill。关闭进度框和应用退出走同一 interruption/等待边界。
+`E_INSTANCE_EXISTS` 只证明另一个 Owner/启动者赢得互斥；worker 反复读取发现记录并验证 baseline 到主 deadline。进度框提供“取消等待”；UI 取消请求 worker interruption，禁止重复取消，worker 返回 `CANCELLED_UI`；不对 subprocess 调用 terminate/kill。关闭进度框和应用退出走同一 interruption/等待边界。
 
 ## 诊断合同
 
-阶段变化包含 state、用户可读消息、账户别名和脱敏登录。失败保留错误码和 stderr/phase 路径；不记录凭据。超时明确说明 Owner 可能仍在继续，禁止用户用自动重试制造第二个 Owner。
+阶段变化包含 state、用户可读消息、账户别名和脱敏登录。Runtime 发现记录只含实例 ID、PID、pipe、account key、别名、脱敏登录与 Runtime 根路径，不含凭据；退出时按实例 ID 条件删除，崩溃残留由下一次握手判为无效。失败保留错误码和 stderr/phase 路径。超时明确说明 Owner 可能仍在继续，禁止用户用自动重试制造第二个 Owner 或第二个 Workbench。
 
 ## 回退入口与验收边界
 

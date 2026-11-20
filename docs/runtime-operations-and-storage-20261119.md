@@ -8,7 +8,7 @@
 
 ## 默认产品入口
 
-后续未明确指定路径的 OnlineTrader 启动、重启、验收候选和打包均默认指 Standalone Trading Runtime。普通用户从 `online-trader-desktop --runtime-root <目录>` 进入；Runtime 配置便携版直接双击 `OnlineTrader.exe`，统一入口会先附着已有 Runtime，缺失时启动 `DISARMED` Owner，取得权威投影后再打开与 dev 共用的 `WorkbenchWindow` / `WorkbenchLayout`。`runtime run`、受 `runtime-control.json` 约束的 `runtime schedule` 与 `--runtime-pipe` 保留为运维、无人值守及高级附着入口。普通 Legacy 工作台不作为默认启动或交付入口，只在用户明确要求旧路径维护时使用。
+后续未明确指定路径的 OnlineTrader 启动、重启、验收候选和打包均默认指 Standalone Trading Runtime。普通用户从 `online-trader-desktop --runtime-root <目录>` 进入；Runtime 配置便携版直接双击 `OnlineTrader.exe`。每台 Windows 电脑只有一个 Runtime 和一个附着它的 Workbench：统一入口先唤醒已有 Workbench；若只有 Runtime，则验证并附着它；若 Runtime 也不存在，才启动 `DISARMED` Owner，取得权威投影后打开与 dev 共用的 `WorkbenchWindow` / `WorkbenchLayout`。`runtime run`、受 `runtime-control.json` 约束的 `runtime schedule` 与 `--runtime-pipe` 保留为运维、无人值守及高级附着入口，但高级附着也不能创建第二个 Workbench。普通 Legacy 工作台不作为默认启动或交付入口，只在用户明确要求旧路径维护时使用。
 
 该默认只决定目标架构，不扩大当次权限：账号连接、测试、订单操作和打包仍分别需要用户授权。打包时交付并验收 Runtime 完整目录/ZIP，配置、操作员授权与已初始化账户原账本均按接收方核对；禁止用能够打开但缺少 Runtime 配置或账本的普通工作台包替代。
 
@@ -105,7 +105,7 @@ Trading Runtime 的 Owner 主线程仍是唯一的交易决策和 SDK 驱动线�
 - 大帧编码在后台线程完成；已有编码任务积压时不在 Owner 线程不断重复构造新帧。
 - runtime-view-process 负责对外状态、历史、账户读取和操作员接口，可退出并重建。
 
-Trading Workbench 通过 runtime-view-process 的本机控制通道提交命令，不在 Qt 中输入操作员 ID 或令牌。命名管道核验连接进程的 Windows 身份；当前服务端边界包含 Owner SID 与 `LocalSystem`，但这种检查不能证明命令来自真实用户的按钮点击，也不能把 Capability 当成授权票据。接口和原 Runtime Owner 仍逐次核对显式 Workbench allowlist、账号、能力、owner boot、配置版本及交易前置条件。命令日志保留脱敏账号、actor、boot 与 peer PID/SID。超时或断线保留原 `command_id`，只能查询原回执，不能由界面自动生成新 ID 重发；多个显式工作台通过跨进程锁合并本地待核 ID，不能整表覆盖。CLI、定时任务和受托工具仍走操作员协议。Qt 和 runtime-view-process 仍只是控制/读侧，不因此成为 SDK sender 或账本 writer。详细威胁模型与迁移门禁见[架构收敛与安全改造计划](refactor/runtime-architecture-hardening-plan-20261120.md)。
+Trading Workbench 通过 runtime-view-process 的本机控制通道提交命令，不在 Qt 中输入操作员 ID 或令牌。命名管道核验连接进程的 Windows 身份；当前服务端边界包含 Owner SID 与 `LocalSystem`，但这种检查不能证明命令来自真实用户的按钮点击，也不能把 Capability 当成授权票据。接口和原 Runtime Owner 仍逐次核对显式 Workbench allowlist、账号、能力、owner boot、配置版本及交易前置条件。命令日志保留脱敏账号、actor、boot 与 peer PID/SID。超时或断线保留原 `command_id`，只能查询原回执，不能由界面自动生成新 ID 重发；同机唯一 Workbench 在当前进程内保留待核 ID，Workbench 退出后必须重新从 Runtime 与柜台事实同步。CLI、定时任务和受托工具仍走操作员协议。Qt 和 runtime-view-process 仍只是控制/读侧，不因此成为 SDK sender 或账本 writer。详细威胁模型与迁移门禁见[架构收敛与安全改造计划](refactor/runtime-architecture-hardening-plan-20261120.md)。
 
 750 ms 和 2.5 s 是当前实现的发布节奏，不是交易 SLA，也不改变报单、撤单、策略或保护轮次。性能评审应观察 `OWNER_LOOP_SLOW`、SDK 泵间隔以及 Tick → 决策 → 发送的 P95/P99。
 

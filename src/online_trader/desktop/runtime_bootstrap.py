@@ -14,6 +14,7 @@ from online_trader.contracts.codec import strict_loads
 from online_trader.errors import TraderError
 from online_trader.runtime.executable import bundled_cli
 from online_trader.runtime.portable_config import PortableAccountStore
+from online_trader.runtime.instance_registry import read_runtime_instance
 from online_trader.transport.runtime_view import RuntimeViewClient
 
 
@@ -85,6 +86,14 @@ def _probe(pipe, expected_account_key):
     if value.get('kind') != 'BASELINE' or account_key != expected_account_key:
         raise TraderError('E_SCOPE', 'Runtime baseline belongs to a different account')
     return value
+
+
+def _discover_runtime():
+    """Return a verified host Runtime endpoint, never a registry claim alone."""
+    record = read_runtime_instance()
+    if record is None:
+        return None
+    return record if _probe(record['pipe'], record['account_key']) is not None else None
 
 
 def _read_small_json(path):
@@ -214,6 +223,13 @@ class BootstrapWorker(QThread):
                 return
 
             self._phase('ATTACHING', '正在附着已有 Runtime；不会改变当前权限…', selected)
+            discovered = _discover_runtime()
+            if discovered is not None:
+                attached = {'alias': discovered['account_alias'],
+                            'masked_login': discovered['masked_login']}
+                self._phase('READY', '已取得本机唯一 Runtime 基线。', attached)
+                self.ready.emit(discovered['pipe'])
+                return
             if _probe(pipe, selected['account_key']) is not None:
                 self._phase('READY', '已取得现有 Runtime 基线。', selected)
                 self.ready.emit(pipe)
@@ -222,8 +238,15 @@ class BootstrapWorker(QThread):
                 self.cancelled.emit()
                 return
 
-            self._phase('LAUNCHING', '未发现可附着 Runtime，正在启动 DISARMED Owner…', selected)
-            process, stdout_path, stderr_path = _launch_owner(runtime_root, self.mode, self.account)
+            from online_trader.runtime.instance import runtime_owner_exists
+            if runtime_owner_exists():
+                process = None
+                stdout_path = None
+                stderr_path = runtime_root / 'logs' / 'desktop-bootstrap'
+                self._phase('WAITING_BASELINE', '本机 Runtime 正在启动，等待其工作台接口…', selected)
+            else:
+                self._phase('LAUNCHING', '未发现可附着 Runtime，正在启动 DISARMED Owner…', selected)
+                process, stdout_path, stderr_path = _launch_owner(runtime_root, self.mode, self.account)
             deadline = time.monotonic() + self.timeout
             run_directory = None
             exited_at = None
@@ -235,12 +258,20 @@ class BootstrapWorker(QThread):
                     self._phase('CANCELLED_UI', '桌面已取消等待；已启动的 Owner 保持独立运行。', selected)
                     self.cancelled.emit()
                     return
+                discovered = _discover_runtime()
+                if discovered is not None:
+                    attached = {'alias': discovered['account_alias'],
+                                'masked_login': discovered['masked_login']}
+                    self._phase('READY', 'Runtime 已就绪，正在打开唯一交易工作台。', attached)
+                    self.ready.emit(discovered['pipe'])
+                    return
                 value = _probe(pipe, selected['account_key'])
                 if value is not None:
                     self._phase('READY', 'Runtime 已就绪，正在打开交易工作台。', selected)
                     self.ready.emit(pipe)
                     return
-                run_directory = run_directory or _run_directory(runtime_root, stdout_path)
+                run_directory = run_directory or (_run_directory(runtime_root, stdout_path)
+                                                  if stdout_path is not None else None)
                 record, diagnostic = _startup_record(run_directory)
                 if record is not None:
                     phase = record.get('phase') or record.get('status')
@@ -258,7 +289,7 @@ class BootstrapWorker(QThread):
                     if phase != last_phase and phase in _PHASE_LABELS:
                         last_phase = phase
                         self._phase('WAITING_BASELINE', _PHASE_LABELS[phase], selected)
-                if process.poll() is not None:
+                if process is not None and process.poll() is not None:
                     exited_at = exited_at or time.monotonic()
                     # A concurrent launcher may have won the account lock. Its
                     # E_INSTANCE_EXISTS record keeps this worker on attach-only

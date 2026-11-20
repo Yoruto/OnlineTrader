@@ -1,0 +1,22 @@
+{
+  "schema_version": "ONLINE_TRADER_READONLY_CACHE_TEST_SUMMARY/1",
+  "masked_login": "****千秋",
+  "searched_scopes": [
+    "WORKSPACE",
+    "LOCALAPPDATA"
+  ],
+  "matching_cache_count": 1,
+  "caches": [
+    {
+      "location_scope": "WORKSPACE",
+      "coverage": "OBSERVED_BROKER_SNAPSHOTS",
+      "snapshot_checkpoint": "80",
+      "daily_count": 1,
+      "first_trading_day": "2026-11-23",
+      "last_trading_day": "2026-11-23",
+      "deduplicated_trade_count": 0
+    }
+  ],
+  "coverage_result": "PARTIAL",
+  "note": "Cached observations are not proof of unobserved trading days; empty results are not zero trades."
+}
