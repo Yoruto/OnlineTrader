@@ -521,7 +521,13 @@ class WorkbenchWindow(StatusWindow):
             return
         self._stale = True
         self._enable_commands(False)
-        self.show_home_feedback(f'等待独立运行时同步 · {code}')
+        self.show_home_feedback(f'工作台未收到最新投影，正在等待 Runtime 同步 · {code}')
+        # A stale client projection is a Workbench/view condition, not a market
+        # quote verdict.  Repaint immediately so the last owner quote cannot
+        # remain labelled as current or be mistaken for an owner-side entry
+        # refusal while the subscription reconnects.
+        if self.view is not None:
+            self.render_view()
 
     def _start_runtime_submit(self, operation, scope, parameters):
         if self.view is None or self._stale or self.published_snapshot_expired() or self.view['truncated']:

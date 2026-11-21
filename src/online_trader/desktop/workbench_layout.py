@@ -1653,7 +1653,8 @@ class WorkbenchLayout:
             state, description = '柜台重连中', '等待原执行器完成柜台同步'
         elif stale or fault or truncated:
             state = '状态待核对'
-            description = '上次状态已过期' if stale else '柜台或执行器状态待核对'
+            description = ('工作台未收到最新投影；Runtime 交易与持仓保护独立运行，正在重连'
+                           if stale else '柜台或执行器状态待核对')
             if truncated:
                 description = '状态数据不完整，请在日志与诊断中核对'
         elif not connected:
@@ -1690,7 +1691,7 @@ class WorkbenchLayout:
         backlogged = sum(state == '本机处理积压' for state in quote_states)
         snapshot_age = w.published_snapshot_age() if view else None
         if stale and snapshot_age is not None:
-            market_health = f'上次确认 {snapshot_age} 秒前'
+            market_health = f'界面未更新 {snapshot_age} 秒'
         elif not available or not quotes:
             market_health = '待同步'
         elif all(state == '休市' for state in quote_states):
@@ -1717,7 +1718,7 @@ class WorkbenchLayout:
                 dot.setStyleSheet(style)
         self.home_state.setText(state)
         self.home_connection.setText(description if snapshot_age is None else
-                                     f'{description} · 快照 {snapshot_age} 秒前')
+                                     f'{description} · 界面快照 {snapshot_age} 秒未更新')
         identity = config.get('runtime_identity') or {}
         engine = {'DSV_LEGACY_KERNEL': '原 DSV 执行链', 'DSV_REPLACEMENT': 'DSV 替代执行链'}.get(identity.get('engine_kind'))
         self.home_connection.setToolTip(f"{engine} · {identity['entry_point']}" if engine else '')
@@ -3858,7 +3859,9 @@ class WorkbenchLayout:
         strategy_records = self.logged_strategy_reasons(run)
         waiting, blocked, pending = [], [], []
         monitor = view['configuration'].get('strategy_monitor')
-        quote_states = market_quote_states(markets, codes, monitor or {})
+        projection_current = self.market_view_current(view)
+        quote_states = (market_quote_states(markets, codes, monitor or {}) if projection_current
+                        else dict.fromkeys(codes, '界面待同步'))
         for code in codes:
             market = markets.get(code,{})
             name = f'{self.names.get(code,code)} ({code})'

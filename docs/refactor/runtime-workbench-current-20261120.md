@@ -46,6 +46,8 @@ UI 不显示或读取操作员 ID/令牌。服务端只接受启动 Runtime 的�
 - **再次启动：**发现现有 Runtime 和 Workbench 后只唤醒原窗口；不得绕过单实例锁另建 Owner 或控制面。
 - **Workbench 退出/崩溃：**Qt、runtime-view 和查询 worker 可以结束；Owner 继续承担已确认订单与保护责任。
 - **runtime-view 失败：**按有界策略重启并重新获取完整基线；不得因此重启 Owner 或创建第二个 sender。
+- **Workbench 投影过期：**客户端只显示“界面未更新/正在重连”并停用新的 UI 控制请求；不得把旧快照重新判定为“行情滞后”，也不得将 Qt/runtime-view 生命周期作为 Owner 开仓门槛。Owner 仍以原始行情到达、盘段、source epoch 和临发单校验独立决策。
+- **Owner 行情滞后：**只有当前 Owner 投影明确给出 quote-age 失败或 `DSV_QUOTE_AGE_EXCEEDED` 时，Workbench 才显示“行情已滞后，暂停开新仓”；该业务拒绝与界面投影过期分别诊断。
 - **Owner 退出：**本次临时执行库结束并删除。下次人工启动以新 boot、新临时库和柜台同步重建状态，不接管旧 boot。
 - **另一台电脑启动：**只受该电脑的本机单实例约束，不使用账号级文件锁互斥；两台 Runtime 分别同步同一期货账户并标识各自 boot/设备事实。
 - **配置或账号变化：**旧快照与命令能力失效；工作台取得新完整基线后才允许控制。
