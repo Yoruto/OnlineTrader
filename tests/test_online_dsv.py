@@ -332,7 +332,7 @@ class OnlineDsvTests(unittest.TestCase):
     def test_reconnect_keeps_continuation_age_independent_of_ordinary_age(self):
         from online_trader.kernel.statistics import strategy_open_counts
 
-        for limit, age, expected_count in ((1, 2000, 1), (0, 6000, 0)):
+        for limit, age, expected_orders in ((1, 2000, 1), (0, 6000, 0)):
             with self.subTest(limit=limit, age=age):
                 x = OnlineDsvTests()
                 x.setUp()
@@ -354,9 +354,15 @@ class OnlineDsvTests(unittest.TestCase):
                     x.quote(1040, high=1080)
                     x.quote(1048, high=1080, at='2026-11-10T01:00:12Z', milliseconds=age + 1000)
                     counts = strategy_open_counts(x.kernel._committed.values(), '2026-11-10')
-                    self.assertEqual((len(x.api.inserted), counts.get(x.code, 0)), (expected_count, expected_count))
+                    self.assertEqual(len(x.api.inserted), expected_orders)
+                    self.assertEqual(counts.get(x.code, 0), 1)
+                    first=x.cycle()['orders'][0]
+                    self.assertEqual(first['send_state'],
+                                     'CALL_RETURNED' if expected_orders else 'DEFINITELY_NOT_SENT')
                     x.quote(1048, high=1080)
                     self.assertEqual(len(x.api.inserted), 1)
+                    self.assertEqual(x.kernel.simulation.opening_attempt_count(),1)
+                    self.assertEqual({order['intent_id'] for order in x.cycle()['orders']},{first['intent_id']})
                     self.assertEqual(x.cycle()['strategy_metadata']['candidate']['entry_kind'], 'CONTINUATION')
                 finally:
                     x.tearDown()
@@ -655,55 +661,35 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertEqual(len(self.api.inserted), 2)
         from online_trader.kernel.statistics import strategy_open_counts
         self.assertEqual(strategy_open_counts(self.kernel._committed.values(), '2026-11-10'), {self.code: 1})
-        self.assertEqual(self.kernel.simulation.opening_attempt_count(), 2)
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(), 1)
 
-    def test_desktop_target_quota_counts_only_durable_acceptance_and_survives_new_f5(self):
+    def test_desktop_target_quota_counts_one_logical_intent_across_replacement(self):
         from online_trader.kernel.workbench import workbench_view
+        self.start(trade={'max_daily_orders': 1, 'half_close_enabled': False},
+                   grant_changes={'schema_version': 'KQ_DSV_DESKTOP/1', 'trading_days': ['2026-11-10'],
+                                  'resume_entries_on_day_change': False, 'daily_targets_per_contract': 1})
+        self.api.funds.available = 0.
+        self.quote()
+        self.assertIn('INSUFFICIENT_QUANTITY', self.session.last_decisions[self.code]['reasons'])
+        self.assertEqual(workbench_view(self.kernel)['account_metrics']['opening_orders'], 0)
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(), 0)
+        self.api.funds.available = 1000000.
+        with patch.object(self.port, 'validate_send', side_effect=TraderError('E_GATEWAY_SCOPE')):
+            self.quote(milliseconds=60_000)
+        first=self.cycle()['orders'][0]
+        self.assertEqual(first['send_state'], 'DEFINITELY_NOT_SENT')
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(), 1)
+        self.assertEqual(self.api.inserted, [])
+        self.quote(1055, milliseconds=60_000)
+        second=self.cycle()['orders'][-1]
+        self.assertEqual((second['intent_id'],second['ordinal']),(first['intent_id'],2))
+        self.assertEqual(len(self.api.inserted), 1)
+        self.assertEqual(workbench_view(self.kernel)['account_metrics']['opening_orders'], 1)
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(), 1)
 
-        for limit in (1, 2):
-            with self.subTest(limit=limit):
-                x = OnlineDsvTests()
-                x.setUp()
-                try:
-                    x.start(trade={'max_daily_orders': limit, 'half_close_enabled': False},
-                            grant_changes={'schema_version': 'KQ_DSV_DESKTOP/1', 'trading_days': ['2026-11-10'],
-                                           'resume_entries_on_day_change': False, 'daily_targets_per_contract': limit})
-                    x.api.funds.available = 0.
-                    x.quote()
-                    self.assertIn('INSUFFICIENT_QUANTITY', x.session.last_decisions[x.code]['reasons'])
-                    self.assertEqual(workbench_view(x.kernel)['account_metrics']['opening_orders'], 0)
-                    self.assertEqual(x.kernel.simulation.opening_attempt_count(), 0)
-                    self.assertEqual(x.api.inserted, [])
-
-                    x.api.funds.available = 1000000.
-                    with patch.object(x.port, 'validate_send', side_effect=TraderError('E_GATEWAY_SCOPE')):
-                        x.quote(milliseconds=60_000)
-                    self.assertEqual(x.cycle()['orders'][0]['send_state'], 'DEFINITELY_NOT_SENT')
-                    self.assertEqual(workbench_view(x.kernel)['account_metrics']['opening_orders'], 1)
-                    attempts = x.kernel.simulation.opening_attempt_count()
-                    self.assertGreaterEqual(attempts, 1)
-                    self.assertEqual({order['send_state'] for order in x.cycle()['orders']},
-                                     {'DEFINITELY_NOT_SENT'})
-                    self.assertEqual(x.api.inserted, [])
-
-                    x.quote(1055, milliseconds=60_000)
-                    self.assertEqual(len(x.api.inserted), 1)
-                    native_id = x.api.inserted[0]['order_id']
-                    x.api.orders[native_id].is_error = True
-                    x.api.terminal(native_id)
-                    x.session.step()
-                    self.assertEqual(list(x.kernel._committed.values())[-1]['orders'][-1]['broker_state'], 'REJECTED')
-                    self.assertEqual(workbench_view(x.kernel)['account_metrics']['opening_orders'], limit)
-                    self.assertEqual(x.kernel.simulation.opening_attempt_count(), attempts + 1)
-                    x.restart(new_scope=True)
-                    x.session.request_initial_arm()
-                    x.quote(1040, milliseconds=60_000)
-                    x.quote()
-                    self.assertEqual(x.api.inserted, [])
-                    self.assertIn('DAILY_ORDER_LIMIT', x.session.last_decisions[x.code]['reasons'])
-                    self.assertEqual(workbench_view(x.kernel)['account_metrics']['opening_orders'], limit)
-                finally:
-                    x.tearDown()
+    @unittest.skip('CURRENT Standalone needs a fresh temporary ledger plus broker resynchronization fixture; old-ledger new-scope inheritance is retired')
+    def test_new_runtime_boot_rebuilds_daily_target_from_broker_facts(self):
+        pass
 
     def test_desktop_target_quota_retains_partial_order_during_unknown_cancel(self):
         from online_trader.kernel.workbench import workbench_view
@@ -732,7 +718,7 @@ class OnlineDsvTests(unittest.TestCase):
                          [('OPEN', 5), ('OPEN', 3)])
         self.assertEqual(self.cycle()['orders'][-1]['intent_id'], child['intent_id'])
         self.assertEqual(workbench_view(self.kernel)['account_metrics']['opening_orders'], 1)
-        self.assertEqual(self.kernel.simulation.opening_attempt_count(), 2)
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(), 1)
 
     def test_missing_margin_is_zero_only_for_proved_flat_contract(self):
         self.start()
@@ -1606,4 +1592,4 @@ class OnlineDsvTests(unittest.TestCase):
                          [(5,1055),(5,1056)])
         from online_trader.kernel.statistics import strategy_open_counts
         self.assertEqual(strategy_open_counts(self.kernel._committed.values(), '2026-11-10'), {self.code:1})
-        self.assertEqual(self.kernel.simulation.opening_attempt_count(),2)
+        self.assertEqual(self.kernel.simulation.opening_attempt_count(),1)

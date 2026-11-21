@@ -1850,10 +1850,17 @@ class WorkbenchLayout:
             cid, code = cycle['position_cycle_id'], cycle['contract_id']
             floating = cycle.get('floating_profit') if available else None
             current = not self.window._stale and not view['truncated']
+            responsibility_label = {
+                'EXIT_RECONCILING': '退出数量已保留，正在核对原委托',
+                'EXIT_MANUAL_INTERVENTION_REQUIRED': '退出目标未完成，需要人工接管核对',
+            }.get(cycle.get('exit_wait_reason'))
             if current and cid in protection_blocked:
                 status = '本地自动保护待恢复'
                 reason = protection_blocked[cid]
                 pending.append(f'{code} {status} · {CLOCK_PROTECTION_REASONS.get(reason, reason)}')
+            elif responsibility_label:
+                status = '平仓待核对'
+                pending.append(f'{code} {responsibility_label}')
             elif current and cid in protection_active:
                 if cid in failed_exits:
                     status = '平仓待核对'
@@ -1875,9 +1882,7 @@ class WorkbenchLayout:
                 if not messages:
                     wait_label = {'EXIT_WAITING_FOR_SESSION': '退出已登记，等待交易时段',
                                   'EXIT_WAITING_FOR_PRICE': '退出已登记，等待有效报价',
-                                  'EXIT_RETRY_SCHEDULED': '退出目标保留，等待安全重报',
-                                  'EXIT_RECONCILING': '退出数量已保留，正在核对原委托',
-                                  'EXIT_MANUAL_INTERVENTION_REQUIRED': '退出目标未完成，需要人工接管核对'}.get(cycle.get('exit_wait_reason'))
+                                  'EXIT_RETRY_SCHEDULED': '退出目标保留，等待安全重报'}.get(cycle.get('exit_wait_reason'))
                     pending.append(f'{code} {wait_label or status}')
             elif (cycle.get('quality') != 'CONTIGUOUS' or connection.get('recovery_required')
                   or (cycle.get('close_route_review') or {}).get('status') == 'BLOCKED'):
@@ -3860,8 +3865,11 @@ class WorkbenchLayout:
         waiting, blocked, pending = [], [], []
         monitor = view['configuration'].get('strategy_monitor')
         projection_current = self.market_view_current(view)
-        quote_states = (market_quote_states(markets, codes, monitor or {}) if projection_current
-                        else dict.fromkeys(codes, '界面待同步'))
+        # Transport staleness and the Owner's per-contract quote state are
+        # separate facts.  Keep the last published business reason visible;
+        # the surrounding snapshot/connection indicators already mark an
+        # expired projection and must not erase actionable contract status.
+        quote_states = market_quote_states(markets, codes, monitor or {})
         for code in codes:
             market = markets.get(code,{})
             name = f'{self.names.get(code,code)} ({code})'

@@ -671,14 +671,11 @@ class DsvStrategyRuntime:
             event = facts['event']
             signal = (cycle.get('entry_intent') or {}).get('signal') or {}
             if signal.get('entry_kind') == 'NORMAL':
-                identity = {key: event[key] for key in ('account_key', 'contract_id', 'trading_day', 'candle_id')}
-                current_candle = 'candle-' + content_hash(identity)
                 last, trigger = Decimal(event['last']), Decimal(signal['trigger_price'])
                 trigger_valid = last >= trigger if signal['direction'] == 'LONG' else last <= trigger
-                if current_candle != signal.get('candle_key') or not trigger_valid:
+                if not trigger_valid:
                     return result | {'allowed': False, 'reason_codes': ['E_ENTRY_SIGNAL_INVALIDATED'],
-                                     'details': {'expected_candle': signal.get('candle_key'),
-                                                 'observed_candle': current_candle,
+                                     'details': {'signal_candle': signal.get('candle_key'),
                                                  'trigger_price': signal['trigger_price'],
                                                  'observed_last': event['last']}}
             cap = signal.get('price_cap')
@@ -697,7 +694,8 @@ class DsvStrategyRuntime:
         if not review["allowed"]:
             return {"recheck": review}
         previous = next((item for item in reversed(cycle['orders']) if item['effect'] == 'OPEN'), None)
-        if previous is not None and previous.get('pricing_quote_id') == review.get('quote_id'):
+        if (previous is not None and previous.get('pricing_quote_id') is not None
+                and previous.get('pricing_quote_id') == review.get('quote_id')):
             return {'recheck': review | {'allowed': False,
                     'reason_codes': ['E_QUOTE_REVISION_UNCHANGED'],
                     'details': {'quote_id': review.get('quote_id'),

@@ -1,3 +1,4 @@
+import copy
 import os
 from pathlib import Path
 import tempfile
@@ -396,29 +397,40 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         self.assertEqual(dashboard.home_positions.item(0, 4).text(), '本地自动保护待恢复')
         self.assertIn('等待同盘次有效的原生报价', dashboard.home_pending.toolTip())
 
-    def test_unsolicited_terminal_close_only_alerts_when_unreserved(self):
+    def test_exit_rejection_retries_then_projects_manual_intervention(self):
         case = test_online_dsv.OnlineDsvTests()
         case.setUp()
         self.addCleanup(case.tearDown)
         case.entered(trade={'half_close_enabled':False})
-        case.quote(1038)
-        self.assertEqual(case.api.inserted[-1]['offset'],'CLOSE')
-        code = 'EXIT_REDUCTION_TERMINAL_UNFILLED'
-        self.assertNotIn(code,{row['reason_code'] for row in workbench_view(case.kernel)['blocks']})
-        case.api.terminal(case.api.inserted[-1]['order_id'])
-        case.session.step()
+        for index,price in enumerate((1038,1037,1036),1):
+            case.quote(price)
+            order=case.api.inserted[-1]
+            self.assertEqual(order['offset'],'CLOSE')
+            case.api.orders[order['order_id']].is_error=True
+            case.api.terminal(order['order_id']);case.session.step()
+            if index<3:
+                responsibility=case.cycle()['exit_responsibility']
+                self.assertNotEqual(responsibility['state'],'MANUAL_INTERVENTION_REQUIRED')
+                case.quote(price-0.5)
         view = workbench_view(case.kernel)
-        self.assertIn(code,{row['reason_code'] for row in view['blocks']})
         self.assertEqual(view['cycles'][0]['remaining_quantity'],5)
-        self.assertEqual(len(case.api.inserted),2)
+        self.assertEqual(view['cycles'][0]['exit_wait_reason'],'EXIT_MANUAL_INTERVENTION_REQUIRED')
+        self.assertEqual(len(case.api.inserted),4)
         window = WorkbenchWindow(None)
         self.addCleanup(dispose_widget, window)
         window.timer.stop()
         window.view = view
         window.render_view()
-        blocks = window.tables['blocks']
-        self.assertTrue(any('剩余目标待核对' in blocks.item(i,0).text() for i in range(blocks.rowCount())))
-        self.assertNotIn(case.code,window.dashboard.status_labels[2].text())
+        pending,_=window.dashboard.home_position_rows(view,view['cycles'],True)
+        self.assertTrue(any('人工接管' in item for item in pending),pending)
+        reconciling=copy.deepcopy(view)
+        reconciling['cycles'][0]['exit_wait_reason']='EXIT_RECONCILING'
+        pending,_=window.dashboard.home_position_rows(reconciling,reconciling['cycles'],True)
+        self.assertTrue(any('核对原委托' in item for item in pending),pending)
+        ordinary=copy.deepcopy(view)
+        ordinary['cycles'][0]['exit_wait_reason']=None
+        pending,_=window.dashboard.home_position_rows(ordinary,ordinary['cycles'],True)
+        self.assertTrue(any('平仓剩余目标待核对' in item for item in pending),pending)
 
     def test_workbench_labels_retained_quote_stale_and_keeps_price(self):
         window = WorkbenchWindow(None)

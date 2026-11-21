@@ -6,7 +6,7 @@ from pathlib import Path
 from online_trader.accounts import AccountStore, account_identity
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.files import load_profile, publish_replace_bytes
-from online_trader.contracts.codec import content_hash, strict_loads
+from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.domain.values import identifier
 from online_trader.errors import TraderError
 from online_trader.ledger.store import Ledger

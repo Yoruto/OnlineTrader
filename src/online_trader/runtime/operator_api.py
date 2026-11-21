@@ -70,6 +70,23 @@ class WorkbenchEndpoint:
             return None
         try:
             with closing(sqlite3.connect(self.ledger.as_uri() + '?mode=ro', uri=True, timeout=.5)) as stream:
+                application = stream.execute('PRAGMA application_id').fetchone()[0]
+                if application == 0x44535631:
+                    scope_row = stream.execute('SELECT payload FROM scope WHERE id=1').fetchone()
+                    receipt_row = stream.execute(
+                        "SELECT payload FROM receipts WHERE kind='RUNTIME_COMMAND' AND id=?", (command_id,)).fetchone()
+                    if scope_row is None or receipt_row is None:
+                        return None
+                    scope = strict_loads(scope_row[0])
+                    bundle = strict_loads(receipt_row[0])
+                    command, receipt = bundle['command'], bundle['receipt']
+                    if (scope.get('account_key') != self.account_key
+                            or scope.get('owner_mode') != 'STANDALONE'
+                            or command.get('operation') not in WORKBENCH_OPERATIONS
+                            or command.get('command_id') != command_id
+                            or receipt.get('command_id') != command_id):
+                        raise TraderError('E_AUTH', 'The command belongs to a different Runtime authority')
+                    return {key: command[key] for key in _COMMAND_FIELDS}, receipt
                 scope = stream.execute('SELECT account_key, environment FROM ledger_scope').fetchall()
                 if scope != [(self.account_key, 'ONLINE_SIM')]:
                     raise TraderError('E_SCOPE', 'Execution ledger does not match the selected simulation account')
@@ -102,6 +119,19 @@ class WorkbenchEndpoint:
             profile = DsvProfile.from_record(body['profile'])
             try:
                 with closing(sqlite3.connect(self.ledger.as_uri() + '?mode=ro', uri=True, timeout=.5)) as stream:
+                    application = stream.execute('PRAGMA application_id').fetchone()[0]
+                    if application == 0x44535631:
+                        row = stream.execute('SELECT payload FROM scope WHERE id=1').fetchone()
+                        target_scope = None if row is None else strict_loads(row[0])
+                        if (target_scope is None or target_scope.get('account_key') != self.account_key
+                                or target_scope.get('owner_mode') != 'STANDALONE'
+                                or target_scope.get('runtime_boot_id') != binding['kernel_boot_id']
+                                or binding['config_revision'] != '1'):
+                            raise TraderError('E_CONFIG_EDIT', 'The target-execution configuration changed before preview')
+                        return {'status': 'VALID', 'account_key': self.account_key,
+                                'kernel_boot_id': binding['kernel_boot_id'],
+                                'config_revision': binding['config_revision'],
+                                'profile_hash': profile.content_hash, 'profile': profile.to_record()}
                     scope = stream.execute('SELECT account_key, environment FROM ledger_scope').fetchall()
                     current = stream.execute('SELECT config_revision FROM authority WHERE singleton=1').fetchone()
             except sqlite3.Error:
@@ -121,19 +151,20 @@ class WorkbenchEndpoint:
             if found is None:
                 raise TraderError('E_OWNERSHIP', 'No committed receipt is currently visible for this command ID')
             return found[1] | {'operation': found[0]['operation'], 'account_key': self.account_key}
-        if (body.keys() - {'binding'} != _COMMAND_FIELDS or type(body['operation']) is not str
-                or type(body['scope']) is not dict or type(body['parameters']) is not dict):
-            raise TraderError('E_SCHEMA', 'Provide the command ID, operation, scope and parameters')
-        binding = body.get('binding')
-        if 'binding' in body:
-            if type(binding) is not dict or binding.keys() != {'account_key', 'kernel_boot_id', 'config_revision'}:
-                raise TraderError('E_SCHEMA', 'The command draft has an invalid account and configuration binding')
-            if binding['account_key'] != self.account_key:
-                raise TraderError('E_SCOPE', 'The command draft belongs to another account')
-            identifier(binding['kernel_boot_id'])
-            sequence(binding['config_revision'], positive=True)
-        if body['operation'] not in WORKBENCH_OPERATIONS:
+        requested_operation = body.get('operation')
+        if type(requested_operation) is str and requested_operation not in WORKBENCH_OPERATIONS:
             raise TraderError('E_AUTH', 'This command channel does not hold the requested capability')
+        if (body.keys() != _COMMAND_FIELDS | {'binding'} or type(body['binding']) is not dict
+                or type(body['operation']) is not str
+                or type(body['scope']) is not dict or type(body['parameters']) is not dict):
+            raise TraderError('E_SCHEMA', 'Provide the command and its Runtime binding')
+        binding = body['binding']
+        if binding.keys() != {'account_key', 'kernel_boot_id', 'config_revision'}:
+            raise TraderError('E_SCHEMA', 'The command draft has an invalid account and configuration binding')
+        if binding['account_key'] != self.account_key:
+            raise TraderError('E_SCOPE', 'The command draft belongs to another account')
+        identifier(binding['kernel_boot_id'])
+        sequence(binding['config_revision'], positive=True)
         if not self._submission.acquire(blocking=False):
             raise TraderError('E_BUSY', 'The command was not enqueued because the interface is busy')
         try:
@@ -144,9 +175,9 @@ class WorkbenchEndpoint:
                 return found[1] | {'operation': found[0]['operation'], 'account_key': self.account_key}
             client = StatusClient(self.pipe, timeout=5, expected_account_key=self.account_key,
                                   client_instance_id=WORKBENCH_ACTOR,
-                                  expected_kernel_boot_id=binding['kernel_boot_id'] if binding else None)
+                                  expected_kernel_boot_id=binding['kernel_boot_id'])
             receipt = client.command(body['operation'], body['scope'], body['parameters'], command_id=command_id,
-                                     expected_config_revision=binding['config_revision'] if binding else None)
+                                     expected_config_revision=binding['config_revision'])
             return receipt | {'operation': body['operation'], 'account_key': self.account_key}
         finally:
             self._submission.release()

@@ -17,7 +17,13 @@ from online_trader.scheduling.clock import NS_PER_SECOND, quote_age_quality, quo
 
 
 def _missing_book_price(value):
-    return value is None or type(value) in (int, float) and (value == 0 or math.isnan(value))
+    if value is None:
+        return True
+    try:
+        price = Decimal(str(value))
+    except (ValueError, TypeError):
+        return False
+    return price.is_nan() or price == 0
 
 
 class TqKqDsvPort(TqKqPort):
@@ -116,7 +122,7 @@ class TqKqDsvPort(TqKqPort):
                                         native_tick_id=event.get('native_tick_id'),
                                         error_code=getattr(error, 'code', type(error).__name__))
 
-    def fresh_strategy_entry(self, code, side, event, *, profile=None):
+    def fresh_strategy_entry(self, code, side, event, *, profile=None, signal=None):
         """Use the strategy age rule and verify the exact legal native quote."""
         if event is None:
             return self._quote_rejected(code, 'OPEN', 'NO_ACCEPTED_TICK', side=side)
@@ -129,7 +135,8 @@ class TqKqDsvPort(TqKqPort):
                                             native_tick_id=event.get('native_tick_id'),
                                             accepted_time_utc=event['source_time_utc'], accepted_last=event['last'],
                                             raw_last=number(quote.last_price))
-            if runtime is not None and runtime.ordinary_quote_stale(event, now=now, profile=profile):
+            if (runtime is not None and (signal or {}).get('entry_kind', 'NORMAL') == 'NORMAL'
+                    and runtime.ordinary_quote_stale(event, now=now, profile=profile)):
                 if getattr(self, '_quote_trace', None) is None:
                     return False
                 limit = (runtime._quote_age_limit if profile is None else
@@ -143,7 +150,7 @@ class TqKqDsvPort(TqKqPort):
                                         getattr(quote,'bid_volume1',None)) if side == 'BUY' else
                                        (getattr(quote,'bid_price1',None), getattr(quote,'ask_price1',None),
                                         getattr(quote,'ask_volume1',None)))
-            if event[field] is not None:
+            if not _missing_book_price(event[field]):
                 if number(quote.ask_price1) != event['ask1'] or number(quote.bid_price1) != event['bid1']:
                     return self._quote_rejected(code, 'OPEN', 'QUOTE_TICK_BOOK_MISMATCH', side=side,
                                                 native_tick_id=event.get('native_tick_id'),
@@ -187,7 +194,7 @@ class TqKqDsvPort(TqKqPort):
                 'tick_size': number(quote.price_tick),
                 'native_tick_id': None,
             }
-            if not self.fresh_strategy_entry(code, side, event, profile=profile):
+            if not self.fresh_strategy_entry(code, side, event, profile=profile, signal=signal):
                 return False
             signal = signal or {}
             if signal.get('entry_kind') == 'NORMAL':

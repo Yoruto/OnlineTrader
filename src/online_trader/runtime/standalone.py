@@ -92,7 +92,7 @@ def run_session(store, selected, request, *, use_profile_file=False):
     from online_trader.runtime.instance_registry import RuntimeInstanceRegistration
     from online_trader.runtime.session_storage import RuntimeSessionStorage
     from online_trader.runtime.view_process import ViewProcess
-    with RuntimeLock(), RuntimeSessionStorage() as session:
+    with RuntimeLock() as runtime_lock, RuntimeSessionStorage() as session:
         process = ViewProcess(pipe, selected['account_key'], store.directory, session.ledger,
                               store.history_path(selected))
         try:
@@ -101,7 +101,10 @@ def run_session(store, selected, request, *, use_profile_file=False):
                                              trusted_control_pid=process.trusted_pid,
                                              use_portable_profile_file=use_profile_file,
                                              execution_ledger=session.ledger,
-                                             history_cache=store.history_path(selected))
+                                             history_cache=store.history_path(selected),
+                                             runtime_lock=runtime_lock,
+                                             runtime_boot_id=session.boot_id,
+                                             session_storage=session)
         finally:
             process.close()
     failure = output / 'startup-failure.json'

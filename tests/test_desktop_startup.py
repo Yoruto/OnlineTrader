@@ -39,12 +39,15 @@ class DesktopStartupTests(unittest.TestCase):
         self.account_id = state['selected_id']
         self.profile = load_confirmed_baseline()[0]
 
-    def idle(self, starter):
+    def idle(self, starter, *, completed=None):
         deadline = time.monotonic() + 5
-        while starter._worker is not None and time.monotonic() < deadline:
+        while (starter._worker is not None or completed is not None and not completed()) and time.monotonic() < deadline:
             self.app.processEvents()
             QTest.qWait(5)
         self.assertIsNone(starter._worker)
+        if completed is not None:
+            self.assertTrue(completed(), f'start did not reach its expected terminal state: {starter.status_text}')
+        flush_deferred_deletes()
 
     def starter(self, parent=None):
         starter = StrategyStarter(self.store, self.account_id, self.profile, parent)
@@ -87,8 +90,15 @@ class DesktopStartupTests(unittest.TestCase):
             self.assertFalse(window.dashboard.parameter_switches['auto_start_on_launch'].isChecked())
             self.assertEqual(window.dashboard.calculator.base_hash, expected.content_hash)
 
+            deadline = time.monotonic() + 5
+            while (window._startup_in_progress or not window.command_buttons['arm'].isEnabled()) and time.monotonic() < deadline:
+                self.app.processEvents()
+                QTest.qWait(5)
+            self.assertFalse(window._startup_in_progress)
+            self.assertTrue(window.command_buttons['arm'].isEnabled())
+
             window.command_buttons['arm'].click()
-            self.idle(window._strategy_starter)
+            self.idle(window._strategy_starter, completed=lambda: launch.call_count == 1)
             launch.assert_called_once()
         request = strict_loads(Path(launch.call_args.args[0]).read_bytes())
         self.assertEqual(request['profile'], expected.to_record())

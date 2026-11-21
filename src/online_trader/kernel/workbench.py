@@ -418,11 +418,12 @@ def _capture_workbench_view(kernel, snapshot, *, native_snapshot=None, native_fa
             'exit_reasons':copy.deepcopy(s.get('exit_reasons',[])),
             'exit_reason':(cycle.get('nominal_exit') or {}).get('exit_reason'),
             'exit_reference_price':(cycle.get('nominal_exit') or {}).get('nominal_exit_price'),
-            'exit_wait_reason': (None if not exit_pending else responsibility_wait or 'EXIT_WAITING_FOR_SESSION'
+            'exit_wait_reason': (None if not exit_pending else responsibility_wait or (
+                                 'EXIT_WAITING_FOR_SESSION'
                                  if market.get('market_session_active') is False else 'EXIT_WAITING_FOR_PRICE'
                                  if not market.get('fresh') or (
                                      p['contract_id'] in getattr(port, 'waiting_reduction_quotes', ())
-                                     and not kernel.execution.manual_reduction(cycle)) else None),
+                                     and not kernel.execution.manual_reduction(cycle)) else None)),
             'break_even_status':s.get('break_even_status'),'max_favorable_move':s.get('max_favorable_move'),
             'management_state':cycle.get('management_state'),'plan_id':p['plan_id'],'plan_revision':p['plan_revision'],'close_route_review':route_review})
         for order in cycle['orders']:

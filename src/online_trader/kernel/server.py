@@ -11,7 +11,7 @@ import uuid
 from online_trader.contracts.codec import encode_frame, content_hash
 from online_trader.errors import TraderError
 from online_trader.kernel.engine import Kernel
-from online_trader.kernel.projection import projection_batch
+from online_trader.kernel.projection import projection_batch as kernel_projection_batch
 from online_trader.kernel.streams import StreamHub
 from online_trader.kernel.control import OPERATIONS
 from online_trader.transport.named_pipe import PipeListener
@@ -56,17 +56,31 @@ class _Peer:
 class ControlServer:
     def __init__(self,kernel:Kernel,pipe_name:str, *, trusted_client_pid=None):
         self.kernel=kernel;self.listener=PipeListener(pipe_name)
+        self._target_owner = getattr(kernel, 'runtime_protocol', None) == 'DSV_TARGET/1'
         self._trusted_client_pid = trusted_client_pid
         self._inbound=queue.Queue(256);self._stop=threading.Event();self._peers=set();self._workers=[];self._waiting=[]
         self._peers_lock=threading.Lock();self._queue_lock=threading.Lock();self._inbound_bytes=0
         self._registered={}
         self.streams=StreamHub(kernel.boot_id,kernel.account_key)
         snap=kernel.snapshot()
-        self.streams.update(projection_batch(snap),snap["durable_seq"],snap["durable_seq"])
+        boundary = self._boundary(snap)
+        self.streams.update(self._projection(snap),boundary,boundary)
         kernel.take_committed_views()
         self._stream_peers={}
         self._last_progress_utc=_utc()
-        self._last_progress_seq=kernel._durable_seq
+        self._last_progress_seq=int(boundary)
+
+    def _projection(self, snapshot):
+        if self._target_owner:
+            from online_trader.dsv_runtime.standalone_projection import projection_batch
+            return projection_batch(snapshot)
+        return kernel_projection_batch(snapshot)
+
+    def _boundary(self, snapshot=None):
+        if self._target_owner:
+            state = self.kernel.snapshot() if snapshot is None else snapshot
+            return str(max(1, int(state.get('sequence') or 0)))
+        return str(self.kernel._durable_seq if snapshot is None else snapshot['durable_seq'])
 
     def register_peer(self,instance_id,pid,role="SHADOW"):
         self.kernel._check_owner()
@@ -77,6 +91,9 @@ class ControlServer:
         with self._peers_lock:return tuple(self._peers)
 
     def _publish_workbench(self, publication, *, standalone=False, native_snapshot=None):
+        if self._target_owner:
+            publication.publish(self.kernel.prepare_workbench_publication)
+            return
         from online_trader.kernel.workbench import prepare_workbench_publication, workbench_publication
 
         if standalone:
@@ -191,12 +208,18 @@ class ControlServer:
             for response_type,response_body in messages:peer.enqueue(self._reply(peer,message,response_type,response_body))
             self._heartbeat(peer)
         elif kind=='WorkbenchRequest':
-            from online_trader.kernel.workbench import workbench_view
-            value=workbench_view(self.kernel)
+            if self._target_owner:
+                value = self.kernel.workbench()
+            else:
+                from online_trader.kernel.workbench import workbench_view
+                value=workbench_view(self.kernel)
             peer.enqueue(self._reply(peer,message,'WorkbenchSnapshot',{'payload':value,'content_hash':content_hash(value)}))
         elif kind == 'WorkbenchPositionsRequest':
-            from online_trader.kernel.workbench import workbench_positions
-            value = workbench_positions(self.kernel, body['after'])
+            if self._target_owner:
+                value = self.kernel.positions(body['after'])
+            else:
+                from online_trader.kernel.workbench import workbench_positions
+                value = workbench_positions(self.kernel, body['after'])
             peer.enqueue(self._reply(peer, message, 'WorkbenchPositionsSnapshot',
                                     {'payload': value, 'content_hash': content_hash(value)}))
         elif kind == 'WorkbenchMonitorRequest':
@@ -210,7 +233,7 @@ class ControlServer:
             if body["purpose"]!="OPERATOR_COMMAND" or body["operation"] not in OPERATIONS:
                 raise TraderError("E_AUTH","Context purpose is not an enabled control capability")
             context=self.kernel.contexts.issue(peer.peer_id,body["purpose"],body["operation"],body["scope_id"],
-                kernel_epoch=str(self.kernel.kernel_epoch),revisions=self.kernel.revisions,issued_event_seq=str(self.kernel._durable_seq))
+                kernel_epoch=str(self.kernel.kernel_epoch),revisions=self.kernel.revisions,issued_event_seq=self._boundary())
             peer.enqueue(self._reply(peer,message,"RequestContext",context))
         elif kind=="OperatorCommand":
             if len(self._waiting)>=256:raise TraderError("E_QUEUE_OVERFLOW","Pending control capacity reached")
@@ -225,7 +248,8 @@ class ControlServer:
             self._waiting.append((peer,message,result))
         elif kind=="HeartbeatAck":
             high=self.streams.last_stream_seq(peer.stream_key) if peer.stream_key else 0
-            if int(body["last_seen_stream_seq"])>high or int(body["last_seen_event_seq"])>self.kernel._sequence:
+            event_high = int(self._boundary()) if self._target_owner else self.kernel._sequence
+            if int(body["last_seen_stream_seq"])>high or int(body["last_seen_event_seq"])>event_high:
                 raise TraderError("E_SCHEMA","Acknowledgement exceeds the emitted boundary")
         else:raise TraderError("E_AUTH","Message is not an enabled desktop capability")
 
@@ -240,12 +264,14 @@ class ControlServer:
     def _heartbeat(self,peer):
         if peer.stream_key is None or not peer.stream_ready or peer.closed.is_set():return
         snap=self.kernel._make_snapshot()
+        boundary = self._boundary()
         high=self.streams.last_stream_seq(peer.stream_key)
         peer.enqueue(self._reply(peer,None,"Heartbeat",{"kernel_epoch":str(self.kernel.kernel_epoch),
-            "business_advance_seq":str(self._last_progress_seq),"last_event_seq":str(self.kernel._sequence),
-            "durable_seq":str(self.kernel._durable_seq),"last_stream_seq":str(high),
+            "business_advance_seq":str(self._last_progress_seq),"last_event_seq":boundary,
+            "durable_seq":boundary,"last_stream_seq":str(high),
             "pending_transactions":len(self.kernel._pending),"critical_queue_depth":self._inbound.qsize(),
-            "kernel_state":projection_batch(snap)["records"][0]["kernel_state"],"last_progress_utc":self._last_progress_utc}))
+            "kernel_state":self._projection(self.kernel.snapshot() if self._target_owner else snap)["records"][0]["kernel_state"],
+            "last_progress_utc":self._last_progress_utc}))
         peer.last_heartbeat=time.monotonic()
 
     def _sync_streams(self):
@@ -257,8 +283,9 @@ class ControlServer:
                 try:peer.enqueue(self._reply(peer,None,kind,body))
                 except (TraderError,queue.Full):peer.close()
         for view in views:
-            updates=self.streams.update(projection_batch(view),view["durable_seq"],view["durable_seq"])
-            self._last_progress_seq=int(view["durable_seq"]);self._last_progress_utc=_utc()
+            boundary = self._boundary(view)
+            updates=self.streams.update(self._projection(view),boundary,boundary)
+            self._last_progress_seq=int(boundary);self._last_progress_utc=_utc()
             for key,messages in updates.items():
                 peer=self._stream_peers.get(key)
                 if peer is None or peer.closed.is_set():continue

@@ -263,7 +263,8 @@ class ExecutionCoordinator:
             facts = runtime._latest.get((plan['contract_id'], plan['trading_day']))
             market['fresh'] = bool(ex['ordinary_entry_fresh'] and facts and
                                    k.port.fresh_strategy_entry(plan['contract_id'], self.side(cycle, effect), facts['event'],
-                                                               profile=runtime.profile_for_plan(plan)))
+                                                               profile=runtime.profile_for_plan(plan),
+                                                               signal=(cycle.get('entry_intent') or {}).get('signal')))
         elif not quote or quote['kernel_boot_id']!=k.boot_id or k._quote_age_ns(quote['received_ns'])>k.max_quote_age_ms*1_000_000:
             market['fresh']=False
         else:market.update(last=quote['price'],bid1=quote.get('bid1'),ask1=quote.get('ask1'))
@@ -303,19 +304,24 @@ class ExecutionCoordinator:
         working = any(order.potential_remaining and order.send_state in {'CALL_RETURNED', 'CONFIRMED'}
                       for order in pending)
         priced = self.price(cycle, 'REDUCE')
+        previous = cycle.get('exit_responsibility') or {}
         if state['owned_qty'] <= target and not unknown and not working:
             status, action = 'COMPLETE', 'NONE'
         elif unknown:
             status, action = 'RECONCILING', 'QUERY_ORIGINAL_ORDER'
         elif working:
             status, action = 'BROKER_WORKING', 'WAIT_BROKER_FACTS'
+        elif previous.get('state') == 'MANUAL_INTERVENTION_REQUIRED':
+            # A quote update is not authority to clear an explicit takeover
+            # requirement.  Only proved broker progress (handled above) or an
+            # authorized takeover flow may move responsibility out of this state.
+            status, action = 'MANUAL_INTERVENTION_REQUIRED', 'TAKEOVER_REVIEW'
         elif not priced['allowed']:
             status = ('MANUAL_INTERVENTION_REQUIRED'
                       if 'DATA_GAP_EXIT' in state.get('exit_reasons', []) else 'WAIT_QUOTE')
             action = 'RESTORE_CURRENT_QUOTE' if status == 'WAIT_QUOTE' else 'TAKEOVER_REVIEW'
         else:
             status, action = 'PREPARING', 'PREPARE_REDUCTION_CHILD'
-        previous = cycle.get('exit_responsibility') or {}
         elapsed = cycle['execution']['elapsed_ms']
         progressed = (previous.get('state') != status
                       or previous.get('target_remaining_qty') != target
@@ -501,7 +507,10 @@ class ExecutionCoordinator:
                 try:k.contexts.validate(context,ex['peer_id'],'OPERATOR_COMMAND','MANUAL_OPEN',cycle['plan']['contract_id'],revisions=k.revisions,kernel_epoch=str(k.kernel_epoch))
                 except TraderError:return
                 cycle['entry_authorization']={'context_id':context,'peer_id':ex['peer_id'],'authority_revision':k._authority_revision}
-            if k._exposure()+Decimal(cycle['risk_per_lot'])*qty>k.budget:return
+            # _exposure() already reserves the unfilled quantity of this ACTIVE
+            # logical entry intent while no child is working.  A replacement is
+            # another price attempt for that same remainder, not new exposure.
+            # Admission of the original intent remains the budget boundary.
             if getattr(k.simulation,'strategy_enabled',False):
                 k.simulation.entry_attempt_prepared(cycle['position_cycle_id'])
                 cycle['protection'].update(entry_terminal_reconciled=False,reconciled_entry_qty=None)

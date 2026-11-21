@@ -1,5 +1,7 @@
 # OnlineTrader：以 DSV 为唯一业务基准的减法重构计划
 
+> 2026-11-21：Replacement 接入 Standalone 前的目标数量、UNKNOWN 占量、责任归属和每 boot 临时执行库边界，使用[Target Execution 与 Standalone 单核心接管合同](../target-execution-and-standalone-cutover-20261121.md)。本目录的冷迁移和持久候选库仍只适用于 Replacement 候选，不构成 Standalone 启动合同。
+
 编制于 2026-11-14，当前状态核对基线为 `ddad472235b9fa0749646d7e3fded831040ca6c3`。原设计代码基线为 `af8b53b`，调度固定回归记录基线为 `f6a2bdd`，A01/A02/A03/B01指定场景记录对应 `6468b00`。**这些是分范围记录，不是整版或发布验收结论。**
 
 **当前入口**：[指定场景与旧格式矩阵](16-exit-recovery-and-evidence-acceptance.md) · [验收证据索引](../../validation/README.md) · [当前状态与开放问题](../../功能实现与待办清单_20261110.md#当前替代链状态) · [策略和 SDK 串联调度](15-strategy-sdk-schedule.md) · [用户批准的行为差异](00-evidence-and-decisions.md#用户批准的行为差异)

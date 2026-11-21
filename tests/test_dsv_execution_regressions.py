@@ -76,23 +76,43 @@ class DsvExecutionReviewTests(unittest.TestCase):
         self.assertEqual(owner.kernel.execution.price(cycle,'OPEN')['mode'],'ACTIVE')
         self.assertEqual(owner.kernel.execution.price(cycle,'OPEN')['price'],'1004')
 
-    def test_rejection_of_an_older_reduction_chain_is_not_bypassed_by_new_exit_intent(self):
+    def test_consecutive_exit_rejections_retry_twice_then_require_manual_intervention(self):
         owner=self.owner
         _,plan=owner.create_cycle(quantity=5,fill=5,execution_version='1.2')
-        owner.tick(owner.event(entry_context=False))
+        owner.tick(owner.event(last='980',bid='979',ask='981',entry_context=False))
         cid=plan['position_cycle_id']
-        owner.kernel.manual_close(cid,2);owner.kernel.wait_idle()
-        first=next(o for o in owner.port.orders if o['effect']=='REDUCE')
-        owner.kernel.manual_close(cid,4);owner.kernel.wait_idle()
-        self.assertEqual([o['original_qty'] for o in owner.port.orders if o['effect']=='REDUCE'],[2,2])
-        owner.kernel.confirm_terminal(first['child_order_id'],'REJECTED',0)
-        owner.kernel.wait_idle()
-        self.assertEqual(len([o for o in owner.port.orders if o['effect']=='REDUCE']),2)
-        owner.tick(owner.event(1000,entry_context=False))
-        self.assertEqual(len([o for o in owner.port.orders if o['effect']=='REDUCE']),2)
-        blocks=workbench_view(owner.kernel)['blocks']
-        self.assertIn({'reason_code':'EXIT_REDUCTION_TERMINAL_UNFILLED','active':True,
-                       'contract_id':owner.cycle()['plan']['contract_id'],'position_cycle_id':cid},blocks)
+        for ordinal in range(1,4):
+            reductions=[o for o in owner.port.orders if o['effect']=='REDUCE']
+            self.assertEqual(len(reductions),ordinal)
+            self.assertEqual(reductions[-1]['original_qty'],5)
+            owner.kernel.confirm_terminal(reductions[-1]['child_order_id'],'REJECTED',0)
+            owner.kernel.wait_idle()
+            if ordinal < 3:
+                owner.tick(owner.event(ordinal*1000,last='980',bid='979',ask='981',entry_context=False))
+        cycle=owner.cycle();responsibility=cycle['exit_responsibility']
+        self.assertEqual((responsibility['state'],responsibility['rejection_count']),
+                         ('MANUAL_INTERVENTION_REQUIRED',3))
+        self.assertEqual(cycle['protection']['target_remaining_qty'],0)
+        self.assertEqual(cycle['protection']['owned_qty'],5)
+        before=len(owner.port.orders)
+        owner.tick(owner.event(4000,last='980',bid='979',ask='981',entry_context=False))
+        self.assertEqual(len(owner.port.orders),before)
+        view=workbench_view(owner.kernel)
+        self.assertEqual(view['cycles'][0]['exit_wait_reason'],'EXIT_MANUAL_INTERVENTION_REQUIRED')
+
+    def test_unknown_exit_send_projects_reconciliation_without_replacement(self):
+        owner=self.owner
+        owner.create_cycle(quantity=5,fill=5,execution_version='1.2')
+        owner.port.fail_send=True
+        owner.tick(owner.event(last='980',bid='979',ask='981',entry_context=False))
+        cycle=owner.cycle();order=cycle['orders'][-1]
+        self.assertEqual((order['effect'],order['send_state']),('REDUCE','UNKNOWN'))
+        self.assertEqual(cycle['protection']['target_remaining_qty'],0)
+        before=len(owner.port.orders)
+        owner.tick(owner.event(1000,last='980',bid='979',ask='981',entry_context=False))
+        self.assertEqual(len(owner.port.orders),before)
+        view=workbench_view(owner.kernel)
+        self.assertEqual(view['cycles'][0]['exit_wait_reason'],'EXIT_RECONCILING')
 
     def test_execution_tick_cannot_replace_the_original_instrument_tick(self):
         owner=self.owner

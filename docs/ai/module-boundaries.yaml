@@ -49,7 +49,7 @@ boundaries:
   - id: standalone-history-cache
     route: STANDALONE
     entries:
-      - src/online_trader/runtime/portable_config.py:PortableRuntimeStore.history_path
+      - src/online_trader/runtime/portable_config.py:PortableAccountStore.history_path
       - src/online_trader/runtime/account_history.py
       - src/online_trader/runtime/account_cache.py
     owns:
@@ -66,17 +66,41 @@ boundaries:
       - src/online_trader/dsv_runtime/runner.py:DsvSession.apply_round
     collaborators:
       - src/online_trader/dsv_runtime/controller.py:ExplicitOrderController
+      - src/online_trader/dsv_runtime/target_execution.py:account_target
       - src/online_trader/dsv_runtime/sdk_adapter.py:DsvSdkAdapter
       - src/online_trader/dsv_storage/journal.py:Journal
       - src/online_trader/dsv_core
     owns:
       - replacement ordered facts and strategy state
+      - Runtime-proved target and non-terminal potential-quantity accounting
       - per-child pre-send durability and UNKNOWN responsibility
       - explicitly bound SDK adapter behavior
     must_not_depend_on:
       - legacy Kernel owner as a second sender
       - Qt or Workbench state
       - QA fixture injection in online SDK mode
+
+  - id: standalone-target-owner-candidate
+    route: STANDALONE_COLD_CUTOVER_CANDIDATE
+    entries:
+      - src/online_trader/runtime/desktop_bootstrap.py:_STANDALONE_EXECUTION_CORE
+      - src/online_trader/runtime/target_owner_startup.py:run_target_owner
+      - src/online_trader/dsv_runtime/standalone_owner.py:create_standalone_owner
+    collaborators:
+      - src/online_trader/dsv_runtime/owner_binding.py:StandaloneOwnerBinding
+      - src/online_trader/dsv_runtime/standalone_commands.py:translate_workbench_command
+      - src/online_trader/dsv_runtime/standalone_projection.py:workbench_view
+      - src/online_trader/kernel/server.py:ControlServer
+      - src/online_trader/runtime/account_publication.py:AccountPublication
+      - src/online_trader/runtime/account_cache.py:BrokerHistoryWriter
+    owns:
+      - one target-execution owner and SDK sender in the current Runtime boot
+      - existing Runtime IPC and Workbench projection adaptation
+      - safe flatten-then-stop completion evidence
+    must_not_be_used_as:
+      - a user-selectable second execution core
+      - a simultaneous sender beside Legacy Kernel
+      - the default route before independent acceptance and cold cutover
 
   - id: legacy-runtime
     route: LEGACY_EXPLICIT_MAINTENANCE

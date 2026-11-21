@@ -161,6 +161,13 @@ class Journal:
     def command_receipt(self, identity):
         return self._read("SELECT payload FROM receipts WHERE kind='COMMAND' AND id=?", (identity,))
 
+    def runtime_command_receipt(self, identity, digest=None):
+        if digest is None:
+            row = self._db.execute(
+                "SELECT payload FROM receipts WHERE kind='RUNTIME_COMMAND' AND id=?", (identity,)).fetchone()
+            return None if row is None else strict_loads(row[0])
+        return self.receipt('RUNTIME_COMMAND', identity, digest)
+
     def storage_metrics(self):
         values = {'sqlite_changes': self._db.total_changes,
                   'event_highwater': self._db.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0],

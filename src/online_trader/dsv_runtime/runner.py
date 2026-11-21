@@ -17,6 +17,7 @@ from online_trader.dsv_core.month_stop import observe_month_stop
 from online_trader.dsv_core.transition import continuation_entry, ordinary_entry, price_value, protect
 from online_trader.dsv_core.price_rules import scheduled_close_mode
 from online_trader.dsv_runtime.controller import ExplicitOrderController, terminal, tighten_target
+from online_trader.dsv_runtime.owner_binding import StandaloneOwnerBinding
 from online_trader.dsv_storage.journal import Journal
 from online_trader.dsv_storage.workbench_evidence import WorkbenchEvidence
 from online_trader.errors import TraderError
@@ -73,13 +74,23 @@ def initial_state(trading_day, contracts):
 class DsvSession:
     """Public synchronous offline runtime. Pass complete scoped snapshots and ordered native changes."""
 
-    def __init__(self, database, *, account_key, provider, trading_day, profile, port, _execution_lock=None):
+    def __init__(self, database, *, account_key, provider, trading_day, profile, port, _execution_lock=None,
+                 _owner_binding=None):
         identifier(account_key)
         offline = account_key.startswith('DEV:') and provider == 'OFFLINE' and not isinstance(port, OnlineSimulationPort)
         if not offline:
             from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
-            if (type(port) is not DsvSdkAdapter or not port.matches_online_scope(account_key, provider)
-                    or type(_execution_lock) is not AccountLock or not _execution_lock.matches(account_key)):
+            standalone = isinstance(_owner_binding, StandaloneOwnerBinding)
+            if standalone:
+                _owner_binding.validate()
+                if (_owner_binding.account_key, _owner_binding.provider) != (account_key, provider):
+                    raise TraderError('E_DSV_SCOPE', 'Standalone binding differs from the DSV session scope')
+            if (type(port) is not DsvSdkAdapter
+                    or not port.matches_online_scope(account_key, provider,
+                                                     owner_mode='STANDALONE' if standalone else 'REPLACEMENT')
+                    or standalone and _execution_lock is not _owner_binding.account_lock
+                    or not standalone and (type(_execution_lock) is not AccountLock
+                                            or not _execution_lock.matches(account_key))):
                 raise TraderError('E_DSV_SCOPE', 'The SDK session requires its explicitly bound account, adapter and owner lock')
         if not isinstance(profile, DsvProfile):
             raise TraderError('E_DSV_SCOPE', 'Expected a normalized DSV business profile')
@@ -97,6 +108,9 @@ class DsvSession:
         self._sdk_port = port if not offline else None
         self._scope = {'account_key': account_key, 'provider': provider, 'trading_day': trading_day,
                        'configuration_id': profile.content_hash}
+        self._owner_binding = _owner_binding
+        if isinstance(_owner_binding, StandaloneOwnerBinding):
+            self._scope.update(owner_mode='STANDALONE', runtime_boot_id=_owner_binding.boot_id)
         settings = profile.to_record()['settings']
         self._trade = settings['trade']
         self._symbols = {item['code']: item for item in settings['symbols']}
@@ -105,7 +119,7 @@ class DsvSession:
             self._journal = Journal(database, self._scope, initial)
             self._state = self._journal.load()
             if not offline:
-                self._bind_sdk_grant()
+                self._bind_online_owner()
             self._state.setdefault('trading_day', trading_day)
             self._state.setdefault('synchronized', True)
             self._state.setdefault('retired_positions', {})
@@ -121,8 +135,14 @@ class DsvSession:
                 self._lock.close()
             raise
 
-    def _bind_sdk_grant(self):
+    def _bind_online_owner(self):
         grant = self._sdk_port.grant
+        if isinstance(self._owner_binding, StandaloneOwnerBinding):
+            binding = {'runtime_boot_id': self._owner_binding.boot_id,
+                       'grant_id': grant.value['grant_id'], 'grant_hash': grant.content_hash}
+            with self._journal.transaction():
+                self._journal.event('RUNTIME_BOOT_BOUND', binding)
+            return
         binding = {'grant_id': grant.value['grant_id'], 'grant_hash': grant.content_hash}
         with self._journal.transaction():
             existing = self._journal.sdk_scope_grant()
@@ -167,6 +187,9 @@ class DsvSession:
             position = row['position']
             if position is not None:
                 position.update(self._controller.position_buckets(state, position, contract))
+                row['target_execution'] = self._controller.target_projection(state, row)
+            else:
+                row['target_execution'] = None
             if detached := row.get('detached_positions'):
                 row['detached_owned'] = sum(state['retired_positions'][key]['owned'] for key in detached)
                 row['detached_cycles'] = []
@@ -198,6 +221,32 @@ class DsvSession:
     def command_receipt(self, command_id):
         self._check_owner()
         return self._journal.command_receipt(identifier(command_id))
+
+    def record_runtime_command_receipt(self, command, receipt):
+        """Persist the current-boot Runtime correlation after DSV commit."""
+        self._check_owner()
+        identity = identifier(command['command_id'])
+        if receipt.get('command_id') != identity or receipt.get('payload_hash') is None:
+            raise TraderError('E_DSV_COMMAND', 'Runtime receipt differs from its original command')
+        digest = receipt['payload_hash']
+        bundle = {'command': command, 'receipt': receipt}
+        try:
+            with self._journal.transaction():
+                prior = self._journal.runtime_command_receipt(identity, digest)
+                if prior is not None:
+                    if prior != bundle:
+                        raise TraderError('E_DSV_DUPLICATE_CONFLICT', 'Runtime receipt identity changed content')
+                    return prior
+                self._journal.event('RUNTIME_COMMAND_RECEIPT', bundle)
+                self._journal.record_receipt('RUNTIME_COMMAND', identity, digest, bundle)
+            return bundle
+        except sqlite3.Error as error:
+            self._failed = True
+            raise TraderError('E_DSV_STORE', 'Runtime command receipt could not be committed') from error
+
+    def runtime_command_receipt(self, command_id):
+        self._check_owner()
+        return self._journal.runtime_command_receipt(identifier(command_id))
 
     def verify_scope(self, expected):
         self._check_owner()
@@ -887,7 +936,11 @@ class DsvSession:
             row['target_count'] += 1
             if self._sdk_port is not None:
                 state['sdk_scope_targets'] = state.get('sdk_scope_targets', 0) + 1
-            row['position'] = goal | {'id': 'position-' + uuid4().hex, 'owned': 0, 'entry_filled': 0,
+            position_id = 'position-' + uuid4().hex
+            row['position'] = goal | {'id': position_id, 'target_id': 'target-' + uuid4().hex,
+                                      'target_revision': 1, 'target_reason': decision['reason'],
+                                      'target_fact_sequence': frame['sequence'],
+                                      'owned': 0, 'entry_filled': 0,
                                       'entry_notional': '0', 'children': [], 'entry_stopped': False,
                                       'peak': '0', 'protected': False, 'half_stage': 0, 'exit_target': None,
                                       'open_day': state['trading_day'], 'fills': [],
@@ -1011,6 +1064,7 @@ class DsvSession:
         position, results = protect(position, market['tick'], self._trade, spec)
         row['position'] = position
         if position['exit_target'] != previous_target:
+            position.pop('manual_close_mode', None)
             position['exit_revision'] = position.get('exit_revision', 0) + 1
         for result in results:
             reason = result['reason']
@@ -1240,21 +1294,85 @@ class DsvSession:
                 reason = 'CANCEL_AWAITING_NATIVE_RESULT'
             return [{'reason': reason, 'cancel_status': order['cancel_status'],
                      'cancel_effect_id': order.get('cancel_effect_id'), 'rule_ids': ['I01', 'I02']}], [request] if request else []
+        if action == 'CANCEL_MANY':
+            if not state['synchronized']:
+                raise TraderError('E_DSV_SYNC', 'Wait for a synchronized order and position snapshot before cancelling')
+            children = command['child_order_ids']
+            if type(children) is not list or len(children) != len(set(children)):
+                raise TraderError('E_DSV_COMMAND', 'Batch cancellation requires unique owned child identities')
+            if not children:
+                return [{'reason': 'NO_OWNED_ORDERS', 'rule_ids': ['I01', 'I02']}], []
+            effects, decisions = [], []
+            for child_id in children:
+                order = state['orders'].get(identifier(child_id))
+                if order is None:
+                    raise TraderError('E_DSV_NATIVE_ID', 'Batch cancellation contains an unowned child')
+                request = self._controller.cancel(order, 'USER_CANCEL', retry_risk_refusal=True)
+                if request:
+                    effects.append(request)
+                decisions.append({'reason': 'USER_CANCEL' if request else 'CANCEL_UNAVAILABLE',
+                                  'child_order_id': child_id, 'cancel_status': order['cancel_status'],
+                                  'rule_ids': ['I01', 'I02']})
+            return decisions, effects
         if action == 'REDUCE':
             row = state['symbols'].get(command['contract_id'])
             position = row['position'] if row else None
             qty = quantity(command['quantity'], positive=True)
             if position is None or qty > position['owned']:
                 raise TraderError('E_DSV_OWNERSHIP', 'Manual reduction exceeds the owned position')
+            if (command.get('expected_target_id', position.get('target_id', position['id']))
+                    != position.get('target_id', position['id'])
+                    or command.get('expected_target_revision', position.get('target_revision', 1))
+                    != position.get('target_revision', 1)):
+                raise TraderError('E_DSV_OWNERSHIP', 'The strategy target changed before the reduction command')
             if row.get('detached_positions') or row.get('native_conflicts'):
                 raise TraderError('E_DSV_OWNERSHIP', 'Late fill from another cycle requires ownership review')
             target = position['owned'] - qty
             if position['exit_target'] is not None:
                 target = min(target, position['exit_target'])
             tighten_target(position, target, new_request=True)
+            position['target_reason'] = 'USER_REDUCE'
+            if command.get('price_mode') is not None:
+                position['manual_close_mode'] = command['price_mode']
             if target == 0 and not position.get('rollback_exit'):
                 position['rollback_exit'] = {'reason': 'MANUAL_EXIT', 'at': None, 'price': None, 'slip': None}
             return [{'reason': 'USER_REDUCE', 'remaining': target, 'rule_ids': ['I01', 'I02']}], []
+        if action in {'REDUCE_ALL', 'FLATTEN_STOP'}:
+            if not state['synchronized']:
+                raise TraderError('E_DSV_SYNC', 'A complete broker snapshot is required before flattening owned targets')
+            requested = command.get('position_ids')
+            if type(requested) is not list or len(requested) != len(set(requested)):
+                raise TraderError('E_DSV_COMMAND', 'Flattening requires unique current strategy position identities')
+            current = {row['position']['id']: row['position'] for row in state['symbols'].values()
+                       if row['position'] is not None
+                       and (action == 'FLATTEN_STOP' or row['position']['owned'])}
+            if set(requested) != set(current):
+                raise TraderError('E_DSV_OWNERSHIP', 'The current owned target set changed before flattening')
+            if not requested:
+                if action == 'FLATTEN_STOP':
+                    state['running'] = False
+                return [{'reason': 'NO_OWNED_TARGETS', 'rule_ids': ['I01', 'I02']}], []
+            decisions, effects = [], []
+            state['running'] = False if action == 'FLATTEN_STOP' else state['running']
+            for position_id in requested:
+                position = current[position_id]
+                tighten_target(position, 0, new_request=True)
+                position['target_reason'] = 'USER_FLATTEN'
+                if command.get('price_mode') is not None:
+                    position['manual_close_mode'] = command['price_mode']
+                position.setdefault('rollback_exit', {
+                    'reason': 'MANUAL_EXIT', 'at': None, 'price': None, 'slip': None})
+                for order in self._controller.child_orders(state, position, 'OPEN'):
+                    if request := self._controller.cancel(order, 'TARGET_REDUCED', retry_risk_refusal=True):
+                        effects.append(request)
+                decisions.append({'reason': 'USER_FLATTEN', 'position_id': position_id,
+                                  'remaining': 0, 'rule_ids': ['I01', 'I02']})
+            return decisions, effects
+        if action == 'RECONCILE':
+            if not state['synchronized']:
+                raise TraderError('E_DSV_SYNC', 'Broker reconciliation is still waiting for a complete native frame')
+            return [{'reason': 'BROKER_FACTS_RECONCILED', 'sequence': state['sequence'],
+                     'rule_ids': ['I01', 'I02']}], []
         if action == 'REDUCE_DETACHED':
             row = state['symbols'].get(command['contract_id'])
             identity = identifier(command['position_id'])

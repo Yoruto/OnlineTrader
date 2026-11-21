@@ -6,7 +6,7 @@ from io import StringIO
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.dsv import DsvProfile
@@ -246,8 +246,11 @@ class AutoOffsetRuntimeTests(unittest.TestCase):
         class Server:
             def __init__(self,kernel,pipe,**_kwargs):captured.append(kernel)
             def serve(self,stop,**kwargs):stop.set()
+        connect = Mock(return_value=self.port)
+        factory = Mock()
+        factory.connect = connect
         with (patch('online_trader.runtime.dsv_simulation.Thread'),
-              patch.object(SimNowDsvPort,'connect',return_value=self.port) as connect,
+              patch('online_trader.runtime.dsv_simulation.strategy_port', return_value=factory),
               patch('online_trader.kernel.server.ControlServer',Server)):
             run(self.root/'scope.json','NEVER_READ',self.root/'profile.json',self.root/'calendar.json',self.root/'run',pipe='offline-auto')
         self.assertEqual(connect.call_count,1);self.assertEqual(self.api.inserted,[])

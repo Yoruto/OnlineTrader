@@ -30,6 +30,10 @@ from online_trader.scheduling.reference import CalibratedClock
 REQUEST_SCHEMA = 'DESKTOP_START/1'
 REQUEST_LIFETIME = timedelta(minutes=10)
 MAX_REQUEST_BYTES = 1024 * 1024
+# Cold-cutover selection is version-owned and intentionally not configurable
+# by an operator or startup request.  Independent acceptance changes this one
+# constant in the release candidate; a Runtime never hosts both cores.
+_STANDALONE_EXECUTION_CORE = 'LEGACY_KERNEL'
 _REQUEST_KEYS = {'schema_version', 'request_id', 'created_at_utc', 'expires_at_utc',
     'account_store', 'account_id', 'account_key', 'provider', 'profile', 'profile_hash',
     'arm', 'confirmed'}
@@ -319,7 +323,8 @@ def run_desktop_start(request_path, output, *, now=None):
 
 def run_confirmed_start(request_path, output, *, now=None, configured_store=None, trusted_control_pid=None,
                         use_portable_profile_file=False,
-                        execution_ledger=None, history_cache=None):
+                        execution_ledger=None, history_cache=None, runtime_lock=None, runtime_boot_id=None,
+                        session_storage=None):
     """Run the original owner using the selected desktop or portable account inputs."""
     directory = Path(output).resolve()
     directory.mkdir(parents=True, exist_ok=False)
@@ -342,7 +347,22 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
             if configured_store is not None:
                 if execution_ledger is None or history_cache is None:
                     raise TraderError('E_SCOPE', 'Standalone Runtime requires session storage and a broker history cache')
-                configured_store.initialize_session_ledger(row, lease, execution_ledger)
+                from online_trader.runtime.instance import RuntimeLock
+                if (not isinstance(runtime_lock, RuntimeLock) or not runtime_lock.matches()
+                        or not isinstance(runtime_boot_id, str) or not runtime_boot_id.startswith('runtime-')):
+                    raise TraderError('E_INSTANCE_LOCK', 'Standalone startup requires its current host Runtime boot binding')
+                if (session_storage is None or session_storage.ledger != Path(execution_ledger).resolve()
+                        or session_storage.boot_id != runtime_boot_id):
+                    raise TraderError('E_STORAGE', 'Standalone startup requires its current temporary session store')
+                if _STANDALONE_EXECUTION_CORE == 'LEGACY_KERNEL':
+                    configured_store.initialize_session_ledger(row, lease, execution_ledger)
+                elif _STANDALONE_EXECUTION_CORE == 'DSV_TARGET':
+                    target_ledger = Path(execution_ledger).resolve()
+                    if target_ledger != session_storage.ledger or target_ledger.name != 'ledger.db' or target_ledger.exists():
+                        raise TraderError('E_STORAGE', 'Target Runtime requires a new temporary Journal path')
+                    target_ledger.parent.mkdir(parents=True, exist_ok=True)
+                else:
+                    raise TraderError('E_RUNTIME_CONFIG', 'This build selects an unknown Standalone execution core')
                 runtime_options.update(_existing_ledger=False, _trusted_control_pid=trusted_control_pid or -1,
                                        _history_cache=history_cache, _configured_store=configured_store)
                 if not use_portable_profile_file:
@@ -403,6 +423,14 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
             # account lease to the original owner so another window cannot
             # switch accounts or race a second login between these phases.
             row = _selected(store, request['account_id'])
+            if configured_store is not None and _STANDALONE_EXECUTION_CORE == 'DSV_TARGET':
+                from online_trader.runtime.target_owner_startup import run_target_owner
+                return run_target_owner(
+                    grant=grant, profile=effective, calendar=calendar, credentials=reference,
+                    output=directory, pipe=store.pipe_name(row), session_storage=session_storage,
+                    runtime_lock=runtime_lock, account_lock=lease, clock=clock,
+                    trusted_control_pid=trusted_control_pid or -1, history_cache=history_cache,
+                    arm=request['arm'], configuration_revision='1')
             return dsv_simulation.run(directory / 'scope.json', reference, directory / 'profile.json',
                 directory / 'calendar.json', directory, pipe=store.pipe_name(row), arm=request['arm'],
                 _execution_lock=lease, **({'_reference': clock} if clock is not None else {}), **runtime_options)

@@ -799,6 +799,17 @@ class Kernel:
                         if isinstance(gate_result, dict):
                             for reason in gate_result['reason_codes']:
                                 checks[reason] = False
+                            current_limit = (gate_result.get('details') or {}).get('current_limit_price')
+                            if (current_limit is not None and not committed_limit_is_safe(
+                                    self.execution.side(cycle, order['effect']),
+                                    order['limit_price'], current_limit)):
+                                checks['E_QUOTE_REVISION_CHANGED'] = False
+                                review_details['E_QUOTE_REVISION_CHANGED'] = {
+                                    'committed_limit_price': order['limit_price'],
+                                    'current_policy_price': current_limit,
+                                    'quote_id': gate_result.get('quote_id'),
+                                    'source_epoch': gate_result.get('source_epoch'),
+                                }
                         else:
                             checks['STRATEGY_RECHECK'] = bool(gate_result)
                             gate_result = None
@@ -949,13 +960,12 @@ class Kernel:
             intent.update(status='ACTIVE', next_action='REPRICE_FROM_LATEST_QUOTE')
 
     def _progress_definitely_not_sent(self, cycle_id, effect):
-        if effect == 'REDUCE':
-            self._progress_exits(cycle_id)
-            return
-        cycle = self._staged.get(cycle_id)
-        if (cycle and self.execution.active(cycle)
-                and (cycle.get('entry_intent') or {}).get('status') == 'ACTIVE'):
-            self.execution.progress(cycle_id, allow_open=True, allow_retry=True)
+        # A proved local non-send releases the child quantity but does not make
+        # the same quote a new execution fact.  Retrying synchronously here can
+        # spin through durable children without a newer market observation.
+        # The retained entry/exit responsibility is advanced by the next
+        # explicit quote or broker fact.
+        return
 
     def record_fill(self, child_id: str, trade_key: str, qty: int, price: str, *, observed_at_utc=None,
                     trading_day=None,commission=None,estimated_commission=None,native_day_evidence=None,

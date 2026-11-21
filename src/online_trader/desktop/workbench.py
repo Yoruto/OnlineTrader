@@ -1033,10 +1033,13 @@ class WorkbenchWindow(StatusWindow):
                           str(sum(v.get('history_omitted', {}).values())) + ' 条。' if v.get('history_truncated') else '')
         capacity_notice = ('当前明细超过容量，省略 ' + str(sum(v.get('detail_omitted', {}).values())) +
                            ' 条。可停止策略、撤自有开仓单或平仓。平仓时向执行器查询可操作持仓。')
+        source_notice = ('状态来自目标执行 Owner' if
+                         v['configuration'].get('execution_core') == 'DSV_TARGET_EXECUTION'
+                         else '状态来自原内核')
         self.notice_label.setText(capacity_notice if v.get('detail_unavailable') else
             '当前摘要不完整，请通过执行器核对控制请求。' if v['truncated'] else
             history_notice or
-            self._control_notice or '状态来自原内核；行情来源时间与新鲜度单独显示。关闭工作台保留原持仓保护。')
+            self._control_notice or source_notice + '；行情来源时间与新鲜度单独显示。关闭工作台保留原持仓保护。')
 
     def filter_markets(self):
         table=self.tables['markets'];term=self.filter_input.text().casefold()

@@ -10,6 +10,17 @@ rules:
     remain authoritative. A dirty worktree or later HEAD requires rechecking affected entries.
 
 documents:
+  - path: docs/refactor/target-execution-and-standalone-cutover-20261121.md
+    scope: replacement/target-execution-and-standalone-cutover
+    status: CURRENT
+    verified_at_sha: WORKTREE
+    evidence:
+      design: USER_DIRECTED_REVIEWED
+      source: IMPLEMENTED_CANDIDATE
+      tests: NOT_RUN
+      product_acceptance: NOT_RUN
+    notes: Target ownership, pending/UNKNOWN accounting, temporary-boot boundary and phased single-core cutover contract.
+
   - path: docs/refactor/runtime-workbench-current-20261120.md
     scope: standalone/workbench-current-overview
     status: CURRENT

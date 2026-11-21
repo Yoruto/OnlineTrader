@@ -57,18 +57,28 @@ class DsvSdkAdapter:
     """
 
     def __init__(self, api, account, *, account_key, profile, calendar, sdk_version, clock=None, _connection=None,
-                 _legacy_native_orders=None, continuity=None, reference=None):
+                 _legacy_native_orders=None, continuity=None, reference=None, owner_mode='REPLACEMENT'):
         if sdk_version != SDK_VERSION or not isinstance(profile, DsvProfile) or not isinstance(calendar, TradingCalendar):
             raise TraderError('E_DSV_SDK_SCOPE', 'Expected the pinned SDK, normalized profile and explicit calendar')
         identifier(account_key)
         grant = None if _connection is None else getattr(_connection, 'grant', None)
+        standalone = owner_mode == 'STANDALONE'
+        standalone_schema = None if grant is None else grant.value.get('schema_version')
+        standalone_scope = standalone_schema in {'KQ_DSV_DESKTOP/1', 'SIMNOW_DSV_DESKTOP/1'} or (
+            standalone_schema == 'SIMNOW_DSV_SIM/1'
+            and str(grant.value.get('authorization_reference', '')).startswith('AUTO:'))
+        if owner_mode not in {'REPLACEMENT', 'STANDALONE'}:
+            raise TraderError('E_DSV_SDK_SCOPE', 'Expected an explicit DSV owner mode')
         if account is None or (_connection is None and not account_key.startswith('DEV:')) or (
-                _connection is not None and (type(grant) is not DsvSimulationGrant or not grant.replacement
+                _connection is not None and (type(grant) is not DsvSimulationGrant
+                or (grant.replacement == standalone)
+                or standalone and not standalone_scope
                 or grant.account_key != account_key or _connection.api is not api or _connection.account is not account
                 or not _connection.broker_connected or _connection.read_only)):
             raise TraderError('E_DSV_SDK_SCOPE', 'Expected an explicitly bound SDK account and connection')
         self.api, self.account, self.account_key = api, account, account_key
         self.grant, self.connection = grant, _connection
+        self.owner_mode = owner_mode
         self.provider = 'OFFLINE' if grant is None else grant.provider
         self.profile, self.calendar = profile, calendar
         self.contracts = tuple(row['code'] for row in profile.to_record()['settings']['symbols'])
@@ -103,8 +113,9 @@ class DsvSdkAdapter:
         self.quotes = {code: api.get_quote(code) for code in self.contracts}
         self.minutes = {code: api.get_kline_serial(code, 60, data_length=500) for code in self.contracts}
 
-    def matches_online_scope(self, account, provider):
-        return self.grant is not None and (account, provider) == (self.account_key, self.provider)
+    def matches_online_scope(self, account, provider, *, owner_mode='REPLACEMENT'):
+        return (self.grant is not None and self.owner_mode == owner_mode
+                and (account, provider) == (self.account_key, self.provider))
 
     def check_start(self, state):
         sample = self._clock_sample()
@@ -660,7 +671,11 @@ class DsvSdkAdapter:
         value = self.grant.value
         if state.get('scope_expired_at') or not self.opening_window(state['trading_day'], now):
             return 'SCOPE_OPENING_WINDOW_CLOSED'
-        if state.get('sdk_scope_targets', 0) >= value['opening_attempts']:
+        if self.grant.daily_targets_per_contract is not None:
+            used = state['symbols'][market['contract_id']]['target_count']
+            if used >= self.grant.daily_targets_per_contract:
+                return 'SCOPE_TARGET_LIMIT'
+        elif state.get('sdk_scope_targets', 0) >= value['opening_attempts']:
             return 'SCOPE_TARGET_LIMIT'
         price = market['tick']['last']
         multiplier = market.get('multiplier')

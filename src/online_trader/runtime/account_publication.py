@@ -29,16 +29,17 @@ class AccountPublication:
         self._projector.start()
         self._thread.start()
 
-    def capture(self, kernel):
+    def capture(self, owner):
         """Offer one native value without queuing or waiting on the read worker."""
         try:
-            snapshot = self._native_snapshot(kernel)
+            snapshot = self._native_snapshot(owner)
             if snapshot is None:
                 self._sample = ('E_ACCOUNT_SYNC', None)
             else:
                 stamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
                 observed = {'observed_ns': str(time.monotonic_ns()), 'observed_at_utc': stamp,
-                            'kernel_boot_id': kernel.boot_id, 'checkpoint_event_seq': str(kernel._durable_seq)}
+                            'kernel_boot_id': owner.boot_id,
+                            'checkpoint_event_seq': self._checkpoint(owner)}
                 self._sample = (None, (snapshot, observed))
             return snapshot
         except Exception:
@@ -48,14 +49,22 @@ class AccountPublication:
             self._ready.set()
 
     @staticmethod
-    def _native_snapshot(kernel):
-        port = kernel.port
-        if kernel.simulation is None or not getattr(port, 'broker_connected', False) or port.fault:
+    def _checkpoint(owner):
+        if getattr(owner, 'runtime_protocol', None) == 'DSV_TARGET/1':
+            return str(max(1, int(owner.snapshot().get('sequence') or 0)))
+        return str(owner._durable_seq)
+
+    @staticmethod
+    def _native_snapshot(owner):
+        if getattr(owner, 'runtime_protocol', None) == 'DSV_TARGET/1':
+            return owner.native_account_snapshot()
+        port = owner.port
+        if owner.simulation is None or not getattr(port, 'broker_connected', False) or port.fault:
             return None
         snapshot = port.snapshot()
         if not snapshot['complete'] or snapshot['trading_day'] is None or snapshot['funds'].get('balance') is None:
             return None
-        kernel.simulation._validate_snapshot(snapshot)
+        owner.simulation._validate_snapshot(snapshot)
         return snapshot
 
     def _apply(self, sample):

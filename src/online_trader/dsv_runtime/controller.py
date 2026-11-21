@@ -11,6 +11,7 @@ from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text, quantity
 from online_trader.dsv_core.price_rules import strategy_price
 from online_trader.dsv_core.transition import entry_price, price_value
+from online_trader.dsv_runtime.target_execution import account_target
 from online_trader.errors import TraderError, exception_record
 from online_trader.execution.close_routes import close_routes, replay_lots
 
@@ -45,10 +46,14 @@ def terminal(order):
 
 
 def tighten_target(position, remaining, *, new_request=False):
+    # Strategy/schedule target changes supersede a prior Workbench-only price
+    # preference. Manual commands set a fresh preference after tightening.
+    position.pop('manual_close_mode', None)
     previous = position['exit_target']
     target = remaining if previous is None else min(previous, remaining)
     if target != previous or new_request:
         position['exit_revision'] = position.get('exit_revision', 0) + 1
+        position['target_revision'] = position.get('target_revision', 1) + 1
     position.update(exit_target=target, entry_stopped=True)
 
 
@@ -265,7 +270,8 @@ class ExplicitOrderController:
         position['fills'].append({'event_seq': len(position['fills']) + 1, 'contract_id': order['contract_id'],
                                   'direction': position['direction'],
                                   'trade_key': [order['native_trading_day'], fact['native_order_id'], fact['native_trade_id']],
-                                  'trading_day': fill_day, 'quantity': fact['quantity'], 'effect': order['effect'],
+                                  'trading_day': fill_day, 'quantity': fact['quantity'], 'price': fact['price'],
+                                  'effect': order['effect'],
                                   'offset_kind': order['native_offset']})
 
     def _record_detached_late_open(self, state, row, current, order, qty, fact, fill_day):
@@ -480,6 +486,12 @@ class ExplicitOrderController:
             reference = position['theory'] if mode == 'PASSIVE' else position['cap']
         else:
             direction = 'SHORT' if direction == 'LONG' else 'LONG'
+            manual = position.get('manual_close_mode')
+            if manual is not None:
+                buy = direction == 'LONG'
+                field = ('last' if manual == '最新价'
+                         else 'bid1' if (manual == '排队价') == buy else 'ask1')
+                return legal_price(tick, tick.get(field))
             mode = market.get('close_price_mode', position.get('close_mode'))
             if mode in {'AGGR1', 'MARKET'}:
                 buy = direction == 'LONG'
@@ -497,13 +509,67 @@ class ExplicitOrderController:
             mode, reference = 'ACTIVE', None
         return legal_price(tick, entry_price(tick, direction, mode, None if reference is None else float(reference)))
 
-    @staticmethod
-    def _needed(position, effect):
+    def target_accounting(self, state, position, effect):
+        """Return the single quantity projection used by maintenance and pricing."""
+        orders = self.child_orders(state, position, effect)
         if effect == 'OPEN':
-            if position.get('preserve_open_on_stop') and position['exit_target'] is None:
-                return None
-            return 0 if position['entry_stopped'] else position['quantity'] - position['entry_filled']
-        return 0 if position['exit_target'] is None else position['owned'] - position['exit_target']
+            target = position['entry_filled'] if position['entry_stopped'] else position['quantity']
+            confirmed = position['entry_filled']
+        else:
+            confirmed = 0
+            target = 0 if position['exit_target'] is None else position['owned'] - position['exit_target']
+        return account_target(confirmed_qty=confirmed, target_qty=target,
+                              orders=orders, terminal=terminal)
+
+    def target_projection(self, state, row):
+        """Build the read-only execution projection consumed by Runtime views."""
+        position = row.get('position')
+        if position is None:
+            return None
+        opening = self.target_accounting(state, position, 'OPEN')
+        reducing = self.target_accounting(state, position, 'REDUCE')
+        uncertain = opening.uncertain_children + reducing.uncertain_children
+        cancelling = opening.cancel_pending_children + reducing.cancel_pending_children
+        if row.get('native_conflicts') or row.get('detached_positions'):
+            status, reason = 'BLOCKED', 'BROKER_FACTS_INCOMPLETE'
+        elif uncertain:
+            status, reason = 'RECONCILING', 'SEND_RESULT_UNKNOWN'
+        elif cancelling:
+            status = 'CANCELLING'
+            reason = (position.get('execution_reason')
+                      if position.get('execution_reason') == 'PRICE_REPRICE_REQUIRED'
+                      else 'CANCEL_PENDING')
+        elif opening.excess_pending_qty or reducing.excess_pending_qty:
+            status, reason = 'CANCELLING', 'TARGET_REDUCED'
+        elif opening.pending_qty or reducing.pending_qty:
+            status, reason = 'WORKING', 'WORKING_ORDER_COVERS_TARGET'
+        elif opening.needed_qty or reducing.needed_qty:
+            reason = position.get('execution_reason') or 'TARGET_GAP'
+            status = 'BLOCKED' if reason in {'POSITION_CHANGED', 'NO_LEGAL_PRICE'} else 'READY'
+        else:
+            status, reason = 'DONE', 'TARGET_ALREADY_COVERED'
+        target_owned = position['exit_target']
+        if target_owned is None:
+            target_owned = position['entry_filled'] if position['entry_stopped'] else position['quantity']
+        return {
+            'target_id': position.get('target_id', position['id']),
+            'target_revision': position.get('target_revision', 1),
+            'position_id': position['id'],
+            'contract_id': position['contract_id'],
+            'direction': position['direction'],
+            'target_owned_qty': target_owned,
+            'confirmed_owned_qty': position['owned'],
+            'open_pending_qty': opening.pending_qty,
+            'reduce_pending_qty': reducing.pending_qty,
+            'open_needed_qty': opening.needed_qty,
+            'reduce_needed_qty': reducing.needed_qty,
+            'uncertain_children': list(uncertain),
+            'cancel_pending_children': list(cancelling),
+            'status': status,
+            'reason': reason,
+            'decision_reason': position.get('execution_reason'),
+            'exit_revision': position.get('exit_revision', 0),
+        }
 
     def plan_maintenance(self, state, row, market):
         """Cancel provably owned residual orders using identity and quantity alone."""
@@ -533,13 +599,22 @@ class ExplicitOrderController:
             return [request for order in children if not order.get('terminal_conflict')
                     and (request := self.cancel(order, 'TARGET_REDUCED'))], False
         effects = []
-        for order in children:
-            if terminal(order):
+        for effect in ('OPEN', 'REDUCE'):
+            accounting = self.target_accounting(state, position, effect)
+            excess = accounting.excess_pending_qty
+            if not excess:
                 continue
-            needed = self._needed(position, order['effect'])
-            if needed is not None and order['original_qty'] - order['filled_qty'] > max(0, needed):
+            # A cancellation does not release capacity. Cancel newest children
+            # first and let later native facts drive a fresh calculation.
+            for order in reversed(self.child_orders(state, position, effect)):
+                if terminal(order):
+                    continue
                 if request := self.cancel(order, 'TARGET_REDUCED'):
                     effects.append(request)
+                    position['execution_reason'] = 'TARGET_REDUCED'
+                excess -= max(0, order['original_qty'] - order['filled_qty'])
+                if excess <= 0:
+                    break
         return effects, True
 
     def plan_priced_effects(self, state, row, market, wall_time):
@@ -551,27 +626,42 @@ class ExplicitOrderController:
         for effect in ('OPEN', 'REDUCE'):
             previous = self.child_orders(state, position, effect)
             outstanding = [order for order in previous if not terminal(order)]
-            needed = self._needed(position, effect)
-            if needed is None or needed <= 0:
-                continue
+            accounting = self.target_accounting(state, position, effect)
+            needed = accounting.needed_qty
             opening = effect == 'OPEN'
             desired = self._desired(position, market, effect, wall_time)
+            repricing = False
             if proven_position and desired is not None:
                 for order in outstanding:
                     pending = order['original_qty'] - order['filled_qty']
                     current = Decimal(order['limit_price'])
                     proposed = Decimal(desired)
                     worse = proposed > current if order['direction'] == 'BUY' else proposed < current
-                    if worse and 0 < pending <= needed and (request := self.cancel(order, 'REPRICE')):
+                    # ``needed`` already subtracts all non-terminal children.  A
+                    # fully covered target therefore has needed == 0, but its
+                    # working child must still be cancelled when the strategy
+                    # price moves against that order.  Compare the child with
+                    # the target gap before pending quantity is applied.
+                    target_gap = max(0, accounting.target_qty - accounting.confirmed_qty)
+                    if worse and 0 < pending <= target_gap and (request := self.cancel(order, 'REPRICE')):
                         effects.append(request)
-            if not proven_position or outstanding or desired is None:
+                        repricing = True
+                        position['execution_reason'] = 'PRICE_REPRICE_REQUIRED'
+            if not proven_position:
+                position['execution_reason'] = 'POSITION_CHANGED'
+            elif desired is None:
+                position['execution_reason'] = 'NO_LEGAL_PRICE'
+            if (not proven_position or desired is None or accounting.cancel_pending_children
+                    or accounting.uncertain_children or repricing):
+                continue
+            if needed <= 0:
                 continue
             maximum = market.get('max_order_qty', 2_147_483_647)
             if opening and not market.get('min_order_qty', 1) <= needed <= maximum:
                 position['entry_stopped'] = True
                 continue
             # Reconciliation proves completion independently of the result of the cancel call.
-            if previous and previous[-1]['filled_qty'] < previous[-1]['original_qty']:
+            if previous and not outstanding and previous[-1]['filled_qty'] < previous[-1]['original_qty']:
                 old = previous[-1]
                 allowed_retry = old['cancel_reason'] in {'REPRICE', 'TARGET_REDUCED'}
                 rolled_exit = not opening and old['native_trading_day'] != state['trading_day']
@@ -587,12 +677,21 @@ class ExplicitOrderController:
                 routes = self._reduction_routes(state, position, market, needed)
                 if routes:
                     route = routes[0]
+                    previous_offsets = {order['native_offset'] for order in previous}
+                    if previous_offsets and route['native_offset'] not in previous_offsets:
+                        position['execution_reason'] = 'OFFSET_ROUTE_CHANGED'
                     effects.append(self.new_order(state, position, market, effect,
                                                   min(route['quantity'], maximum), desired, route['native_offset']))
         return effects
 
     def plan(self, state, row, market, wall_time):
+        if row.get('position') is not None:
+            row['position'].pop('execution_reason', None)
         maintenance, can_price = self.plan_maintenance(state, row, market)
+        if (can_price and market.get('tick') is None
+                and any(self.target_accounting(state, row['position'], effect).needed_qty
+                        for effect in ('OPEN', 'REDUCE'))):
+            row['position']['execution_reason'] = 'NO_LEGAL_PRICE'
         if can_price and market.get('tick') is not None and market.get('allow_new_order', True):
             maintenance.extend(self.plan_priced_effects(state, row, market, wall_time))
         if can_price and not row.get('detached_positions'):
