@@ -33,7 +33,7 @@ MAX_REQUEST_BYTES = 1024 * 1024
 # Cold-cutover selection is version-owned and intentionally not configurable
 # by an operator or startup request.  Independent acceptance changes this one
 # constant in the release candidate; a Runtime never hosts both cores.
-_STANDALONE_EXECUTION_CORE = 'LEGACY_KERNEL'
+_STANDALONE_EXECUTION_CORE = 'DSV_TARGET'
 _REQUEST_KEYS = {'schema_version', 'request_id', 'created_at_utc', 'expires_at_utc',
     'account_store', 'account_id', 'account_key', 'provider', 'profile', 'profile_hash',
     'arm', 'confirmed'}

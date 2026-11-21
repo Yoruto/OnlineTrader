@@ -687,10 +687,6 @@ class OnlineDsvTests(unittest.TestCase):
         self.assertEqual(workbench_view(self.kernel)['account_metrics']['opening_orders'], 1)
         self.assertEqual(self.kernel.simulation.opening_attempt_count(), 1)
 
-    @unittest.skip('CURRENT Standalone needs a fresh temporary ledger plus broker resynchronization fixture; old-ledger new-scope inheritance is retired')
-    def test_new_runtime_boot_rebuilds_daily_target_from_broker_facts(self):
-        pass
-
     def test_desktop_target_quota_retains_partial_order_during_unknown_cancel(self):
         from online_trader.kernel.workbench import workbench_view
 

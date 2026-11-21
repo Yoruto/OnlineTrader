@@ -1,15 +1,15 @@
 # Target Execution 与 Standalone 单核心接管合同
 
-> 状态：`CURRENT DESIGN / IMPLEMENTED CANDIDATE`
+> 状态：`CURRENT DESIGN / OFFLINE-ACCEPTED COLD-SWITCH CANDIDATE`
 > 日期：2026-11-21
 > 适用范围：DSV Replacement 的目标执行、Standalone Trading Runtime 的后续接管。
-> 验证状态：源码实现候选；功能、回放、柜台、GUI、打包均 `NOT_RUN`。
+> 验证状态：离线受影响范围 37/37、冷切换定向 138/138、冷切换后完整回归 1919/1919 通过；真实柜台、多机与制品验收未执行。
 
 ## 1. 决策
 
 OnlineTrader 不新增独立 Reconciler、OMS、事件总线或第二个交易服务。DSV Strategy 产生版本化业务目标，`ExplicitOrderController` 同时拥有目标数量核算、child order 状态机、撤改单、UNKNOWN 占量、平今平昨路由和 commit-before-send。柜台提供持仓、委托和成交事实；每次事实或目标变化后重新计算。
 
-最终生产形态只有一个 Standalone Runtime Owner、一个 DSV Strategy、一个 `ExplicitOrderController`、一个 SDK sender 和一套 Workbench。当前 Legacy Kernel 在完成冷切换前仍是独立维护路径，不与 Replacement 同时控制同一账户。
+最终生产形态只有一个 Standalone Runtime Owner、一个 DSV Strategy、一个 `ExplicitOrderController`、一个 SDK sender 和一套 Workbench。Standalone 默认入口已冷切换到 Target Owner；Legacy Kernel 仅保留为显式维护路径，不与 Target/Replacement 同时控制同一账户。
 
 ## 2. 状态权威和生命周期
 
@@ -122,6 +122,7 @@ Broker Fact Frame
 - 人工减仓保留工作台选择的对手价/排队价/最新价，并校验单周期、批量持仓数量和所选 child 范围；策略产生的新退出目标会覆盖此前人工价格偏好；
 - 账户页从同一 Owner 的只读原生快照发布，可重建 history cache 由有界异步 writer 写入且不参与执行决策；
 - `FLATTEN_THEN_STOP` 只有在自有仓位、未终态 child 与分配冲突全部清空后才结束 Owner，并发布 `STOPPED` 证据；
-- 目标 Owner 已接入版本固定的内部冷切换点，但当前常量仍选择 `LEGACY_KERNEL`，不向用户暴露双内核开关；自动 offset 也保持发送前计算合同；
-- 现有桌面生产入口尚未切换到目标 Owner；独立测试、冷切换、发行隔离和旧 Kernel 退役仍未完成；
-- 当前仅完成编译检查，所有行为验收保持 `NOT_RUN`。
+- 目标 Owner 已通过版本固定的内部冷切换点成为 Standalone 默认核心；不向用户暴露双内核开关，回退仍以完整已知版本进行；自动 offset 保持发送前计算合同；
+- 离线公共 Runtime/pipe 夹具已覆盖完整/不完整基线、命令绑定与幂等、未归属柜台持仓、flatten-stop、history cache 故障、容量边界和 fresh boot 临时 Journal；受影响离线范围 37/37 通过；
+- 冷切换后定向回归 138/138 通过；默认 Standalone bootstrap 探针确认 Target Owner 1 次、Legacy Owner 0 次，并使用 fresh Journal；完整源码回归 1919/1919 通过，无 FAIL、SKIP 或 NOT_RUN；
+- 真实柜台、多物理机同账号、自然订单和最终制品仍未验证；发行隔离和旧 Kernel 生产依赖闭包退役尚未完成。
