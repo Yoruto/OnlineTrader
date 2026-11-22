@@ -436,6 +436,7 @@
       "cases": [
         "CycleBucketAllocationTests.test_combined_close_cannot_spend_another_cycles_today_lots",
         "CycleBucketAllocationTests.test_combined_close_consumes_native_today_before_historical_not_cost_fifo",
+        "CycleBucketAllocationTests.test_combined_close_historical_first_deducts_historical_and_protects_other_cycles_historical_lots",
         "CycleBucketAllocationTests.test_fill_cannot_close_another_cycles_lots",
         "CycleBucketAllocationTests.test_other_cycle_pending_does_not_reduce_the_selected_cycles_target",
         "CycleBucketAllocationTests.test_reduction_cannot_consume_a_later_open_even_on_combined_exchange",
@@ -4025,6 +4026,7 @@
         "DispatcherTests.test_pending_arm_ack_cannot_leak_into_snapshot_or_heartbeat_progress",
         "DispatcherTests.test_registered_shadow_pid_cannot_claim_desktop_even_with_changed_instance",
         "DispatcherTests.test_server_created_after_commits_does_not_replay_older_view",
+        "DispatcherTests.test_service_inbound_unexpected_python_error_closes_peer_and_invariant_fails_closed",
         "DispatcherTests.test_shutdown_drain_is_bounded_for_an_unresponsive_reader",
         "DispatcherTests.test_shutdown_waits_for_an_accepted_command_receipt_before_closing_pipe",
         "DispatcherTests.test_slow_reader_output_overflow_closes_only_that_peer",
@@ -4700,7 +4702,12 @@
         "TargetOwnerRuntimeTests.test_flatten_then_stop_waits_for_original_child_terminal_fact",
         "TargetOwnerRuntimeTests.test_history_cache_failure_does_not_change_target_authority",
         "TargetOwnerRuntimeTests.test_incomplete_baseline_stays_disarmed_then_complete_frame_enables_controls",
+        "TargetOwnerRuntimeTests.test_manual_close_all_requires_and_verifies_per_cycle_target_revisions",
+        "TargetOwnerRuntimeTests.test_manual_close_requires_and_verifies_expected_target_revision",
+        "TargetOwnerRuntimeTests.test_market_break_retains_current_trading_day_until_next_session_is_active",
         "TargetOwnerRuntimeTests.test_new_boot_uses_a_new_ledger_and_does_not_inherit_runtime_commands",
+        "TargetOwnerRuntimeTests.test_owner_tick_error_classification_and_persistent_disarm_blocks_auto_recovery",
+        "TargetOwnerRuntimeTests.test_process_runtime_harness_lifecycle_and_public_pipe_control",
         "TargetOwnerRuntimeTests.test_projection_has_one_rule_set_two_policies_and_bounded_capabilities",
         "TargetOwnerRuntimeTests.test_public_pipe_command_is_bound_idempotent_and_conflicting_content_is_rejected",
         "TargetOwnerRuntimeTests.test_public_pipe_rejects_wrong_account_boot_and_configuration_bindings",
@@ -4727,7 +4734,32 @@
             "Windows"
           ]
         },
+        "TargetOwnerRuntimeTests.test_manual_close_all_requires_and_verifies_per_cycle_target_revisions": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "TargetOwnerRuntimeTests.test_manual_close_requires_and_verifies_expected_target_revision": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "TargetOwnerRuntimeTests.test_market_break_retains_current_trading_day_until_next_session_is_active": {
+          "platform": [
+            "Windows"
+          ]
+        },
         "TargetOwnerRuntimeTests.test_new_boot_uses_a_new_ledger_and_does_not_inherit_runtime_commands": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "TargetOwnerRuntimeTests.test_owner_tick_error_classification_and_persistent_disarm_blocks_auto_recovery": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "TargetOwnerRuntimeTests.test_process_runtime_harness_lifecycle_and_public_pipe_control": {
           "platform": [
             "Windows"
           ]
@@ -5046,6 +5078,7 @@
       "timeout_seconds": 120,
       "cases": [
         "WorkbenchSoundTests.test_margin_reference_uses_source_threshold_grace_and_reset",
+        "WorkbenchSoundTests.test_new_trade_sounds_once_even_when_projection_checkpoint_leads_trade_event_seq",
         "WorkbenchSoundTests.test_open_close_and_error_events_only_sound_once",
         "WorkbenchSoundTests.test_switches_persist_and_test_button_plays_dsv_tone_while_muted",
         "WorkbenchSoundTests.test_unfilled_terminal_reduction_warns_once_per_active_cycle"

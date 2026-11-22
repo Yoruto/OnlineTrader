@@ -61,12 +61,14 @@ def replay_lots(contract_id,direction,current_day,fills,*,require_allocations,hi
     return lots
 
 
-def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_quantity,position_cycle_id=None,allow_external=False):
+def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_quantity,position_cycle_id=None,allow_external=False,historical_first_on_combined=False):
     """Allocate the remaining exit across proved lots and existing reservations."""
     quantity(target_quantity)
     separated=contract_id.split('.')[0] in {'SHFE','INE'}
     if type(orders) is not list:raise TraderError('E_FACT_BARRIER','Explicit original order facts are required')
-    lots=replay_lots(contract_id,direction,current_day,fills,require_allocations=position_cycle_id is not None)
+    effective_historical_first=bool(historical_first_on_combined)
+    lots=replay_lots(contract_id,direction,current_day,fills,require_allocations=position_cycle_id is not None,
+                     historical_first_on_combined=effective_historical_first)
     today=sum(l['quantity'] for l in lots if l['day']==current_day and not l['already_historical'])
     historical=sum(l['quantity'] for l in lots)-today
     if (type(native) is not dict or set(native)!={'today','historical','total'} or
@@ -74,14 +76,17 @@ def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_
             native['today']+native['historical']!=native['total']):
         raise TraderError('E_OWNERSHIP','Native today/historical quantities do not exactly match original owned fills')
     if not separated and native!={'today':today,'historical':historical,'total':today+historical}:
-        his_lots=replay_lots(contract_id,direction,current_day,fills,
+        alt_historical_first=not effective_historical_first
+        alt_lots=replay_lots(contract_id,direction,current_day,fills,
                              require_allocations=position_cycle_id is not None,
-                             historical_first_on_combined=True)
-        his_today=sum(l['quantity'] for l in his_lots if l['day']==current_day and not l['already_historical'])
-        his_historical=sum(l['quantity'] for l in his_lots)-his_today
-        if (native=={'today':his_today,'historical':his_historical,'total':his_today+his_historical}
-                or (allow_external and native['today']>=his_today and native['historical']>=his_historical)):
-            lots,today,historical=his_lots,his_today,his_historical
+                             historical_first_on_combined=alt_historical_first)
+        alt_today=sum(l['quantity'] for l in alt_lots if l['day']==current_day and not l['already_historical'])
+        alt_historical=sum(l['quantity'] for l in alt_lots)-alt_today
+        if (native=={'today':alt_today,'historical':alt_historical,'total':alt_today+alt_historical}
+                or (allow_external and native['today']>=alt_today and native['historical']>=alt_historical
+                    and not (native['today']>=today and native['historical']>=historical))):
+            lots,today,historical=alt_lots,alt_today,alt_historical
+            effective_historical_first=alt_historical_first
     if allow_external:
         if separated and (native['today']<today or native['historical']<historical):
             raise TraderError('E_OWNERSHIP','Native split buckets cannot cover original owned fills')
@@ -122,12 +127,21 @@ def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_
                 max(0,today+historical-sum(reserved.values())))
     reasons=[]
     if target_quantity and not uncovered:reasons.append('TARGET_COVERED_BY_PENDING')
-    if not separated and selected_lots['today']<today:
-        # CLOSE cannot select historical lots while another cycle still owns
-        # today's lots. Pending orders are not proof those lots have closed.
-        safe=max(0,selected_lots['today']-selected_reserved['combined'])
-        if desired>safe:reasons.append('COMBINED_CLOSE_WOULD_SPEND_OTHER_CYCLE_TODAY')
-        desired=min(desired,safe)
+    if not separated:
+        if effective_historical_first:
+            if selected_lots['historical']<historical:
+                # Under historical-first combined CLOSE (DCE/CZCE/CFFEX/GFEX and
+                # TqSdk trade_future.py), CLOSE deducts historical lots before
+                # today's lots and cannot spend another cycle's historical lots.
+                safe=max(0,selected_lots['historical']-selected_reserved['combined'])
+                if desired>safe:reasons.append('COMBINED_CLOSE_WOULD_SPEND_OTHER_CYCLE_HISTORICAL')
+                desired=min(desired,safe)
+        elif selected_lots['today']<today:
+            # CLOSE cannot select historical lots while another cycle still owns
+            # today's lots. Pending orders are not proof those lots have closed.
+            safe=max(0,selected_lots['today']-selected_reserved['combined'])
+            if desired>safe:reasons.append('COMBINED_CLOSE_WOULD_SPEND_OTHER_CYCLE_TODAY')
+            desired=min(desired,safe)
     routes=[]
     if separated:
         # DSV does not override the pinned SDK's "今昨,开" offset priority.

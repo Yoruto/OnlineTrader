@@ -15,6 +15,60 @@ from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.simnow import strategy_port
 from online_trader.kernel.server import ControlServer
 from online_trader.runtime.account_cache import BrokerHistoryWriter
+from online_trader.scheduling.clock import utc_text
+
+
+_TRANSIENT_TICK_CODES = frozenset({
+    'E_DSV_SDK_SYNC', 'E_DSV_SYNC', 'E_GATEWAY_CONNECT', 'E_GATEWAY_SYNC',
+    'E_TIMEOUT', 'E_PIPE_TIMEOUT',
+})
+_PERSISTENT_DISARM_CODES = frozenset({
+    'E_DSV_NATIVE_FACT', 'E_DSV_NATIVE_ID', 'E_DSV_SDK_FACT', 'E_DSV_OWNERSHIP',
+    'E_DSV_SCOPE', 'E_DSV_SDK_SCOPE', 'E_DSV_ROUND', 'E_DSV_ROUND_SEQUENCE',
+    'E_DSV_TIME_VERSION', 'E_DSV_SDK_CLOCK', 'E_DSV_NIGHT_BOUNDARY', 'E_CLOCK_INPUT',
+})
+
+
+def resolve_active_trading_day(calendar, contracts, current_day, now=None, *, clock=None):
+    """Advance the cabinet day only when all scoped contracts are in an active session."""
+    if calendar is None or not contracts:
+        return current_day
+    if now is None and clock is not None:
+        capture = getattr(clock, 'capture_live', None) or getattr(clock, 'capture', None)
+        sample = capture() if callable(capture) else None
+        now_utc = getattr(sample, 'now_utc', None)
+    elif isinstance(now, str):
+        now_utc = now
+    elif now is not None:
+        now_utc = utc_text(now)
+    else:
+        now_utc = None
+    if not now_utc:
+        return current_day
+    windows = [calendar.query(code, now_utc) for code in contracts]
+    if all(window.get('complete') and window.get('is_trading') and window.get('session') for window in windows):
+        active_days = {window['session'].get('trading_day') for window in windows}
+        if len(active_days) == 1:
+            candidate = next(iter(active_days))
+            if candidate and (not current_day or candidate >= current_day):
+                return candidate
+    return current_day
+
+
+def classify_owner_tick_error(error, *, storage_failed=False):
+    """Classify an owner tick error into TRANSIENT_DISCONNECT, PERSISTENT_DISARM, or FAIL_STOP."""
+    if storage_failed:
+        return 'FAIL_STOP'
+    if isinstance(error, OSError):
+        return 'TRANSIENT_DISCONNECT'
+    if isinstance(error, TraderError):
+        if error.code in {'E_DSV_STORE', 'E_DSV_OWNER', 'E_DSV_SDK_OWNER', 'E_STORAGE'}:
+            return 'FAIL_STOP'
+        if error.code in _TRANSIENT_TICK_CODES:
+            return 'TRANSIENT_DISCONNECT'
+        if error.code in _PERSISTENT_DISARM_CODES:
+            return 'PERSISTENT_DISARM'
+    return 'FAIL_STOP'
 
 
 def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
@@ -74,17 +128,10 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
 
         contracts = tuple(grant.value.get('contracts', ()))
 
-        def current_trading_day():
-            if calendar is not None and clock is not None and contracts:
-                capture = getattr(clock, 'capture_live', None) or getattr(clock, 'capture', None)
-                sample = capture() if callable(capture) else None
-                now_utc = getattr(sample, 'now_utc', None)
-                if now_utc:
-                    window = calendar.query(contracts[0], now_utc)
-                    session = window.get('session') or window.get('next_session')
-                    if window.get('complete') and session and session.get('trading_day'):
-                        return session['trading_day']
-            return owner.snapshot().get('trading_day') or grant.value['trading_day']
+        def current_trading_day(current_day=None, now=None):
+            base_day = current_day or owner.snapshot().get('trading_day') or grant.value['trading_day']
+            return resolve_active_trading_day(
+                calendar, contracts, base_day, now, clock=clock)
 
         def is_complete():
             return bool(connection.broker_connected and connection.complete())
@@ -92,9 +139,9 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
         def tick():
             nonlocal last_status, last_history_capture, initial_start_pending
             try:
-                receipt = owner.step(trading_day=current_trading_day(), complete=is_complete)
+                receipt = owner.step(trading_day=current_trading_day, complete=is_complete)
                 state = owner.snapshot()
-                if initial_start_pending and state['synchronized']:
+                if initial_start_pending and state['synchronized'] and not state.get('owner_fault_code'):
                     owner.start_confirmed()
                     initial_start_pending = False
                     state = owner.snapshot()
@@ -104,21 +151,48 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                     if snapshot is not None:
                         history_writer.offer(snapshot)
                     last_history_capture = now
-            except (TraderError, OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
-                if getattr(owner.session, '_failed', False):
+            except Exception as error:
+                category = classify_owner_tick_error(
+                    error, storage_failed=bool(getattr(owner.session, '_failed', False)))
+                if category == 'FAIL_STOP':
                     raise
+                initial_start_pending = False
+                code = getattr(error, 'code', 'E_DSV_SDK_RUNTIME')
+                disarm = category == 'PERSISTENT_DISARM'
+                owner.disconnect_for_error(
+                    'PERSISTENT_OWNER_FACT_CONFLICT' if disarm else 'TRANSIENT_OWNER_TICK_ERROR',
+                    disarm=disarm,
+                    fault_code=code if disarm else None,
+                )
+                state = owner.snapshot()
+                authority_effect = ('DISARMED_RECOVERY_REQUIRED' if disarm
+                                    else 'SYNCHRONIZATION_LOST_AUTHORITY_PRESERVED' if state['running']
+                                    else 'SYNCHRONIZATION_LOST_DISARMED')
                 publish_replace_bytes(canonical_bytes({
                     'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
-                    'execution_core': 'DSV_TARGET_EXECUTION', 'authority_effect': 'DISARMED_ON_TRANSIENT_ERROR',
-                    'diagnostic': getattr(error, 'code', 'E_DSV_SDK_RUNTIME'),
+                    'execution_core': 'DSV_TARGET_EXECUTION', 'authority_effect': authority_effect,
+                    'error_category': category,
+                    'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
+                    'diagnostic': code,
                     'exception': exception_record(error),
                 }), diagnostics)
-                owner.session.disconnect('TRANSIENT_OWNER_TICK_ERROR')
+                current = {
+                    'phase': 'NEEDS_REVIEW' if disarm else 'WAITING_FOR_NATIVE_SYNC',
+                    'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
+                }
+                if current != last_status:
+                    publish_replace_bytes(canonical_bytes({
+                        **current,
+                        'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
+                        'execution_core': 'DSV_TARGET_EXECUTION',
+                    }), status)
+                    last_status = current
                 time.sleep(0.1)
                 return
             if receipt is not None:
                 current = {
-                    'phase': 'READY' if state['synchronized'] else 'WAITING_FOR_NATIVE_SYNC',
+                    'phase': ('NEEDS_REVIEW' if state.get('owner_fault_code')
+                              else 'READY' if state['synchronized'] else 'WAITING_FOR_NATIVE_SYNC'),
                     'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
                 }
                 if current == last_status:

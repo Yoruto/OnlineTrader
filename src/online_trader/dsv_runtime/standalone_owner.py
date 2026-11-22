@@ -149,6 +149,13 @@ class StandaloneDsvOwner:
         self._update_stop_ready()
         return receipt
 
+    def disconnect_for_error(self, reason, *, disarm=False, fault_code=None):
+        receipt = self.session.disconnect(reason, disarm=disarm, fault_code=fault_code)
+        self._projection_seq += 1
+        self._commit_views.append(self.snapshot())
+        self._update_stop_ready()
+        return receipt
+
     def poll(self):
         self._update_stop_ready()
         return 0
@@ -163,12 +170,14 @@ class StandaloneDsvOwner:
 
     def _make_snapshot(self):
         state = self.snapshot()
-        revision = str(max(1, int(state.get('sequence') or 0)))
+        revision = str(max(1, int(state.get('projection_seq') or state.get('sequence') or 0)))
+        fault_code = state.get('owner_fault_code')
         return {'account_key': self.account_key, 'kernel_boot_id': self.boot_id,
                 'kernel_epoch': str(self.kernel_epoch), 'durable_seq': revision,
-                'armed': state['running'], 'recovery_required': not state['synchronized'],
+                'armed': state['running'],
+                'recovery_required': not state['synchronized'] or bool(fault_code),
                 'storage_failed': bool(state.get('storage_failed', False)), 'pending_transactions': 0,
-                'revisions': self.revisions, 'errors': [], 'cycles': []}
+                'revisions': self.revisions, 'errors': [fault_code] if fault_code else [], 'cycles': []}
 
     @staticmethod
     def _ready(value):
@@ -207,7 +216,7 @@ class StandaloneDsvOwner:
                                    'config_revision': self.configuration_revision}
         dsv_receipt = self.command(command_body)
         state = self.snapshot()
-        seq = str(max(1, int(state.get('sequence') or 0)))
+        seq = str(max(1, int(state.get('projection_seq') or state.get('sequence') or 0)))
         result = {'command_id': command_id, 'payload_hash': digest, 'status': 'SUCCEEDED',
                   'receipt_revision': '1', 'tx_id': 'target-' + content_hash(command_id)[:40],
                   'event_seq': seq, 'durable_seq': seq, 'state_revision': seq,

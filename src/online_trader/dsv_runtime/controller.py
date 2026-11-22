@@ -447,7 +447,8 @@ class ExplicitOrderController:
     def position_buckets(state, position, contract):
         day = state['trading_day']
         lots = replay_lots(contract, position['direction'], day,
-                           ExplicitOrderController._position_fills(position, contract), require_allocations=False)
+                           ExplicitOrderController._position_fills(position, contract),
+                           require_allocations=False, historical_first_on_combined=True)
         today = sum(lot['quantity'] for lot in lots if lot['day'] == day and not lot['already_historical'])
         return {'today': today, 'historical': sum(lot['quantity'] for lot in lots) - today}
 
@@ -478,7 +479,8 @@ class ExplicitOrderController:
             result = close_routes(contract_id=market['contract_id'], direction=position['direction'], current_day=day,
                                   fills=fills, native={'today': today, 'historical': historical, 'total': today + historical},
                                   orders=pending_orders, target_quantity=target_quantity,
-                                  allow_external=bool(market.get('standalone_external_model')))
+                                  allow_external=bool(market.get('standalone_external_model')),
+                                  historical_first_on_combined=True)
         except TraderError as error:
             if error.code in {'E_OWNERSHIP', 'E_FACT_BARRIER'}:
                 return []
@@ -520,7 +522,7 @@ class ExplicitOrderController:
             native['total'] = native['today'] + native['historical']
             result = close_routes(contract_id=contract, direction=position['direction'], current_day=day, fills=fills,
                                   native=native, orders=[], target_quantity=position['owned'] - target,
-                                  position_cycle_id=position['id'])
+                                  position_cycle_id=position['id'], historical_first_on_combined=True)
             desired = self._desired(position, market, 'REDUCE', wall_time)
             if result['routes'] and desired is not None:
                 route = result['routes'][0]

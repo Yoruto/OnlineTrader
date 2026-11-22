@@ -56,12 +56,31 @@ class WorkbenchSounds:
         self.dingtalk = dingtalk if dingtalk is not None else WorkbenchDingTalk(settings, log=log)
         self.identity = None
         self.checkpoint = -1
+        self.seen_trades = set()
         self.trade_events = set()
         self.strategy_events = set()
         self.strategy_ready = False
         self.error_events = set()
         self.margin_events = set()
         self.request_failed = False
+
+    @staticmethod
+    def _trade_identity(trade):
+        raw_key = trade.get('trade_key')
+        if isinstance(raw_key, (list, tuple)) and raw_key:
+            return ('key', tuple(str(part) for part in raw_key))
+        if isinstance(raw_key, str) and raw_key:
+            return ('key', raw_key)
+        return (
+            'fill',
+            str(trade.get('position_cycle_id') or ''),
+            str(trade.get('child_order_id') or ''),
+            str(trade.get('native_trade_id') or ''),
+            str(trade.get('event_seq') or ''),
+            str(trade.get('effect') or ''),
+            str(trade.get('quantity') or ''),
+            str(trade.get('price') or ''),
+        )
 
     def _emit(self, event, *, contract=None, message=None):
         if not self.settings.value(f'sound/{event}', True, bool):
@@ -112,6 +131,7 @@ class WorkbenchSounds:
         if initial:
             self.identity = identity
             self.checkpoint = -1
+            self.seen_trades.clear()
             self.trade_events.clear()
             self.strategy_events.clear()
             self.strategy_ready = False
@@ -123,9 +143,9 @@ class WorkbenchSounds:
         orders = {order['child_order_id']: order.get('intent_id') for order in view['orders']}
         new_trade_events = {}
         for trade in view['trades']:
-            sequence = trade.get('event_seq')
-            if sequence is None:
-                continue
+            trade_id = self._trade_identity(trade)
+            is_unseen_fill = trade_id not in self.seen_trades
+            self.seen_trades.add(trade_id)
             effect = trade.get('effect')
             if effect == 'OPEN':
                 event = 'open', trade['position_cycle_id']
@@ -137,7 +157,7 @@ class WorkbenchSounds:
                 event = 'close', orders.get(child) or child
             else:
                 continue
-            if event not in self.trade_events and not initial and int(sequence) > self.checkpoint:
+            if event not in self.trade_events and not initial and is_unseen_fill:
                 new_trade_events.setdefault(event, []).append(trade)
         self.trade_events.update(new_trade_events)
         if initial:

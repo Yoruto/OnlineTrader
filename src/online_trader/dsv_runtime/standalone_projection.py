@@ -50,7 +50,8 @@ def projection_batch(snapshot):
     scope = snapshot['scope']
     revision_num = max(1, int(snapshot.get('projection_seq') or snapshot.get('sequence') or 0))
     revision = str(revision_num)
-    ready = snapshot['synchronized'] and not snapshot.get('clock_recovery_required')
+    fault_code = snapshot.get('owner_fault_code')
+    ready = snapshot['synchronized'] and not snapshot.get('clock_recovery_required') and not fault_code
     records = [{
         'record_type': 'ACCOUNT', 'record_id': scope['account_key'], 'record_revision': revision,
         'kernel_state': 'READY' if ready else 'RECONCILING',
@@ -152,18 +153,19 @@ def workbench_positions(snapshot, after=None):
                 or after is not None and position['id'] <= after):
             continue
         rows.append({'position_cycle_id': position['id'], 'contract_id': contract,
-                     'direction': position['direction'], 'remaining_quantity': position['owned']})
+                     'direction': position['direction'], 'remaining_quantity': position['owned'],
+                     'plan_revision': str(position.get('target_revision', 1))})
     rows.sort(key=lambda item: item['position_cycle_id'])
     return {'account_key': snapshot['scope']['account_key'],
             'kernel_boot_id': snapshot['scope']['runtime_boot_id'],
-            'checkpoint_event_seq': str(snapshot.get('sequence') or 0),
+            'checkpoint_event_seq': str(snapshot['sequence']),
             'positions': rows[:64], 'has_more': len(rows) > 64}
 
 
 def workbench_view(snapshot, *, profile, adapter, configuration_revision):
     scope = snapshot['scope']
     boot = scope['runtime_boot_id']
-    revision = str(max(1, int(snapshot.get('sequence') or 0)))
+    revision = str(snapshot['sequence'])
     settings = profile.to_record()['settings']
     symbols = {item['code']: item for item in settings['symbols']}
     markets, cycles, orders, trades, external_positions = [], [], [], [], []
@@ -266,6 +268,7 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
     synchronized = connected and snapshot['synchronized'] and adapter.synchronized
     storage_failed = bool(snapshot.get('storage_failed', False))
     clock_fault = snapshot.get('clock_recovery_required')
+    owner_fault = snapshot.get('owner_fault_code')
     operation_scopes = {
         'ARM_ENTRIES': 'ACCOUNT',
         'PAUSE_NEW_ENTRIES': 'ACCOUNT',
@@ -282,9 +285,10 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
         if storage_failed:
             allowed, reason = False, 'E_STORAGE'
         elif operation == 'ARM_ENTRIES':
-            allowed = synchronized and not snapshot['running'] and not clock_fault
+            allowed = synchronized and not snapshot['running'] and not clock_fault and not owner_fault
             reason = (None if allowed else
                       'CLOCK_FAULT' if clock_fault else
+                      owner_fault if owner_fault else
                       'ALREADY_ARMED' if snapshot['running'] else 'RUNTIME_NOT_READY')
         elif operation in {'PAUSE_NEW_ENTRIES', 'STOP_DSV_STRATEGY', 'REQUEST_RECONCILIATION'}:
             allowed, reason = True, None
@@ -320,6 +324,8 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
         blocks.append({'reason_code': 'BROKER_FACTS_INCOMPLETE', 'active': True})
     if clock_fault:
         blocks.append({'reason_code': 'CLOCK_FAULT', 'active': True})
+    if owner_fault:
+        blocks.append({'reason_code': owner_fault, 'active': True})
     if any(row.get('external_order_block') for row in snapshot['symbols'].values()):
         blocks.append({'reason_code': 'E_FOREIGN_ACTIVE_ORDER', 'active': True})
     result = {
@@ -328,7 +334,8 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
         'entry_authority': 'ARMED' if snapshot['running'] else 'DISARMED',
         'execution_scope': 'ONLINE_SIMULATION', 'configuration': config,
         'connection': {'broker_connected': connected, 'synchronized': synchronized,
-                       'fault': False, 'recovery_required': not synchronized,
+                       'fault': False,
+                       'recovery_required': not synchronized or bool(owner_fault),
                        'storage_failed': storage_failed,
                        'clock_fault': clock_fault,
                        'pending_transactions': 0},

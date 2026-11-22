@@ -116,6 +116,47 @@ class CycleBucketAllocationTests(unittest.TestCase):
             fills=facts,native={'today':2,'historical':3,'total':5},orders=[],target_quantity=3,position_cycle_id='old')
         self.assertEqual(review['routes'],[])
 
+    def test_combined_close_historical_first_deducts_historical_and_protects_other_cycles_historical_lots(self):
+        for code in ('DCE.p2701', 'CZCE.OI701'):
+            with self.subTest(code=code):
+                facts = [
+                    fill('old', '2026-11-09', 3) | {'contract_id': code, 'position_cycle_id': 'old'},
+                    fill('new', '2026-11-10', 2, seq=2) | {'contract_id': code, 'position_cycle_id': 'today'},
+                ]
+                # Under historical_first_on_combined (pinned TqSdk 3.10.4 / DCE / CZCE):
+                # 1) Closing the historical cycle 'old' is safe because CLOSE deducts historical lots first.
+                old_review = close_routes(
+                    contract_id=code, direction='LONG', current_day='2026-11-10',
+                    fills=facts, native={'today': 2, 'historical': 3, 'total': 5},
+                    orders=[], target_quantity=3, position_cycle_id='old',
+                    historical_first_on_combined=True)
+                self.assertEqual(old_review['routes'], [{'native_offset': 'CLOSE', 'quantity': 3}])
+                self.assertEqual(old_review['routing_reasons'], [])
+
+                # 2) Closing the today cycle 'today' while 'old' still holds historical lots
+                # is blocked because CLOSE would spend 'old' cycle's historical lots first.
+                today_review = close_routes(
+                    contract_id=code, direction='LONG', current_day='2026-11-10',
+                    fills=facts, native={'today': 2, 'historical': 3, 'total': 5},
+                    orders=[], target_quantity=2, position_cycle_id='today',
+                    historical_first_on_combined=True)
+                self.assertEqual(today_review['routes'], [])
+                self.assertIn('COMBINED_CLOSE_WOULD_SPEND_OTHER_CYCLE_HISTORICAL', today_review['routing_reasons'])
+
+                # 3) After 2 lots of 'old' close on CLOSE, historical shrinks to 1 and today stays 2.
+                after_partial = facts + [
+                    fill('close-old', '2026-11-10', 2, effect='REDUCE', offset='CLOSE', seq=3)
+                    | {'contract_id': code, 'position_cycle_id': 'old'}
+                ]
+                partial_review = close_routes(
+                    contract_id=code, direction='LONG', current_day='2026-11-10',
+                    fills=after_partial, native={'today': 2, 'historical': 1, 'total': 3},
+                    orders=[], target_quantity=1, position_cycle_id='old',
+                    historical_first_on_combined=True)
+                self.assertEqual(partial_review['owned_today'], 2)
+                self.assertEqual(partial_review['owned_historical'], 1)
+                self.assertEqual(partial_review['routes'], [{'native_offset': 'CLOSE', 'quantity': 1}])
+
 
 class NativeRolloverOwnerTests(unittest.TestCase):
     def setUp(self):

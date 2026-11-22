@@ -84,8 +84,17 @@ def translate_workbench_command(body, snapshot, *, runtime_boot_id, configuratio
             raise TraderError('E_SCOPE', 'Manual close scope differs from its strategy position')
         position = _position(snapshot, position_id)
         current_revision = int(position.get('target_revision', 1))
-        expected_revision = (current_revision if parameters.get('expected_target_revision') is None
-                             else sequence(parameters['expected_target_revision'], positive=True))
+        raw_expected = parameters.get('expected_target_revision')
+        if raw_expected is None:
+            raw_expected = parameters.get('external_takeover_id')
+        if raw_expected is None:
+            raise TraderError('E_SCHEMA', 'Manual close requires expected_target_revision')
+        if isinstance(raw_expected, str) and raw_expected.startswith('target-rev-'):
+            raw_expected = raw_expected.removeprefix('target-rev-')
+        try:
+            expected_revision = sequence(raw_expected, positive=True)
+        except TraderError:
+            raise TraderError('E_REVISION_CONFLICT', 'The strategy position target revision is invalid') from None
         if expected_revision != current_revision:
             raise TraderError('E_REVISION_CONFLICT', 'The strategy position target changed before manual close')
         return common | {'action': 'REDUCE', 'contract_id': position['contract_id'],
@@ -95,13 +104,54 @@ def translate_workbench_command(body, snapshot, *, runtime_boot_id, configuratio
                          'expected_target_revision': expected_revision}
     if operation in {'MANUAL_CLOSE_ALL', 'FLATTEN_THEN_STOP'}:
         _account_scope(scope)
-        current = {row['position']['id']: row['position']['owned'] for row in snapshot['symbols'].values()
-                   if row.get('position') is not None
-                   and (operation == 'FLATTEN_THEN_STOP' or row['position']['owned'])}
-        if operation == 'MANUAL_CLOSE_ALL' and parameters.get('positions') != current:
-            raise TraderError('E_REVISION_CONFLICT', 'Bulk close quantities changed before target submission')
+        current_positions = {row['position']['id']: row['position'] for row in snapshot['symbols'].values()
+                             if row.get('position') is not None
+                             and (operation == 'FLATTEN_THEN_STOP' or row['position']['owned'])}
+        current = {pid: pos['owned'] for pid, pos in current_positions.items()}
+        current_revisions = {pid: int(pos.get('target_revision', 1)) for pid, pos in current_positions.items()}
+        if operation == 'MANUAL_CLOSE_ALL':
+            submitted = parameters.get('positions')
+            if type(submitted) is not dict or not submitted:
+                raise TraderError('E_SCHEMA', 'Bulk close requires a positions map')
+            submitted_qty = {}
+            submitted_rev = {}
+            raw_rev_map = parameters.get('expected_target_revisions')
+            if raw_rev_map is not None and type(raw_rev_map) is not dict:
+                raise TraderError('E_SCHEMA', 'Bulk close expected_target_revisions must be an object')
+            for raw_key, qty in submitted.items():
+                if type(raw_key) is not str:
+                    raise TraderError('E_SCHEMA', 'Bulk close position keys must be strings')
+                if ':rev:' in raw_key:
+                    pid_part, rev_part = raw_key.rsplit(':rev:', 1)
+                    pid = identifier(pid_part)
+                    if pid in submitted_qty:
+                        raise TraderError('E_SCHEMA', 'Duplicate position_cycle_id in bulk close')
+                    try:
+                        submitted_rev[pid] = sequence(rev_part, positive=True)
+                    except TraderError:
+                        raise TraderError('E_REVISION_CONFLICT', 'Bulk close target revision is invalid') from None
+                else:
+                    pid = identifier(raw_key)
+                    if pid in submitted_qty:
+                        raise TraderError('E_SCHEMA', 'Duplicate position_cycle_id in bulk close')
+                submitted_qty[pid] = qty
+            if raw_rev_map is not None:
+                for raw_pid, raw_rev in raw_rev_map.items():
+                    pid = identifier(raw_pid)
+                    try:
+                        rev = sequence(raw_rev, positive=True)
+                    except TraderError:
+                        raise TraderError('E_REVISION_CONFLICT', 'Bulk close target revision is invalid') from None
+                    if pid in submitted_rev and submitted_rev[pid] != rev:
+                        raise TraderError('E_REVISION_CONFLICT', 'Conflicting bulk close target revisions')
+                    submitted_rev[pid] = rev
+            if not submitted_rev or set(submitted_rev) != set(submitted_qty):
+                raise TraderError('E_SCHEMA', 'Bulk close requires expected target revision for every position')
+            if submitted_qty != current or submitted_rev != current_revisions:
+                raise TraderError('E_REVISION_CONFLICT', 'Bulk close quantities or target revisions changed before submission')
         return common | {'action': 'FLATTEN_STOP' if operation == 'FLATTEN_THEN_STOP' else 'REDUCE_ALL',
-                         'position_ids': list(current), 'price_mode': _price_mode(parameters)}
+                         'position_ids': list(current), 'price_mode': _price_mode(parameters),
+                         **(({'expected_target_revisions': current_revisions}) if operation == 'MANUAL_CLOSE_ALL' else {})}
     if operation == 'REQUEST_RECONCILIATION':
         _account_scope(scope)
         if set(parameters) - {'requested_scope', 'position_cycle_id', 'clock_recovery_id'}:

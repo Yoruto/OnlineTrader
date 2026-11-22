@@ -67,7 +67,7 @@ def _initial_symbol():
 
 def initial_state(trading_day, contracts):
     return {'running': False, 'sequence': 0, 'monotonic_ms': None, 'session_id': None,
-            'trading_day': trading_day, 'synchronized': True,
+            'trading_day': trading_day, 'synchronized': True, 'owner_fault_code': None,
             'symbols': {key: _initial_symbol() for key in contracts}, 'orders': {}, 'retired_positions': {}}
 
 
@@ -122,6 +122,7 @@ class DsvSession:
                 self._bind_online_owner()
             self._state.setdefault('trading_day', trading_day)
             self._state.setdefault('synchronized', True)
+            self._state.setdefault('owner_fault_code', None)
             self._state.setdefault('retired_positions', {})
             for row in self._state['symbols'].values():
                 position = row['position']
@@ -258,22 +259,35 @@ class DsvSession:
         if expected is not None and expected != self._state['trading_day']:
             raise TraderError('E_DSV_SCOPE', 'The observed cabinet trading day changed')
 
-    def disconnect(self, reason='FEED_DISCONNECTED'):
+    def disconnect(self, reason='FEED_DISCONNECTED', *, disarm=False, fault_code=None):
         """Keep the last committed owner state; require a fresh complete round before effects."""
         self._check_owner()
         if self._busy:
             raise TraderError('E_DSV_OWNER', 'Do not reenter the account owner from the order port')
         state = copy.deepcopy(self._state)
         self._mark_unsynchronized(state)
+        if disarm:
+            state['running'] = False
+            for row in state['symbols'].values():
+                if position := row['position']:
+                    position.update(entry_stopped=True, preserve_open_on_stop=False)
+        if fault_code is not None:
+            state['owner_fault_code'] = fault_code
         try:
             with self._journal.transaction():
-                self._journal.event('DISCONNECTED', {'reason': reason})
+                event_payload = {'reason': reason}
+                if disarm:
+                    event_payload['entry_authority'] = 'DISARMED'
+                if fault_code is not None:
+                    event_payload['fault_code'] = fault_code
+                self._journal.event('DISCONNECTED', event_payload)
                 self._journal.save(state)
         except sqlite3.Error as error:
             self._failed = True
             raise TraderError('E_DSV_STORE', 'Connection loss could not be recorded; owner requires restart') from error
         self._state = state
-        return {'synchronized': False, 'running': state['running']}
+        return {'synchronized': False, 'running': state['running'],
+                'owner_fault_code': state.get('owner_fault_code')}
 
     def disable_entries_on_restart(self):
         self._check_owner()
@@ -1319,6 +1333,8 @@ class DsvSession:
         if action in {'START', 'STOP'}:
             if action == 'START' and state.get('clock_recovery_required'):
                 raise TraderError('E_DSV_SDK_CLOCK', 'Recover the clock explicitly before enabling entries')
+            if action == 'START' and state.get('owner_fault_code'):
+                raise TraderError('E_DSV_SYNC', 'Reconcile the owner fault before enabling entries')
             if action == 'START' and self._sdk_port is not None:
                 self._sdk_port.check_start(state)
             state['running'] = action == 'START'
@@ -1406,6 +1422,12 @@ class DsvSession:
                        and (action == 'FLATTEN_STOP' or row['position']['owned'])}
             if set(requested) != set(current):
                 raise TraderError('E_DSV_OWNERSHIP', 'The current owned target set changed before flattening')
+            expected_revisions = command.get('expected_target_revisions')
+            if expected_revisions is not None:
+                if (type(expected_revisions) is not dict
+                        or {pid: int(current[pid].get('target_revision', 1)) for pid in current}
+                        != {pid: int(rev) for pid, rev in expected_revisions.items()}):
+                    raise TraderError('E_DSV_OWNERSHIP', 'A strategy target revision changed before bulk reduction')
             if not requested:
                 if action == 'FLATTEN_STOP':
                     state['running'] = False
@@ -1437,6 +1459,10 @@ class DsvSession:
         if action == 'RECONCILE':
             if not state['synchronized']:
                 raise TraderError('E_DSV_SYNC', 'Broker reconciliation is still waiting for a complete native frame')
+            if any(row.get('ownership_conflict') or row.get('native_conflicts') or row.get('detached_positions')
+                   for row in state['symbols'].values()):
+                raise TraderError('E_DSV_OWNERSHIP', 'Resolve native position or late-fill conflicts before clearing fault')
+            state['owner_fault_code'] = None
             return [{'reason': 'BROKER_FACTS_RECONCILED', 'sequence': state['sequence'],
                      'rule_ids': ['I01', 'I02']}], []
         if action == 'REDUCE_DETACHED':

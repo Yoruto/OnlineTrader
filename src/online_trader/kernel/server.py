@@ -217,6 +217,10 @@ class ControlServer:
         elif kind == 'WorkbenchPositionsRequest':
             if self._target_owner:
                 value = self.kernel.positions(body['after'])
+                value = dict(value, positions=[
+                    {key: row[key] for key in ('position_cycle_id', 'contract_id', 'direction', 'remaining_quantity')}
+                    for row in value.get('positions', ())
+                ])
             else:
                 from online_trader.kernel.workbench import workbench_positions
                 value = workbench_positions(self.kernel, body['after'])
@@ -295,7 +299,7 @@ class ControlServer:
                     except (TraderError,queue.Full):
                         self.streams.invalidate(key,"QUEUE_OVERFLOW");peer.close();break
 
-    def _error(self,peer,message,error):
+    def _error(self,peer,message,error,*,action="KEEP"):
         known={"E_AUTH","E_SCOPE","E_VERSION","E_SCHEMA","E_CONTEXT_EXPIRED","E_BOOT_MISMATCH","E_EPOCH_REVOKED","E_REVISION_CONFLICT",
             "E_DUPLICATE_CONFLICT","E_NOT_READY","E_RULE_UNAPPROVED","E_STORAGE","E_UNSUPPORTED","E_OWNERSHIP","E_QUEUE_OVERFLOW","E_FACT_BARRIER","E_RISK"}
         mapped={
@@ -314,7 +318,25 @@ class ControlServer:
         reason=(str(error)[:512] if isinstance(error,TraderError) and str(error)
                 else "Request refused; inspect current status and operation scope")
         peer.enqueue(self._reply(peer,message,"ProtocolError",{"error_code":code,"safe_reason":reason,
-            "related_message_id":message["message_id"],"connection_action":"KEEP"}))
+            "related_message_id":message["message_id"],"connection_action":action}))
+
+    def _fail_closed_owner(self,error):
+        session=getattr(self.kernel,"session",None)
+        if session is not None:
+            session._failed=True
+        elif hasattr(self.kernel,"_failed"):
+            self.kernel._failed=True
+            if hasattr(self.kernel,"_armed"):
+                self.kernel._armed=False
+        try:
+            self.kernel.contexts.revoke_all(reason="OWNER_INVARIANT_FAILED")
+        except Exception:
+            pass
+        if hasattr(self.kernel,"stop_event"):
+            self.kernel.stop_event.set()
+        self._stop.set()
+        logging.getLogger(__name__).error("Owner invariant failure in ControlServer: %s",
+                                          getattr(error,"code",type(error).__name__))
 
     def _drain_outgoing(self,timeout=1):
         deadline=time.monotonic()+timeout
@@ -333,6 +355,7 @@ class ControlServer:
 
     def _service_inbound(self,*,closing=False):
         # Bounded batches keep a busy status reader from starving the owner.
+        invariant_codes={"E_DSV_STORE","E_DSV_OWNER","E_DSV_SDK_OWNER","E_STORAGE","E_OWNER","E_CLOSED"}
         for _ in range(32):
             try:peer,message,size=self._inbound.get_nowait()
             except queue.Empty:break
@@ -342,19 +365,37 @@ class ControlServer:
                 if closing and message['type'] not in {'Hello','SnapshotRequest','GetCommandStatus','HeartbeatAck'}:
                     raise TraderError('E_NOT_READY','Execution owner is closing; no new command is accepted')
                 self._handle(peer,message)
-            except Exception as error:
-                try:self._error(peer,message,error)
+            except TraderError as error:
+                fatal=error.code in invariant_codes
+                try:self._error(peer,message,error,action="CLOSE" if fatal else "KEEP")
                 except Exception:peer.close()
+                if fatal:
+                    peer.close()
+                    self._fail_closed_owner(error)
+                    break
+            except Exception as error:
+                try:self._error(peer,message,error,action="CLOSE")
+                except Exception:pass
+                peer.close()
 
     def _flush_receipts(self):
+        invariant_codes={"E_DSV_STORE","E_DSV_OWNER","E_DSV_SDK_OWNER","E_STORAGE","E_OWNER","E_CLOSED"}
         remaining=[]
         for peer,message,result in self._waiting:
             if peer.closed.is_set():continue
             if not result.done():remaining.append((peer,message,result));continue
             try:peer.enqueue(self._reply(peer,message,'CommandReceipt',result.result()))
-            except Exception as error:
-                try:self._error(peer,message,error)
+            except TraderError as error:
+                fatal=error.code in invariant_codes
+                try:self._error(peer,message,error,action="CLOSE" if fatal else "KEEP")
                 except Exception:peer.close()
+                if fatal:
+                    peer.close()
+                    self._fail_closed_owner(error)
+            except Exception as error:
+                try:self._error(peer,message,error,action="CLOSE")
+                except Exception:pass
+                peer.close()
         self._waiting=remaining
 
     def serve(self,stop_event=None,*,owner_tick=None,publish_workbench=False):

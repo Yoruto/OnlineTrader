@@ -10,8 +10,10 @@ import unittest
 from online_trader.dsv_runtime.standalone_projection import workbench_view
 from online_trader.errors import TraderError
 from online_trader.runtime.account_cache import BrokerHistoryWriter
+from online_trader.runtime.target_owner_startup import classify_owner_tick_error, resolve_active_trading_day
 from online_trader.transport.status_client import StatusClient
-from qa.target_owner.offline_runtime import OfflineTargetRuntime, frame, order_fact, profile
+from qa.target_owner.offline_runtime import CONTRACT, DAY, OfflineTargetRuntime, frame, order_fact, profile
+from qa.target_owner.process_runtime import OfflineTargetOwnerProcess
 
 
 @unittest.skipUnless(sys.platform == 'win32', 'Named-pipe Runtime acceptance requires Windows')
@@ -171,6 +173,269 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
         self.assertEqual(len(projected['commands']), 64)
         self.assertEqual(projected['history_omitted']['commands'], 36)
         self.assertTrue(projected['history_truncated'])
+
+    def test_market_break_retains_current_trading_day_until_next_session_is_active(self):
+        class FakeCalendar:
+            def __init__(self):
+                self.window = {
+                    'complete': True,
+                    'is_trading': False,
+                    'session': None,
+                    'next_session': {'trading_day': '2026-11-16', 'open_utc': '2026-11-13T13:00:00Z'},
+                }
+
+            def query(self, _code, _now_utc):
+                return dict(self.window)
+
+        cal = FakeCalendar()
+        # During the day-to-night or weekend break, next_session points to 2026-11-16
+        # while is_trading is False. The cabinet trading day must remain 2026-11-13.
+        self.assertEqual(
+            resolve_active_trading_day(cal, (CONTRACT,), DAY, '2026-11-13T07:30:00Z'),
+            DAY,
+        )
+        # Stepping the owner with this callable during the break must not trigger
+        # a trading day switch or disconnect.
+        self.synchronize()
+        self.client.command(
+            'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'authority_policy_id': 'target-authority-current-boot',
+             'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
+            expected_config_revision='1')
+        day_holding = self.runtime.call_owner(
+            lambda owner: resolve_active_trading_day(
+                cal, (CONTRACT,), owner.snapshot()['trading_day'], '2026-11-13T07:30:00Z'))
+        self.assertEqual(day_holding, DAY)
+        view = self.client.workbench()
+        self.assertTrue(view['connection']['synchronized'])
+        self.assertEqual(view['entry_authority'], 'ARMED')
+
+        # Once the next session becomes active, resolve_active_trading_day advances cleanly.
+        cal.window = {
+            'complete': True,
+            'is_trading': True,
+            'session': {'trading_day': '2026-11-16', 'open_utc': '2026-11-13T13:00:00Z'},
+            'next_session': None,
+        }
+        self.assertEqual(
+            resolve_active_trading_day(cal, (CONTRACT,), DAY, '2026-11-13T13:01:00Z'),
+            '2026-11-16',
+        )
+
+    def _open_working_position(self):
+        self.synchronize()
+        self.client.command(
+            'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'authority_policy_id': 'target-authority-current-boot',
+             'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
+            expected_config_revision='1')
+        self.runtime.submit(frame(2))
+        working = self.wait_view(lambda value: bool(value['orders']))
+        child = working['orders'][0]['child_order_id']
+        trade_fact = {
+            'kind': 'TRADE', 'child_order_id': child,
+            'native_order_id': child + '|qa-native',
+            'native_trade_id': child + '|qa-trade-1',
+            'quantity': 5, 'price': '1060',
+        }
+        self.runtime.submit(frame(3, owned=5, facts=[order_fact(child, 'FILLED', filled=5), trade_fact]))
+        return self.wait_view(lambda value: bool(value['cycles']) and value['cycles'][0]['remaining_quantity'] == 5)
+
+    def test_manual_close_requires_and_verifies_expected_target_revision(self):
+        opened = self._open_working_position()
+        cycle = opened['cycles'][0]
+        cycle_id = cycle['position_cycle_id']
+        rev = cycle['plan_revision']
+        scope = {'scope_type': 'CYCLE', 'scope_ids': [cycle_id]}
+
+        # 1. Missing expected_target_revision is rejected with E_SCHEMA.
+        with self.assertRaises(TraderError) as missing:
+            self.client.command(
+                'MANUAL_CLOSE', scope,
+                {'position_cycle_id': cycle_id, 'quantity': 5,
+                 'execution_policy_id': 'target-execution-current-boot',
+                 'external_takeover_id': None},
+                expected_config_revision='1')
+        self.assertEqual(missing.exception.code, 'E_SCHEMA')
+
+        # 2. Stale expected_target_revision is rejected with E_REVISION_CONFLICT.
+        with self.assertRaises(TraderError) as stale:
+            self.client.command(
+                'MANUAL_CLOSE', scope,
+                {'position_cycle_id': cycle_id, 'quantity': 5,
+                 'execution_policy_id': 'target-execution-current-boot',
+                 'external_takeover_id': None,
+                 'expected_target_revision': str(int(rev) + 99)},
+                expected_config_revision='1')
+        self.assertEqual(stale.exception.code, 'E_REVISION_CONFLICT')
+
+        # 3. Matching expected_target_revision succeeds and advances target_revision.
+        receipt = self.client.command(
+            'MANUAL_CLOSE', scope,
+            {'position_cycle_id': cycle_id, 'quantity': 5,
+             'execution_policy_id': 'target-execution-current-boot',
+             'external_takeover_id': None,
+             'expected_target_revision': rev},
+            expected_config_revision='1')
+        self.assertEqual(receipt['status'], 'SUCCEEDED')
+        with self.assertRaises(TraderError) as replay_old_rev:
+            self.client.command(
+                'MANUAL_CLOSE', scope,
+                {'position_cycle_id': cycle_id, 'quantity': 5,
+                 'execution_policy_id': 'target-execution-current-boot',
+                 'external_takeover_id': None,
+                 'expected_target_revision': rev},
+                expected_config_revision='1')
+        self.assertEqual(replay_old_rev.exception.code, 'E_REVISION_CONFLICT')
+
+    def test_manual_close_all_requires_and_verifies_per_cycle_target_revisions(self):
+        opened = self._open_working_position()
+        cycle = opened['cycles'][0]
+        cycle_id = cycle['position_cycle_id']
+        rev = cycle['plan_revision']
+        scope = {'scope_type': 'ACCOUNT', 'scope_ids': []}
+
+        # 1. Missing target revisions map is rejected with E_SCHEMA.
+        with self.assertRaises(TraderError) as missing:
+            self.client.command(
+                'MANUAL_CLOSE_ALL', scope,
+                {'execution_policy_id': 'target-execution-current-boot',
+                 'price_mode': '对手价',
+                 'positions': {cycle_id: 5}},
+                expected_config_revision='1')
+        self.assertEqual(missing.exception.code, 'E_SCHEMA')
+
+        # 2. Stale target revision in map is rejected with E_REVISION_CONFLICT.
+        with self.assertRaises(TraderError) as stale:
+            self.client.command(
+                'MANUAL_CLOSE_ALL', scope,
+                {'execution_policy_id': 'target-execution-current-boot',
+                 'price_mode': '对手价',
+                 'positions': {cycle_id: 5},
+                 'expected_target_revisions': {cycle_id: str(int(rev) + 5)}},
+                expected_config_revision='1')
+        self.assertEqual(stale.exception.code, 'E_REVISION_CONFLICT')
+
+        # 3. Matching quantity and revision succeeds.
+        receipt = self.client.command(
+            'MANUAL_CLOSE_ALL', scope,
+            {'execution_policy_id': 'target-execution-current-boot',
+             'price_mode': '对手价',
+             'positions': {cycle_id: 5},
+             'expected_target_revisions': {cycle_id: rev}},
+            expected_config_revision='1')
+        self.assertEqual(receipt['status'], 'SUCCEEDED')
+
+    def test_owner_tick_error_classification_and_persistent_disarm_blocks_auto_recovery(self):
+        # 1. Verify 3-tier classification rules.
+        self.assertEqual(classify_owner_tick_error(OSError('pipe timeout')), 'TRANSIENT_DISCONNECT')
+        self.assertEqual(
+            classify_owner_tick_error(TraderError('E_DSV_SDK_SYNC', 'transient sync loss')),
+            'TRANSIENT_DISCONNECT',
+        )
+        self.assertEqual(
+            classify_owner_tick_error(TraderError('E_DSV_NATIVE_FACT', 'fact mismatch')),
+            'PERSISTENT_DISARM',
+        )
+        self.assertEqual(
+            classify_owner_tick_error(TraderError('E_DSV_OWNERSHIP', 'ownership conflict')),
+            'PERSISTENT_DISARM',
+        )
+        self.assertEqual(
+            classify_owner_tick_error(TraderError('E_DSV_SDK_SCOPE', 'unexpected day switch')),
+            'PERSISTENT_DISARM',
+        )
+        self.assertEqual(
+            classify_owner_tick_error(TraderError('E_DSV_STORE', 'sqlite failure')),
+            'FAIL_STOP',
+        )
+        self.assertEqual(classify_owner_tick_error(RuntimeError('bug')), 'FAIL_STOP')
+        self.assertEqual(classify_owner_tick_error(KeyError('missing')), 'FAIL_STOP')
+
+        # 2. Verify transient disconnect preserves running state while persistent disarm clears it
+        # and blocks re-arming until explicit reconciliation.
+        self.synchronize()
+        self.client.command(
+            'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'authority_policy_id': 'target-authority-current-boot',
+             'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
+            expected_config_revision='1')
+        self.runtime.call_owner(
+            lambda owner: owner.disconnect_for_error('TRANSIENT_OWNER_TICK_ERROR', disarm=False))
+        transient_state = self.runtime.call_owner(lambda owner: owner.snapshot())
+        self.assertFalse(transient_state['synchronized'])
+        self.assertTrue(transient_state['running'])
+
+        # Now trigger persistent disarm on invariant conflict.
+        self.runtime.call_owner(
+            lambda owner: owner.disconnect_for_error(
+                'PERSISTENT_OWNER_FACT_CONFLICT', disarm=True, fault_code='E_DSV_NATIVE_FACT'))
+        disarmed_state = self.runtime.call_owner(lambda owner: owner.snapshot())
+        self.assertFalse(disarmed_state['synchronized'])
+        self.assertFalse(disarmed_state['running'])
+        self.assertEqual(disarmed_state['owner_fault_code'], 'E_DSV_NATIVE_FACT')
+
+        # Even after a new synchronized frame arrives, the owner stays DISARMED with
+        # recovery_required=True and refuses ARM_ENTRIES until REQUEST_RECONCILIATION succeeds.
+        self.runtime.submit(frame(2))
+        fault_view = self.wait_view(lambda value: value['connection']['synchronized'])
+        self.assertEqual(fault_view['entry_authority'], 'DISARMED')
+        self.assertTrue(fault_view['connection']['recovery_required'])
+        self.assertIn('E_DSV_NATIVE_FACT', [b['reason_code'] for b in fault_view['blocks']])
+        self.assertFalse(next(row for row in fault_view['capabilities']['operations']
+                              if row['operation'] == 'ARM_ENTRIES')['allowed'])
+        with self.assertRaises(TraderError) as blocked_arm:
+            self.client.command(
+                'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                {'authority_policy_id': 'target-authority-current-boot',
+                 'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
+                expected_config_revision='1')
+        self.assertEqual(blocked_arm.exception.code, 'E_NOT_READY')
+
+        # Explicit reconciliation clears the persistent fault when facts are clean.
+        self.client.command(
+            'REQUEST_RECONCILIATION', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'requested_scope': 'FULL_ACCOUNT', 'position_cycle_id': None},
+            expected_config_revision='1')
+        cleared_view = self.wait_view(lambda value: not value['connection']['recovery_required'])
+        self.assertTrue(next(row for row in cleared_view['capabilities']['operations']
+                             if row['operation'] == 'ARM_ENTRIES')['allowed'])
+
+    def test_process_runtime_harness_lifecycle_and_public_pipe_control(self):
+        proc_root = Path(self.temp.name) / 'process-harness'
+        with OfflineTargetOwnerProcess(proc_root) as proc:
+            self.assertTrue(proc.is_alive)
+            self.assertIsNotNone(proc.boot_id)
+            client = StatusClient(proc.pipe, timeout=5)
+            initial = client.workbench()
+            self.assertEqual(initial['entry_authority'], 'DISARMED')
+            self.assertFalse(initial['connection']['synchronized'])
+
+            f1 = frame(1)
+            accepted = proc.send_fact_frame(f1)
+            self.assertEqual(accepted['event_type'], 'FACT_FRAME_ACCEPTED')
+            applied = proc.wait_for_frame_applied(f1['id'])
+            self.assertEqual(applied['event_type'], 'FACT_FRAME_APPLIED')
+
+            synced = client.workbench()
+            self.assertTrue(synced['connection']['synchronized'])
+            receipt = client.command(
+                'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                {'authority_policy_id': 'target-authority-current-boot',
+                 'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
+                expected_config_revision='1')
+            self.assertEqual(receipt['status'], 'SUCCEEDED')
+
+            f2 = frame(2)
+            proc.send_fact_frame(f2)
+            proc.wait_for_frame_applied(f2['id'])
+            outbound = proc.wait_for_event('OUTBOUND_SEND', timeout=5)
+            self.assertEqual(outbound['adapter_result'], 'RETURNED')
+
+            stopped = proc.teardown()
+            self.assertIsNotNone(stopped)
+            self.assertEqual(stopped['event_type'], 'OWNER_STOPPED')
+            self.assertTrue(stopped['ledger_removed'])
 
 
 if __name__ == '__main__':

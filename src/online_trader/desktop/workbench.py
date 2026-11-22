@@ -1100,6 +1100,39 @@ class WorkbenchWindow(StatusWindow):
                 {'authority_policy_id':policy,'rule_set_id':identity[-2],'config_revision':identity[-1]})
         self._action(action)
 
+    def _target_execution_core(self):
+        return (self.view is not None
+                and self.view.get('configuration', {}).get('execution_core') == 'DSV_TARGET_EXECUTION')
+
+    def _cycle_target_revision(self, row):
+        rev = row.get('plan_revision')
+        if rev is None and isinstance(row.get('target_execution'), Mapping):
+            rev = row['target_execution'].get('target_revision')
+        if rev is None and self.view is not None:
+            cid = row.get('position_cycle_id')
+            for item in self.view.get('cycles', ()):
+                if item.get('position_cycle_id') == cid and item.get('plan_revision') is not None:
+                    rev = item['plan_revision']
+                    break
+            if rev is None:
+                records = (self.view.get('status_projection') or {}).get('records', ())
+                for rec in records:
+                    if rec.get('record_type') == 'CYCLE' and rec.get('position_cycle_id') == cid:
+                        rev = rec.get('plan_revision')
+                        break
+        return None if rev is None else str(rev)
+
+    def _manual_close_params(self, cycle_id, quantity, row, *, include_price_mode=True):
+        target_rev = self._cycle_target_revision(row)
+        takeover_token = f'target-rev-{target_rev}' if self._target_execution_core() and target_rev is not None else None
+        params = {
+            'position_cycle_id': cycle_id, 'quantity': quantity,
+            'execution_policy_id': self.policy('EXECUTION'), 'external_takeover_id': takeover_token,
+        }
+        if include_price_mode and self.view is not None and 'manual_close_price_mode' in self.view['configuration']:
+            params['price_mode'] = self.dashboard.manual_close_price_mode.currentText()
+        return params
+
     def close_selected(self):
         if self.view is not None and self.view.get('detail_unavailable'):
             self._request_close_positions()
@@ -1113,8 +1146,11 @@ class WorkbenchWindow(StatusWindow):
             cid=self._base_cycle_ids[i]
             row=next(r for r in self.view['cycles'] if r['position_cycle_id']==cid)
             if row['remaining_quantity']<=0:raise TraderError('E_SCOPE','所选周期没有可减持仓')
+            params = self._manual_close_params(cid, 1, row, include_price_mode=False)
             qty,ok=QInputDialog.getInt(self,'平选定自有仓',row['contract_id']+' · 平仓手数',1,1,row['remaining_quantity'])
-            if ok:self.send('MANUAL_CLOSE',{'scope_type':'CYCLE','scope_ids':[cid]},{'position_cycle_id':cid,'quantity':qty,'execution_policy_id':self.policy('EXECUTION'),'external_takeover_id':None})
+            if ok:
+                params['quantity'] = qty
+                self.send('MANUAL_CLOSE',{'scope_type':'CYCLE','scope_ids':[cid]},params)
         self._action(action)
 
     def close_manual_cycle(self, cycle_id, quantity=None):
@@ -1126,12 +1162,7 @@ class WorkbenchWindow(StatusWindow):
                 raise TraderError('E_SCOPE', '所选周期没有可平的自有持仓')
             remaining = cycle['remaining_quantity']
             amount = remaining if quantity is None else min(quantity, remaining)
-            params = {
-                'position_cycle_id': cycle_id, 'quantity': amount,
-                'execution_policy_id': self.policy('EXECUTION'), 'external_takeover_id': None,
-            }
-            if 'manual_close_price_mode' in self.view['configuration']:
-                params['price_mode'] = self.dashboard.manual_close_price_mode.currentText()
+            params = self._manual_close_params(cycle_id, amount, cycle, include_price_mode=True)
             self.send('MANUAL_CLOSE', {'scope_type': 'CYCLE', 'scope_ids': [cycle_id]}, params)
         self._action(action)
 
@@ -1194,14 +1225,14 @@ class WorkbenchWindow(StatusWindow):
             return
         cycle = rows[choices.index(choice)]
         maximum = cycle['remaining_quantity']
+        cycle_id = cycle['position_cycle_id']
+        parameters = self._manual_close_params(cycle_id, 1, cycle, include_price_mode=True)
         qty, ok = QInputDialog.getInt(self, '平选定自有仓', cycle['contract_id'] + ' · 平仓手数', 1, 1, maximum)
         if not ok:
             return
         if self.view is None or binding != self._command_binding():
             raise TraderError('E_SCOPE', '账户、执行器或参数已变化，请重新查询持仓。')
-        cycle_id = cycle['position_cycle_id']
-        parameters = {'position_cycle_id': cycle_id, 'quantity': qty,
-                      'execution_policy_id': self.policy('EXECUTION'), 'external_takeover_id': None}
+        parameters['quantity'] = qty
         if 'manual_close_price_mode' in self.view['configuration']:
             parameters['price_mode'] = self.dashboard.manual_close_price_mode.currentText()
         self.send('MANUAL_CLOSE', {'scope_type': 'CYCLE', 'scope_ids': [cycle_id]}, parameters)
@@ -1211,7 +1242,13 @@ class WorkbenchWindow(StatusWindow):
             raise TraderError('E_SCOPE', '没有可平的自有持仓')
         if len(cycles) > 64:
             raise TraderError('E_WORKBENCH_CAPACITY', '可平持仓超过单次批量平仓上限，请按持仓周期操作。')
-        positions = {row['position_cycle_id']: row['remaining_quantity'] for row in cycles}
+        target_core = self._target_execution_core()
+        positions = {}
+        for row in cycles:
+            cid = row['position_cycle_id']
+            rev = self._cycle_target_revision(row)
+            key = f'{cid}:rev:{rev}' if target_core and rev is not None else cid
+            positions[key] = row['remaining_quantity']
         identity = self._command_binding()
         mode = self.dashboard.manual_close_price_mode.currentText()
         policy = self.policy('EXECUTION')

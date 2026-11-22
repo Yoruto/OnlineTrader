@@ -157,6 +157,19 @@ class StatusClient:
                 raise TraderError('E_AUTH','Command capability was not granted')
             ids=scope['scope_ids'];kind=scope['scope_type']
             scope_id=welcome['account_key'] if kind in {'ACCOUNT','OWNED_ORDERS'} else ids[0] if len(ids)==1 else content_hash(scope)
+            wire_parameters = dict(parameters)
+            if operation == 'MANUAL_CLOSE' and 'expected_target_revision' in wire_parameters:
+                target_rev = wire_parameters.pop('expected_target_revision')
+                if wire_parameters.get('external_takeover_id') is None and target_rev is not None:
+                    wire_parameters['external_takeover_id'] = f'target-rev-{target_rev}'
+            elif operation == 'MANUAL_CLOSE_ALL' and 'expected_target_revisions' in wire_parameters:
+                rev_map = wire_parameters.pop('expected_target_revisions')
+                positions = wire_parameters.get('positions')
+                if isinstance(rev_map, dict) and isinstance(positions, dict):
+                    wire_parameters['positions'] = {
+                        (f'{pid}:rev:{rev_map[pid]}' if pid in rev_map and ':rev:' not in str(pid) else pid): qty
+                        for pid, qty in positions.items()
+                    }
             request=self._message('ContextRequest',{'purpose':'OPERATOR_COMMAND','operation':operation,'scope_id':scope_id},welcome)
             connection.send(request,timeout=self._remaining(deadline))
             context=self._receive(connection,deadline,request=request,welcome=welcome,expected_type='RequestContext')['body']
@@ -167,7 +180,7 @@ class StatusClient:
                 raise TraderError('E_REVISION_CONFLICT', 'The draft was prepared for a different strategy configuration')
             request=self._message('OperatorCommand',{'command_id':command_id or _id('desktop-command'),'context_id':context['context_id'],
                 'kernel_epoch':context['kernel_epoch'],'expected_revisions':context['related_revisions'],'operation':operation,
-                'scope':scope,'parameters':parameters,'payload_hash':'0'*64},welcome)
+                'scope':scope,'parameters':wire_parameters,'payload_hash':'0'*64},welcome)
             request['body']['payload_hash']=payload_hash(request);validate_message(request)
             self.last_command={key:request['body'][key] for key in ('command_id','payload_hash')}
             connection.send(request,timeout=self._remaining(deadline))

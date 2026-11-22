@@ -89,3 +89,32 @@ class WorkbenchSoundTests(unittest.TestCase):
         self.assertEqual(self.tones,[(440,200)])
         self.sound.dingtalk.notify.assert_called_once_with(
             'error',None,'DCE.p2701 平仓委托已终态，剩余目标未完成，请人工核对')
+
+    def test_new_trade_sounds_once_even_when_projection_checkpoint_leads_trade_event_seq(self):
+        # In Standalone Target Owner, projection_seq advances on commands and
+        # start_confirmed() while trade.event_seq uses DSV state.sequence.
+        baseline_trade = {
+            'event_seq': '1', 'effect': 'OPEN', 'position_cycle_id': 'cycle-old',
+            'child_order_id': 'child-old', 'trade_key': ['2026-11-13', 'ord-old', 'trd-old'],
+        }
+        self.sound.observe(self.view(5, trades=[baseline_trade]))
+        self.assertEqual(self.tones, [])
+
+        # New open trade arrives with event_seq=2 while checkpoint_event_seq is 6.
+        open_trade = {
+            'event_seq': '2', 'effect': 'OPEN', 'position_cycle_id': 'cycle-new',
+            'child_order_id': 'child-open', 'trade_key': ['2026-11-13', 'ord-1', 'trd-1'],
+        }
+        self.sound.observe(self.view(6, trades=[baseline_trade, open_trade]))
+        self.sound.observe(self.view(7, trades=[baseline_trade, open_trade]))
+        self.assertEqual(self.tones, [(880, 200)])
+
+        # New close trade arrives with event_seq=3 while checkpoint_event_seq is 9.
+        close_trade = {
+            'event_seq': '3', 'effect': 'REDUCE', 'position_cycle_id': 'cycle-new',
+            'child_order_id': 'child-close', 'trade_key': ['2026-11-13', 'ord-2', 'trd-2'],
+        }
+        orders = [{'child_order_id': 'child-close', 'intent_id': 'reduce-intent-1'}]
+        self.sound.observe(self.view(9, trades=[baseline_trade, open_trade, close_trade], orders=orders))
+        self.sound.observe(self.view(10, trades=[baseline_trade, open_trade, close_trade], orders=orders))
+        self.assertEqual(self.tones, [(880, 200), (660, 200)])

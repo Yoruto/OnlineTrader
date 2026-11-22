@@ -159,3 +159,43 @@ class DispatcherTests(unittest.TestCase):
             self.assertEqual(next(r for r in deltas if r["record_type"]=="ACCOUNT")["entry_authority"],"ARMED")
         finally:
             if not held.done():held.set_result(arm.result(timeout=3))
+
+    def test_service_inbound_unexpected_python_error_closes_peer_and_invariant_fails_closed(self):
+        self.peer.ready=True;self.peer.role="DESKTOP"
+        request=self.message("Heartbeat",{})
+        self.server._inbound.put((self.peer,request,64))
+        self.server._inbound_bytes=64
+        original_handle=self.server._handle
+        try:
+            def raise_runtime(_peer,_message):raise RuntimeError("unexpected bug")
+            self.server._handle=raise_runtime
+            self.server._service_inbound()
+        finally:
+            self.server._handle=original_handle
+        replies=self.drain(self.peer)
+        self.assertEqual(len(replies),1)
+        self.assertEqual(replies[0]["type"],"ProtocolError")
+        self.assertEqual(replies[0]["body"]["error_code"],"E_INTERNAL")
+        self.assertEqual(replies[0]["body"]["connection_action"],"CLOSE")
+        self.assertTrue(self.peer.closed.is_set())
+
+        peer2=_Peer(SimpleNamespace(peer_pid=os.getpid(),close=lambda:None))
+        peer2.ready=True;peer2.role="DESKTOP"
+        self.server._inbound.put((peer2,self.message("Heartbeat",{},peer2),64))
+        self.server._inbound_bytes=64
+        self.server._peers.add(peer2)
+        try:
+            def raise_store(_peer,_message):raise TraderError("E_DSV_STORE","journal invariant failed")
+            self.server._handle=raise_store
+            self.server._service_inbound()
+            self.assertTrue(self.kernel._failed)
+            self.assertTrue(self.server._stop.is_set())
+        finally:
+            self.server._handle=original_handle
+            self.kernel._failed=False
+        replies2=self.drain(peer2)
+        self.assertEqual(len(replies2),1)
+        self.assertEqual(replies2[0]["body"]["error_code"],"E_INTERNAL")
+        self.assertEqual(replies2[0]["body"]["connection_action"],"CLOSE")
+        self.assertTrue(peer2.closed.is_set())
+
