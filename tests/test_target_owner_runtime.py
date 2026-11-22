@@ -1,6 +1,7 @@
 """Public-entry acceptance for the isolated Standalone target owner."""
 
 from pathlib import Path
+from types import SimpleNamespace
 import copy
 import sys
 import tempfile
@@ -10,10 +11,197 @@ import unittest
 from online_trader.dsv_runtime.standalone_projection import workbench_view
 from online_trader.errors import TraderError
 from online_trader.runtime.account_cache import BrokerHistoryWriter
-from online_trader.runtime.target_owner_startup import classify_owner_tick_error, resolve_active_trading_day
+from online_trader.runtime.target_owner_startup import (
+    classify_owner_tick_error, execute_owner_tick, resolve_active_trading_day,
+)
 from online_trader.transport.status_client import StatusClient
 from qa.target_owner.offline_runtime import CONTRACT, DAY, OfflineTargetRuntime, frame, order_fact, profile
 from qa.target_owner.process_runtime import OfflineTargetOwnerProcess
+
+
+class TargetOwnerPureLogicTests(unittest.TestCase):
+    """Cross-platform unit tests for Target Owner trading-day, error-tier, and auto-arm logic."""
+
+    def test_market_break_retains_current_trading_day_until_next_session_is_active(self):
+        class FakeCalendar:
+            def __init__(self):
+                self.window = {
+                    'complete': True,
+                    'is_trading': False,
+                    'session': None,
+                    'next_session': {'trading_day': '2026-11-16', 'open_utc': '2026-11-13T13:00:00Z'},
+                }
+
+            def query(self, _code, _now_utc):
+                return dict(self.window)
+
+        cal = FakeCalendar()
+        self.assertEqual(
+            resolve_active_trading_day(cal, (CONTRACT,), DAY, '2026-11-13T07:30:00Z'),
+            DAY,
+        )
+        cal.window = {
+            'complete': True,
+            'is_trading': True,
+            'session': {'trading_day': '2026-11-16', 'open_utc': '2026-11-13T13:00:00Z'},
+            'next_session': None,
+        }
+        self.assertEqual(
+            resolve_active_trading_day(cal, (CONTRACT,), DAY, '2026-11-13T13:01:00Z'),
+            '2026-11-16',
+        )
+
+    def test_mixed_night_and_day_sessions_advance_trading_day_when_active_contracts_agree_and_fail_closed_on_conflict(self):
+        class MixedCalendar:
+            def __init__(self, windows):
+                self.windows = windows
+
+            def query(self, code, _now_utc):
+                return dict(self.windows[code])
+
+        # Scenario 1: Night session active (DCE.p2701 -> 2026-11-16) while day-only
+        # contract (CFFEX.IF2612) is inactive -> must advance to 2026-11-16.
+        night_plus_day = MixedCalendar({
+            'DCE.p2701': {
+                'complete': True,
+                'is_trading': True,
+                'session': {'trading_day': '2026-11-16', 'open_utc': '2026-11-13T13:00:00Z'},
+                'next_session': None,
+            },
+            'CFFEX.IF2612': {
+                'complete': True,
+                'is_trading': False,
+                'session': None,
+                'next_session': {'trading_day': '2026-11-16', 'open_utc': '2026-11-16T01:30:00Z'},
+            },
+        })
+        self.assertEqual(
+            resolve_active_trading_day(
+                night_plus_day, ('DCE.p2701', 'CFFEX.IF2612'), DAY, '2026-11-13T13:01:00Z'),
+            '2026-11-16',
+        )
+
+        # Scenario 2: Two active contracts disagree on trading_day -> fail closed with E_DSV_SCOPE.
+        conflicting = MixedCalendar({
+            'DCE.p2701': {
+                'complete': True,
+                'is_trading': True,
+                'session': {'trading_day': '2026-11-16'},
+            },
+            'SHFE.rb2701': {
+                'complete': True,
+                'is_trading': True,
+                'session': {'trading_day': '2026-11-13'},
+            },
+        })
+        with self.assertRaises(TraderError) as conflict_err:
+            resolve_active_trading_day(
+                conflicting, ('DCE.p2701', 'SHFE.rb2701'), DAY, '2026-11-13T13:01:00Z')
+        self.assertEqual(conflict_err.exception.code, 'E_DSV_SCOPE')
+
+    def test_owner_tick_error_classification_rules(self):
+        self.assertEqual(classify_owner_tick_error(OSError('pipe timeout')), 'TRANSIENT_DISCONNECT')
+        self.assertEqual(
+            classify_owner_tick_error(TraderError('E_DSV_SDK_SYNC', 'transient sync loss')),
+            'TRANSIENT_DISCONNECT',
+        )
+        self.assertEqual(
+            classify_owner_tick_error(TraderError('E_DSV_NATIVE_FACT', 'fact mismatch')),
+            'PERSISTENT_DISARM',
+        )
+        self.assertEqual(
+            classify_owner_tick_error(TraderError('E_DSV_OWNERSHIP', 'ownership conflict')),
+            'PERSISTENT_DISARM',
+        )
+        self.assertEqual(
+            classify_owner_tick_error(TraderError('E_DSV_SDK_SCOPE', 'unexpected day switch')),
+            'PERSISTENT_DISARM',
+        )
+        self.assertEqual(
+            classify_owner_tick_error(TraderError('E_DSV_STORE', 'sqlite failure')),
+            'FAIL_STOP',
+        )
+        self.assertEqual(classify_owner_tick_error(RuntimeError('bug')), 'FAIL_STOP')
+        self.assertEqual(classify_owner_tick_error(KeyError('missing')), 'FAIL_STOP')
+
+    def test_initial_auto_arm_survives_transient_error_and_confirms_once_while_persistent_disarm_cancels_it(self):
+        class StubOwner:
+            def __init__(self, outcomes):
+                self.outcomes = list(outcomes)
+                self.session = SimpleNamespace(_failed=False)
+                self.state = {'synchronized': False, 'running': False, 'owner_fault_code': None}
+                self.start_confirmed_calls = 0
+                self.disconnect_calls = []
+
+            def step(self, **_kwargs):
+                outcome = self.outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                self.state.update(outcome)
+                return {'type': 'APPLIED'}
+
+            def snapshot(self):
+                return dict(self.state)
+
+            def start_confirmed(self):
+                self.start_confirmed_calls += 1
+                self.state['running'] = True
+
+            def disconnect_for_error(self, reason, *, disarm=False, fault_code=None):
+                self.disconnect_calls.append((reason, disarm, fault_code))
+                self.state['synchronized'] = False
+                if disarm:
+                    self.state['running'] = False
+                    self.state['owner_fault_code'] = fault_code
+
+            def native_account_snapshot(self):
+                return None
+
+        binding = SimpleNamespace(boot_id='boot-1', account_key='DEV:auto-arm')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1. Transient error before first sync preserves initial_start_pending and arms once recovered.
+            owner = StubOwner([
+                TraderError('E_DSV_SDK_SYNC', 'transient gateway sync loss'),
+                {'synchronized': True},
+                {'synchronized': True},
+            ])
+            loop_state = {
+                'last_status': {'phase': 'WAITING_FOR_NATIVE_SYNC', 'entry_authority': 'DISARMED'},
+                'last_history_capture': 0.0,
+                'initial_start_pending': True,
+            }
+            for _ in range(3):
+                execute_owner_tick(
+                    owner, binding=binding, current_trading_day=DAY, is_complete=lambda: True,
+                    history_writer=None, status_path=root / 'status.json',
+                    diagnostics_path=root / 'diag.json', loop_state=loop_state,
+                    sleep_fn=lambda _s: None,
+                )
+            self.assertEqual(owner.start_confirmed_calls, 1)
+            self.assertTrue(owner.state['running'])
+            self.assertFalse(loop_state['initial_start_pending'])
+
+            # 2. Persistent disarm cancels initial_start_pending so subsequent sync does not arm.
+            owner2 = StubOwner([
+                TraderError('E_DSV_NATIVE_FACT', 'fact conflict'),
+                {'synchronized': True},
+            ])
+            loop_state2 = {
+                'last_status': {'phase': 'WAITING_FOR_NATIVE_SYNC', 'entry_authority': 'DISARMED'},
+                'last_history_capture': 0.0,
+                'initial_start_pending': True,
+            }
+            for _ in range(2):
+                execute_owner_tick(
+                    owner2, binding=binding, current_trading_day=DAY, is_complete=lambda: True,
+                    history_writer=None, status_path=root / 'status2.json',
+                    diagnostics_path=root / 'diag2.json', loop_state=loop_state2,
+                    sleep_fn=lambda _s: None,
+                )
+            self.assertEqual(owner2.start_confirmed_calls, 0)
+            self.assertFalse(owner2.state['running'])
+            self.assertFalse(loop_state2['initial_start_pending'])
 
 
 @unittest.skipUnless(sys.platform == 'win32', 'Named-pipe Runtime acceptance requires Windows')
@@ -174,54 +362,6 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
         self.assertEqual(projected['history_omitted']['commands'], 36)
         self.assertTrue(projected['history_truncated'])
 
-    def test_market_break_retains_current_trading_day_until_next_session_is_active(self):
-        class FakeCalendar:
-            def __init__(self):
-                self.window = {
-                    'complete': True,
-                    'is_trading': False,
-                    'session': None,
-                    'next_session': {'trading_day': '2026-11-16', 'open_utc': '2026-11-13T13:00:00Z'},
-                }
-
-            def query(self, _code, _now_utc):
-                return dict(self.window)
-
-        cal = FakeCalendar()
-        # During the day-to-night or weekend break, next_session points to 2026-11-16
-        # while is_trading is False. The cabinet trading day must remain 2026-11-13.
-        self.assertEqual(
-            resolve_active_trading_day(cal, (CONTRACT,), DAY, '2026-11-13T07:30:00Z'),
-            DAY,
-        )
-        # Stepping the owner with this callable during the break must not trigger
-        # a trading day switch or disconnect.
-        self.synchronize()
-        self.client.command(
-            'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
-            {'authority_policy_id': 'target-authority-current-boot',
-             'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
-            expected_config_revision='1')
-        day_holding = self.runtime.call_owner(
-            lambda owner: resolve_active_trading_day(
-                cal, (CONTRACT,), owner.snapshot()['trading_day'], '2026-11-13T07:30:00Z'))
-        self.assertEqual(day_holding, DAY)
-        view = self.client.workbench()
-        self.assertTrue(view['connection']['synchronized'])
-        self.assertEqual(view['entry_authority'], 'ARMED')
-
-        # Once the next session becomes active, resolve_active_trading_day advances cleanly.
-        cal.window = {
-            'complete': True,
-            'is_trading': True,
-            'session': {'trading_day': '2026-11-16', 'open_utc': '2026-11-13T13:00:00Z'},
-            'next_session': None,
-        }
-        self.assertEqual(
-            resolve_active_trading_day(cal, (CONTRACT,), DAY, '2026-11-13T13:01:00Z'),
-            '2026-11-16',
-        )
-
     def _open_working_position(self):
         self.synchronize()
         self.client.command(
@@ -326,33 +466,8 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
             expected_config_revision='1')
         self.assertEqual(receipt['status'], 'SUCCEEDED')
 
-    def test_owner_tick_error_classification_and_persistent_disarm_blocks_auto_recovery(self):
-        # 1. Verify 3-tier classification rules.
-        self.assertEqual(classify_owner_tick_error(OSError('pipe timeout')), 'TRANSIENT_DISCONNECT')
-        self.assertEqual(
-            classify_owner_tick_error(TraderError('E_DSV_SDK_SYNC', 'transient sync loss')),
-            'TRANSIENT_DISCONNECT',
-        )
-        self.assertEqual(
-            classify_owner_tick_error(TraderError('E_DSV_NATIVE_FACT', 'fact mismatch')),
-            'PERSISTENT_DISARM',
-        )
-        self.assertEqual(
-            classify_owner_tick_error(TraderError('E_DSV_OWNERSHIP', 'ownership conflict')),
-            'PERSISTENT_DISARM',
-        )
-        self.assertEqual(
-            classify_owner_tick_error(TraderError('E_DSV_SDK_SCOPE', 'unexpected day switch')),
-            'PERSISTENT_DISARM',
-        )
-        self.assertEqual(
-            classify_owner_tick_error(TraderError('E_DSV_STORE', 'sqlite failure')),
-            'FAIL_STOP',
-        )
-        self.assertEqual(classify_owner_tick_error(RuntimeError('bug')), 'FAIL_STOP')
-        self.assertEqual(classify_owner_tick_error(KeyError('missing')), 'FAIL_STOP')
-
-        # 2. Verify transient disconnect preserves running state while persistent disarm clears it
+    def test_persistent_disarm_blocks_auto_recovery_and_requires_reconciliation(self):
+        # Transient disconnect preserves running state while persistent disarm clears it
         # and blocks re-arming until explicit reconciliation.
         self.synchronize()
         self.client.command(

@@ -30,7 +30,7 @@ _PERSISTENT_DISARM_CODES = frozenset({
 
 
 def resolve_active_trading_day(calendar, contracts, current_day, now=None, *, clock=None):
-    """Advance the cabinet day only when all scoped contracts are in an active session."""
+    """Advance the cabinet day when currently active contracts agree on a trading day."""
     if calendar is None or not contracts:
         return current_day
     if now is None and clock is not None:
@@ -46,12 +46,18 @@ def resolve_active_trading_day(calendar, contracts, current_day, now=None, *, cl
     if not now_utc:
         return current_day
     windows = [calendar.query(code, now_utc) for code in contracts]
-    if all(window.get('complete') and window.get('is_trading') and window.get('session') for window in windows):
-        active_days = {window['session'].get('trading_day') for window in windows}
-        if len(active_days) == 1:
-            candidate = next(iter(active_days))
-            if candidate and (not current_day or candidate >= current_day):
-                return candidate
+    active_windows = [
+        window for window in windows
+        if window.get('complete') and window.get('is_trading') and window.get('session')
+    ]
+    if not active_windows:
+        return current_day
+    active_days = {window['session'].get('trading_day') for window in active_windows}
+    if len(active_days) > 1:
+        raise TraderError('E_DSV_SCOPE', 'Active contracts disagree on cabinet trading day')
+    candidate = next(iter(active_days))
+    if candidate and (not current_day or candidate >= current_day):
+        return candidate
     return current_day
 
 
@@ -69,6 +75,78 @@ def classify_owner_tick_error(error, *, storage_failed=False):
         if error.code in _PERSISTENT_DISARM_CODES:
             return 'PERSISTENT_DISARM'
     return 'FAIL_STOP'
+
+
+def execute_owner_tick(owner, *, binding, current_trading_day, is_complete,
+                       history_writer, status_path, diagnostics_path,
+                       loop_state, sleep_fn=time.sleep):
+    """Execute one Target Owner step, preserving pending auto-arm across transient errors."""
+    try:
+        receipt = owner.step(trading_day=current_trading_day, complete=is_complete)
+        state = owner.snapshot()
+        if loop_state.get('initial_start_pending') and state['synchronized'] and not state.get('owner_fault_code'):
+            owner.start_confirmed()
+            loop_state['initial_start_pending'] = False
+            state = owner.snapshot()
+        now = time.monotonic()
+        if history_writer is not None and now - loop_state.get('last_history_capture', 0.0) >= 10:
+            snapshot = owner.native_account_snapshot()
+            if snapshot is not None:
+                history_writer.offer(snapshot)
+            loop_state['last_history_capture'] = now
+    except Exception as error:
+        category = classify_owner_tick_error(
+            error, storage_failed=bool(getattr(owner.session, '_failed', False)))
+        if category == 'FAIL_STOP':
+            raise
+        disarm = category == 'PERSISTENT_DISARM'
+        if disarm:
+            loop_state['initial_start_pending'] = False
+        code = getattr(error, 'code', 'E_DSV_SDK_RUNTIME')
+        owner.disconnect_for_error(
+            'PERSISTENT_OWNER_FACT_CONFLICT' if disarm else 'TRANSIENT_OWNER_TICK_ERROR',
+            disarm=disarm,
+            fault_code=code if disarm else None,
+        )
+        state = owner.snapshot()
+        authority_effect = ('DISARMED_RECOVERY_REQUIRED' if disarm
+                            else 'SYNCHRONIZATION_LOST_AUTHORITY_PRESERVED' if state['running']
+                            else 'SYNCHRONIZATION_LOST_DISARMED')
+        publish_replace_bytes(canonical_bytes({
+            'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
+            'execution_core': 'DSV_TARGET_EXECUTION', 'authority_effect': authority_effect,
+            'error_category': category,
+            'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
+            'diagnostic': code,
+            'exception': exception_record(error),
+        }), diagnostics_path)
+        current = {
+            'phase': 'NEEDS_REVIEW' if disarm else 'WAITING_FOR_NATIVE_SYNC',
+            'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
+        }
+        if current != loop_state.get('last_status'):
+            publish_replace_bytes(canonical_bytes({
+                **current,
+                'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
+                'execution_core': 'DSV_TARGET_EXECUTION',
+            }), status_path)
+            loop_state['last_status'] = current
+        sleep_fn(0.1)
+        return
+    if receipt is not None:
+        current = {
+            'phase': ('NEEDS_REVIEW' if state.get('owner_fault_code')
+                      else 'READY' if state['synchronized'] else 'WAITING_FOR_NATIVE_SYNC'),
+            'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
+        }
+        if current == loop_state.get('last_status'):
+            return
+        publish_replace_bytes(canonical_bytes({
+            **current,
+            'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
+            'execution_core': 'DSV_TARGET_EXECUTION',
+        }), status_path)
+        loop_state['last_status'] = current
 
 
 def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
@@ -122,9 +200,11 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             'execution_core': 'DSV_TARGET_EXECUTION',
         }), status)
         server = ControlServer(owner, pipe, trusted_client_pid=trusted_control_pid)
-        last_status = {'phase': 'WAITING_FOR_NATIVE_SYNC', 'entry_authority': 'DISARMED'}
-        last_history_capture = 0.0
-        initial_start_pending = bool(arm)
+        loop_state = {
+            'last_status': {'phase': 'WAITING_FOR_NATIVE_SYNC', 'entry_authority': 'DISARMED'},
+            'last_history_capture': 0.0,
+            'initial_start_pending': bool(arm),
+        }
 
         contracts = tuple(grant.value.get('contracts', ()))
 
@@ -137,72 +217,12 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             return bool(connection.broker_connected and connection.complete())
 
         def tick():
-            nonlocal last_status, last_history_capture, initial_start_pending
-            try:
-                receipt = owner.step(trading_day=current_trading_day, complete=is_complete)
-                state = owner.snapshot()
-                if initial_start_pending and state['synchronized'] and not state.get('owner_fault_code'):
-                    owner.start_confirmed()
-                    initial_start_pending = False
-                    state = owner.snapshot()
-                now = time.monotonic()
-                if now - last_history_capture >= 10:
-                    snapshot = owner.native_account_snapshot()
-                    if snapshot is not None:
-                        history_writer.offer(snapshot)
-                    last_history_capture = now
-            except Exception as error:
-                category = classify_owner_tick_error(
-                    error, storage_failed=bool(getattr(owner.session, '_failed', False)))
-                if category == 'FAIL_STOP':
-                    raise
-                initial_start_pending = False
-                code = getattr(error, 'code', 'E_DSV_SDK_RUNTIME')
-                disarm = category == 'PERSISTENT_DISARM'
-                owner.disconnect_for_error(
-                    'PERSISTENT_OWNER_FACT_CONFLICT' if disarm else 'TRANSIENT_OWNER_TICK_ERROR',
-                    disarm=disarm,
-                    fault_code=code if disarm else None,
-                )
-                state = owner.snapshot()
-                authority_effect = ('DISARMED_RECOVERY_REQUIRED' if disarm
-                                    else 'SYNCHRONIZATION_LOST_AUTHORITY_PRESERVED' if state['running']
-                                    else 'SYNCHRONIZATION_LOST_DISARMED')
-                publish_replace_bytes(canonical_bytes({
-                    'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
-                    'execution_core': 'DSV_TARGET_EXECUTION', 'authority_effect': authority_effect,
-                    'error_category': category,
-                    'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
-                    'diagnostic': code,
-                    'exception': exception_record(error),
-                }), diagnostics)
-                current = {
-                    'phase': 'NEEDS_REVIEW' if disarm else 'WAITING_FOR_NATIVE_SYNC',
-                    'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
-                }
-                if current != last_status:
-                    publish_replace_bytes(canonical_bytes({
-                        **current,
-                        'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
-                        'execution_core': 'DSV_TARGET_EXECUTION',
-                    }), status)
-                    last_status = current
-                time.sleep(0.1)
-                return
-            if receipt is not None:
-                current = {
-                    'phase': ('NEEDS_REVIEW' if state.get('owner_fault_code')
-                              else 'READY' if state['synchronized'] else 'WAITING_FOR_NATIVE_SYNC'),
-                    'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
-                }
-                if current == last_status:
-                    return
-                publish_replace_bytes(canonical_bytes({
-                    **current,
-                    'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
-                    'execution_core': 'DSV_TARGET_EXECUTION',
-                }), status)
-                last_status = current
+            execute_owner_tick(
+                owner, binding=binding, current_trading_day=current_trading_day,
+                is_complete=is_complete, history_writer=history_writer,
+                status_path=status, diagnostics_path=diagnostics,
+                loop_state=loop_state,
+            )
 
         server.serve(stop_event=owner.stop_event, owner_tick=tick, publish_workbench=True)
         shutdown = owner.session.prepare_shutdown()

@@ -4698,15 +4698,18 @@
       "requirements": [],
       "timeout_seconds": 30,
       "cases": [
+        "TargetOwnerPureLogicTests.test_initial_auto_arm_survives_transient_error_and_confirms_once_while_persistent_disarm_cancels_it",
+        "TargetOwnerPureLogicTests.test_market_break_retains_current_trading_day_until_next_session_is_active",
+        "TargetOwnerPureLogicTests.test_mixed_night_and_day_sessions_advance_trading_day_when_active_contracts_agree_and_fail_closed_on_conflict",
+        "TargetOwnerPureLogicTests.test_owner_tick_error_classification_rules",
         "TargetOwnerRuntimeTests.test_external_broker_position_is_not_claimed_or_extended",
         "TargetOwnerRuntimeTests.test_flatten_then_stop_waits_for_original_child_terminal_fact",
         "TargetOwnerRuntimeTests.test_history_cache_failure_does_not_change_target_authority",
         "TargetOwnerRuntimeTests.test_incomplete_baseline_stays_disarmed_then_complete_frame_enables_controls",
         "TargetOwnerRuntimeTests.test_manual_close_all_requires_and_verifies_per_cycle_target_revisions",
         "TargetOwnerRuntimeTests.test_manual_close_requires_and_verifies_expected_target_revision",
-        "TargetOwnerRuntimeTests.test_market_break_retains_current_trading_day_until_next_session_is_active",
         "TargetOwnerRuntimeTests.test_new_boot_uses_a_new_ledger_and_does_not_inherit_runtime_commands",
-        "TargetOwnerRuntimeTests.test_owner_tick_error_classification_and_persistent_disarm_blocks_auto_recovery",
+        "TargetOwnerRuntimeTests.test_persistent_disarm_blocks_auto_recovery_and_requires_reconciliation",
         "TargetOwnerRuntimeTests.test_process_runtime_harness_lifecycle_and_public_pipe_control",
         "TargetOwnerRuntimeTests.test_projection_has_one_rule_set_two_policies_and_bounded_capabilities",
         "TargetOwnerRuntimeTests.test_public_pipe_command_is_bound_idempotent_and_conflicting_content_is_rejected",
@@ -4744,17 +4747,12 @@
             "Windows"
           ]
         },
-        "TargetOwnerRuntimeTests.test_market_break_retains_current_trading_day_until_next_session_is_active": {
-          "platform": [
-            "Windows"
-          ]
-        },
         "TargetOwnerRuntimeTests.test_new_boot_uses_a_new_ledger_and_does_not_inherit_runtime_commands": {
           "platform": [
             "Windows"
           ]
         },
-        "TargetOwnerRuntimeTests.test_owner_tick_error_classification_and_persistent_disarm_blocks_auto_recovery": {
+        "TargetOwnerRuntimeTests.test_persistent_disarm_blocks_auto_recovery_and_requires_reconciliation": {
           "platform": [
             "Windows"
           ]
