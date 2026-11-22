@@ -203,6 +203,9 @@ class CommandBus(QObject):
     _DEFINITE_SUBMIT_REJECTIONS = {
         'E_AUTH', 'E_BUSY', 'E_CAPABILITY', 'E_CONFIG_EDIT', 'E_CONTEXT_EXPIRED',
         'E_BOOT_MISMATCH', 'E_NOT_READY', 'E_REVISION_CONFLICT', 'E_SCHEMA', 'E_SCOPE',
+        'E_OWNERSHIP', 'E_RULE_UNAPPROVED', 'E_UNSUPPORTED',
+        'E_DSV_COMMAND', 'E_DSV_SCOPE', 'E_DSV_SDK_CLOCK', 'E_DSV_SYNC',
+        'E_DSV_NATIVE_ID', 'E_DSV_OWNERSHIP',
     }
 
     def __init__(self, coordinator, store, parent=None):
@@ -349,7 +352,10 @@ class CommandBus(QObject):
             return
         command_id = expected_id
         status = value.get('status')
-        mapped = (PendingCommandStatus.COMPLETED if status in {'SUCCEEDED', 'SUPERSEDED'} else
+        terminal_commit = (status == 'COMMITTED'
+                           and str(value.get('tx_id', '')).startswith('target-'))
+        is_terminal = status in self._TERMINAL or terminal_commit
+        mapped = (PendingCommandStatus.COMPLETED if (status in {'SUCCEEDED', 'SUPERSEDED'} or terminal_commit) else
                   PendingCommandStatus.REJECTED if status in {'FAILED', 'REJECTED'} else
                   PendingCommandStatus.OUTCOME_UNKNOWN if status == 'NEEDS_RECONCILIATION' else
                   PendingCommandStatus.PROCESSING)
@@ -357,14 +363,14 @@ class CommandBus(QObject):
                                       mapped, value.get('reason'), _freeze_receipt(value),
                                       request.get('scope_hash'))
         try:
-            if status in self._TERMINAL:
+            if is_terminal:
                 records = self._registry.remove(
                     command_id, request['account_key'], request['operation'])
             else:
                 records = self._registry.upsert(pending)
         except TraderError as error:
             self._record_storage_error(error)
-            if status in self._TERMINAL:
+            if is_terminal:
                 pending = replace(pending, status=PendingCommandStatus.OUTCOME_UNKNOWN,
                                   reason='E_PENDING_STORAGE')
                 self.store.pending[command_id] = pending
@@ -372,7 +378,7 @@ class CommandBus(QObject):
             self.feedback.emit(
                 f'已收到命令 {command_id} 的回执，但本机注册表无法同步；已禁止新命令。')
             return
-        self._replace_pending(records, preserve={} if status in self._TERMINAL else {command_id: pending})
+        self._replace_pending(records, preserve={} if is_terminal else {command_id: pending})
         self.command_changed.emit(pending)
         self.feedback.emit(f"命令回执 · {status} · {value.get('reason', '')}")
 

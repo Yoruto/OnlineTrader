@@ -1,7 +1,7 @@
 {
   "version": "DSV_ONLINE_SIMULATION/1",
   "resources": {
-    "protection-plan-v1.3.schema.json": "6cb5849cae169849fda3d5a63a4974e918fb2e0b8e195143473987dbe48609db"
+    "protection-plan-v1.3.schema.json": "1ebb1335a8e13a13681e0e3981106efee5b19c7c44bab4f5da8d617ce357d723"
   },
   "note": "Version 1.3 also accepts the passive wait resolved from the bound profile. Previously stored plans retain their values."
 }

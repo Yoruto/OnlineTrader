@@ -157,7 +157,7 @@ def quote_age_quality(age_ns, reference=None):
     if reference and reference.get('utc_error_ns') is not None:
         observed = reference['reference']
         corrected_age = age_ns + int(observed['offset_ns'])
-        if corrected_age < -int(observed['estimated_error_ns']):
+        if corrected_age < -max(int(observed['estimated_error_ns']), NS_PER_SECOND):
             return 'SOURCE_ANOMALY', 'QUOTE_REFERENCE_CONFLICT'
         return 'VALID', None
     return ('CLOCK_UNVERIFIED', 'QUOTE_LEADS_LOCAL_UTC') if age_ns < 0 else ('VALID', None)

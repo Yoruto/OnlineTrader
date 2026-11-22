@@ -1148,6 +1148,21 @@ class WorkbenchWindow(StatusWindow):
         self._action(action)
 
     def _request_close_positions(self, *, after=None, bulk=False):
+        if self._runtime_command_bus is not None and self.view is not None:
+            records = (self.view.get('status_projection') or {}).get('records', ())
+            rows = sorted(
+                ({'position_cycle_id': rec['position_cycle_id'], 'contract_id': rec['contract_id'],
+                  'direction': rec['direction'], 'remaining_quantity': rec['remaining_quantity'],
+                  'plan_revision': rec.get('plan_revision')}
+                 for rec in records
+                 if rec.get('record_type') == 'CYCLE' and int(rec.get('remaining_quantity', 0)) > 0
+                 and rec.get('takeover_state') not in {'TAKEOVER_PENDING', 'TAKEN_OVER'}
+                 and (after is None or rec['position_cycle_id'] > after)),
+                key=lambda item: item['position_cycle_id'],
+            )
+            page = {'positions': rows[:64], 'has_more': len(rows) > 64}
+            self._review_close_positions((self._command_binding(), after, bulk), page)
+            return
         self.show_home_feedback('正在向执行器查询可平持仓。')
         self._start_job('close_positions', (self._command_binding(), after, bulk))
 
@@ -1653,6 +1668,7 @@ class WorkbenchWindow(StatusWindow):
 def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None,autostart=False,
         update_root=None, notification=None, runtime_view=False, activation_server=None):
     app=QApplication.instance() or QApplication([])
+    app.setQuitOnLastWindowClosed(False)
     restart_for_update = False
     window = None
 

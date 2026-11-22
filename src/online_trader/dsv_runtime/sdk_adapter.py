@@ -364,7 +364,8 @@ class DsvSdkAdapter:
             quote_time, observation = self._observe_quote(code, sample, windows[code], day)
             market = self._market(code, day, sample.utc, funds, state['symbols'][code],
                                   code in foreign_orders or code in foreign_trades, state['orders'],
-                                  quote_time=quote_time, window=windows[code], observation=observation)
+                                  quote_time=quote_time, window=windows[code], observation=observation,
+                                  external_active=code in foreign_orders)
             if code in deferred:
                 market.update(ticks=[], native_coverage=False, calendar_reason='CABINET_DAY_UNPROVED')
             markets.append(market)
@@ -399,11 +400,14 @@ class DsvSdkAdapter:
                 if actual != binding['native_trading_day']:
                     raise TraderError('E_DSV_SDK_FACT', 'SDK order belongs to a different cabinet day')
             elif not rejected:
-                if (order.status == 'ALIVE' and filled == 0 and (stamp is None or type(stamp) is int and stamp == 0)
-                        and getattr(order, '_this_session', False) is True
-                        and not getattr(order, 'exchange_order_id', None)
-                        and binding['send_state'] == 'CALL_RETURNED'
-                        and binding['child_order_id'] in self._local_returns):
+                is_local_pending = (
+                    order.status == 'ALIVE' and filled == 0 and (stamp is None or type(stamp) is int and stamp == 0)
+                    and getattr(order, '_this_session', False) is True
+                    and not getattr(order, 'exchange_order_id', None)
+                    and binding['send_state'] == 'CALL_RETURNED')
+                if is_local_pending and (
+                        binding['child_order_id'] in self._local_returns
+                        or getattr(self, 'owner_mode', None) == 'STANDALONE'):
                     result.append(self._fact('LOCAL_ORDER', binding, native_id))
                     continue
                 raise TraderError('E_DSV_SDK_FACT', 'SDK order is missing its native acceptance time')
@@ -436,7 +440,7 @@ class DsvSdkAdapter:
             if type(stamp) is not int:
                 raise TraderError('E_DSV_SDK_FACT', 'SDK trade needs an exact nanosecond timestamp')
             ordered = accepted.get(trade.order_id)
-            if ordered is not None and stamp < int(ordered):
+            if ordered is not None and stamp + 5_000_000_000 < int(ordered):
                 raise TraderError('E_DSV_SDK_FACT', 'Native trade precedes its original order timestamp')
             if ordered is None:
                 # The account trade map can change before the original order
@@ -557,7 +561,8 @@ class DsvSdkAdapter:
                        'quote_session': None if session is None else session['session_id']}
         return (source if quality in {'VALID', 'CLOCK_UNVERIFIED'} else None), observation
 
-    def _market(self, code, day, now, funds, previous, external, orders, *, quote_time=None, window=None, observation=None):
+    def _market(self, code, day, now, funds, previous, external, orders, *, quote_time=None, window=None,
+                observation=None, external_active=None):
         if window is None:
             window = self.calendar.query(code, utc(now))
         active = bool(window['is_trading'] and window['trading_day'] == day)
@@ -567,10 +572,22 @@ class DsvSdkAdapter:
         position = self.api.get_position(code, account=self.account)
         quote = self.quotes[code]
         tick = self._tick(code, quote, session, quote_time) if active else None
+        standalone_model = getattr(self, 'owner_mode', None) == 'STANDALONE'
+        active_ext = bool(external if external_active is None else external_active)
         result = {'contract_id': code, 'session_open': session['open_utc'], 'session_close': session['close_utc'],
                   'opening_session': session['is_opening_session'], 'ticks': [] if tick is None else [tick],
-                  'external_orders': external, 'native_coverage': window['complete'],
-                  'market_session_active': active}
+                  'external_orders': active_ext if standalone_model else bool(external),
+                  ' native_coverage': window['complete']}
+        result.pop(' native_coverage', None)
+        result['native_coverage'] = window['complete']
+        result['market_session_active'] = active
+        if standalone_model:
+            result['standalone_external_model'] = True
+            result['external_active_orders'] = active_ext
+        prof = getattr(self, 'profile', None)
+        if prof is not None:
+            result['limit_fallback_ratio'] = str(
+                prof.to_record()['settings']['trade'].get('limit_fallback_ratio', '0.01'))
         if observation is not None:
             prior_liquidation = next((period for period in reversed(periods) if period['force_close_at_end']
                                       and datetime.fromisoformat(period['close_utc']) <= now), None)
@@ -622,7 +639,7 @@ class DsvSdkAdapter:
             result['days_to_expiry'] = str((midnight - (quote_time or now).astimezone(_BEIJING)).days)
         for field, native in (('min_order_qty', 'min_limit_order_volume'), ('max_order_qty', 'max_limit_order_volume')):
             value = getattr(quote, native, None)
-            if value is not None and active:
+            if value is not None and active and not (type(value) is int and value == 0):
                 actual = native_integer(value, minimum=1)
                 result[field] = min(actual, result.get(field, actual))
         return result
@@ -703,19 +720,47 @@ class DsvSdkAdapter:
                 raise TraderError('E_DSV_SDK_CLOCK', 'Application UTC protection window expired')
             market = self.dispatch_market[effect['contract_id']]
             tick = market['ticks'][-1] if market['ticks'] else None
-            if (tick is None or market['external_orders'] or
+            standalone_model = bool(market.get('standalone_external_model'))
+            ext_blocked = (
+                market.get('external_active_orders', False) if (standalone_model and effect['native_offset'] == 'OPEN')
+                else False if standalone_model
+                else market['external_orders'])
+            if (tick is None or ext_blocked or
                     legal_price(tick, Decimal(effect['limit_price'])) != effect['limit_price']):
-                rejection_reason = 'QUOTE_OR_PRICE_SCOPE'
+                rejection_reason = 'FOREIGN_ACTIVE_ORDER' if ext_blocked and standalone_model else 'QUOTE_OR_PRICE_SCOPE'
                 raise TraderError('E_DSV_SDK_SCOPE', 'A native dispatch requires a legal price and current scoped quote')
             clock = self._clock_sample()
             if 'calendar_session_id' in market:
                 window = self.calendar.query(effect['contract_id'], clock.now_utc)
                 if (self._continuity.compare(clock)['reason'] or not window['is_trading']
                         or window['trading_day'] != effect['trading_day']
-                        or window['session']['session_id'] != market['calendar_session_id']
-                        or self.quotes[effect['contract_id']].datetime != tick['native_quote_stamp']):
+                        or window['session']['session_id'] != market['calendar_session_id']):
                     rejection_reason = 'QUOTE_OR_PRICE_SCOPE'
                     raise TraderError('E_DSV_SDK_SCOPE', 'The selected quote or trading session changed before dispatch')
+                live_quote = self.quotes[effect['contract_id']]
+                if live_quote.datetime != tick['native_quote_stamp']:
+                    live_source = None
+                    try:
+                        live_source = self._quote_time(live_quote)
+                    except (TypeError, ValueError, OverflowError):
+                        live_source = None
+                    live_tick = (self._tick(effect['contract_id'], live_quote, window['session'], live_source)
+                                 if live_source is not None else None)
+                    limit_dec = Decimal(effect['limit_price'])
+                    buy = effect['direction'] == 'BUY'
+                    opp = None if live_tick is None else live_tick.get('ask1' if buy else 'bid1')
+                    ref_price = opp if price_value(opp) is not None else (
+                        None if live_tick is None else live_tick.get('last'))
+                    price_still_safe = (
+                        live_tick is not None
+                        and legal_price(live_tick, limit_dec) == effect['limit_price']
+                        and price_value(ref_price) is not None
+                        and (Decimal(ref_price) <= limit_dec if buy else Decimal(ref_price) >= limit_dec))
+                    if not price_still_safe:
+                        rejection_reason = 'QUOTE_REVISION_CHANGED'
+                        raise TraderError('E_QUOTE_REVISION_CHANGED',
+                                          'Quote revision changed before dispatch; reprice required')
+                    tick = live_tick
                 stamp = tick['native_quote_stamp']
                 source = quote_timestamp(stamp, _BEIJING)
                 age = source_age_ns(clock.utc, source, stamp)

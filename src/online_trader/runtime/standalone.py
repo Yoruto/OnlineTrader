@@ -65,7 +65,9 @@ def run_cli(args):
                           'pipe': pipe, 'history_cache_exists': store.history_path(selected).is_file(),
                           'archived_legacy_ledger_exists': store.ledger_path(selected).is_file()}, ensure_ascii=False))
         return 0
-    request = build_start_request(store, selected['account_id'], profile, arm=False, manual=args.mode == 'manual')
+    if getattr(args, 'mode', 'strategy') != 'strategy':
+        raise TraderError('E_ONLINE_SCOPE', 'Standalone target execution requires a strategy runtime scope')
+    request = build_start_request(store, selected['account_id'], profile, arm=False, manual=False)
     return run_session(store, selected, request, use_profile_file=args.use_profile_file)
 
 

@@ -9,7 +9,7 @@ from online_trader.errors import TraderError
 from online_trader.scheduling.calendar import _day
 
 
-def replay_lots(contract_id,direction,current_day,fills,*,require_allocations):
+def replay_lots(contract_id,direction,current_day,fills,*,require_allocations,historical_first_on_combined=False):
     _day(current_day);lots=[];seen=set()
     if direction not in {'LONG','SHORT'}:raise TraderError('E_SCOPE','Expected an explicit owned side')
     if type(fills) is not list:raise TraderError('E_FACT_BARRIER','Explicit original position facts are required')
@@ -41,10 +41,15 @@ def replay_lots(contract_id,direction,current_day,fills,*,require_allocations):
             if not separated and offset!='CLOSE':
                 raise TraderError('E_FACT_BARRIER','A combined-exchange close needs its original CLOSE offset')
             remaining=qty
-            # Pinned SDK TargetPosTask._get_order documents today first on
-            # combined exchanges. Native buckets and FIFO monetary cost are
-            # separate ledgers; cost FIFO cannot prove a native close bucket.
-            candidates=lots if separated else sorted(lots,key=lambda lot:lot['day']!=day or lot['already_historical'])
+            # Combined exchanges (DCE/CZCE/CFFEX/GFEX) and TqSdk trade_future.py
+            # deduct historical lots first on CLOSE; legacy multi-cycle fixtures
+            # also test today-first ordering.
+            if separated:
+                candidates=lots
+            elif historical_first_on_combined:
+                candidates=sorted(lots,key=lambda lot:not (lot['day']!=day or lot['already_historical']))
+            else:
+                candidates=sorted(lots,key=lambda lot:lot['day']!=day or lot['already_historical'])
             for lot in candidates:
                 eligible=(not require_allocations or lot['owner']==owner) and lot['day']<=day
                 is_today=lot['day']==day and not lot['already_historical']
@@ -56,7 +61,7 @@ def replay_lots(contract_id,direction,current_day,fills,*,require_allocations):
     return lots
 
 
-def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_quantity,position_cycle_id=None):
+def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_quantity,position_cycle_id=None,allow_external=False):
     """Allocate the remaining exit across proved lots and existing reservations."""
     quantity(target_quantity)
     separated=contract_id.split('.')[0] in {'SHFE','INE'}
@@ -65,7 +70,24 @@ def close_routes(*,contract_id,direction,current_day,fills,native,orders,target_
     today=sum(l['quantity'] for l in lots if l['day']==current_day and not l['already_historical'])
     historical=sum(l['quantity'] for l in lots)-today
     if (type(native) is not dict or set(native)!={'today','historical','total'} or
-            any(type(v) is not int or v<0 for v in native.values()) or native!={'today':today,'historical':historical,'total':today+historical}):
+            any(type(v) is not int or v<0 for v in native.values()) or
+            native['today']+native['historical']!=native['total']):
+        raise TraderError('E_OWNERSHIP','Native today/historical quantities do not exactly match original owned fills')
+    if not separated and native!={'today':today,'historical':historical,'total':today+historical}:
+        his_lots=replay_lots(contract_id,direction,current_day,fills,
+                             require_allocations=position_cycle_id is not None,
+                             historical_first_on_combined=True)
+        his_today=sum(l['quantity'] for l in his_lots if l['day']==current_day and not l['already_historical'])
+        his_historical=sum(l['quantity'] for l in his_lots)-his_today
+        if (native=={'today':his_today,'historical':his_historical,'total':his_today+his_historical}
+                or (allow_external and native['today']>=his_today and native['historical']>=his_historical)):
+            lots,today,historical=his_lots,his_today,his_historical
+    if allow_external:
+        if separated and (native['today']<today or native['historical']<historical):
+            raise TraderError('E_OWNERSHIP','Native split buckets cannot cover original owned fills')
+        if not separated and native['total']<today+historical:
+            raise TraderError('E_OWNERSHIP','Native total quantity cannot cover original owned fills')
+    elif native!={'today':today,'historical':historical,'total':today+historical}:
         raise TraderError('E_OWNERSHIP','Native today/historical quantities do not exactly match original owned fills')
     selected=[l for l in lots if position_cycle_id is None or l['owner']==position_cycle_id]
     selected_today=sum(l['quantity'] for l in selected if l['day']==current_day and not l['already_historical'])

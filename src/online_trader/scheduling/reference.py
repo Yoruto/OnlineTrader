@@ -286,41 +286,46 @@ class CalibratedClock(LocalWallClock):
             pass
         else:
             self._worker = None
-            self._valid = reference is not None and 0 <= now - reference.monotonic_anchor < 30
-            if self._valid:
-                candidate = reference.wall_anchor + now - reference.monotonic_anchor
-                current = candidate if self._utc is None else self._timestamp(now)
-                conflict = abs(candidate - current) > .25
-                previous = self._pending_reference
-                if previous is None and self._reference_state == 'RECALIBRATING':
-                    previous = self._reference
-                consistent = (previous is not None
-                              and reference.monotonic_anchor > previous.monotonic_anchor
-                              and abs(candidate - (previous.wall_anchor + now - previous.monotonic_anchor)) <= .25)
-                self._valid = not conflict or consistent
-                if self._valid:
-                    if before_install is not None:
-                        self._valid = False
-                        self._next_refresh = now + 10
-                        before_install(reference)
-                        self._valid = True
-                    self._anchor, self._utc = now, current
-                    self._correction = candidate - current
-                    self._reference = reference
-                    self._pending_reference = None
-                    self._reference_state = 'RECALIBRATING' if conflict else 'CALIBRATED'
-                    self._trusted_reference_mono = reference.monotonic_anchor
-                    self._trusted_error = reference.error_seconds
-                    self._holding = False
-                    if self.protection_ready():
-                        self._checkpoint(now)
-                else:
-                    self._pending_reference = reference
-                    self._reference_state = 'REFERENCE_CONFLICT'
+            if (reference is None and self._reference is not None
+                    and self._trusted_reference_mono is not None
+                    and 0 <= now - self._trusted_reference_mono < 300):
+                self._next_refresh = now + 10
             else:
-                self._pending_reference = None
-                self._reference_state = 'HOLDOVER_PROTECTION' if self.protection_ready() else 'REFERENCE_EXPIRED'
-            self._next_refresh = now + (120 if self.entry_ready() else 10)
+                self._valid = reference is not None and 0 <= now - reference.monotonic_anchor < 30
+                if self._valid:
+                    candidate = reference.wall_anchor + now - reference.monotonic_anchor
+                    current = candidate if self._utc is None else self._timestamp(now)
+                    conflict = abs(candidate - current) > .25
+                    previous = self._pending_reference
+                    if previous is None and self._reference_state == 'RECALIBRATING':
+                        previous = self._reference
+                    consistent = (previous is not None
+                                  and reference.monotonic_anchor > previous.monotonic_anchor
+                                  and abs(candidate - (previous.wall_anchor + now - previous.monotonic_anchor)) <= .25)
+                    self._valid = not conflict or consistent
+                    if self._valid:
+                        if before_install is not None:
+                            self._valid = False
+                            self._next_refresh = now + 10
+                            before_install(reference)
+                            self._valid = True
+                        self._anchor, self._utc = now, current
+                        self._correction = candidate - current
+                        self._reference = reference
+                        self._pending_reference = None
+                        self._reference_state = 'RECALIBRATING' if conflict else 'CALIBRATED'
+                        self._trusted_reference_mono = reference.monotonic_anchor
+                        self._trusted_error = reference.error_seconds
+                        self._holding = False
+                        if self.protection_ready():
+                            self._checkpoint(now)
+                    else:
+                        self._pending_reference = reference
+                        self._reference_state = 'REFERENCE_CONFLICT'
+                else:
+                    self._pending_reference = None
+                    self._reference_state = 'HOLDOVER_PROTECTION' if self.protection_ready() else 'REFERENCE_EXPIRED'
+                self._next_refresh = now + (120 if self.entry_ready() else 10)
         if self.entry_ready() and self._reference_state == 'RECALIBRATING':
             self._reference_state = 'CALIBRATED'
             self._checkpoint(now)

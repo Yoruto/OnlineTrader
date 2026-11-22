@@ -1,6 +1,6 @@
 schema_version: ONLINE_TRADER_MODULE_BOUNDARIES/1
-verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
-verified_on: "2026-11-20"
+verified_at_sha: WORKTREE
+verified_on: "2026-11-21"
 note: Static navigation aid only. Dynamic Qt, IPC and SDK relationships still require source review.
 
 current_workbench_contract: docs/refactor/runtime-workbench-current-20261120.md
@@ -26,23 +26,23 @@ boundaries:
       - execution-ledger writes
       - cross-boot command responsibility
 
-  - id: standalone-runtime-owner
-    route: STANDALONE
+  - id: standalone-runtime-bootstrap
+    route: STANDALONE_BOOTSTRAP
     entries:
       - src/online_trader/runtime/standalone.py:run_session
-      - src/online_trader/runtime/launch.py
+      - src/online_trader/runtime/launch.py:run_cli
+      - src/online_trader/runtime/desktop_bootstrap.py:run_confirmed_start
       - src/online_trader/runtime/view_process.py:ViewProcess
     collaborators:
       - src/online_trader/runtime/session_storage.py:RuntimeSessionStorage
-      - src/online_trader/runtime/account_history.py
-      - src/online_trader/runtime/operator_api.py
-      - src/online_trader/kernel
+      - src/online_trader/runtime/target_owner_startup.py:run_target_owner
+      - src/online_trader/runtime/instance.py:RuntimeLock
     owns:
-      - one process-owned execution store for the current boot
-      - broker synchronization and current business state
-      - command validation, execution and receipts
-      - SDK/order/protection lifecycle
+      - one Runtime boot and process-owned temporary Journal allocation
+      - version-fixed selection of the single current Standalone owner
+      - launch validation and shutdown/lifecycle coordination
     must_not_own:
+      - SDK order sending or target-execution state beside the Target Owner
       - cross-device locks for the same futures account
       - durable handoff of a prior boot execution ledger
 
@@ -80,8 +80,8 @@ boundaries:
       - Qt or Workbench state
       - QA fixture injection in online SDK mode
 
-  - id: standalone-target-owner-candidate
-    route: STANDALONE_COLD_CUTOVER_CANDIDATE
+  - id: standalone-target-owner
+    route: STANDALONE_DEFAULT_OWNER
     entries:
       - src/online_trader/runtime/desktop_bootstrap.py:_STANDALONE_EXECUTION_CORE
       - src/online_trader/runtime/target_owner_startup.py:run_target_owner
@@ -100,7 +100,6 @@ boundaries:
     must_not_be_used_as:
       - a user-selectable second execution core
       - a simultaneous sender beside Legacy Kernel
-      - the default route before independent acceptance and cold cutover
 
   - id: legacy-runtime
     route: LEGACY_EXPLICIT_MAINTENANCE
@@ -119,9 +118,14 @@ boundaries:
     entries:
       - qa/dsv_parity
       - qa/runtime_replay.py
+      - qa/target_owner/offline_runtime.py
+      - qa/target_owner/process_runtime.py
+      - qa/target_owner/fake_broker.py
       - src/online_trader/dsv_runtime/offline_endpoint.py
     owns:
       - frozen fixtures and bounded offline replay
+      - QA-only Standalone Target Owner process and private fact channel
+      - parent-side Fake Broker state, explicit native facts, and virtual-time frames
     must_not_be_used_as:
       - production online input port
       - proof of live broker behavior

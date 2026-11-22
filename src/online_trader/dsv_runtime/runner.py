@@ -584,6 +584,15 @@ class DsvSession:
             if state.get('clock_recovery_required'):
                 timing.utc_error_ns = None
                 state['clock_native_reconciled'] = self._clock_facts_reconciled(state, frame)
+                if (state['clock_recovery_required'] == 'OWNER_SCHEDULING_GAP'
+                        and state['clock_native_reconciled']
+                        and frame['clock_health'].get('continuous_samples', 0) >= 2):
+                    prior = state.pop('clock_recovery_required', None)
+                    state.pop('clock_recovery_id', None)
+                    state.pop('clock_native_reconciled', None)
+                    state['running'] = False
+                    timing.events.append({'result': 'CLOCK_GAP_RECOVERED', 'reason': prior,
+                                          'sample': state['time_sample'], 'entry_authority': 'DISARMED'})
         if self._sdk_port is not None:
             authorization_time = _utc(frame.get('authorization_time', frame['wall_time']))
             if (timing and not state.get('clock_recovery_required') and not state.get('scope_expired_at')
@@ -626,8 +635,16 @@ class DsvSession:
                 timing.recover(row, contract)
                 if position := row['position']:
                     timing.recover(position, position['id'])
-                observed['allow_new_order'] = not state.get('clock_recovery_required') and self._in_session(frame, observed)
-                observed['calendar_clock_unverified'] = state.get('clock_recovery_required') not in (
+                in_sess = self._in_session(frame, observed)
+                clock_fault = state.get('clock_recovery_required')
+                manual_exit = bool(position and position.get('manual_close_mode') is not None)
+                observed['allow_new_entry'] = not clock_fault and in_sess
+                observed['allow_protective_exit'] = in_sess and (
+                    not clock_fault or clock_fault == 'OWNER_SCHEDULING_GAP' or manual_exit)
+                observed['allow_new_order'] = observed['allow_new_entry'] or (
+                    bool(position and position['exit_target'] is not None and position['owned'] > position['exit_target'])
+                    and observed['allow_protective_exit'])
+                observed['calendar_clock_unverified'] = clock_fault not in (
                     None, 'OWNER_SCHEDULING_GAP')
             if frame.get('market_clock') and tick is not None:
                 native_time = _utc(tick['native_time'])
@@ -686,7 +703,9 @@ class DsvSession:
                     and not order.get('terminal_conflict') and order['reported_fill_qty'] == order['filled_qty']
                     for child, order in state['orders'].items() if not terminal(order))
                 and all(not row.get('native_conflicts') and not row.get('detached_positions')
-                        and (row['position'] is None or self._controller.proves_position(state, row['position'], market))
+                        and (row['position'] is None or self._controller.proves_position(
+                            state, row['position'], market,
+                            for_effect='REDUCE' if market.get('standalone_external_model') else None))
                         for market in frame['market'] if (row := state['symbols'][market['contract_id']]) is not None))
 
     def _plan_timed_symbol(self, state, row, market, timing, values, effects):
@@ -694,6 +713,8 @@ class DsvSession:
         if position and position.get('gap_exit') and (
                 market['tick'] is None or not self._fresh_after_gap(market, position['gap_exit'])):
             market['allow_new_order'] = False
+            market['allow_new_entry'] = False
+            market['allow_protective_exit'] = False
         if position:
             if timing.due(position, 'price_context', position['id'], consume=True):
                 position['price_context_expired'] = True
@@ -708,11 +729,11 @@ class DsvSession:
         if active_exit:
             if not market.get('market_session_active'):
                 reason = 'EXIT_WAITING_FOR_SESSION'
-            elif state.get('clock_recovery_required'):
+            elif state.get('clock_recovery_required') and not market.get('allow_protective_exit', False):
                 reason = 'EXIT_WAITING_FOR_CLOCK_REVIEW'
             elif (market.get('quote_observation') or {}).get('reason') == 'CLOCK_PROTECTION_WINDOW_EXPIRED':
                 reason = 'EXIT_WAITING_FOR_UTC_REFERENCE'
-            elif market['tick'] is None or not market['allow_new_order']:
+            elif market['tick'] is None or not market.get('allow_protective_exit', market.get('allow_new_order')):
                 reason = 'EXIT_WAITING_FOR_PRICE'
         row['exit_wait_reason'] = reason
         if reason:
@@ -844,6 +865,13 @@ class DsvSession:
             position = row['position']
             if row.get('detached_positions') or row.get('native_conflicts'):
                 continue
+            if market.get('standalone_external_model'):
+                if position is not None and not self._controller.proves_position(
+                        state, position, market, for_effect='REDUCE'):
+                    row['ownership_conflict'] = 'POSITION_UNDERCOVERED'
+                else:
+                    row.pop('ownership_conflict', None)
+                continue
             if position is not None and not self._controller.proves_position(state, position, market):
                 return
         state['synchronized'] = True
@@ -894,7 +922,12 @@ class DsvSession:
             market.update(entry_throttle_active=throttle is not None and throttle < NS_PER_SECOND,
                           stop_cooldown_active=(stop.get('until') is not None and (
                               cooldown < int(stop_timer['duration_ns']) if cooldown is not None else True)))
-        if market['long_qty'] or market['short_qty'] or market.get('external_orders'):
+        if market.get('standalone_external_model'):
+            if market.get('external_active_orders'):
+                return [{'reason': 'E_FOREIGN_ACTIVE_ORDER', 'rule_ids': ['I01', 'I02']}]
+            if market['long_qty'] or market['short_qty']:
+                return [{'reason': 'EXTERNAL_POSITION_PRESENT', 'rule_ids': ['I01', 'I02']}]
+        elif market['long_qty'] or market['short_qty'] or market.get('external_orders'):
             return [{'reason': 'UNOWNED_POSITION', 'rule_ids': ['I01', 'I02']}]
         if 'quote_age_seconds' in market:
             age_limit = float(self._trade['max_quote_age_seconds'])
@@ -965,12 +998,15 @@ class DsvSession:
     def _synchronize_protection_exit(self, state, position, market, frame, spec, *, timing=None):
         """Keep the strategy exit pending while preserving the native flat facts."""
         reads = market.get('wall_reads', {})
-        native_flat = not market['long_qty'] and not market['short_qty'] and not market.get('external_orders')
+        ext_orders = (market.get('external_active_orders')
+                      if market.get('standalone_external_model') else market.get('external_orders'))
+        native_flat = not market['long_qty'] and not market['short_qty'] and not ext_orders
         children = self._controller.child_orders(state, position)
+        all_terminal = all(terminal(order) for order in children)
         # _run line 6236 guards the account read for five seconds. The
         # position mismatch (booked side versus native flat) takes the
         # reconciliation branch regardless of POSITION_ACT_GRACE.
-        if native_flat and not position['owned'] and all(terminal(order) for order in children):
+        if native_flat and not position['owned'] and all_terminal:
             if timing:
                 due = timing.due(position, 'protection_sync', position['id'], consume=True)
             else:
@@ -991,7 +1027,8 @@ class DsvSession:
                 position['close_request_at'] = reads.get('protection', frame['wall_time'])
                 if timing:
                     position['protection_request_quote'] = quote_revision
-                    timing.arm(position, 'protection_sync', position['id'], 5)
+                    if not (native_flat and not position['owned'] and all_terminal):
+                        timing.arm(position, 'protection_sync', position['id'], 5)
         if not position['owned']:
             return {'reason': 'PROTECTION_EXIT_AWAITING_SYNC', 'rule_ids': ['D08', 'I02']}
         return None
@@ -1065,7 +1102,11 @@ class DsvSession:
         row['position'] = position
         if position['exit_target'] != previous_target:
             position.pop('manual_close_mode', None)
+            position.pop('manual_close_started_at', None)
+            position.pop('exit_manual_takeover', None)
             position['exit_revision'] = position.get('exit_revision', 0) + 1
+            position['target_revision'] = position.get('target_revision', 1) + 1
+            position['consecutive_exit_rejections'] = 0
         for result in results:
             reason = result['reason']
             if 'remaining' in result:
@@ -1145,7 +1186,7 @@ class DsvSession:
         first = close is None
         if first:
             reason = frame['clock_health'].get('reason')
-            if position['exit_target'] == 0 or market.get('calendar_clock_unverified') or (
+            if market.get('calendar_clock_unverified') or (
                     reason and reason != 'OWNER_SCHEDULING_GAP'):
                 return None
             end = market.get('liquidation_at')
@@ -1176,13 +1217,15 @@ class DsvSession:
                      'missed_window': missed}
             position['calendar_exit'] = close
             last = None if tick is None or missed else price_value(tick.get('last'))
-            position['rollback_exit'] = {'reason': 'SESSION_CLOSE', 'at': sample.now_utc,
-                                         'price': None if last is None else tick['last'], 'slip': None}
-            if last is not None:
-                movement = Decimal(str(last)) - Decimal(position['theory'])
-                if position['direction'] == 'SHORT':
-                    movement = -movement
-                row['net_loss'] = decimal_text(Decimal(row['net_loss']) - movement)
+            had_prior_exit = 'rollback_exit' in position
+            if not had_prior_exit:
+                position['rollback_exit'] = {'reason': 'SESSION_CLOSE', 'at': sample.now_utc,
+                                             'price': None if last is None else tick['last'], 'slip': None}
+                if last is not None:
+                    movement = Decimal(str(last)) - Decimal(position['theory'])
+                    if position['direction'] == 'SHORT':
+                        movement = -movement
+                    row['net_loss'] = decimal_text(Decimal(row['net_loss']) - movement)
             close['nominal_price_status'] = 'UNDETERMINED' if last is None else 'BOOKED'
             if is_night and row.get('night_reference'):
                 row['night_reference']['fallback'] = position['direction']
@@ -1200,15 +1243,24 @@ class DsvSession:
                 position['close_native_checks'] = checks - 1
             else:
                 refresh = timing.due(position, 'close_refresh', position['id'], consume=True)
+        mode_escalated = False
         if refresh:
             elapsed = timing.elapsed(position, 'close_span')
             if elapsed is not None:
-                remaining_ms = window * 1000 - elapsed // 1_000_000
-                position['close_mode'] = scheduled_close_mode(remaining_ms)
+                span_remaining_ms = window * 1000 - elapsed // 1_000_000
+                if close and close.get('end_utc') and not close.get('missed_window'):
+                    end_remaining_ms = max(0, int((_utc(close['end_utc']) - sample.utc).total_seconds() * 1000))
+                    remaining_ms = min(span_remaining_ms, end_remaining_ms)
+                else:
+                    remaining_ms = span_remaining_ms
+                new_mode = scheduled_close_mode(remaining_ms)
+                if new_mode != position.get('close_mode'):
+                    mode_escalated = True
+                position['close_mode'] = new_mode
             timing.arm(position, 'close_refresh', position['id'], 3)
             position['close_refresh'] = str(sample.utc.timestamp())
             position['close_native_checks'] = 6 if tick is not None and self._in_session(frame, market) else 0
-        tighten_target(position, 0)
+        tighten_target(position, 0, new_request=first or mode_escalated)
         result = {'reason': 'SCHEDULED_CLOSE' if first else 'SCHEDULED_CLOSE_PENDING',
                   'price_mode': position.get('close_mode'), 'rule_ids': ['D06', 'D11']}
         if refresh:
@@ -1327,13 +1379,19 @@ class DsvSession:
                 raise TraderError('E_DSV_OWNERSHIP', 'The strategy target changed before the reduction command')
             if row.get('detached_positions') or row.get('native_conflicts'):
                 raise TraderError('E_DSV_OWNERSHIP', 'Late fill from another cycle requires ownership review')
+            prior_exit = position['exit_target']
             target = position['owned'] - qty
-            if position['exit_target'] is not None:
-                target = min(target, position['exit_target'])
+            if prior_exit is not None:
+                target = min(target, prior_exit)
+            urgent_auto_exit = (
+                position.get('calendar_exit') is not None
+                or (prior_exit == 0 and position.get('rollback_exit', {}).get('reason') not in {None, 'MANUAL_EXIT'}))
             tighten_target(position, target, new_request=True)
             position['target_reason'] = 'USER_REDUCE'
-            if command.get('price_mode') is not None:
+            if command.get('price_mode') is not None and not (urgent_auto_exit and command['price_mode'] == '排队价'):
                 position['manual_close_mode'] = command['price_mode']
+                if state.get('time_sample') and state['time_sample'].get('now_utc'):
+                    position['manual_close_started_at'] = str(_utc(state['time_sample']['now_utc']).timestamp())
             if target == 0 and not position.get('rollback_exit'):
                 position['rollback_exit'] = {'reason': 'MANUAL_EXIT', 'at': None, 'price': None, 'slip': None}
             return [{'reason': 'USER_REDUCE', 'remaining': target, 'rule_ids': ['I01', 'I02']}], []
@@ -1354,12 +1412,20 @@ class DsvSession:
                 return [{'reason': 'NO_OWNED_TARGETS', 'rule_ids': ['I01', 'I02']}], []
             decisions, effects = [], []
             state['running'] = False if action == 'FLATTEN_STOP' else state['running']
+            started_stamp = (str(_utc(state['time_sample']['now_utc']).timestamp())
+                             if state.get('time_sample') and state['time_sample'].get('now_utc') else None)
             for position_id in requested:
                 position = current[position_id]
+                urgent_auto_exit = (
+                    position.get('calendar_exit') is not None
+                    or (position['exit_target'] == 0
+                        and position.get('rollback_exit', {}).get('reason') not in {None, 'MANUAL_EXIT'}))
                 tighten_target(position, 0, new_request=True)
                 position['target_reason'] = 'USER_FLATTEN'
-                if command.get('price_mode') is not None:
+                if command.get('price_mode') is not None and not (urgent_auto_exit and command['price_mode'] == '排队价'):
                     position['manual_close_mode'] = command['price_mode']
+                    if started_stamp is not None:
+                        position['manual_close_started_at'] = started_stamp
                 position.setdefault('rollback_exit', {
                     'reason': 'MANUAL_EXIT', 'at': None, 'price': None, 'slip': None})
                 for order in self._controller.child_orders(state, position, 'OPEN'):

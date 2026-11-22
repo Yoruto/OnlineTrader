@@ -125,7 +125,7 @@ class TqKqPort(OnlineSimulationPort):
             raise TraderError('E_ONLINE_SCOPE','Scope provider differs from its native adapter')
         self.api,self.account,self.grant,self.clock=api,account,grant,clock
         self._bindings={};self._issued=set();self._known_notifications=set(api._data.get('notify',{}))
-        self._transport_up=True;self.fault=False;self.source_epoch=1
+        self._transport_up=True;self._md_transport_up=True;self._td_transport_up=True;self.fault=False;self.source_epoch=1
         self.read_only=False
         self.broker_connected=False
         self._closed=False
@@ -164,8 +164,22 @@ class TqKqPort(OnlineSimulationPort):
         for key,item in self.api._data.get('notify',{}).items():
             if key in self._known_notifications:continue
             self._known_notifications.add(key);code=item.get('code')
-            if code in {2019112910,2019112911}:self.fault=True;self._transport_up=False
-            elif code==2019112902:self.fault=True;self._transport_up=True;self.source_epoch+=1
+            text=' '.join(str(item.get(field,'')) for field in ('content','url','conn_id')).lower()
+            is_md=('行情' in text or 'md' in text) and not ('交易' in text or 'td' in text)
+            is_td=('交易' in text or 'td' in text) and not ('行情' in text or 'md' in text)
+            if code in {2019112910,2019112911}:
+                self.fault=True
+                if is_md:self._md_transport_up=False
+                elif is_td:self._td_transport_up=False
+                else:self._md_transport_up=self._td_transport_up=False
+                self._transport_up=self._md_transport_up and self._td_transport_up
+            elif code==2019112902:
+                self.fault=True
+                if is_md:self._md_transport_up=True
+                elif is_td:self._td_transport_up=True
+                else:self._md_transport_up=self._td_transport_up=True
+                self._transport_up=self._md_transport_up and self._td_transport_up
+                self.source_epoch+=1
         if trace is not None:
             trace.sdk_quotes(self.quotes, received[0], self.source_epoch, self.fault)
             trace.sdk_clock(sample, self.clock)

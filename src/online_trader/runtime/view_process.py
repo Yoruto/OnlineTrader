@@ -344,11 +344,14 @@ def serve(pipe, account_key, root, ledger, history_cache):
 
     def read_owner():
         while not stopped.is_set():
-            value = read_workbench_publication(pipe, account_key)
-            if value is not None:
-                if account_display is not None:
-                    value = value | {'view': value['view'] | {'account_display': account_display}}
-                history.publish(value)
+            try:
+                value = read_workbench_publication(pipe, account_key)
+                if value is not None:
+                    if account_display is not None:
+                        value = value | {'view': value['view'] | {'account_display': account_display}}
+                    history.publish(value)
+            except (OSError, TraderError, KeyError, TypeError, ValueError):
+                pass
             stopped.wait(.15)
 
     Thread(target=observe_parent, daemon=True).start()

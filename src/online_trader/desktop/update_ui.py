@@ -161,7 +161,7 @@ class ManagedUpdateController(QObject):
         answer = QMessageBox.question(
             self.window, '安全更新并重启',
             f'安装 {candidate.version} 并重新打开工作台？\n\n'
-            '只有 Runtime 已安全退出、账户无持仓和未决委托时才会安装。',
+            '只有 Trading Runtime 与账户进程已退出、未占用运行锁时才会安装。',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )

@@ -4,7 +4,7 @@
   "scope": "DEVELOPMENT_INTERNAL_ONLY",
   "legacy_resources_unchanged": false,
   "resources": {
-    "protection-plan-v1.2.schema.json": "da7a0cfb640c2a1aa87ae3256e6bd09e421d9454f5441b384da533a49a55d45d"
+    "protection-plan-v1.2.schema.json": "5d99835f425072aeebd4e80ce2572fb938c2880fce576ad64eba3ac694aad376"
   },
   "reason": "Explicit SDK price-worsening cancel/reprice and source session close timing need an independent execution policy. A saved passive wait may differ from the default 3000 ms. Previously stored plans retain their values."
 }

@@ -49,6 +49,7 @@ class Journal:
         self._path = Path(path)
         self._journal_mode = 'unknown'
         try:
+            self._db.execute('PRAGMA busy_timeout=5000')
             self._journal_mode = self._db.execute('PRAGMA journal_mode').fetchone()[0].lower()
             with self.transaction():
                 application = self._db.execute('PRAGMA application_id').fetchone()[0]
@@ -175,9 +176,12 @@ class Journal:
         for name, suffix in (('database_bytes', ''), ('wal_bytes', '-wal'), ('shm_bytes', '-shm')):
             try:
                 values[name] = Path(str(self._path) + suffix).stat().st_size
-            except FileNotFoundError:
+            except (FileNotFoundError, OSError):
                 values[name] = 0
-        values['disk_free_bytes'] = shutil.disk_usage(self._path.resolve().parent).free
+        try:
+            values['disk_free_bytes'] = shutil.disk_usage(self._path.resolve().parent).free
+        except OSError:
+            values['disk_free_bytes'] = 0
         return values
 
     def record_order(self, child, native_id, fact):
@@ -194,7 +198,7 @@ class Journal:
         identity = (order_day, native_order, native_trade)
         stored = self._read('SELECT payload FROM native_trades WHERE trading_day=? AND native_order=? AND native_trade=?', identity)
         if stored is not None:
-            if 'fill_day' not in stored:
+            if 'fill_day' not in stored and 'fill_day' in fact:
                 stored['fill_day'] = order_day
             if 'source_time_ns' in fact and 'source_time_ns' not in stored and stored == {
                     key: value for key, value in fact.items() if key != 'source_time_ns'}:

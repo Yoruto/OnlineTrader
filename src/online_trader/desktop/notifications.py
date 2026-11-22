@@ -130,7 +130,10 @@ class WorkbenchSounds:
             if effect == 'OPEN':
                 event = 'open', trade['position_cycle_id']
             elif effect == 'REDUCE':
-                child = trade['child_order_id']
+                child = (trade.get('child_order_id')
+                         or (trade['trade_key'][0]
+                             if isinstance(trade.get('trade_key'), (list, tuple)) and trade['trade_key']
+                             else str(trade.get('trade_key', ''))))
                 event = 'close', orders.get(child) or child
             else:
                 continue
@@ -142,7 +145,10 @@ class WorkbenchSounds:
                 if trade.get('effect') == 'OPEN':
                     self.trade_events.add(('open', trade['position_cycle_id']))
                 elif trade.get('effect') == 'REDUCE':
-                    child = trade['child_order_id']
+                    child = (trade.get('child_order_id')
+                             or (trade['trade_key'][0]
+                                 if isinstance(trade.get('trade_key'), (list, tuple)) and trade['trade_key']
+                                 else str(trade.get('trade_key', ''))))
                     self.trade_events.add(('close', orders.get(child) or child))
             self.trade_events.update(('open', cycle['position_cycle_id']) for cycle in view['cycles']
                                      if cycle['remaining_quantity'] > 0)

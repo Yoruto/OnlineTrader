@@ -72,20 +72,50 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
         last_history_capture = 0.0
         initial_start_pending = bool(arm)
 
+        contracts = tuple(grant.value.get('contracts', ()))
+
+        def current_trading_day():
+            if calendar is not None and clock is not None and contracts:
+                capture = getattr(clock, 'capture_live', None) or getattr(clock, 'capture', None)
+                sample = capture() if callable(capture) else None
+                now_utc = getattr(sample, 'now_utc', None)
+                if now_utc:
+                    window = calendar.query(contracts[0], now_utc)
+                    session = window.get('session') or window.get('next_session')
+                    if window.get('complete') and session and session.get('trading_day'):
+                        return session['trading_day']
+            return owner.snapshot().get('trading_day') or grant.value['trading_day']
+
+        def is_complete():
+            return bool(connection.broker_connected and connection.complete())
+
         def tick():
             nonlocal last_status, last_history_capture, initial_start_pending
-            receipt = owner.step(trading_day=grant.value['trading_day'], complete=connection.complete)
-            state = owner.snapshot()
-            if initial_start_pending and state['synchronized']:
-                owner.start_confirmed()
-                initial_start_pending = False
+            try:
+                receipt = owner.step(trading_day=current_trading_day(), complete=is_complete)
                 state = owner.snapshot()
-            now = time.monotonic()
-            if now - last_history_capture >= 10:
-                snapshot = owner.native_account_snapshot()
-                if snapshot is not None:
-                    history_writer.offer(snapshot)
-                last_history_capture = now
+                if initial_start_pending and state['synchronized']:
+                    owner.start_confirmed()
+                    initial_start_pending = False
+                    state = owner.snapshot()
+                now = time.monotonic()
+                if now - last_history_capture >= 10:
+                    snapshot = owner.native_account_snapshot()
+                    if snapshot is not None:
+                        history_writer.offer(snapshot)
+                    last_history_capture = now
+            except (TraderError, OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                if getattr(owner.session, '_failed', False):
+                    raise
+                publish_replace_bytes(canonical_bytes({
+                    'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
+                    'execution_core': 'DSV_TARGET_EXECUTION', 'authority_effect': 'DISARMED_ON_TRANSIENT_ERROR',
+                    'diagnostic': getattr(error, 'code', 'E_DSV_SDK_RUNTIME'),
+                    'exception': exception_record(error),
+                }), diagnostics)
+                owner.session.disconnect('TRANSIENT_OWNER_TICK_ERROR')
+                time.sleep(0.1)
+                return
             if receipt is not None:
                 current = {
                     'phase': 'READY' if state['synchronized'] else 'WAITING_FOR_NATIVE_SYNC',

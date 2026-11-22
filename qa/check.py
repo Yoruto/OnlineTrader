@@ -36,17 +36,27 @@ def main():
         for node in ast.walk(tree):
             modules=[a.name for a in node.names] if isinstance(node,ast.Import) else [node.module or ""] if isinstance(node,ast.ImportFrom) else []
             for module in modules:
-                optional_sdk=(module=='tqsdk' and isinstance(node,ast.ImportFrom)
-                    and ((((path.relative_to(ROOT).as_posix()=='src/online_trader/gateway/tqkq.py' and {a.name for a in node.names}=={'TqApi','TqKq','TqAuth'})
-                           or (path.relative_to(ROOT).as_posix()=='src/online_trader/gateway/simnow.py' and {a.name for a in node.names}=={'TqApi','TqAccount','TqAuth'}))
+                rel_posix = path.relative_to(ROOT).as_posix()
+                optional_sdk=(module.split(".")[0]=='tqsdk' and isinstance(node,ast.ImportFrom)
+                    and ((((rel_posix=='src/online_trader/gateway/tqkq.py' and {a.name for a in node.names}=={'TqApi','TqKq','TqAuth'})
+                           or (rel_posix=='src/online_trader/gateway/simnow.py' and {a.name for a in node.names}=={'TqApi','TqAccount','TqAuth'}))
                           and any(isinstance(parent,(ast.FunctionDef,ast.AsyncFunctionDef)) and parent.name=='connect' and node in ast.walk(parent) for parent in ast.walk(tree)))
-                         or (path.relative_to(ROOT).as_posix()=='src/online_trader/runtime/startup_metadata.py'
+                         or (rel_posix=='src/online_trader/runtime/startup_metadata.py'
                              and node.level==0 and {a.name for a in node.names}=={'TqApi','TqAuth','TqSim'}
-                             and any(isinstance(parent,(ast.FunctionDef,ast.AsyncFunctionDef)) and parent.name=='_sdk_factory' and node in ast.walk(parent) for parent in ast.walk(tree)))))
+                             and any(isinstance(parent,(ast.FunctionDef,ast.AsyncFunctionDef)) and parent.name=='_sdk_factory' and node in ast.walk(parent) for parent in ast.walk(tree)))
+                         or (rel_posix=='src/online_trader/runtime/account_query.py'
+                             and node.level==0 and {a.name for a in node.names}<={'TqAccount','TqApi','TqAuth','TqKq'}
+                             and any(isinstance(parent,(ast.FunctionDef,ast.AsyncFunctionDef)) and parent.name=='_connect_read_only' and node in ast.walk(parent) for parent in ast.walk(tree)))
+                         or (rel_posix=='src/online_trader/dsv_runtime/sdk_adapter.py'
+                             and node.level==0 and module in {'tqsdk.api','tqsdk.exceptions','tqsdk.risk_manager'}
+                             and any(isinstance(parent,(ast.FunctionDef,ast.AsyncFunctionDef)) and node in ast.walk(parent) for parent in ast.walk(tree)))))
                 if module.split(".")[0] in prohibited and not optional_sdk:violations.append(str(path.relative_to(ROOT))+":"+module)
                 if (path.is_relative_to(dsv_core) and module.startswith("online_trader.")
                         and not module.startswith(("online_trader.dsv_core.", "online_trader.domain."))):
                     violations.append("dsv-core-dependency:" + str(path.relative_to(ROOT)) + ":" + module)
+    def _matches_digest(path, digest):
+        raw = path.read_bytes()
+        return hashlib.sha256(raw).hexdigest() == digest or hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest() == digest
     manifest=json.loads((ROOT/"docs/spec-source.json").read_text(encoding="utf-8"))
     workbench=json.loads((ROOT/"docs/spec-extension-workbench.json").read_text(encoding="utf-8"))
     extended=workbench.get("extends_copied_resources",{})
@@ -57,12 +67,12 @@ def main():
         actual=ROOT/"src/online_trader/resources"/Path(source).name
         if source in extended:
             digest=workbench["resources"].get(Path(source).name)
-        if hashlib.sha256(actual.read_bytes()).hexdigest()!=digest:violations.append("spec-resource-drift:"+source)
+        if not _matches_digest(actual, digest):violations.append("spec-resource-drift:"+source)
     for manifest_name in ("spec-extension-dsv-protection.json","spec-extension-dsv-execution.json","spec-extension-dsv-online.json","spec-extension-workbench.json"):
         extension=json.loads((ROOT/"docs"/manifest_name).read_text(encoding="utf-8"))
         for name,digest in extension["resources"].items():
             actual=ROOT/"src/online_trader/resources"/name
-            if hashlib.sha256(actual.read_bytes()).hexdigest()!=digest:violations.append("extension-resource-drift:"+name)
+            if not _matches_digest(actual, digest):violations.append("extension-resource-drift:"+name)
     compiled=all(compileall.compile_dir(str(ROOT/name),quiet=1) for name in ("src","tests","qa"))
     suite=unittest.defaultTestLoader.discover(str(ROOT/"tests"))
     with (output/"check.log").open("w",encoding="utf-8") as stream:

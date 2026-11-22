@@ -2919,8 +2919,9 @@ class WorkbenchLayout:
         self.window.submit_manual(self.manual_code.currentText(),('LONG','SHORT')[side],qty,'OPPONENT')
 
     def selected_manual_ids(self, key):
-        return [index.data(Qt.UserRole) for index in self.manual_tables[key].selectionModel().selectedRows()
-                if index.data(Qt.UserRole) is not None]
+        return [tuple(value) if isinstance(value, list) else value
+                for index in self.manual_tables[key].selectionModel().selectedRows()
+                if (value := index.data(Qt.UserRole)) is not None]
 
     def refresh_manual_selection(self):
         view = self.rendered_view or {}
@@ -2981,8 +2982,9 @@ class WorkbenchLayout:
             grid.clearSelection()
             populate(grid,[cells(item) for item in items])
             for index,item in enumerate(items):
-                grid.item(index,0).setData(Qt.UserRole,item[identity])
-                if item[identity] in selected:
+                row_id = tuple(item[identity]) if isinstance(item[identity], list) else item[identity]
+                grid.item(index,0).setData(Qt.UserRole,row_id)
+                if row_id in selected:
                     grid.selectionModel().select(grid.model().index(index,0),
                         QItemSelectionModel.Select | QItemSelectionModel.Rows)
         self.refresh_manual_selection()

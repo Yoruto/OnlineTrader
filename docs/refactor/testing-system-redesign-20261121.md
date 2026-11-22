@@ -27,8 +27,8 @@
 | 现有资产 | 本次定位 | 迁移要求 |
 |---|---|---|
 | `qa/check.py`, `scripts/check.ps1` | 离线全量门禁 | 保留兼容包装，拆分 Quick/Affected/FullOffline；保留检查源码及验证资产哈希的能力 |
-| `qa/runtime_fixture.py` | Native-shaped 离线事实宿主 | 作为 Harness 起点，后续抽象 Fake Broker、虚拟时间与数据隔离 |
-| `qa/runtime_replay.py` | Runtime 公共 IPC 离线回放 | 升级成 T3 场景；真正进程故障需独立 Owner subprocess，不能只重置对象 |
+| `qa/runtime_fixture.py`, `qa/runtime_replay.py` | Kernel / DsvSimulationSession 离线夹具及公共 IPC rehearsal | 保留其组件或旧执行路径覆盖；不能据此证明当前 Standalone Target Owner |
+| `qa/target_owner/offline_runtime.py`, `tests/test_target_owner_runtime.py` | 当前 StandaloneDsvOwner + ControlServer 公共 pipe 的 QA-only 夹具；Owner 在测试进程内的线程运行 | 作为 T2 起点；增加独立 Owner 子进程与跨进程事实通道后才能计入 T3/T4 进程证据 |
 | `tests/test_dsv_execution_regressions.py` | 组件回归 | 保留内部状态断言；关键 P0 行为另以公共接口场景验证 |
 | `tests/test_runtime_client_foundation.py` | Runtime Client/Windows pipe 合同 | 保留，按 test case 区分平台，不能把整模块笼统标 Windows |
 | `tests/test_runtime_parallel_ledger_guard.py` | 会话账本隔离 | 归 T1/T2；不冒充柜台恢复验收 |
@@ -38,7 +38,7 @@
 | `qa/build_audit.py` | 旧交付验证 | 包含调用 Legacy rehearsal 与硬编码历史 `output/artifacts/.../smoke-source.py`；先消除历史输出依赖，再归档或替代 |
 | `scripts/release_preflight.py`, 便携构建脚本 | 发行静态门禁/制品构建 | 与新的 Release Profile 协调，保留正式候选冻结与无秘密缓存要求 |
 
-以上为 2026-11-21 仓库阅读形成的设计基线；任何历史报告的 PASS 数量不向新候选转移。现有 [Runtime 测试迁移文档](standalone-trading-runtime-test-migration-20261119.md) 已规定当前用户级验收应走 Runtime 公共接口，而不能仅凭直接 Kernel/ControlServer 的旧组件路径宣称产品通过。
+以上基线随 2026-11-21 Target Owner 冷切换源码更新。当前 `desktop_bootstrap.py` 的版本固定核心是 `DSV_TARGET`；旧 Kernel fixture 即使使用 ControlServer 和公共客户端，也只证明它实际运行的旧 owner 路径。当前 Target fixture 已走真实 `StandaloneDsvOwner` 与产品 pipe，但进程仍在同一 Python 进程中，不能证明 Owner 崩溃、重启、孤儿清理或生产启动链。历史 PASS 数量仍不向新候选转移。现有 [Runtime 测试迁移文档](standalone-trading-runtime-test-migration-20261119.md) 的公共入口原则继续适用，但其旧 Owner 证据须按本表重新归类。
 
 ## 3. 分层验证合同
 
@@ -86,27 +86,28 @@ flowchart TD
 
 ### 5.1 输入及输出
 
-Oracle 从 **Strategy Target、独立 Fake Broker 事实与订单逐笔记录** 计算参考状态，不照抄执行器内部派生数量。第一版仅单账户/单合约/单方向，分别验证开仓与退出；日后扩展今昨仓与多方向。
+Oracle 从 **Strategy Target、独立 Fake Broker 事实与订单逐笔记录** 计算参考状态，不照抄执行器内部派生数量。第一版仅单账户/单合约/单方向，分别验证开仓与退出；日后扩展今昨仓与多方向。此处的“账户”是绑定的柜台观测范围，不表示把账户全部净持仓归给当前 Runtime。
 
 ```text
-Strategy Target + Broker Position Snapshot + Orders/Fills/Cancel Facts
+Strategy Target + Broker Position Snapshot + Runtime-Owned Attribution + Orders/Fills/Cancel Facts
       -> Reference Reducer -> Expected State + Violated Invariants
 ```
 
-逐笔事实至少记录：`order_ref`、关联 `intent_ref`、方向、开平类型、原始数量、唯一 `fill_id`、累计成交、确定/不确定的潜在剩余、已知发送状态、柜台终态及事实版本。数量必须按订单唯一身份去重，避免把同一份剩余在 `WORKING` 和 `CANCEL_PENDING` 中重复占量。
+逐笔事实至少记录：`order_ref`、关联 `intent_ref`、Owner boot / 目标身份、方向、开平类型、原始数量、唯一 `fill_id`、累计成交、确定/不确定的潜在剩余、已知发送状态、柜台终态、交易日、同步水位及事实版本。数量必须按订单唯一身份去重，避免把同一份剩余在 `WORKING` 和 `CANCEL_PENDING` 中重复占量。测试快照须区分 Runtime 已证明持仓与外部或无法归属持仓；不得按价格、数量或时间相似性认领另一台电脑或人工产生的事实。
 
 ### 5.2 安全容量与不确定性
 
 在同一方向、有效且完整的柜台快照下：
 
 ```text
-potential_max_position = confirmed_position
-                       + sum(max_possible_remaining_of_distinct_open_orders)
+potential_target_owned_position = runtime_proved_position
+                                + sum(max_possible_remaining_of_distinct_owned_open_orders)
 
-safe_additional_capacity = max(0, desired_position - potential_max_position)
+safe_additional_capacity = max(0, desired_position - potential_target_owned_position)
 ```
 
-- `safe_additional_capacity` **只是一条数量上界**，不是新开仓许可；还需策略授权、行情、风险、配置、柜台日有效。
+- 公式中的 `runtime_proved_position` 仅包含当前 boot 有证据承担的持仓，不得替换成柜台全账户净持仓。外部或无法归属持仓/委托单独保留；与目标冲突时要求核对并阻止冲突发送，不可被 Oracle 当成目标已覆盖。
+- `safe_additional_capacity` **只是一条数量上界**，不是新开仓许可；还需策略授权、行情、风险、配置、柜台日和事实水位有效。
 - 发送 UNKNOWN：按尚不能排除的剩余上界占量；必须核对，不能视为 DEFINITELY_NOT_SENT。
 - CANCEL_REQUESTED / CANCEL_PENDING：终态未确认时继续占量；撤单请求或超时不释放。
 - 可靠终态 CANCELLED / REJECTED / FILLED：结合成交累计及柜台可信度更新在途数量。
@@ -249,21 +250,17 @@ negative_control: force UNKNOWN treated as rejected; test must fail
 
 ```text
 qa/
-  test_runner.py
-  test_registry.py
-  test_manifest.json
-  test_selection.py
-  test_report.py
-  harness/
-    broker.py
-    clock.py
-    scenario.py
-    invariants.py
+  test_registry.py      # PR1: AST inventory and manifest validation
+  test_runner.py        # PR1: explicit offline profiles and evidence
+  test_manifest.json    # PR1: registered unittest IDs and metadata
+  target_owner/
+    process_runtime.py  # PR2: QA-only independent Owner process and fact channel
+  harness/              # PR2: QA-only broker, clock and scenarios
 scripts/
-  test.ps1
+  test.ps1              # PR1: required Profile, no implicit execution
 ```
 
-`test_manifest.json` 最少包含 `test_id/module/case/tier/domains/profiles/requirements/platform/broker_mode/legacy/risk/timeout`。混合模块按 test case 标记，不可以用单一模块标签屏蔽 Windows/跨平台差异。发现未分类测试必须使 manifest validation 失败；静态发现不能导入可能连接 SDK 的代码。
+`test_manifest.json` 使用模块默认元数据和逐 case override 规范化出 `test_id/module/case/tier/domains/profiles/requirements/platform/broker_mode/legacy/risk/timeout`。混合模块的 Windows 限制与额外依赖必须逐 case 标记，不可以用单一模块标签屏蔽差异。`qa/test_registry.py` 以 AST 检查实际测试 ID，不导入测试模块；新增、删除或改名造成清单差异时，Runner 在导入前失败。`broker_mode: OFFLINE` 是清单约束；PR1 Runner 自身不连接柜台、不下真实订单，但没有给用例及其子进程安装操作系统级网络沙箱，不能把它视为对任意测试代码的强制断网证明。
 
 阶段二在所有导入/运行入口适配完成后，逐步迁移到 `tests/unit`、`contract`、`integration`、`scenarios`、`stateful`、`legacy`；`qa/harness`、`fixtures`、`live`、`release` 分责。对于 Python 3.13 的 `unittest` 子目录 discovery 要补齐 package `__init__.py` 或使用显式 loader。
 
@@ -275,14 +272,12 @@ scripts/
 .\scripts\test.ps1 -Profile Trading
 .\scripts\test.ps1 -Profile Runtime
 .\scripts\test.ps1 -Profile FullOffline
-.\scripts\test.ps1 -Profile Stateful -Seed 20261121
-.\scripts\test.ps1 -Scenario EXEC-RACE-001
-# 仅在额外明确的在线测试授权下：
-.\scripts\test.ps1 -Profile SimNow -GrantFile <explicit-test-authorization>
-.\scripts\test.ps1 -Profile Release
+.\scripts\test.ps1 -Profile Affected -BaseRef <commit>
 ```
 
-这是拟定命令，**当前未实现**。默认 profile 严禁连 SDK、发真实单、打包或安装。SimNow 的授权文件需核对账户、合约、时间、操作、数量和预算；配置存在默认模拟账号不构成发单授权。
+这是 PR1 的离线 Runner 命令；必须显式指定 Profile，没有默认测试 Profile。`-ListOnly` 只展示选择结果，不执行用例。当前 Affected 选择在依赖映射尚未验证前一律回退 `FullOffline`，不能以文件名启发式缩小范围。`Stateful`、`Scenario`、`SimNow` 和 `Release` 尚未开放；未来的 Release Profile 也只选择验证集，不得自行构建、安装或生成 ZIP。单独的测试授权仍须来自本次用户指令；授权文件、默认模拟账号和参数配置均不能自行授予在线连接、发单或打包权限。
+
+初始清单位于 `qa/test_manifest.json`，静态识别到 1,919 个用例、133 个模块；风险目前标为 `UNTRIAGED` 并保留在 `FullOffline`。`Quick`、`Trading` 和 `Runtime` 只供显式的开发定位使用，不能作为发布放行；未完成影响映射的 `Affected` 仍回退全量。清单不代表风险审查已完成。PR1 的 `Quick` 组合尚未计时，不能据此宣称达到 15 秒目标。timeout 目前保存在 manifest，独立子进程超时与进程树清理留待 PR2。
 
 ### 9.3 Affected 影响分析
 
@@ -306,7 +301,7 @@ scripts/
 
 - 每个场景独立目录、pipe、配置、账本、子进程和资源清理；
 - 支持 test/case timeout、进程树强杀和残留进程检测；
-- 候选及测试文件执行前后计算身份；失败时留存脱敏证据，不能静默重跑掩盖；
+- 候选及测试文件执行前后计算身份；PR1 Runner 对比前后 commit 与 tracked/untracked tree SHA，变化即失败；失败时留存脱敏证据，不能静默重跑掩盖；
 - 并行仅用于真正只读且互不共享状态的测试；同一真实账户、Build Cache、GUI 测试串行；
 - 失败汇总按 `test_id` 和首次差异，不能只输出单个 `unittest` 总数；
 - T0/T1/T2 的快速检查不自动升级为 T3/T5/T6 证据。
@@ -322,13 +317,12 @@ output/tests/<run-id>/
   environment.json
   summary.json
   test-results.json
-  test-results.xml
   evidence-hashes.json
   logs/
-  scenarios/
-  failures/<case-id>/
+    run.log               # PR1: sanitized IDs/statuses only
+  scenarios/              # PR2/PR3
+  failures/<case-id>/     # PR2/PR3
     scenario.json
-    seed.json
     inputs.jsonl
     observed-events.jsonl
     expected-state.json
@@ -337,7 +331,7 @@ output/tests/<run-id>/
     diagnostics.txt
 ```
 
-`manifest` 记录完整 `candidate_commit`、含 tracked/modified/untracked 的 `candidate_tree_sha256`、脚本和 fixture hash、实际 Python/OS/Qt/SDK 版本、测试授权、真实入口、进程 boot/owner 身份。Git HEAD 不能单独证明工作树未修改。结果 `PASS/FAIL/ERROR/SKIP/BLOCKED/NOT_RUN` 独立计数；与 `evidence_status`、`reported_result` 分开。关键用例缺结果不能视为成功。
+PR1 报告记录完整 `candidate_commit`、含 tracked/modified/untracked 的 `candidate_tree_sha256`、manifest 和已选测试模块 hash、实际 Python/OS/Qt/SDK 版本、Runner 自身的能力边界与入口。报告明确 `OFFLINE_MANIFEST_ONLY`、Runner 无账户连接/真实报单能力、无 OS 级网络沙箱、无打包能力；它不代表用户已授权执行测试。Git HEAD 不能单独证明工作树未修改；Runner 比较测试前后的 commit/tree hash，变化即失败。异常报告保留源码行和异常消息 hash，不写原始异常消息；日志只记测试 ID 与状态。结果 `PASS/FAIL/ERROR/SKIP/BLOCKED/NOT_RUN` 独立计数；与 `evidence_status`、`reported_result` 分开。关键用例缺结果不能视为成功。Runtime boot/owner 身份、事件轨迹和失败场景证据由后续 Harness 增加。
 
 失效归因建议：`ASSERTION_FAILED`、`INVARIANT_VIOLATED`、`PRODUCT_ERROR`、`TEST_HARNESS_ERROR`、`ENVIRONMENT_ERROR`、`TIMEOUT`、`PROCESS_CRASH`、`UNEXPECTED_SKIP`、`NOT_EXECUTED`。记录首次偏离序号和原始输入/实际出站，便于独立 Agent 重跑。
 
@@ -378,13 +372,14 @@ output/tests/<run-id>/
 
 ## 13. 开始实施前的检查清单
 
-- [ ] 锁定一份当前 main 的测试文件/实际测试 ID 清单及其执行耗时、平台、skip 原因；
+- [ ] 锁定一份当前 main 的测试文件/实际测试 ID 清单；PR1 已生成静态清单，运行耗时和实际 skip 原因仍须在获准的测试中采集；
 - [ ] 以历史 P0 的真实日志确定 Oracle 事实边界、订单唯一标识和 terminal 证据；
 - [ ] 将已有 DSV 批准差异与核心安全 invariant 分离，防止测试预期自证；
 - [ ] 明确用于 T3 的 QA-only Runtime 宿主与产品 Runtime 的二进制/入口隔离；
+- [ ] 将当前 Target Owner 的 T2 同进程线程夹具升级为 T3 独立 Owner 子进程；生产 Runtime 不增加假事实入口；
 - [ ] 确认 Windows 子进程强杀、IPC 命名、SQLite 清理和超时契约；
 - [ ] 明确 PR1 前后 FullOffline 测试数量与被执行实际 test ID 的等价映射；
 - [ ] 将有风险的在线测试独立授权，默认所有非 Live Profile 禁止真实 SDK 连接和报单；
 - [ ] 最后才删除/归档不再使用的 Legacy 脚本，并保留必要历史证据索引。
 
-**设计状态：仅文档。尚未实现 Runner、Oracle、48 项新场景或执行任何本文建议的验收。**
+**设计状态：PR1 清单一致性校验与 Profile 仅列出检查已通过；PR2 独立 Owner 子进程与单合约 Fake Broker 状态模型已进入候选工作树。5 手/3+2/撤单/退出场景驱动、Oracle、强杀后恢复场景及独立行为验收仍未完成。48 项新场景、stateful/fault 与 Live/Release Profile 尚未实现。本次未执行功能用例。详见 [PR2 Harness 设计](testing-system-pr2-harness-20261121.md)。**

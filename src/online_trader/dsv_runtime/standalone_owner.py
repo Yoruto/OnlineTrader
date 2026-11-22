@@ -40,6 +40,7 @@ class StandaloneDsvOwner:
         self._pending = []
         self._command_receipts = {}
         self._latest_account_snapshot = None
+        self._projection_seq = 1
         self._commit_views = [self.snapshot()]
         self.stop_event = Event()
         self._shutdown_after_flatten = False
@@ -65,6 +66,9 @@ class StandaloneDsvOwner:
 
     def snapshot(self):
         state = self.session.snapshot()
+        state['projection_seq'] = self._projection_seq
+        state['storage_failed'] = bool(getattr(self.session, '_failed', False))
+        state['retired_positions'] = copy.deepcopy(self.session._state.get('retired_positions', {}))
         if self._latest_account_snapshot is not None:
             state['account_snapshot'] = copy.deepcopy(self._latest_account_snapshot)
         state['runtime_commands'] = [copy.deepcopy(value)
@@ -119,6 +123,7 @@ class StandaloneDsvOwner:
         receipt = self.adapter.command(self.session, command)
         if command['action'] == 'FLATTEN_STOP':
             self._shutdown_after_flatten = True
+        self._projection_seq += 1
         self._commit_views.append(self.snapshot())
         self._update_stop_ready()
         return receipt
@@ -129,6 +134,7 @@ class StandaloneDsvOwner:
             'id': 'standalone-confirmed-start-' + self.boot_id,
             'action': 'START',
         })
+        self._projection_seq += 1
         self._commit_views.append(self.snapshot())
         return receipt
 
@@ -138,6 +144,7 @@ class StandaloneDsvOwner:
     def step(self, *, trading_day, complete):
         receipt = self.adapter.step(self.session, trading_day=trading_day, complete=complete)
         if receipt is not None:
+            self._projection_seq += 1
             self._commit_views.append(self.snapshot())
         self._update_stop_ready()
         return receipt
@@ -160,7 +167,7 @@ class StandaloneDsvOwner:
         return {'account_key': self.account_key, 'kernel_boot_id': self.boot_id,
                 'kernel_epoch': str(self.kernel_epoch), 'durable_seq': revision,
                 'armed': state['running'], 'recovery_required': not state['synchronized'],
-                'storage_failed': False, 'pending_transactions': 0,
+                'storage_failed': bool(state.get('storage_failed', False)), 'pending_transactions': 0,
                 'revisions': self.revisions, 'errors': [], 'cycles': []}
 
     @staticmethod
@@ -180,6 +187,9 @@ class StandaloneDsvOwner:
             raise TraderError('E_SCHEMA', 'Command payload hash differs')
         command_id = identifier(body['command_id'])
         prior = self._command_receipts.get(command_id)
+        if prior is None:
+            stored = self.session.runtime_command_receipt(command_id)
+            prior = None if stored is None else stored['receipt']
         if prior is not None:
             if prior['payload_hash'] != digest:
                 raise TraderError('E_DUPLICATE_CONFLICT', 'Command identity changed content')
@@ -198,7 +208,7 @@ class StandaloneDsvOwner:
         dsv_receipt = self.command(command_body)
         state = self.snapshot()
         seq = str(max(1, int(state.get('sequence') or 0)))
-        result = {'command_id': command_id, 'payload_hash': digest, 'status': 'COMMITTED',
+        result = {'command_id': command_id, 'payload_hash': digest, 'status': 'SUCCEEDED',
                   'receipt_revision': '1', 'tx_id': 'target-' + content_hash(command_id)[:40],
                   'event_seq': seq, 'durable_seq': seq, 'state_revision': seq,
                   'error_code': 'NONE', 'reason': 'Target execution command committed',

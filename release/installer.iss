@@ -8,7 +8,7 @@
 #ifndef GitLabProjectId
   #define GitLabProjectId 89047383
 #endif
-#if FileExists(AddBackslash(BundleDir) + "OnlineTrader-defaults.json")
+#if FileExists(AddBackslash(BundleDir) + "OnlineTrader-defaults.json") || FileExists(AddBackslash(BundleDir) + "runtime\private\OnlineTrader-defaults.json")
   #define SetupSuffix "-Configured"
 #else
   #define SetupSuffix ""

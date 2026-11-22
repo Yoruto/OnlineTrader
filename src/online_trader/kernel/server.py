@@ -79,7 +79,7 @@ class ControlServer:
     def _boundary(self, snapshot=None):
         if self._target_owner:
             state = self.kernel.snapshot() if snapshot is None else snapshot
-            return str(max(1, int(state.get('sequence') or 0)))
+            return str(max(1, int(state.get('projection_seq') or state.get('sequence') or 0)))
         return str(self.kernel._durable_seq if snapshot is None else snapshot['durable_seq'])
 
     def register_peer(self,instance_id,pid,role="SHADOW"):
@@ -297,9 +297,23 @@ class ControlServer:
 
     def _error(self,peer,message,error):
         known={"E_AUTH","E_SCOPE","E_VERSION","E_SCHEMA","E_CONTEXT_EXPIRED","E_BOOT_MISMATCH","E_EPOCH_REVOKED","E_REVISION_CONFLICT",
-            "E_DUPLICATE_CONFLICT","E_NOT_READY","E_RULE_UNAPPROVED","E_STORAGE","E_UNSUPPORTED","E_OWNERSHIP","E_QUEUE_OVERFLOW"}
-        code=getattr(error,"code","E_INTERNAL");code=code if code in known else "E_INTERNAL"
-        peer.enqueue(self._reply(peer,message,"ProtocolError",{"error_code":code,"safe_reason":"Request refused; inspect current status and operation scope",
+            "E_DUPLICATE_CONFLICT","E_NOT_READY","E_RULE_UNAPPROVED","E_STORAGE","E_UNSUPPORTED","E_OWNERSHIP","E_QUEUE_OVERFLOW","E_FACT_BARRIER","E_RISK"}
+        mapped={
+            "E_DSV_COMMAND":"E_SCHEMA",
+            "E_DSV_SCOPE":"E_SCOPE",
+            "E_DSV_SDK_CLOCK":"E_NOT_READY",
+            "E_DSV_SYNC":"E_NOT_READY",
+            "E_DSV_NATIVE_ID":"E_OWNERSHIP",
+            "E_DSV_OWNERSHIP":"E_REVISION_CONFLICT",
+            "E_CAPABILITY":"E_NOT_READY",
+            "E_CONFIG_EDIT":"E_REVISION_CONFLICT",
+        }
+        raw_code=getattr(error,"code","E_INTERNAL")
+        code=mapped.get(raw_code,raw_code)
+        code=code if code in known else "E_INTERNAL"
+        reason=(str(error)[:512] if isinstance(error,TraderError) and str(error)
+                else "Request refused; inspect current status and operation scope")
+        peer.enqueue(self._reply(peer,message,"ProtocolError",{"error_code":code,"safe_reason":reason,
             "related_message_id":message["message_id"],"connection_action":"KEEP"}))
 
     def _drain_outgoing(self,timeout=1):
@@ -328,7 +342,7 @@ class ControlServer:
                 if closing and message['type'] not in {'Hello','SnapshotRequest','GetCommandStatus','HeartbeatAck'}:
                     raise TraderError('E_NOT_READY','Execution owner is closing; no new command is accepted')
                 self._handle(peer,message)
-            except (TraderError,queue.Full) as error:
+            except Exception as error:
                 try:self._error(peer,message,error)
                 except Exception:peer.close()
 
@@ -403,8 +417,10 @@ class ControlServer:
                 accounts.close()
             if publication is not None:
                 publication.close()
-            self._drain_outgoing()
-            self._stop.set();self.listener.close()
-            for peer in self._peer_snapshot():peer.close()
-            acceptor.join(timeout=2)
-            for worker in self._workers:worker.join(timeout=1)
+            try:
+                self._drain_outgoing()
+            finally:
+                self._stop.set();self.listener.close()
+                for peer in self._peer_snapshot():peer.close()
+                acceptor.join(timeout=2)
+                for worker in self._workers:worker.join(timeout=1)

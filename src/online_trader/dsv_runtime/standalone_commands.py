@@ -42,8 +42,15 @@ def translate_workbench_command(body, snapshot, *, runtime_boot_id, configuratio
     expected = {'account_key': snapshot['scope']['account_key'],
                 'kernel_boot_id': runtime_boot_id,
                 'config_revision': str(sequence(configuration_revision, positive=True))}
-    if binding != expected or snapshot['scope'].get('runtime_boot_id') != runtime_boot_id:
-        raise TraderError('E_OWNERSHIP', 'The Runtime boot or configuration changed before command execution')
+    if type(binding) is not dict:
+        raise TraderError('E_SCHEMA', 'Workbench command binding must be an object')
+    if (binding.get('kernel_boot_id') != runtime_boot_id
+            or snapshot['scope'].get('runtime_boot_id') != runtime_boot_id):
+        raise TraderError('E_BOOT_MISMATCH', 'The Runtime boot changed before command execution')
+    if binding.get('account_key') != expected['account_key']:
+        raise TraderError('E_SCOPE', 'The command account differs from the Runtime owner')
+    if binding.get('config_revision') != expected['config_revision'] or binding != expected:
+        raise TraderError('E_REVISION_CONFLICT', 'The Runtime configuration changed before command execution')
     common = {'id': command_id, 'workbench_operation': operation,
               'workbench_scope': scope, 'runtime_boot_id': runtime_boot_id,
               'configuration_revision': expected['config_revision']}
@@ -54,13 +61,18 @@ def translate_workbench_command(body, snapshot, *, runtime_boot_id, configuratio
         _account_scope(scope)
         return common | {'action': 'STOP'}
     if operation in {'CANCEL_SELECTED', 'CANCEL_OWNED'}:
+        if type(scope) is not dict:
+            raise TraderError('E_SCOPE', 'Cancellation requires an explicit scope')
         children = parameters.get('child_order_ids')
-        if operation == 'CANCEL_OWNED' and children is None:
-            if parameters.get('include_exits') not in {None, False, True}:
-                raise TraderError('E_DSV_COMMAND', 'Owned-order cancellation needs an explicit exit switch')
-            children = [child for child, order in snapshot['orders'].items()
-                        if not terminal(order) and (
-                            parameters.get('include_exits') is True or order['effect'] == 'OPEN')]
+        if operation == 'CANCEL_OWNED':
+            if scope.get('scope_type') not in {'OWNED_ORDERS', 'ACCOUNT'}:
+                raise TraderError('E_SCOPE', 'Owned-order cancellation requires OWNED_ORDERS or ACCOUNT scope')
+            if children is None:
+                if parameters.get('include_exits') not in {None, False, True}:
+                    raise TraderError('E_DSV_COMMAND', 'Owned-order cancellation needs an explicit exit switch')
+                children = [child for child, order in snapshot['orders'].items()
+                            if not terminal(order) and (
+                                parameters.get('include_exits') is True or order['effect'] == 'OPEN')]
         if operation == 'CANCEL_SELECTED' and (
                 scope.get('scope_type') != 'SELECTED_ORDERS'
                 or scope.get('scope_ids') != children):
@@ -68,27 +80,37 @@ def translate_workbench_command(body, snapshot, *, runtime_boot_id, configuratio
         return common | {'action': 'CANCEL_MANY', 'child_order_ids': children}
     if operation == 'MANUAL_CLOSE':
         position_id = identifier(parameters.get('position_cycle_id'))
-        if scope.get('scope_type') != 'CYCLE' or scope.get('scope_ids') != [position_id]:
+        if type(scope) is not dict or scope.get('scope_type') != 'CYCLE' or scope.get('scope_ids') != [position_id]:
             raise TraderError('E_SCOPE', 'Manual close scope differs from its strategy position')
         position = _position(snapshot, position_id)
+        current_revision = int(position.get('target_revision', 1))
+        expected_revision = (current_revision if parameters.get('expected_target_revision') is None
+                             else sequence(parameters['expected_target_revision'], positive=True))
+        if expected_revision != current_revision:
+            raise TraderError('E_REVISION_CONFLICT', 'The strategy position target changed before manual close')
         return common | {'action': 'REDUCE', 'contract_id': position['contract_id'],
                          'quantity': parameters.get('quantity'),
                          'price_mode': _price_mode(parameters),
                          'expected_target_id': position.get('target_id', position['id']),
-                         'expected_target_revision': position.get('target_revision', 1)}
+                         'expected_target_revision': expected_revision}
     if operation in {'MANUAL_CLOSE_ALL', 'FLATTEN_THEN_STOP'}:
         _account_scope(scope)
         current = {row['position']['id']: row['position']['owned'] for row in snapshot['symbols'].values()
                    if row.get('position') is not None
                    and (operation == 'FLATTEN_THEN_STOP' or row['position']['owned'])}
         if operation == 'MANUAL_CLOSE_ALL' and parameters.get('positions') != current:
-            raise TraderError('E_DSV_OWNERSHIP', 'Bulk close quantities changed before target submission')
+            raise TraderError('E_REVISION_CONFLICT', 'Bulk close quantities changed before target submission')
         return common | {'action': 'FLATTEN_STOP' if operation == 'FLATTEN_THEN_STOP' else 'REDUCE_ALL',
                          'position_ids': list(current), 'price_mode': _price_mode(parameters)}
     if operation == 'REQUEST_RECONCILIATION':
         _account_scope(scope)
-        if set(parameters) - {'requested_scope', 'position_cycle_id'}:
+        if set(parameters) - {'requested_scope', 'position_cycle_id', 'clock_recovery_id'}:
             raise TraderError('E_AUTH', 'Legacy evidence import is not a target-owner reconciliation command')
+        if snapshot.get('clock_recovery_required'):
+            return common | {
+                'action': 'CLOCK_RECOVER',
+                'clock_recovery_id': parameters.get('clock_recovery_id') or snapshot.get('clock_recovery_id'),
+            }
         return common | {'action': 'RECONCILE'}
     raise TraderError('E_AUTH', 'The target-execution owner does not support this Workbench operation')
 

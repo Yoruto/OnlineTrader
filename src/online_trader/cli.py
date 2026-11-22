@@ -80,7 +80,7 @@ def main(argv=None):
         if name == 'account':
             command.add_argument('--attached', action='store_true', help='读取已运行执行器的全账户截面')
         if name == 'run':
-            command.add_argument('--mode', choices=('strategy', 'manual'), default='strategy')
+            command.add_argument('--mode', choices=('strategy',), default='strategy')
             command.add_argument('--use-profile-file', action='store_true', help='本次以明确选定的参数文件建立新范围')
         if name == 'history':
             from online_trader.runtime.account_cache import SECTIONS

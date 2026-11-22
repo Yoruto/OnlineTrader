@@ -182,8 +182,13 @@ def apply_pending(root, current):
                 else:
                     staged.rename(target)
             runtime_store = _managed_runtime_store(root, current)
-            candidate_defaults = target / 'runtime' / 'OnlineTrader-parameters.json'
-            if runtime_store is not None and candidate_defaults.is_file():
+            candidate_defaults = next(
+                (path for path in (target / 'runtime' / 'OnlineTrader-parameters.json',
+                                   target / 'OnlineTrader-parameters.json')
+                 if path.is_file()),
+                None,
+            )
+            if runtime_store is not None and candidate_defaults is not None:
                 runtime_store.profile_with_defaults(candidate_defaults)
                 defaults_path = runtime_store.directory / 'OnlineTrader-parameters.json'
                 defaults_before = defaults_path.read_bytes()

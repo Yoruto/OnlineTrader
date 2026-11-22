@@ -93,10 +93,11 @@ class ClientStateStore(QObject):
             self.connection_changed.emit(state.value, reason)
 
     def mark_stale(self, reason):
-        if self.runtime is not None:
-            self.set_connection(ClientConnectionState.STALE, reason)
-        else:
-            self.set_connection(ClientConnectionState.SYNCHRONIZING, reason)
+        target = ClientConnectionState.STALE if self.runtime is not None else ClientConnectionState.SYNCHRONIZING
+        if target == self.connection_state and reason == self.connection_reason:
+            self.connection_changed.emit(target.value, reason)
+            return
+        self.set_connection(target, reason)
 
     def apply(self, state, cursor, published_ns):
         view = state['view']
@@ -187,16 +188,20 @@ class RuntimeTableModel(QAbstractTableModel):
     def row_value(self, row):
         return self._rows[row] if 0 <= row < len(self._rows) else None
 
+    @staticmethod
+    def _key(value):
+        return tuple(value) if isinstance(value, list) else value
+
     def replace(self, rows):
         values = [dict(row) for row in rows]
-        identities = [row.get(self.identity) for row in values]
+        identities = [self._key(row.get(self.identity)) for row in values]
         if any(value is None for value in identities) or len(set(identities)) != len(identities):
             self.beginResetModel()
             self._rows = values
-            self._by_id = {row.get(self.identity): row for row in values}
+            self._by_id = {self._key(row.get(self.identity)): row for row in values}
             self.endResetModel()
             return
-        old_ids = [row[self.identity] for row in self._rows]
+        old_ids = [self._key(row[self.identity]) for row in self._rows]
         if old_ids != identities:
             self.beginResetModel()
             self._rows = values

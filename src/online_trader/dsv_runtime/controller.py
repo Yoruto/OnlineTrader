@@ -49,11 +49,14 @@ def tighten_target(position, remaining, *, new_request=False):
     # Strategy/schedule target changes supersede a prior Workbench-only price
     # preference. Manual commands set a fresh preference after tightening.
     position.pop('manual_close_mode', None)
+    position.pop('manual_close_started_at', None)
+    position.pop('exit_manual_takeover', None)
     previous = position['exit_target']
     target = remaining if previous is None else min(previous, remaining)
     if target != previous or new_request:
         position['exit_revision'] = position.get('exit_revision', 0) + 1
         position['target_revision'] = position.get('target_revision', 1) + 1
+        position['consecutive_exit_rejections'] = 0
     position.update(exit_target=target, entry_stopped=True)
 
 
@@ -82,6 +85,36 @@ def legal_price(tick, raw):
     with localcontext() as ctx:
         ctx.prec = 80
         return decimal_text(value) if lo <= value <= hi and value % step == 0 else None
+
+
+def _align_reference_to_tick(tick, reference, direction):
+    """Align a strategy reference price to tick_size without exceeding its cap."""
+    if reference is None or price_value(tick.get('tick_size')) is None:
+        return reference
+    value = Decimal(str(reference))
+    step = Decimal(str(tick['tick_size']))
+    if step <= 0:
+        return reference
+    with localcontext() as ctx:
+        ctx.prec = 80
+        if value % step == 0:
+            return float(value)
+        quotient = value // step
+        aligned = quotient * step if direction == 'LONG' else (quotient + (1 if value % step != 0 else 0)) * step
+        return float(aligned)
+
+
+def _clamp_to_limits(tick, raw):
+    if raw is None:
+        return None
+    value = Decimal(str(raw))
+    lo = Decimal(str(tick['lower_limit'])) if price_value(tick.get('lower_limit')) is not None else None
+    hi = Decimal(str(tick['upper_limit'])) if price_value(tick.get('upper_limit')) is not None else None
+    if lo is not None and value < lo:
+        value = lo
+    if hi is not None and value > hi:
+        value = hi
+    return value
 
 
 class ExplicitOrderController:
@@ -164,8 +197,17 @@ class ExplicitOrderController:
         if order_day != state['trading_day'] and 'fill_day' not in fact:
             raise TraderError('E_DSV_SCOPE', 'Late trade requires the original fill day')
         if 'source_time_ns' in fact and 'native_order_time_ns' in order:
-            if int(fact['source_time_ns']) < int(order['native_order_time_ns']):
+            skew_limit_ns = 5_000_000_000 if order_day == fill_day else 0
+            if int(fact['source_time_ns']) + skew_limit_ns < int(order['native_order_time_ns']):
                 raise TraderError('E_DSV_NATIVE_FACT', 'Native trade precedes its original order timestamp')
+            if int(fact['source_time_ns']) < int(order['native_order_time_ns']):
+                self.journal.event('NATIVE_TRADE_CLOCK_SKEW', {
+                    'child_order_id': order['child_order_id'],
+                    'native_order_id': native_id,
+                    'native_trade_id': trade_id,
+                    'order_time_ns': str(order['native_order_time_ns']),
+                    'trade_time_ns': str(fact['source_time_ns']),
+                })
         separated = order['contract_id'].split('.')[0] in {'SHFE', 'INE'}
         if fill_day != order_day and separated and order['effect'] == 'REDUCE':
             raise TraderError('E_DSV_NATIVE_FACT', 'A split-offset child cannot spend lots on a different cabinet day')
@@ -199,9 +241,12 @@ class ExplicitOrderController:
             position['entry_filled'] += qty
             position['owned'] += qty
             position['entry_notional'] = decimal_text(Decimal(position['entry_notional']) + Decimal(fact['price']) * qty)
-            self._position_fill(position, order, fact, fill_day)
+            self._position_fill(position, order, fact, fill_day, state_seq=state.get('sequence'))
             self.position_buckets(state, position, order['contract_id'])
             self._reconcile_pending_reduces(state, row, position)
+        else:
+            position['consecutive_exit_rejections'] = 0
+            position.pop('exit_manual_takeover', None)
         if order.get('terminal_conflict') and terminal(order):
             order.pop('terminal_conflict')
         self.journal.event('NATIVE_TRADE', fact)
@@ -228,7 +273,7 @@ class ExplicitOrderController:
         qty = fact['quantity']
         if qty > position['owned']:
             return False
-        self._position_fill(position, order, fact, fill_day)
+        self._position_fill(position, order, fact, fill_day, state_seq=state.get('sequence'))
         try:
             buckets = self.position_buckets(state, position, order['contract_id'])
         except TraderError:
@@ -266,8 +311,10 @@ class ExplicitOrderController:
             order.pop('terminal_conflict')
 
     @staticmethod
-    def _position_fill(position, order, fact, fill_day):
-        position['fills'].append({'event_seq': len(position['fills']) + 1, 'contract_id': order['contract_id'],
+    def _position_fill(position, order, fact, fill_day, *, state_seq=None):
+        seq = max(len(position['fills']) + 1, int(state_seq or 0))
+        position['fills'].append({'event_seq': seq, 'contract_id': order['contract_id'],
+                                  'child_order_id': order['child_order_id'],
                                   'direction': position['direction'],
                                   'trade_key': [order['native_trading_day'], fact['native_order_id'], fact['native_trade_id']],
                                   'trading_day': fill_day, 'quantity': fact['quantity'], 'price': fact['price'],
@@ -284,7 +331,7 @@ class ExplicitOrderController:
         original['entry_filled'] += qty
         original['owned'] += qty
         original['entry_notional'] = decimal_text(Decimal(original['entry_notional']) + Decimal(fact['price']) * qty)
-        self._position_fill(original, order, fact, fill_day)
+        self._position_fill(original, order, fact, fill_day, state_seq=state.get('sequence'))
         # Keep detached cycles distinct; the current position may be another side.
         detached = row.setdefault('detached_positions', [])
         if original['id'] not in detached:
@@ -324,9 +371,9 @@ class ExplicitOrderController:
         order.update(contract_id=contract, direction=side, position_id=position['id'], native_id=None, cancel_reason=None)
         if not opening:
             order['exit_revision'] = position.get('exit_revision', 0)
-            tick = market.get('tick')
-            if tick is not None and tick.get('native_time') is not None:
-                order['quote_at'] = tick['native_time']
+        tick = market.get('tick')
+        if tick is not None and tick.get('native_time') is not None:
+            order['quote_at'] = tick['native_time']
         state['orders'][child_id] = order
         position['children'].append(child_id)
         return self._prepare(order, 'SEND', quantity=qty, limit_price=price, native_offset=offset, direction=side)
@@ -361,14 +408,29 @@ class ExplicitOrderController:
         return effect
 
     @staticmethod
-    def proves_position(state, position, market):
+    def proves_position(state, position, market, *, for_effect=None):
         own = 'long_qty' if position['direction'] == 'LONG' else 'short_qty'
         other = 'short_qty' if own == 'long_qty' else 'long_qty'
+        if market.get('standalone_external_model'):
+            if for_effect == 'REDUCE':
+                if market[own] < position['owned']:
+                    return False
+                if not position['owned']:
+                    return True
+                return bool(ExplicitOrderController._reduction_routes(
+                    state, position, market, position['owned'], include_pending_orders=False))
+            if market[own] != position['owned'] or market[other] or market.get('external_active_orders'):
+                return False
+            if not position['owned']:
+                return True
+            return bool(ExplicitOrderController._reduction_routes(
+                state, position, market, position['owned'], include_pending_orders=False))
         if market[own] != position['owned'] or market[other] or market.get('external_orders'):
             return False
         if not position['owned']:
             return True
-        return bool(ExplicitOrderController._reduction_routes(state, position, market, position['owned']))
+        return bool(ExplicitOrderController._reduction_routes(
+            state, position, market, position['owned'], include_pending_orders=False))
 
     @staticmethod
     def _position_fills(position, contract):
@@ -390,7 +452,7 @@ class ExplicitOrderController:
         return {'today': today, 'historical': sum(lot['quantity'] for lot in lots) - today}
 
     @staticmethod
-    def _reduction_routes(state, position, market, needed):
+    def _reduction_routes(state, position, market, needed, *, include_pending_orders=True):
         day = state['trading_day']
         side = position['direction'].lower()
         today = market.get(f'{side}_today')
@@ -400,10 +462,23 @@ class ExplicitOrderController:
                 return []
             today, historical = position['owned'], 0
         fills = ExplicitOrderController._position_fills(position, market['contract_id'])
+        pending_orders = []
+        target_quantity = needed
+        if include_pending_orders and 'orders' in state:
+            pending_orders = [
+                order | {'contract_id': market['contract_id'], 'direction': position['direction'],
+                         'trading_day': order.get('native_trading_day', day)}
+                for child_id in position.get('children', ())
+                if (order := state['orders'].get(child_id)) is not None
+                and order['effect'] == 'REDUCE' and not terminal(order)
+            ]
+            if pending_orders and position.get('exit_target') is not None:
+                target_quantity = max(needed, position['owned'] - position['exit_target'])
         try:
             result = close_routes(contract_id=market['contract_id'], direction=position['direction'], current_day=day,
                                   fills=fills, native={'today': today, 'historical': historical, 'total': today + historical},
-                                  orders=[], target_quantity=needed)
+                                  orders=pending_orders, target_quantity=target_quantity,
+                                  allow_external=bool(market.get('standalone_external_model')))
         except TraderError as error:
             if error.code in {'E_OWNERSHIP', 'E_FACT_BARRIER'}:
                 return []
@@ -432,7 +507,7 @@ class ExplicitOrderController:
             if old and old[-1]['filled_qty'] < old[-1]['original_qty']:
                 last = old[-1]
                 newer_target = position.get('exit_revision', 0) > last.get('exit_revision', 0)
-                rejected_retry = last['broker_state'] == 'REJECTED' and terminal(last) and newer_target
+                rejected_retry = self._retry_broker_exit_failure(position, last, market, newer_target)
                 if not rejected_retry and not self._retry_unsent_exit(last, market, newer_target) and (
                         last['broker_state'] != 'CANCELLED' or not newer_target):
                     continue
@@ -455,13 +530,7 @@ class ExplicitOrderController:
         return []
 
     @staticmethod
-    def _retry_unsent_exit(order, market, newer_target):
-        if order['effect'] != 'REDUCE' or order['send_state'] != 'DEFINITELY_NOT_SENT' or not terminal(order):
-            return False
-        if newer_target:
-            return True
-        # Each automatic successor needs a new received quote and a fresh
-        # route/price check. A limit-band fallback alone does not prove recovery.
+    def _has_fresh_quote_for_order(order, market):
         tick = market['tick']
         opponent = 'ask1' if order['direction'] == 'BUY' else 'bid1'
         if price_value(tick.get(opponent)) is None and price_value(tick.get('last')) is None:
@@ -470,6 +539,43 @@ class ExplicitOrderController:
         previous = order.get('quote_at')
         return quote_at is not None and (
             previous is None or datetime.fromisoformat(quote_at) > datetime.fromisoformat(previous))
+
+    @classmethod
+    def _retry_unsent_exit(cls, order, market, newer_target):
+        if order['effect'] != 'REDUCE' or order['send_state'] != 'DEFINITELY_NOT_SENT' or not terminal(order):
+            return False
+        if newer_target:
+            return True
+        return cls._has_fresh_quote_for_order(order, market)
+
+    @classmethod
+    def _retry_unsent_open(cls, order, market):
+        if order['effect'] != 'OPEN' or order['send_state'] != 'DEFINITELY_NOT_SENT' or not terminal(order):
+            return False
+        reason = order.get('local_send_rejection', {}).get('rejection_reason')
+        if reason not in {'QUOTE_REVISION_CHANGED', 'NATIVE_QUOTE_NOT_CURRENT'}:
+            return False
+        return cls._has_fresh_quote_for_order(order, market)
+
+    def _retry_broker_exit_failure(self, position, order, market, newer_target):
+        if order['effect'] != 'REDUCE' or not terminal(order):
+            return False
+        is_rejected = order['broker_state'] == 'REJECTED'
+        is_exchange_cancel = order['broker_state'] == 'CANCELLED' and order.get('cancel_reason') is None
+        if not (is_rejected or is_exchange_cancel):
+            return False
+        if newer_target:
+            position['consecutive_exit_rejections'] = 0
+            position.pop('exit_manual_takeover', None)
+            return True
+        if not order.get('exit_failure_counted'):
+            order['exit_failure_counted'] = True
+            position['consecutive_exit_rejections'] = position.get('consecutive_exit_rejections', 0) + 1
+        if position.get('consecutive_exit_rejections', 0) >= 3:
+            position['exit_manual_takeover'] = True
+            position['execution_reason'] = 'EXIT_MANUAL_TAKEOVER_REQUIRED'
+            return False
+        return self._has_fresh_quote_for_order(order, market)
 
     @staticmethod
     def _desired(position, market, effect, wall_time):
@@ -483,7 +589,8 @@ class ExplicitOrderController:
                     expired = wall_time - float(position['context_at']) > 90
                 if expired:
                     mode = 'ACTIVE'
-            reference = position['theory'] if mode == 'PASSIVE' else position['cap']
+            raw_ref = position['theory'] if mode == 'PASSIVE' else position['cap']
+            reference = _align_reference_to_tick(tick, raw_ref, direction) if raw_ref is not None else None
         else:
             direction = 'SHORT' if direction == 'LONG' else 'LONG'
             manual = position.get('manual_close_mode')
@@ -491,7 +598,21 @@ class ExplicitOrderController:
                 buy = direction == 'LONG'
                 field = ('last' if manual == '最新价'
                          else 'bid1' if (manual == '排队价') == buy else 'ask1')
-                return legal_price(tick, tick.get(field))
+                direct = legal_price(tick, tick.get(field))
+                if direct is not None:
+                    return direct
+                started = position.get('manual_close_started_at')
+                if started is not None and wall_time is not None:
+                    elapsed_ms = max(0, int((float(wall_time) - float(started)) * 1000))
+                    if elapsed_ms >= 4000:
+                        from online_trader.execution.policy import select_manual_price
+                        fallback = select_manual_price(
+                            manual, 'BUY' if buy else 'SELL', tick,
+                            elapsed_ms=elapsed_ms,
+                            limit_fallback_ratio=str(market.get('limit_fallback_ratio', '0.01')))
+                        if fallback.get('price') is not None:
+                            return legal_price(tick, fallback['price'])
+                return None
             mode = market.get('close_price_mode', position.get('close_mode'))
             if mode in {'AGGR1', 'MARKET'}:
                 buy = direction == 'LONG'
@@ -505,6 +626,8 @@ class ExplicitOrderController:
                 raw = strategy_price('BUY' if buy else 'SELL', mode, opponent=positive(quote),
                                      tick=positive(tick.get('tick_size')),
                                      limit=positive(tick.get('upper_limit' if buy else 'lower_limit')), reference=None)
+                if mode == 'AGGR1':
+                    raw = _clamp_to_limits(tick, raw)
                 return legal_price(tick, raw)
             mode, reference = 'ACTIVE', None
         return legal_price(tick, entry_price(tick, direction, mode, None if reference is None else float(reference)))
@@ -513,7 +636,13 @@ class ExplicitOrderController:
         """Return the single quantity projection used by maintenance and pricing."""
         orders = self.child_orders(state, position, effect)
         if effect == 'OPEN':
-            target = position['entry_filled'] if position['entry_stopped'] else position['quantity']
+            if (position['entry_stopped'] and position.get('preserve_open_on_stop')
+                    and position.get('exit_target') is None):
+                pending_open = sum(max(0, int(order['original_qty']) - int(order['filled_qty']))
+                                   for order in orders if not terminal(order))
+                target = min(position['quantity'], position['entry_filled'] + pending_open)
+            else:
+                target = position['entry_filled'] if position['entry_stopped'] else position['quantity']
             confirmed = position['entry_filled']
         else:
             confirmed = 0
@@ -545,7 +674,9 @@ class ExplicitOrderController:
             status, reason = 'WORKING', 'WORKING_ORDER_COVERS_TARGET'
         elif opening.needed_qty or reducing.needed_qty:
             reason = position.get('execution_reason') or 'TARGET_GAP'
-            status = 'BLOCKED' if reason in {'POSITION_CHANGED', 'NO_LEGAL_PRICE'} else 'READY'
+            status = ('BLOCKED' if reason in {
+                'POSITION_CHANGED', 'NO_LEGAL_PRICE', 'EXIT_MANUAL_TAKEOVER_REQUIRED', 'E_ENTRY_PRICE_CAP'
+            } else 'READY')
         else:
             status, reason = 'DONE', 'TARGET_ALREADY_COVERED'
         target_owned = position['exit_target']
@@ -621,14 +752,18 @@ class ExplicitOrderController:
         if row.get('detached_positions'):
             return self.plan_detached(state, row, market, wall_time)
         position = row['position']
-        proven_position = self.proves_position(state, position, market)
         effects = []
         for effect in ('OPEN', 'REDUCE'):
+            opening = effect == 'OPEN'
+            if opening and not market.get('allow_new_entry', market.get('allow_new_order', True)):
+                continue
+            if not opening and not market.get('allow_protective_exit', market.get('allow_new_order', True)):
+                continue
+            proven_position = self.proves_position(state, position, market, for_effect=effect)
             previous = self.child_orders(state, position, effect)
             outstanding = [order for order in previous if not terminal(order)]
             accounting = self.target_accounting(state, position, effect)
             needed = accounting.needed_qty
-            opening = effect == 'OPEN'
             desired = self._desired(position, market, effect, wall_time)
             repricing = False
             if proven_position and desired is not None:
@@ -666,11 +801,19 @@ class ExplicitOrderController:
                 allowed_retry = old['cancel_reason'] in {'REPRICE', 'TARGET_REDUCED'}
                 rolled_exit = not opening and old['native_trading_day'] != state['trading_day']
                 newer_target = not opening and position.get('exit_revision', 0) > old.get('exit_revision', 0)
-                local_retry = self._retry_unsent_exit(old, market, newer_target)
-                rejected_retry = not opening and old['broker_state'] == 'REJECTED' and terminal(old) and newer_target
+                local_retry = self._retry_unsent_open(old, market) if opening else self._retry_unsent_exit(old, market, newer_target)
+                rejected_retry = not opening and self._retry_broker_exit_failure(position, old, market, newer_target)
                 if not rejected_retry and not local_retry and (old['broker_state'] != 'CANCELLED' or not (
                         allowed_retry or newer_target or rolled_exit and old['cancel_reason'] != 'USER_CANCEL')):
                     continue
+                if opening and local_retry and position.get('cap') is not None:
+                    cap = Decimal(str(position['cap']))
+                    proposed = Decimal(desired)
+                    exceeds = proposed > cap if position['direction'] == 'LONG' else proposed < cap
+                    if exceeds:
+                        position.update(entry_stopped=True, preserve_open_on_stop=False,
+                                        execution_reason='E_ENTRY_PRICE_CAP')
+                        continue
             if opening:
                 effects.append(self.new_order(state, position, market, effect, needed, desired, 'OPEN'))
             else:
@@ -692,7 +835,10 @@ class ExplicitOrderController:
                 and any(self.target_accounting(state, row['position'], effect).needed_qty
                         for effect in ('OPEN', 'REDUCE'))):
             row['position']['execution_reason'] = 'NO_LEGAL_PRICE'
-        if can_price and market.get('tick') is not None and market.get('allow_new_order', True):
+        allow_any = (market.get('allow_new_order', True)
+                     or market.get('allow_new_entry', False)
+                     or market.get('allow_protective_exit', False))
+        if can_price and market.get('tick') is not None and allow_any:
             maintenance.extend(self.plan_priced_effects(state, row, market, wall_time))
         if can_price and not row.get('detached_positions'):
             self.settle(state, row)
@@ -708,7 +854,13 @@ class ExplicitOrderController:
         if (position['owned'] == 0 and position['children']
                 and all(terminal(order) for order in self.child_orders(state, position))):
             opens = self.child_orders(state, position, 'OPEN')
-            if (position['entry_filled'] or position['entry_stopped'] or
+            retryable_open_unsent = (
+                opens and not position['entry_filled'] and not position['entry_stopped']
+                and opens[-1]['send_state'] == 'DEFINITELY_NOT_SENT'
+                and opens[-1].get('local_send_rejection', {}).get('rejection_reason') in {
+                    'QUOTE_REVISION_CHANGED', 'NATIVE_QUOTE_NOT_CURRENT'})
+            if not retryable_open_unsent and (
+                    position['entry_filled'] or position['entry_stopped'] or
                     opens[-1]['cancel_reason'] != 'REPRICE' or opens[-1]['broker_state'] != 'CANCELLED'):
                 if position.get('gap_exit', {}).get('day_stop'):
                     row['day_stop'] = True
@@ -756,7 +908,11 @@ class ExplicitOrderController:
                     # a cancelled order. Do not refund the consumed strategy target.
                     order['local_send_rejection'] = {'effect_id': effect['id'], **details}
                     position = state['symbols'][order['contract_id']]['position']
-                    if position is not None and position['id'] == order['position_id'] and order['effect'] == 'OPEN':
+                    retryable_open_race = (
+                        order['effect'] == 'OPEN'
+                        and details.get('rejection_reason') in {'QUOTE_REVISION_CHANGED', 'NATIVE_QUOTE_NOT_CURRENT'})
+                    if (position is not None and position['id'] == order['position_id']
+                            and order['effect'] == 'OPEN' and not retryable_open_race):
                         position.update(entry_stopped=True, preserve_open_on_stop=False)
             else:
                 if result == 'DEFINITELY_NOT_SENT':

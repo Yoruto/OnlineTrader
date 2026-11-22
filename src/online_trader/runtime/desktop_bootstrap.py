@@ -88,7 +88,8 @@ def timed_start_trigger(profile, now, *, on_launch=False, metadata=None):
     from online_trader.strategy.entry import CHINA_TIME
     settings = profile.to_record()['settings']
     local = now.astimezone(CHINA_TIME)
-    if local.weekday() >= 5 or local.date().isoformat() in settings['trade']['holidays']:
+    saturday_night_tail = on_launch and local.weekday() == 5 and (local.hour, local.minute) <= (2, 35)
+    if (local.weekday() >= 5 and not saturday_night_tail) or local.date().isoformat() in settings['trade']['holidays']:
         return None
     trigger = 'AUTO_START_ON_LAUNCH' if on_launch and settings['trade']['auto_start_on_launch'] else (
         scheduled_minute(settings['schedule'], local))
@@ -154,7 +155,8 @@ def _request(path, instant=None):
             raise ValueError()
         identifier(value['request_id'])
         created, expiry = _utc(value['created_at_utc']), _utc(value['expires_at_utc'])
-        if expiry - created != REQUEST_LIFETIME or (instant is not None and not created <= instant < expiry):
+        if expiry - created != REQUEST_LIFETIME or (
+                instant is not None and not created - timedelta(seconds=60) <= instant < expiry):
             raise ValueError()
         if 'recover_original' in value and (value['recover_original'] is not True or value['arm']
                                              or 'timed_trigger' in value):
@@ -381,9 +383,11 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
                 anchor = ProtectionClockAnchor(grant.value['ledger_path'], row['account_key'])
                 clock = CalibratedClock(recovery_anchor=anchor, recovering=True)
             else:
-                clock = CalibratedClock() if now is None else None
+                anchor = (ProtectionClockAnchor(execution_ledger, row['account_key'])
+                          if execution_ledger is not None else None)
+                clock = CalibratedClock(recovery_anchor=anchor) if now is None else None
             instant = clock.now() if clock is not None else _now(now)
-            if not _utc(request['created_at_utc']) <= instant < _utc(request['expires_at_utc']):
+            if not _utc(request['created_at_utc']) - timedelta(seconds=60) <= instant < _utc(request['expires_at_utc']):
                 raise TraderError('E_DESKTOP_START_REQUEST', ERROR_MESSAGES['E_DESKTOP_START_REQUEST'])
             claim = store.directory / 'desktop-start-claims' / (request['request_id'] + '.json')
             if claim.exists():

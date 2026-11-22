@@ -79,11 +79,16 @@ def load_preparation(source,profile):
     if ledger.exists():
         try:
             conn=sqlite3.connect(ledger.resolve().as_uri()+'?mode=ro',uri=True)
-            identity=conn.execute('SELECT account_key,broker_identity FROM ledger_scope WHERE singleton=1').fetchone()
-            if identity!=(source.account_key,'TQ_SIMNOW'):raise TraderError('E_AUTO_OFFSETS','Original automatic ledger identity differs')
-            saved=conn.execute("SELECT payload_json FROM event_journal WHERE event_type='ONLINE_AUTO_OFFSETS_APPLIED' ORDER BY event_seq DESC LIMIT 1").fetchone()
-            if saved:
-                material=strict_loads(saved[0]);record=material.get('data',material).get('preparation')
+            app_id=conn.execute('PRAGMA application_id').fetchone()[0]
+            has_tables=bool(conn.execute('SELECT 1 FROM sqlite_master LIMIT 1').fetchone())
+            if app_id==0x44535631 or not has_tables:
+                conn.close();conn=None
+            else:
+                identity=conn.execute('SELECT account_key,broker_identity FROM ledger_scope WHERE singleton=1').fetchone()
+                if identity!=(source.account_key,'TQ_SIMNOW'):raise TraderError('E_AUTO_OFFSETS','Original automatic ledger identity differs')
+                saved=conn.execute("SELECT payload_json FROM event_journal WHERE event_type='ONLINE_AUTO_OFFSETS_APPLIED' ORDER BY event_seq DESC LIMIT 1").fetchone()
+                if saved:
+                    material=strict_loads(saved[0]);record=material.get('data',material).get('preparation')
         except sqlite3.Error:
             if conn is not None:conn.close()
             raise TraderError('E_AUTO_OFFSETS','Cannot verify the original automatic ledger; no new calculation is permitted') from None
@@ -93,7 +98,7 @@ def load_preparation(source,profile):
     try:
         if record is None:
             if not path.exists():
-                if ledger.exists():raise TraderError('E_AUTO_OFFSETS','An existing ledger has no original automatic preparation; do not recalculate it')
+                if conn is not None:raise TraderError('E_AUTO_OFFSETS','An existing ledger has no original automatic preparation; do not recalculate it')
                 return None
             with path.open('rb') as stream:raw=stream.read(4*1024*1024+1)
             if len(raw)>4*1024*1024:raise TraderError('E_AUTO_OFFSETS','Saved automatic preparation exceeds its bound')

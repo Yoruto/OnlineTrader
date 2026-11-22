@@ -123,7 +123,6 @@ def main(argv=None):
                     window.setAttribute(Qt.WA_DeleteOnClose)
                     window.destroyed.connect(app.quit)
                     windows.append(window)
-                    app.setQuitOnLastWindowClosed(True)
                     window.show()
                     QTimer.singleShot(0, window.refresh)
 

@@ -108,6 +108,7 @@ class OfflineAdapter(RecordingPort):
             self.synchronized = False
             session.disconnect('QA_INCOMPLETE_BROKER_BASELINE')
             return {'type': 'DISCONNECTED', 'synchronized': False}
+        self.dispatch_market = {row['contract_id']: row for row in current.get('market', ())}
         result = session.apply_round(current)
         self.synchronized = session.snapshot()['synchronized']
         return result

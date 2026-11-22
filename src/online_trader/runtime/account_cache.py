@@ -234,9 +234,8 @@ def read_account_days(path, account_key, *, from_day, to_day, section='coverage'
         raise TraderError('E_STORAGE', 'Cannot read the broker history cache') from None
     by_day = {}
     decoded = []
+    decode_payload = section not in ('coverage', 'owned-trades')
     for row in rows:
-        value = strict_loads(row['payload_json'])
-        decoded.append((row, value))
         stats = by_day.setdefault(row['trading_day'], {'observations': 0, 'complete_observations': 0,
                                                        'observation_seq': 0, 'complete_seq': None})
         stats['observations'] += 1
@@ -244,6 +243,8 @@ def read_account_days(path, account_key, *, from_day, to_day, section='coverage'
         if row['complete']:
             stats['complete_observations'] += 1
             stats['complete_seq'] = row['snapshot_seq']
+            if decode_payload:
+                decoded.append((row, strict_loads(row['payload_json'])))
     coverage = []
     for day_offset in range((last - first).days + 1):
         day = (first + timedelta(days=day_offset)).isoformat()

@@ -170,12 +170,14 @@ def build_metadata(calendar_dates, quote_records, contracts, *, now, provider):
     if prior is None:
         _error('未取得上一完整交易日。', 'E_CALENDAR_INCOMPLETE')
     gap = [prior + timedelta(days=i) for i in range(1, (target - prior).days)]
-    if any(day.weekday() < 5 and not calendar_dates[day] for day in gap):
+    holiday_gap = any(day.weekday() < 5 and not calendar_dates[day] for day in gap)
+    if holiday_gap and local.date() < target and any(schedules[code]['night'] for code in contracts):
         _error('节假日前后的夜盘安排尚未确认，请等待完整交易时段资料。', 'E_CALENDAR_INCOMPLETE')
+    session_kinds = (('day', target),) if holiday_gap else (('night', prior), ('day', target))
     rows, opened, closed = [], [], []
     for code in contracts:
         sessions = []
-        for kind, actual in (('night', prior), ('day', target)):
+        for kind, actual in session_kinds:
             periods = schedules[code][kind]
             midnight = datetime.combine(actual, datetime.min.time(), BEIJING)
             for index, (start, end) in enumerate(periods):
