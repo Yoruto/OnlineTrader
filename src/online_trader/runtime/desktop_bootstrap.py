@@ -341,8 +341,12 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
         if row['account_key'] != request['account_key'] or row['provider'] != request['provider']:
             raise TraderError('E_SCOPE', ERROR_MESSAGES['E_SCOPE'])
         def phase(index, name, **extra):
-            publish_new_bytes(canonical_bytes({'phase': name, 'message': _PHASE_MESSAGES[name],
-                'entry_authority': 'DISARMED', **extra}), directory / f'phase-{index:03}-bootstrap.json')
+            publish_new_bytes(canonical_bytes({
+                'phase': name, 'message': _PHASE_MESSAGES[name],
+                'entry_authority': 'DISARMED',
+                'observed_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                **extra,
+            }), directory / f'phase-{index:03}-bootstrap.json')
         phase(0, 'STARTUP_CHECKING')
         with ClockActivity(), AccountLock(row['account_key']) as lease:
             runtime_options = {}
@@ -434,13 +438,14 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
                     output=directory, pipe=store.pipe_name(row), session_storage=session_storage,
                     runtime_lock=runtime_lock, account_lock=lease, clock=clock,
                     trusted_control_pid=trusted_control_pid or -1, history_cache=history_cache,
-                    arm=request['arm'], configuration_revision='1')
+                    arm=request['arm'], configuration_revision='1', configured_store=configured_store)
             return dsv_simulation.run(directory / 'scope.json', reference, directory / 'profile.json',
                 directory / 'calendar.json', directory, pipe=store.pipe_name(row), arm=request['arm'],
                 _execution_lock=lease, **({'_reference': clock} if clock is not None else {}), **runtime_options)
     except Exception as error:
         code = error.code if isinstance(error, TraderError) else 'E_DESKTOP_START'
         failure = {'status': 'STARTUP_FAILED', 'error_code': code, 'entry_authority': 'DISARMED',
+            'observed_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
             'exception': exception_record(error),
             'message': ERROR_MESSAGES.get(code, '启动未完成，请检查网络与模拟连接状态后重试。')}
         path = directory / 'startup-failure.json'

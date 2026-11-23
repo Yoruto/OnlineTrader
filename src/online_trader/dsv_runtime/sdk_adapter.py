@@ -82,6 +82,7 @@ class DsvSdkAdapter:
         self.owner_mode = owner_mode
         self.provider = 'OFFLINE' if grant is None else grant.provider
         self.profile, self.calendar = profile, calendar
+        self._initial_configuration_id = profile.content_hash
         self.contracts = tuple(row['code'] for row in profile.to_record()['settings']['symbols'])
         calendar_record = calendar.to_record()
         self.periods = {row['contract_id']: row['sessions'] for row in calendar_record['contracts']}
@@ -115,6 +116,8 @@ class DsvSdkAdapter:
         self._diagnostics = OrderDiagnosticTracker(account_key=account_key)
         self.quotes = {code: api.get_quote(code) for code in self.contracts}
         self.minutes = {code: api.get_kline_serial(code, 60, data_length=500) for code in self.contracts}
+        self._minute_chart_sample_at = None
+        self._minute_chart_cache = {}
 
     def matches_online_scope(self, account, provider, *, owner_mode='REPLACEMENT'):
         return (self.grant is not None and self.owner_mode == owner_mode
@@ -180,8 +183,9 @@ class DsvSdkAdapter:
             raise TraderError('E_DSV_SDK_OWNER', 'SDK calls must use the bound DSV owner thread and port')
         state = session.snapshot()
         scope = state['scope']
+        expected_config = getattr(self, '_initial_configuration_id', self.profile.content_hash)
         if (scope['account_key'] != self.account_key or scope['provider'] != self.provider or
-                scope['configuration_id'] != self.profile.content_hash or self.session not in (None, session)):
+                scope['configuration_id'] != expected_config or self.session not in (None, session)):
             raise TraderError('E_DSV_SDK_SCOPE', 'The session does not match the adapter scope')
         if self.session is None:
             session.disconnect('SDK_ATTACHED')
@@ -196,6 +200,8 @@ class DsvSdkAdapter:
         self.flat_confirmed = False
         self.dispatch_market = {}
         self.quote_observations = {}
+        self._minute_chart_sample_at = None
+        self._minute_chart_cache = {}
         self._local_returns.clear()
         self.epoch = uuid4().hex
         session.disconnect('SDK_DISCONNECTED')
@@ -207,7 +213,14 @@ class DsvSdkAdapter:
             self._clock_resume_day = None
         self.enabled = self.synchronized and state['synchronized']
         try:
-            return session.command(command)
+            receipt = session.command(command)
+            if command.get('action') == 'SAVE_PARAMETERS' and any(
+                item.get('reason') == 'DSV_PARAMETERS_SAVED' for item in receipt.get('decisions', ())
+            ):
+                updated = DsvProfile.from_record(command['profile'])
+                self.profile = updated
+                self.contracts = tuple(row['code'] for row in updated.to_record()['settings']['symbols'])
+            return receipt
         finally:
             self.enabled = False
 
@@ -292,6 +305,8 @@ class DsvSdkAdapter:
             self.flat_confirmed = False
             self.dispatch_market = {}
             self.quote_observations = {}
+            self._minute_chart_sample_at = None
+            self._minute_chart_cache = {}
             self._local_returns.clear()
             self.epoch = uuid4().hex
             if not session._failed:
@@ -488,6 +503,9 @@ class DsvSdkAdapter:
                       ) if order.status == 'FINISHED' else 'ALIVE'
             self._local_returns.discard(binding['child_order_id'])
             temporal = {'source_time_ns': str(stamp)} if type(stamp) is int and stamp > 0 else {}
+            native_msg = getattr(order, 'last_msg', None)
+            if isinstance(native_msg, str) and native_msg:
+                temporal['native_message'] = native_msg[:200]
             rejection = {}
             if status == 'REJECTED':
                 category, detail = classify_broker_rejection(getattr(order, 'last_msg', None))
@@ -750,6 +768,62 @@ class DsvSdkAdapter:
         return {'native_time': native_time, 'candle_id': candle,
                 'native_candle_ns': str(minute) if candle is not None else None, 'native_quote_stamp': stamp,
                 **{name: _amount(getattr(quote, field, None)) for name, field in _PRICE_FIELDS.items()}}
+
+    def minute_chart_bars(self):
+        """Return a bounded display-only copy of the owner's native minute serials."""
+        now = time.monotonic()
+        if self._minute_chart_sample_at is not None and now - self._minute_chart_sample_at < 2:
+            return self._minute_chart_cache
+        ready = getattr(self.api, 'is_serial_ready', None)
+        result = {}
+        for code, serial in self.minutes.items():
+            try:
+                if callable(ready) and not ready(serial):
+                    continue
+                bars = {}
+                for row in serial.tail(48).to_dict('records'):
+                    try:
+                        stamp = native_integer(row.get('datetime'), minimum=60_000_000_000)
+                    except TraderError:
+                        continue
+                    values = tuple(number(row.get(key)) for key in ('open', 'high', 'low', 'close'))
+                    if any(value is None or len(value) > 32 for value in values):
+                        continue
+                    opening, high, low, closing = map(Decimal, values)
+                    if 0 < low <= min(opening, closing) <= max(opening, closing) <= high:
+                        bars[stamp // 60_000_000_000] = list(values)
+                if bars:
+                    result[code] = [[minute, *bars[minute]] for minute in sorted(bars)]
+            except (AttributeError, TypeError, ValueError, ArithmeticError):
+                continue
+        self._minute_chart_sample_at = now
+        self._minute_chart_cache = result
+        return result
+
+    def display_market_details(self, code, trading_day=None, *, fresh=False):
+        """Return bounded display-only quote and rollover metadata for Workbench views."""
+        details = {}
+        quote = self.quotes.get(code)
+        if fresh and quote is not None:
+            for field in (
+                'open', 'pre_settlement', 'settlement', 'volume', 'open_interest',
+                'bid_volume1', 'ask_volume1', 'commission',
+            ):
+                try:
+                    value = number(getattr(quote, field, None))
+                except (AttributeError, TypeError, ValueError, ArithmeticError, TraderError):
+                    value = None
+                if value is not None:
+                    details[field] = value
+        reader = getattr(self.connection, 'rollover_market_facts', None)
+        if callable(reader) and trading_day:
+            try:
+                facts = reader(code, trading_day)
+            except (AttributeError, TypeError, ValueError, OSError, TraderError):
+                facts = None
+            if facts:
+                details['rollover'] = facts
+        return details
 
     def _authorized(self, effect, kind, *, require_enabled=True):
         if (get_ident() != self.owner or (require_enabled and not self.enabled)

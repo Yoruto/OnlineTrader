@@ -1,5 +1,6 @@
 """Runtime-compatible read projections for the Standalone DSV owner."""
 
+import copy
 from datetime import datetime, timezone
 from decimal import Decimal, localcontext
 import re
@@ -7,6 +8,8 @@ import re
 from online_trader.contracts.codec import canonical_bytes, content_hash
 from online_trader.domain.values import decimal_text
 from online_trader.dsv_runtime.controller import terminal
+from online_trader.dsv_core.entry_rules import trigger_prices
+from online_trader.errors import TraderError
 
 
 def _utc_now():
@@ -43,6 +46,63 @@ def _level_prices(position):
     stop_price = decimal_text(base - sign * Decimal(stop)) if stop is not None else None
     profit_price = decimal_text(base + sign * Decimal(profit)) if profit is not None else None
     return stop_price, profit_price
+
+
+def _trigger_lines(tick, symbol):
+    high, low, offset = tick.get('day_high'), tick.get('day_low'), symbol.get('open_offset')
+    if high is None or low is None or offset is None:
+        return {}
+    try:
+        lines = trigger_prices(Decimal(high), Decimal(low), Decimal(offset))
+    except (ArithmeticError, ValueError):
+        return {}
+    return {side: decimal_text(value) for side, value in lines.items()}
+
+
+def _exit_wait_reason(row, position, target):
+    if position.get('exit_manual_takeover') or target.get('decision_reason') == 'EXIT_MANUAL_TAKEOVER_REQUIRED':
+        return 'EXIT_MANUAL_INTERVENTION_REQUIRED'
+    if target.get('status') == 'RECONCILING':
+        return 'EXIT_RECONCILING'
+    if row.get('exit_wait_reason'):
+        return row['exit_wait_reason']
+    if position.get('consecutive_exit_rejections', 0) > 0 and target.get('reduce_needed_qty'):
+        return 'EXIT_RETRY_SCHEDULED'
+    return None
+
+
+def _schedule_display(adapter, trading_day, contracts):
+    calendar = getattr(adapter, 'calendar', None)
+    reader = getattr(calendar, 'session_times', None)
+    if not callable(reader) or not trading_day or not contracts:
+        return None
+    try:
+        schedules = {code: reader(code, trading_day) for code in contracts}
+    except (TraderError, KeyError, TypeError, ValueError):
+        return None
+    return {
+        'trading_day': trading_day,
+        'intervals': {code: [list(pair) for pair in rows[:16]] for code, rows in schedules.items()},
+        'truncated': any(len(rows) > 16 for rows in schedules.values()),
+    }
+
+
+def _strategy_diagnostics(clock_health, clock_fault, cycles):
+    diagnostics = {}
+    if isinstance(clock_health, dict):
+        status = clock_health.get('reference_status')
+        if status in {'OBSERVED_OK', 'CALIBRATED'}:
+            diagnostics['ntp'] = 'NTP_ALIGNED'
+        elif status == 'REFERENCE_CONFLICT':
+            diagnostics['ntp'] = 'NTP_SKEW'
+        elif status is not None:
+            diagnostics['ntp'] = 'NTP_UNAVAILABLE'
+    if clock_fault:
+        diagnostics['clock_protection'] = {
+            'active_cycles': [row['position_cycle_id'] for row in cycles],
+            'blocked_cycles': {},
+        }
+    return diagnostics
 
 
 def projection_batch(snapshot):
@@ -168,12 +228,17 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
     revision = str(max(1, int(snapshot.get('projection_seq') or snapshot.get('sequence') or 0)))
     settings = profile.to_record()['settings']
     symbols = {item['code']: item for item in settings['symbols']}
+    latest_decisions = snapshot.get('latest_decisions') or {}
+    detail_reader = getattr(adapter, 'display_market_details', None)
     markets, cycles, orders, trades, external_positions = [], [], [], [], []
     seen_trade_positions = set()
     for contract, row in snapshot['symbols'].items():
         tick = row.get('tick') or {}
         market = adapter.dispatch_market.get(contract, {})
         quote = row.get('quote_observation') or {}
+        decision = latest_decisions.get(contract) or {}
+        decision_reasons = list(dict.fromkeys(
+            item.get('reason') for item in decision.get('decisions', ()) if item.get('reason')))
         fresh = bool(tick and quote.get('age_quality') == 'VALID'
                      and row.get('market_session_active') is not False)
         position = row.get('position')
@@ -191,22 +256,39 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
                 'contract_id': contract, 'direction': 'SHORT', 'quantity': ext_short,
                 'classification': 'UNOWNED_BROKER_POSITION',
             })
-        markets.append({
+        if ext_long or ext_short:
+            decision_reasons = [
+                reason for reason in decision_reasons
+                if reason != 'UNOWNED_POSITION'
+            ]
+        entry_reasons = (['EXTERNAL_POSITION_PRESENT'] if (ext_long or ext_short) else []) + decision_reasons
+        day_stop_reason = ((row.get('day_stop_reason') or '当日已停止开仓')
+                           if row.get('day_stop') else None)
+        market_row = {
             'contract_id': contract, 'name': symbols[contract]['name'],
             'trading_day': snapshot['trading_day'], 'session_id': snapshot.get('session_id'),
             'last': tick.get('last'), 'bid1': tick.get('bid1'), 'ask1': tick.get('ask1'),
             'day_high': tick.get('day_high'), 'day_low': tick.get('day_low'),
+            'upper_limit': tick.get('upper_limit'), 'lower_limit': tick.get('lower_limit'),
+            'margin': market.get('margin_per_lot'), 'volume_multiple': market.get('multiplier'),
             'source_time_utc': tick.get('native_time'),
             'source_time_raw': quote.get('source_time_raw') or tick.get('native_time'),
             'source_age_raw_ns': quote.get('source_age_raw_ns'),
             'quote_time_reason': quote.get('reason'),
             'fresh': fresh,
-            'enabled': bool(snapshot['running'] and not row.get('day_stop', False)),
-            'entry_reasons': ['EXTERNAL_POSITION_PRESENT'] if (ext_long or ext_short) else [],
+            'enabled': True,
+            'day_stop_reason': day_stop_reason,
+            'entry_reasons': list(dict.fromkeys(entry_reasons)),
+            'trigger_prices': _trigger_lines(tick, symbols[contract]),
+            'decision_time_utc': decision.get('decision_time_utc'),
+            'price_tick': tick.get('tick_size'),
             'market_session_active': market.get('market_session_active'),
             'position_quantity': 0 if position is None else position['owned'],
             'net_loss_points': row.get('net_loss'), 'opening_orders': row.get('target_count', 0),
-        })
+        }
+        if callable(detail_reader):
+            market_row.update(detail_reader(contract, snapshot.get('trading_day'), fresh=fresh))
+        markets.append(market_row)
         if position is None:
             continue
         target = row.get('target_execution') or {}
@@ -226,6 +308,10 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
             decimal_text(Decimal(str(margin_per_lot)) * Decimal(position['owned']))
             if margin_per_lot is not None and position['owned'] > 0 else None
         )
+        half_stage = int(position.get('half_stage') or 0)
+        exit_pending = bool(target.get('reduce_needed_qty') or target.get('reduce_pending_qty'))
+        rollback_exit = position.get('rollback_exit') or {}
+        exit_reason = rollback_exit.get('reason')
         cycles.append({
             'position_cycle_id': position['id'], 'contract_id': contract,
             'direction': position['direction'], 'trading_day': position.get('open_day'),
@@ -234,11 +320,28 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
             'target_remaining_quantity': position['exit_target'],
             'mode': 'PROTECTED' if position.get('protected') else 'NORMAL',
             'quality': 'CONTIGUOUS' if snapshot['synchronized'] else 'UNKNOWN',
-            'exit_pending': bool(target.get('reduce_needed_qty') or target.get('reduce_pending_qty')),
+            'exit_pending': exit_pending,
             'entry_price': entry_price,
             'stop_price': stop_price, 'take_profit_price': take_profit_price,
             'last_price': last_price, 'price_difference': price_diff,
             'margin': margin, 'floating_profit': floating_profit, 'commission': None,
+            'initial_open_confirmation': (
+                {'status': 'CONFIRMED', 'quantity': position['entry_filled'],
+                 'value': position['entry_notional']}
+                if position.get('entry_filled') else None
+            ),
+            'phase1_status': 'DONE' if half_stage >= 1 else 'NOT_TRIGGERED',
+            'phase2_status': 'DONE' if half_stage >= 2 else 'NOT_TRIGGERED',
+            'phase1_target': (position['exit_target']
+                              if half_stage == 1 and position.get('exit_target') not in (None, 0) else None),
+            'phase2_target': (position['exit_target']
+                              if half_stage >= 2 and position.get('exit_target') not in (None, 0) else None),
+            'break_even_status': 'NOT_TRIGGERED',
+            'max_favorable_move': position.get('peak'),
+            'exit_reason': exit_reason,
+            'exit_reasons': [exit_reason] if exit_reason else [],
+            'exit_reference_price': rollback_exit.get('price'),
+            'exit_wait_reason': _exit_wait_reason(row, position, target) if exit_pending else None,
             'entry_tag': position.get('entry_kind'),
             'management_state': None, 'plan_id': position.get('target_id', position['id']),
             'plan_revision': str(position.get('target_revision', 1)),
@@ -263,6 +366,8 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
             'cancel_status', 'terminal_confirmed', 'reported_fill_qty')}
             | {'position_cycle_id': order['position_id'], 'contract_id': order['contract_id'],
                'native_order_id': order.get('native_id'), 'direction': strategy_direction,
+               'source_time_ns': order.get('native_order_time_ns'),
+               'native_message': order.get('native_message'),
                'potential_remaining': remaining, 'order_source': 'STRATEGY'})
     connected = bool(adapter.connection and adapter.connection.broker_connected)
     synchronized = connected and snapshot['synchronized'] and adapter.synchronized
@@ -279,6 +384,7 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
         'CANCEL_OWNED': 'OWNED_ORDERS',
         'FLATTEN_THEN_STOP': 'ACCOUNT',
         'REQUEST_RECONCILIATION': 'ACCOUNT',
+        'SAVE_DSV_PARAMETERS': 'ACCOUNT',
     }
     operations = []
     for operation, scope_type in operation_scopes.items():
@@ -290,6 +396,18 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
                       'CLOCK_FAULT' if clock_fault else
                       owner_fault if owner_fault else
                       'ALREADY_ARMED' if snapshot['running'] else 'RUNTIME_NOT_READY')
+        elif operation == 'SAVE_DSV_PARAMETERS':
+            allowed = synchronized and not clock_fault and not owner_fault
+            reason = (None if allowed else
+                      'CLOCK_FAULT' if clock_fault else
+                      owner_fault if owner_fault else 'RUNTIME_NOT_READY')
+        elif operation == 'FLATTEN_THEN_STOP':
+            flat_and_clean = not cycles and not orders and not any(
+                row.get('native_conflicts') or row.get('detached_positions')
+                for row in snapshot['symbols'].values()
+            )
+            allowed = synchronized or flat_and_clean
+            reason = None if allowed else 'RUNTIME_NOT_READY'
         elif operation in {'PAUSE_NEW_ENTRIES', 'STOP_DSV_STRATEGY', 'REQUEST_RECONCILIATION'}:
             allowed, reason = True, None
         else:
@@ -297,6 +415,9 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
             reason = None if allowed else 'RUNTIME_NOT_READY'
         operations.append({'operation': operation, 'scope_type': scope_type,
                            'allowed': allowed, 'reason': reason})
+    clock_health = getattr(adapter, '_health', None)
+    schedule_display = _schedule_display(adapter, snapshot.get('trading_day'), list(symbols))
+    strategy_diagnostics = _strategy_diagnostics(clock_health, clock_fault, cycles)
     config = {
         'config_revision': str(configuration_revision),
         'rule_set_id': 'DSV_TARGET_EXECUTION',
@@ -305,10 +426,17 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
         'scoped_contracts': list(symbols), 'strategy_symbols': list(symbols.values()),
         'cancel_on_stop': settings['trade']['cancel_on_stop'],
         'manual_close_price_mode': settings['trade']['close_price_mode'],
-        'manual_workbench': False, 'live_parameter_save': False,
+        'manual_workbench': False, 'live_parameter_save': True,
         'calendar_hash': adapter.grant.value['calendar_hash'],
         'runtime_identity': snapshot.get('runtime_identity'),
+        'run_directory': snapshot.get('run_directory'),
     }
+    if isinstance(clock_health, dict):
+        config['clock_health'] = copy.deepcopy(clock_health)
+    if schedule_display is not None:
+        config['schedule_display'] = schedule_display
+    if strategy_diagnostics:
+        config['strategy_diagnostics'] = strategy_diagnostics
     config_snapshot = {
         'schema_version': 'ONLINE_TRADER_CONFIG_SNAPSHOT/1',
         'account_key': scope['account_key'], 'kernel_boot_id': boot,
@@ -328,6 +456,9 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
         blocks.append({'reason_code': owner_fault, 'active': True})
     if any(row.get('external_order_block') for row in snapshot['symbols'].values()):
         blocks.append({'reason_code': 'E_FOREIGN_ACTIVE_ORDER', 'active': True})
+    bar_reader = getattr(adapter, 'minute_chart_bars', None)
+    minute_bars = bar_reader() if callable(bar_reader) else {}
+    observed_at_utc = _utc_now()
     result = {
         'view_schema': 'workbench/1', 'account_key': scope['account_key'],
         'kernel_boot_id': boot, 'checkpoint_event_seq': revision,
@@ -340,13 +471,21 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
                        'clock_fault': clock_fault,
                        'pending_transactions': 0},
         'markets': markets, 'cycles': cycles, 'orders': orders, 'trades': trades,
+        'minute_bars': minute_bars,
         'blocks': blocks, 'commands': list(snapshot.get('runtime_commands', ())), 'policies': [
             {'policy_id': 'target-authority-current-boot', 'policy_kind': 'AUTHORITY'},
             {'policy_id': 'target-execution-current-boot', 'policy_kind': 'EXECUTION'},
         ], 'truncated': False,
         'symbol_entry_switches': {}, 'external_positions': external_positions,
         'config_snapshot': config_snapshot,
-        'capabilities': {'revision': revision, 'observed_at_utc': _utc_now(),
+        'contract_catalog': {
+            'revision': revision,
+            'observed_at_utc': observed_at_utc,
+            'complete': False,
+            'source': 'RUNTIME_SCOPED_MARKET_CACHE',
+            'contracts': sorted(symbols)[:4_096],
+        },
+        'capabilities': {'revision': revision, 'observed_at_utc': observed_at_utc,
                          'operations': operations},
         'diagnostics': [_diagnostic(block['reason_code']) for block in blocks],
         'current_responsibility': {
@@ -385,4 +524,5 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
         for name in result['detail_omitted']:
             result[name] = []
         result['blocks'] = [{'reason_code': 'WORKBENCH_DETAIL_CAPACITY', 'active': True}]
+        result.pop('minute_bars', None)
     return result

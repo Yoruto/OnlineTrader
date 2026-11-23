@@ -37,6 +37,7 @@ boundaries:
       - src/online_trader/runtime/session_storage.py:RuntimeSessionStorage
       - src/online_trader/runtime/target_owner_startup.py:run_target_owner
       - src/online_trader/runtime/instance.py:RuntimeLock
+      - src/online_trader/runtime/shutdown.py:shutdown_runtime_and_wait
     owns:
       - one Runtime boot and process-owned temporary Journal allocation
       - version-fixed selection of the single current Standalone owner

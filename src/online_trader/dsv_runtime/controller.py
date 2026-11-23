@@ -233,6 +233,8 @@ class ExplicitOrderController:
         if status != 'ALIVE' and filled < max(order['filled_qty'], order['reported_fill_qty'] or 0):
             raise TraderError('E_DSV_NATIVE_FACT', 'Terminal quantity contradicts accepted fills')
         order.update(broker_state=status, terminal_confirmed=status != 'ALIVE', reported_fill_qty=filled)
+        if isinstance(fact.get('native_message'), str) and fact['native_message']:
+            order['native_message'] = fact['native_message'][:200]
         if fact.get('rejection_category') is not None:
             order['broker_rejection_category'] = fact['rejection_category']
         if fact.get('rejection_detail') is not None:
@@ -369,13 +371,20 @@ class ExplicitOrderController:
     @staticmethod
     def _position_fill(position, order, fact, fill_day, *, state_seq=None):
         seq = max(len(position['fills']) + 1, int(state_seq or 0))
-        position['fills'].append({'event_seq': seq, 'contract_id': order['contract_id'],
-                                  'child_order_id': order['child_order_id'],
-                                  'direction': position['direction'],
-                                  'trade_key': [order['native_trading_day'], fact['native_order_id'], fact['native_trade_id']],
-                                  'trading_day': fill_day, 'quantity': fact['quantity'], 'price': fact['price'],
-                                  'effect': order['effect'],
-                                  'offset_kind': order['native_offset']})
+        record = {
+            'event_seq': seq, 'contract_id': order['contract_id'],
+            'child_order_id': order['child_order_id'],
+            'direction': position['direction'],
+            'trade_key': [order['native_trading_day'], fact['native_order_id'], fact['native_trade_id']],
+            'trading_day': fill_day, 'quantity': fact['quantity'], 'price': fact['price'],
+            'effect': order['effect'],
+            'offset_kind': order['native_offset'],
+        }
+        if fact.get('native_trade_id') is not None:
+            record['native_trade_id'] = fact['native_trade_id']
+        if 'source_time_ns' in fact:
+            record['source_time_ns'] = fact['source_time_ns']
+        position['fills'].append(record)
 
     def _record_detached_late_open(self, state, row, current, order, qty, fact, fill_day):
         original = state['retired_positions'].get(order['position_id'])

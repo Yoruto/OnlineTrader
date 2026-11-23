@@ -6,7 +6,7 @@ import time
 import uuid
 from PySide6.QtCore import QEvent,QItemSelectionModel,QSettings,QStandardPaths,Qt,QThread,QTimer,Signal
 from PySide6.QtWidgets import (QApplication,QLabel,QLineEdit,QPushButton,QTableWidget,
-    QTableWidgetItem,QInputDialog,QFileDialog,QMessageBox)
+    QTableWidgetItem,QInputDialog,QFileDialog,QMessageBox,QProgressDialog)
 
 from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.app import StatusWindow
@@ -167,6 +167,7 @@ class WorkbenchWindow(StatusWindow):
                  update_root=None, update_restart=None):
         super().__init__(pipe_name,client_factory=client_factory)
         self._runtime_mode = runtime_view
+        self._runtime_shutdown_verified = False
         self._runtime_client_store = None
         self._runtime_coordinator = None
         self._runtime_command_bus = None
@@ -892,6 +893,14 @@ class WorkbenchWindow(StatusWindow):
                 phase = read_record(phase_path) if phase_path is not None else None
                 if phase and phase.get('phase') == 'DSV_STOPPED':
                     result = phase | {'status':'DSV_STOPPED'}
+                else:
+                    target_status = read_record(run / 'target-owner-status.json')
+                    if target_status and target_status.get('phase') == 'STOPPED':
+                        result = {
+                            'account_key': target_status.get('account_key'),
+                            'kernel_boot_id': target_status.get('runtime_boot_id'),
+                            'status': 'DSV_STOPPED',
+                        }
             identity = (result.get('snapshot') or result) if result else None
             if (isinstance(identity, dict) and isinstance(self._boot, str)
                     and (identity.get('account_key'), identity.get('kernel_boot_id')) == (
@@ -1653,6 +1662,78 @@ class WorkbenchWindow(StatusWindow):
                 and self.isMinimized() and not event.oldState() & Qt.WindowState.WindowMinimized):
             self._tray.on_minimized()
 
+    def _confirm_and_stop_runtime(self):
+        if not self._runtime_mode or not self.pipe_name or self._runtime_shutdown_verified:
+            return True
+        from online_trader.runtime.shutdown import inspect_runtime_for_exit, shutdown_runtime_and_wait
+
+        view, pid, inspect_error = inspect_runtime_for_exit(self.pipe_name)
+        if view is None and pid is None:
+            self._runtime_shutdown_verified = True
+            return True
+        if view is None:
+            QMessageBox.warning(
+                self,
+                '交易服务仍在运行',
+                f'{inspect_error or "无法读取后台交易服务状态。"}\n\n为确保账户安全，桌面工作台未关闭；请恢复连接后再试。',
+            )
+            return False
+
+        open_cycles = [row for row in view.get('cycles', ()) if row.get('remaining_quantity', 0) > 0]
+        active_orders = [row for row in view.get('orders', ()) if row.get('potential_remaining', 0) > 0]
+        external_positions = view.get('external_positions') or []
+        connection = view.get('connection') or {}
+        recovery_required = bool(connection.get('recovery_required'))
+        clock_fault = bool(connection.get('clock_fault'))
+        if open_cycles or active_orders or external_positions or recovery_required or clock_fault:
+            total_lots = sum(int(row.get('remaining_quantity', 0)) for row in open_cycles)
+            detail = (
+                f'当前后台交易服务仍在运行：\n'
+                f'· 自有持仓周期：{len(open_cycles)} 个（共 {total_lots} 手）\n'
+                f'· 未完结委托：{len(active_orders)} 笔\n'
+                f'· 外部持仓差异：{len(external_positions)} 项'
+            )
+            if recovery_required or clock_fault:
+                detail += '\n· 当前存在连接/持仓核对或时钟异常'
+            detail += (
+                '\n\n严格安全停机需先执行「全部平仓并停止」，等待所有自有持仓平清、活动撤单确认且后台 '
+                'Runtime 与视图进程完全退出后才会关闭界面。\n\n是否执行全部平仓并安全退出？'
+            )
+            answer = QMessageBox.warning(
+                self,
+                '确认安全平仓并退出 OnlineTrader',
+                detail,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+
+        progress = QProgressDialog(
+            '正在停止后台交易服务并等待进程完全退出…', '', 0, 0, self
+        )
+        progress.setWindowTitle('OnlineTrader · 安全退出')
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QApplication.processEvents()
+        try:
+            ok, stop_error = shutdown_runtime_and_wait(
+                self.pipe_name, pid=pid, view=view, timeout=20.0
+            )
+        finally:
+            progress.close()
+        if not ok:
+            QMessageBox.critical(
+                self,
+                '交易服务仍在运行，未完成退出',
+                f'{stop_error or "未能确认后台交易服务退出。"}\n\n为确保账户和持仓安全，桌面工作台保持打开，请检查实时持仓与状态后再试。',
+            )
+            return False
+        self._runtime_shutdown_verified = True
+        return True
+
     def closeEvent(self,event):
         if self._strategy_starter is not None and self._strategy_starter.is_preparing():
             self._closing = True
@@ -1667,6 +1748,10 @@ class WorkbenchWindow(StatusWindow):
             return
         self._tray.save_geometry()
         if not self._closing and self._tray.minimize_on_close():
+            event.ignore()
+            return
+        if not self._confirm_and_stop_runtime():
+            self._tray.cancel_exit()
             event.ignore()
             return
         if self._runtime_coordinator is not None:

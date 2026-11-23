@@ -10,6 +10,7 @@ from concurrent.futures import Future
 from importlib.metadata import PackageNotFoundError, version
 from threading import Event
 
+from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import content_hash, payload_hash
 from online_trader.contracts.context import ContextRegistry
 from online_trader.contracts.validation import validate_message
@@ -32,6 +33,7 @@ class StandaloneDsvOwner:
         self.session, self.adapter, self.connection = session, adapter, connection
         self.profile, self.binding = profile, binding
         self.configuration_revision = str(configuration_revision)
+        self.on_parameters_saved = None
         self.closed = False
         self.runtime_protocol = 'DSV_TARGET/1'
         self.kernel_epoch = 1
@@ -40,6 +42,8 @@ class StandaloneDsvOwner:
         self._pending = []
         self._command_receipts = {}
         self._latest_account_snapshot = None
+        self._latest_decisions = {}
+        self.run_directory = None
         self._projection_seq = 1
         self._authority_generation = 0
         self._commit_views = [self.snapshot()]
@@ -76,6 +80,9 @@ class StandaloneDsvOwner:
         state['retired_positions'] = copy.deepcopy(self.session._state.get('retired_positions', {}))
         if self._latest_account_snapshot is not None:
             state['account_snapshot'] = copy.deepcopy(self._latest_account_snapshot)
+        state['latest_decisions'] = copy.deepcopy(self._latest_decisions)
+        if self.run_directory is not None:
+            state['run_directory'] = self.run_directory
         state['runtime_commands'] = [copy.deepcopy(value)
                                      for value in list(self._command_receipts.values())[-64:]]
         return state
@@ -130,6 +137,14 @@ class StandaloneDsvOwner:
             self._authority_generation += 1
         if command['action'] == 'FLATTEN_STOP':
             self._shutdown_after_flatten = True
+        if command['action'] == 'SAVE_PARAMETERS' and any(
+            item.get('reason') == 'DSV_PARAMETERS_SAVED' for item in receipt.get('decisions', ())
+        ):
+            updated = DsvProfile.from_record(command['profile'])
+            self.profile = updated
+            self.configuration_revision = str(int(self.configuration_revision) + 1)
+            if callable(self.on_parameters_saved):
+                self.on_parameters_saved(updated)
         self._projection_seq += 1
         self._commit_views.append(self.snapshot())
         self._update_stop_ready()
@@ -152,6 +167,23 @@ class StandaloneDsvOwner:
     def step(self, *, trading_day, complete):
         receipt = self.adapter.step(self.session, trading_day=trading_day, complete=complete)
         if receipt is not None:
+            configured_contracts = getattr(self.adapter, 'contracts', None)
+            if configured_contracts is None:
+                configured_contracts = {
+                    row['code']
+                    for row in self.profile.to_record().get('settings', {}).get('symbols', ())
+                    if 'code' in row
+                }
+            grouped = {}
+            for decision in receipt.get('decisions', ()):
+                contract = decision.get('contract_id')
+                if contract in configured_contracts:
+                    grouped.setdefault(contract, []).append(copy.deepcopy(decision))
+            for contract, decisions in grouped.items():
+                self._latest_decisions[contract] = {
+                    'decision_time_utc': receipt.get('evaluated_at'),
+                    'decisions': decisions,
+                }
             self._projection_seq += 1
             self._commit_views.append(self.snapshot())
         self._update_stop_ready()
@@ -230,7 +262,10 @@ class StandaloneDsvOwner:
         result = {'command_id': command_id, 'payload_hash': digest, 'status': 'SUCCEEDED',
                   'receipt_revision': '1', 'tx_id': 'target-' + content_hash(command_id)[:40],
                   'event_seq': seq, 'durable_seq': seq, 'state_revision': seq,
-                  'error_code': 'NONE', 'reason': 'Target execution command committed',
+                  'error_code': 'NONE',
+                  'reason': ('参数已保存，下一笔新鲜行情使用新参数；已有持仓维持原保护参数。'
+                             if body['operation'] == 'SAVE_DSV_PARAMETERS'
+                             else 'Target execution command committed'),
                   'evidence_ids': [dsv_receipt['state_after_digest'][:32]]}
         self.session.record_runtime_command_receipt(command_body, result)
         self._command_receipts[command_id] = copy.deepcopy(result)

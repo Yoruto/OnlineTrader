@@ -123,10 +123,14 @@ class WorkbenchEndpoint:
                     if application == 0x44535631:
                         row = stream.execute('SELECT payload FROM scope WHERE id=1').fetchone()
                         target_scope = None if row is None else strict_loads(row[0])
+                        saved = stream.execute(
+                            "SELECT payload FROM events WHERE kind='DSV_PARAMETERS_SAVED' ORDER BY seq DESC LIMIT 1"
+                        ).fetchone()
+                        current_revision = '1' if saved is None else str(strict_loads(saved[0])['config_revision'])
                         if (target_scope is None or target_scope.get('account_key') != self.account_key
                                 or target_scope.get('owner_mode') != 'STANDALONE'
                                 or target_scope.get('runtime_boot_id') != binding['kernel_boot_id']
-                                or binding['config_revision'] != '1'):
+                                or binding['config_revision'] != current_revision):
                             raise TraderError('E_CONFIG_EDIT', 'The target-execution configuration changed before preview')
                         return {'status': 'VALID', 'account_key': self.account_key,
                                 'kernel_boot_id': binding['kernel_boot_id'],

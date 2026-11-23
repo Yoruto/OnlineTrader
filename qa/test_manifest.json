@@ -2248,6 +2248,7 @@
         "DsvWorkbenchParityTests.test_operation_log_recovery_and_rebuilt_rows_are_bound_to_current_owner",
         "DsvWorkbenchParityTests.test_strategy_log_filters_export_and_clear_preserve_dsv_record_order",
         "DsvWorkbenchParityTests.test_suggested_lots_is_display_only_with_unknown_inputs",
+        "DsvWorkbenchParityTests.test_target_owner_workbench_displays_focus_under_geometry_block_and_reads_target_logs",
         "DsvWorkbenchParityTests.test_three_dsv_status_boxes_and_cabinet_account_display",
         "DsvWorkbenchParityTests.test_toolbar_template_updates_preview_without_changing_binding",
         "DsvWorkbenchParityTests.test_workbench_labels_retained_quote_stale_and_keeps_price",
@@ -4708,9 +4709,11 @@
         "TargetOwnerPureLogicTests.test_mixed_night_and_day_sessions_advance_trading_day_when_active_contracts_agree_and_fail_closed_on_conflict",
         "TargetOwnerPureLogicTests.test_owner_tick_error_classification_rules",
         "TargetOwnerRuntimeTests.test_external_broker_position_is_not_claimed_or_extended",
+        "TargetOwnerRuntimeTests.test_flatten_then_stop_shuts_down_flat_runtime_even_when_unsynchronized",
         "TargetOwnerRuntimeTests.test_flatten_then_stop_waits_for_original_child_terminal_fact",
         "TargetOwnerRuntimeTests.test_history_cache_failure_does_not_change_target_authority",
         "TargetOwnerRuntimeTests.test_incomplete_baseline_stays_disarmed_then_complete_frame_enables_controls",
+        "TargetOwnerRuntimeTests.test_live_save_dsv_parameters_updates_revision_triggers_and_preserves_scope",
         "TargetOwnerRuntimeTests.test_manual_close_all_requires_and_verifies_per_cycle_target_revisions",
         "TargetOwnerRuntimeTests.test_manual_close_requires_and_verifies_expected_target_revision",
         "TargetOwnerRuntimeTests.test_new_boot_uses_a_new_ledger_and_does_not_inherit_runtime_commands",
@@ -4719,10 +4722,19 @@
         "TargetOwnerRuntimeTests.test_projection_has_one_rule_set_two_policies_and_bounded_capabilities",
         "TargetOwnerRuntimeTests.test_public_pipe_command_is_bound_idempotent_and_conflicting_content_is_rejected",
         "TargetOwnerRuntimeTests.test_public_pipe_rejects_wrong_account_boot_and_configuration_bindings",
-        "TargetOwnerRuntimeTests.test_workbench_projection_bounds_history_and_declares_omissions"
+        "TargetOwnerRuntimeTests.test_workbench_projection_bounds_history_and_declares_omissions",
+        "TargetOwnerWorkbenchProjectionTests.test_run_target_owner_accepts_callable_trusted_control_pid_and_preserves_dynamic_lookup",
+        "TargetOwnerWorkbenchProjectionTests.test_standalone_owner_retains_latest_decisions_and_run_directory",
+        "TargetOwnerWorkbenchProjectionTests.test_workbench_view_projects_cycle_protection_order_and_fill_timestamps",
+        "TargetOwnerWorkbenchProjectionTests.test_workbench_view_projects_market_triggers_reasons_day_stop_and_minute_bars"
       ],
       "case_overrides": {
         "TargetOwnerRuntimeTests.test_external_broker_position_is_not_claimed_or_extended": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "TargetOwnerRuntimeTests.test_flatten_then_stop_shuts_down_flat_runtime_even_when_unsynchronized": {
           "platform": [
             "Windows"
           ]
@@ -4738,6 +4750,11 @@
           ]
         },
         "TargetOwnerRuntimeTests.test_incomplete_baseline_stays_disarmed_then_complete_frame_enables_controls": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "TargetOwnerRuntimeTests.test_live_save_dsv_parameters_updates_revision_triggers_and_preserves_scope": {
           "platform": [
             "Windows"
           ]
@@ -5112,6 +5129,9 @@
         "WorkbenchTrayTests.test_default_close_to_tray_keeps_refresh_and_exit_closes_the_window",
         "WorkbenchTrayTests.test_minimize_button_hides_same_window_and_tray_restores_maximized_state",
         "WorkbenchTrayTests.test_minimize_uses_taskbar_if_tray_setting_is_off_or_unavailable",
+        "WorkbenchTrayTests.test_runtime_exit_prompts_when_holding_positions_and_cancel_keeps_tray",
+        "WorkbenchTrayTests.test_runtime_exit_stays_open_when_shutdown_fails",
+        "WorkbenchTrayTests.test_runtime_exit_stops_flat_runtime_and_closes",
         "WorkbenchTrayTests.test_saved_opt_out_closes_normally",
         "WorkbenchTrayTests.test_saved_preference_shows_icon_before_first_close_and_updates_status",
         "WorkbenchTrayTests.test_unavailable_tray_uses_normal_close_and_saved_geometry_restores"

@@ -44,7 +44,7 @@ UI 不显示或读取操作员 ID/令牌。服务端只接受启动 Runtime 的�
 ## 生命周期与故障流程
 
 - **再次启动：**发现现有 Runtime 和 Workbench 后只唤醒原窗口；不得绕过单实例锁另建 Owner 或控制面。
-- **Workbench 退出/崩溃：**Qt、runtime-view 和查询 worker 可以结束；Owner 继续承担已确认订单与保护责任。
+- **Workbench 退出/崩溃：**点窗口 `X` 默认最小化到托盘，Owner 继续承担已确认订单与保护责任；当用户显式从托盘选「退出 OnlineTrader」（或关闭托盘驻留后点 `X`）时，经由受控安全停机核对（无持仓与活动委托自动停机；有持仓/在途委托需用户确认「全部平仓并停止」），确认目标 Owner 与 `runtime-view-process` 完全退出后才结束 Qt 进程；若停机失败或用户取消，保持工作台打开与原保护不变。Workbench 进程崩溃时，Owner 仍独立保持既有订单与保护责任。
 - **runtime-view 失败：**按有界策略重启并重新获取完整基线；不得因此重启 Owner 或创建第二个 sender。
 - **Workbench 投影过期：**客户端只显示“界面未更新/正在重连”并停用新的 UI 控制请求；不得把旧快照重新判定为“行情滞后”，也不得将 Qt/runtime-view 生命周期作为 Owner 开仓门槛。Owner 仍以原始行情到达、盘段、source epoch 和临发单校验独立决策。
 - **Owner 行情滞后：**只有当前 Owner 投影明确给出 quote-age 失败或 `DSV_QUOTE_AGE_EXCEEDED` 时，Workbench 才显示“行情已滞后，暂停开新仓”；该业务拒绝与界面投影过期分别诊断。

@@ -560,3 +560,112 @@ class DsvWorkbenchParityTests(unittest.TestCase):
         window.dashboard.render(result)
         window.dashboard.candle_contract.setCurrentText(case.code)
         self.assertEqual(window.dashboard.candle_source.text(),'原生 1 分钟')
+
+    def test_target_owner_workbench_displays_focus_under_geometry_block_and_reads_target_logs(self):
+        window = WorkbenchWindow(None)
+        window.timer.stop()
+        self.addCleanup(dispose_widget, window)
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            account_key = 'SIM:SIMNOW:target-test'
+            boot_id = 'runtime-target-boot-1'
+            (run / 'run-identity.json').write_bytes(canonical_bytes({
+                'schema_version': 'DSV_RUN_IDENTITY/1',
+                'account_key': account_key,
+                'kernel_boot_id': boot_id,
+                'scope_hash': 'scope-1',
+                'run_directory': str(run),
+            }))
+            (run / 'phase-002-bootstrap.json').write_bytes(canonical_bytes({
+                'phase': 'STARTUP_PREPARED',
+                'message': '交易时段已核对，正在启动所选模拟盘策略',
+                'entry_authority': 'DISARMED',
+                'observed_at_utc': '2026-11-23T02:55:00Z',
+            }))
+            (run / 'target-owner-status.json').write_bytes(canonical_bytes({
+                'phase': 'READY',
+                'entry_authority': 'DISARMED',
+                'runtime_boot_id': boot_id,
+                'account_key': account_key,
+                'execution_core': 'DSV_TARGET_EXECUTION',
+                'observed_at_utc': '2026-11-23T02:55:10Z',
+            }))
+            (run / 'target-owner-diagnostics.json').write_bytes(canonical_bytes({
+                'runtime_boot_id': boot_id,
+                'account_key': account_key,
+                'execution_core': 'DSV_TARGET_EXECUTION',
+                'authority_effect': 'NONE',
+                'error_category': 'TRANSIENT_DISCONNECT',
+                'diagnostic': 'E_DSV_SDK_SYNC',
+                'observed_at_utc': '2026-11-23T02:55:20Z',
+            }))
+            (run / 'order-blocking-log.jsonl').write_text(
+                canonical_bytes({
+                    'at': '2026-11-23T02:55:55Z',
+                    'event': 'ORDER_BLOCKED',
+                    'account_key': account_key,
+                    'runtime_boot_id': boot_id,
+                    'contract_id': 'DCE.p2701',
+                    'effect': 'OPEN',
+                    'reason': 'GEOMETRY_BLOCK',
+                }).decode('utf-8') + '\n',
+                encoding='utf-8',
+            )
+
+            view = {
+                'view_schema': 'workbench/1',
+                'account_key': account_key,
+                'kernel_boot_id': boot_id,
+                'checkpoint_event_seq': '2',
+                'entry_authority': 'ARMED',
+                'execution_scope': 'ONLINE_SIMULATION',
+                'configuration': {
+                    'config_revision': '1',
+                    'rule_set_id': 'DSV_TARGET_EXECUTION',
+                    'execution_core': 'DSV_TARGET_EXECUTION',
+                    'scoped_contracts': ['DCE.p2701'],
+                    'strategy_symbols': [{'code': 'DCE.p2701', 'name': '棕榈油', 'open_offset': '2',
+                                          'stop_offset': '16', 'profit_offset': '30', 'order_volume': 1,
+                                          'half_close_ratio': '0.5', 'hysteresis_points': '0'}],
+                    'run_directory': str(run),
+                },
+                'connection': {
+                    'broker_connected': True, 'synchronized': True, 'fault': False,
+                    'recovery_required': False, 'storage_failed': False, 'clock_fault': None,
+                    'pending_transactions': 0,
+                },
+                'markets': [{
+                    'contract_id': 'DCE.p2701', 'name': '棕榈油', 'trading_day': '2026-11-23',
+                    'last': '8290', 'bid1': '8289', 'ask1': '8291', 'day_high': '8330', 'day_low': '8161',
+                    'source_time_utc': '2026-11-23T02:55:55Z', 'fresh': True, 'enabled': True,
+                    'entry_reasons': ['GEOMETRY_BLOCK'],
+                    'trigger_prices': {'LONG': '8300', 'SHORT': '8200'},
+                    'decision_time_utc': '2026-11-23T02:55:55Z',
+                    'price_tick': '2',
+                }],
+                'cycles': [], 'orders': [], 'trades': [],
+                'minute_bars': {'DCE.p2701': [[29396000, '8280', '8295', '8275', '8290']]},
+                'blocks': [], 'commands': [], 'policies': [], 'truncated': False,
+            }
+            window.view = view
+            window._boot = boot_id
+            window._stale = False
+            window.snapshot_published_ns = 1
+            window.dashboard.render(view)
+            self.assertEqual(window.dashboard.dashboard_markets.item(0, 2).text(), '多头触发 8300')
+            self.assertEqual(window.dashboard.dashboard_markets.item(0, 4).text(), '日内振幅超出开仓上限')
+
+            disarmed = copy.deepcopy(view)
+            disarmed['entry_authority'] = 'DISARMED'
+            window.view = disarmed
+            window.dashboard.render(disarmed)
+            self.assertEqual(window.dashboard.dashboard_markets.item(0, 4).text(), '已停止开仓')
+
+            window.dashboard.show_details(window.dashboard.log_tab)
+            window.dashboard.update_logs()
+            self.assertFalse(window.dashboard.log_source_status.isVisible())
+            joined = '\n'.join(window.dashboard.visible_log_lines)
+            self.assertIn('Target Owner 已同步就绪', joined)
+            self.assertIn('E_DSV_SDK_SYNC', joined)
+            self.assertIn('ORDER_BLOCKED', joined)
+            self.assertIn('交易时段已核对', joined)

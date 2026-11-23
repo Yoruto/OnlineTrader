@@ -1271,7 +1271,7 @@ class WorkbenchLayout:
                 status = '等待触发'
             nearby = None
             last = quote.get('last')
-            if status == '等待触发' and last is not None and lines:
+            if last is not None and lines:
                 nearby = min(lines, key=lambda side: abs(Decimal(lines[side]) - Decimal(last)))
             focus = f'{("多头" if nearby == "LONG" else "空头")}触发 {lines[nearby]}' if nearby else '—'
             rows.append((f'{code}  {names[code]}' if code in names else code,
@@ -1720,7 +1720,9 @@ class WorkbenchLayout:
         self.home_connection.setText(description if snapshot_age is None else
                                      f'{description} · 界面快照 {snapshot_age} 秒未更新')
         identity = config.get('runtime_identity') or {}
-        engine = {'DSV_LEGACY_KERNEL': '原 DSV 执行链', 'DSV_REPLACEMENT': 'DSV 替代执行链'}.get(identity.get('engine_kind'))
+        engine = {'DSV_LEGACY_KERNEL': '原 DSV 执行链',
+                  'DSV_REPLACEMENT': 'DSV 替代执行链',
+                  'DSV_TARGET_EXECUTION': 'DSV 目标执行链'}.get(identity.get('engine_kind'))
         self.home_connection.setToolTip(f"{engine} · {identity['entry_point']}" if engine else '')
 
         funds = self.fund_values if available else {}
@@ -3225,9 +3227,16 @@ class WorkbenchLayout:
         return matches_run_identity(run, identity) and comparison_file(run, identity) == archive
 
     def log_paths(self, run):
-        paths = [executor_log_path(run), run/'startup-failure.json', *sorted(run.glob('phase-*.json'))]
+        paths = [
+            executor_log_path(run),
+            run / 'startup-failure.json',
+            run / 'target-owner-status.json',
+            run / 'target-owner-diagnostics.json',
+            *sorted(run.glob('phase-*.json')),
+        ]
         comparison = self.log_comparison
         paths.append(run / 'strategy-log.jsonl')
+        paths.append(run / 'order-blocking-log.jsonl')
         paths.append(run.with_name(run.name + '.operation-log-recovery.json'))
         if comparison is not None:
             paths.append(comparison)
@@ -3297,10 +3306,58 @@ class WorkbenchLayout:
             if run_identity is not None and any(record.get(key) not in (None, expected)
                 for key, expected in zip(('account_key', 'kernel_boot_id'), run_identity)):
                 continue
+            at, stamp = log_time(record.get('observed_at_utc'))
             exception = record.get('exception')
             exception_id = exception.get('exception_id') if isinstance(exception, dict) else None
             suffix = f' · {exception_id}' if isinstance(exception_id, str) and exception_id else ''
-            phases.append(WorkbenchLogLine(f"[执行器] {record.get('message','启动失败')} · {record.get('error_code','—')}{suffix}", 'error'))
+            prefix = f'[{at}] ' if stamp is not None else ''
+            phases.append(WorkbenchLogLine(f"{prefix}[执行器] {record.get('message','启动失败')} · {record.get('error_code','—')}{suffix}", 'error', stamp))
+        target_status = run / 'target-owner-status.json'
+        target_phase_labels = {
+            'WAITING_FOR_NATIVE_SYNC': '等待柜台完整同步',
+            'READY': 'Target Owner 已同步就绪',
+            'NEEDS_REVIEW': 'Target Owner 状态待核对',
+            'STOPPED': 'Target Owner 已安全停止',
+        }
+        for record in self.log_tail(target_status).read(target_status):
+            if run_identity is not None and any(
+                    record.get(key) not in (None, expected)
+                    for key, expected in zip(('account_key', 'runtime_boot_id'), run_identity)):
+                continue
+            phase = record.get('phase')
+            if not isinstance(phase, str):
+                continue
+            at, stamp = log_time(record.get('observed_at_utc'))
+            label = target_phase_labels.get(phase, phase)
+            authority = record.get('entry_authority')
+            parts = [label]
+            if isinstance(authority, str):
+                parts.append(f'权限 {authority}')
+            error_code = record.get('error_code')
+            if isinstance(error_code, str):
+                parts.append(error_code)
+            exception = record.get('exception')
+            if isinstance(exception, dict) and exception.get('exception_id'):
+                parts.append(exception['exception_id'])
+            category = 'error' if (error_code or phase == 'NEEDS_REVIEW') else None
+            phases.append(WorkbenchLogLine(f'[{at}] [执行器] {" · ".join(parts)}', category, stamp))
+        target_diagnostics = run / 'target-owner-diagnostics.json'
+        for record in self.log_tail(target_diagnostics).read(target_diagnostics):
+            if run_identity is not None and any(
+                    record.get(key) not in (None, expected)
+                    for key, expected in zip(('account_key', 'runtime_boot_id'), run_identity)):
+                continue
+            at, stamp = log_time(record.get('observed_at_utc'))
+            parts = [str(record.get('diagnostic') or 'TARGET_DIAGNOSTIC')]
+            if record.get('authority_effect'):
+                parts.append(str(record['authority_effect']))
+            if record.get('error_category'):
+                parts.append(str(record['error_category']))
+            exception = record.get('exception')
+            if isinstance(exception, dict) and exception.get('exception_id'):
+                parts.append(exception['exception_id'])
+            category = 'warning' if record.get('authority_effect') == 'NONE' else 'error'
+            phases.append(WorkbenchLogLine(f'[{at}] [执行器] 诊断 · {" · ".join(parts)}', category, stamp))
         recovery_path = run.with_name(run.name + '.operation-log-recovery.json')
         for recovery in self.log_tail(recovery_path).read(recovery_path):
             if matches_operation_log_recovery(recovery, run, run_identity):
@@ -3321,6 +3378,32 @@ class WorkbenchLayout:
             category = record.get('category')
             phases.append(WorkbenchLogLine(f'[{at}] [{tag}] {message}',
                                            category if isinstance(category, str) else LOG_TAGS.get(tag), moment))
+        blocking_path = run / 'order-blocking-log.jsonl'
+        for record in self.log_tail(blocking_path).read(blocking_path):
+            if run_identity is not None and any(
+                    record.get(key) not in (None, expected)
+                    for key, expected in zip(('account_key', 'runtime_boot_id'), run_identity)):
+                continue
+            at, moment = log_time(record.get('at'))
+            if moment is None:
+                continue
+            event = record.get('event')
+            contract = record.get('contract_id')
+            reason = record.get('reason') or record.get('previous_reason')
+            detail = record.get('detail')
+            parts = [item for item in (contract, event) if isinstance(item, str) and item]
+            if isinstance(reason, str) and reason:
+                parts.append(self.entry_reason_text(reason))
+            if isinstance(detail, str) and detail and detail != reason:
+                parts.append(detail)
+            if record.get('error_code'):
+                parts.append(str(record['error_code']))
+            category = ('error' if event == 'EFFECT_DISPATCH_UNKNOWN' or reason == 'EXIT_MANUAL_TAKEOVER_REQUIRED'
+                        else None if event == 'ORDER_UNBLOCKED'
+                        else 'warning' if event in {'ORDER_BLOCKED', 'EFFECT_DISPATCH_DEFINITELY_NOT_SENT'}
+                        else None)
+            tag = '解除' if event == 'ORDER_UNBLOCKED' else '阻挡'
+            phases.append(WorkbenchLogLine(f'[{at}] [{tag}] {" · ".join(parts)}', category, moment))
         return phases
 
     def comparison_logs(self, run):

@@ -50,9 +50,31 @@ documents:
     evidence:
       design: CONSOLIDATED_FROM_CURRENT_CONTRACTS
       source: IMPLEMENTED_CANDIDATE
-      tests: NOT_RUN
+      tests: TARGETED_LIFECYCLE_AND_PROJECTION_PASS
       product_acceptance: NOT_RUN
-    notes: Current user entry, state ownership, lifecycle, command, failure, diagnostic and acceptance routing for Runtime Workbench work.
+    notes: Current user entry, state ownership, lifecycle (tray hide on X; controlled safe full-process shutdown on explicit exit), live SAVE_DSV_PARAMETERS, command, failure, diagnostic and acceptance routing for Runtime Workbench work.
+
+  - path: docs/refactor/desktop-lifecycle-user-flow-20261120.md
+    scope: standalone/desktop-exit-and-tray-lifecycle
+    status: CURRENT
+    verified_at_sha: WORKTREE
+    evidence:
+      design: APPROVED_AND_IMPLEMENTED
+      source: IMPLEMENTED_CONTROLLED_SAFE_SHUTDOWN
+      tests: TARGETED_TRAY_AND_OWNER_EXIT_PASS
+      product_acceptance: NOT_RUN
+    notes: Closing window hides to tray while Runtime keeps running; explicit Tray Exit or opt-out window close triggers controlled FLATTEN_THEN_STOP and waits for Owner + runtime-view PID exit before closing Qt.
+
+  - path: docs/refactor/runtime-workbench-empty-market-detail-incident-20261123.md
+    scope: standalone/workbench-projection-startup-hot-save-and-exit
+    status: CURRENT
+    verified_at_sha: WORKTREE
+    evidence:
+      design: ROOT_CAUSE_AND_FIX_RECORDED
+      source: IMPLEMENTED_IN_WORKTREE
+      tests: TARGETED_56_OF_56_PASS_AFTER_FINAL_EDIT
+      product_acceptance: NOT_RUN
+    notes: Records 2026-11-23 Target Owner Workbench projection/log repairs, trusted_control_pid callable fix, live SAVE_DSV_PARAMETERS hot-save, dev39 portable build (1941/1941 offline), and subsequent controlled full-process exit remediation.
 
   - path: docs/refactor/testing-and-portable-delivery-pipeline-v2-20261123.md
     scope: delivery/testing-and-portable-pipeline-v2

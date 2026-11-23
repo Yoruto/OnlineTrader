@@ -113,6 +113,8 @@ class DsvSession:
         if isinstance(_owner_binding, StandaloneOwnerBinding):
             self._scope.update(owner_mode='STANDALONE', runtime_boot_id=_owner_binding.boot_id)
         settings = profile.to_record()['settings']
+        self._profile = profile
+        self._position_configs = {}
         self._trade = settings['trade']
         self._symbols = {item['code']: item for item in settings['symbols']}
         initial = initial_state(trading_day, self._symbols)
@@ -394,12 +396,27 @@ class DsvSession:
         except (KeyError, TypeError, AttributeError) as error:
             raise TraderError('E_DSV_ROUND', 'Malformed offline round or native fact') from error
 
+    def _position_profile(self, position, contract, fallback_spec):
+        if position is not None and position['id'] in self._position_configs:
+            trade, symbols = self._position_configs[position['id']]
+            return trade, symbols.get(contract, fallback_spec)
+        return self._trade, fallback_spec
+
     def command(self, command):
         self._check_owner()
         try:
-            return self._run('COMMAND', command, self._operate)
+            receipt = self._run('COMMAND', command, self._operate)
         except (KeyError, TypeError) as error:
             raise TraderError('E_DSV_COMMAND', 'Malformed offline command') from error
+        if command.get('action') == 'SAVE_PARAMETERS' and any(
+            item.get('reason') == 'DSV_PARAMETERS_SAVED' for item in receipt.get('decisions', ())
+        ):
+            candidate = DsvProfile.from_record(command['profile'])
+            settings = candidate.to_record()['settings']
+            self._profile = candidate
+            self._trade = settings['trade']
+            self._symbols = {item['code']: item for item in settings['symbols']}
+        return receipt
 
     def _run(self, kind, source, apply):
         if self._busy:
@@ -1016,20 +1033,22 @@ class DsvSession:
         if row.get('detached_positions') or row.get('native_conflicts'):
             return [{'reason': 'LATE_FILL_OWNERSHIP_REVIEW', 'rule_ids': ['I01', 'I02']}]
         if position is not None:
+            pos_trade, pos_spec = self._position_profile(position, market['contract_id'], spec)
             if (timing and tick is not None and position['owned'] and (row.get('last_stop') or {}).get('until') is not None
                     and (position.get('rollback_exit') or {}).get('reason') == 'STOP_LOSS'
                     and self._in_session(frame, market)
                     and self._controller.proves_position(state, position, market)):
                 # Recheck the stop while the original exit is still working, even on a cached quote.
                 # Only the cooldown is renewed. The exit target and its synchronization timer are separate.
-                _, triggers = protect(position | {'exit_target': None}, tick, self._trade, spec)
+                _, triggers = protect(position | {'exit_target': None}, tick, pos_trade, pos_spec)
                 if any(trigger['reason'] == 'STOP_LOSS' for trigger in triggers):
                     self._record_stop_cooldown(row, position, market, frame, timing)
             if 'close_request_at' in position:
-                wait = self._synchronize_protection_exit(state, position, market, frame, spec, timing=timing)
+                wait = self._synchronize_protection_exit(
+                    state, position, market, frame, pos_spec, timing=timing, trade=pos_trade)
                 if wait is not None:
                     return [wait]
-            return self._maintain_position(row, position, market, frame, spec, timing=timing)
+            return self._maintain_position(row, position, market, frame, pos_spec, timing=timing, trade=pos_trade)
         if any(order['contract_id'] == market['contract_id'] and not terminal(order) for order in state['orders'].values()):
             return [{'reason': 'UNRESOLVED_PRIOR_CHILD', 'rule_ids': ['I02']}]
         if not state['running']:
@@ -1123,8 +1142,9 @@ class DsvSession:
         decisions.append(decision | {'rule_ids': rules})
         return decisions
 
-    def _synchronize_protection_exit(self, state, position, market, frame, spec, *, timing=None):
+    def _synchronize_protection_exit(self, state, position, market, frame, spec, *, timing=None, trade=None):
         """Keep the strategy exit pending while preserving the native flat facts."""
+        trade = self._trade if trade is None else trade
         reads = market.get('wall_reads', {})
         ext_orders = (market.get('external_active_orders')
                       if market.get('standalone_external_model') else market.get('external_orders'))
@@ -1150,7 +1170,7 @@ class DsvSession:
             # sync is due. Recheck the trigger for timing without booking or
             # sending another target.
             original_position = position | {'owned': position['entry_filled'], 'exit_target': None}
-            _, events = protect(original_position, market['tick'], self._trade, spec)
+            _, events = protect(original_position, market['tick'], trade, spec)
             if any(event.get('remaining') == 0 for event in events):
                 position['close_request_at'] = reads.get('protection', frame['wall_time'])
                 if timing:
@@ -1171,7 +1191,8 @@ class DsvSession:
                 timing.arm(row, 'stop_cooldown', market['contract_id'], cooldown)
         row['last_stop'] = {'direction': position['direction'], 'theory': position['theory'], 'until': until}
 
-    def _maintain_position(self, row, position, market, frame, spec, *, timing=None):
+    def _maintain_position(self, row, position, market, frame, spec, *, timing=None, trade=None):
+        trade = self._trade if trade is None else trade
         if timing and position['owned']:
             close = self._timed_close(row, position, market, frame, timing)
             if close is not None:
@@ -1226,7 +1247,7 @@ class DsvSession:
         if market['tick'] is None or not self._in_session(frame, market):
             return [{'reason': 'POSITION_WAITING_FOR_MARKET', 'rule_ids': ['D06']}]
         previous_target = position['exit_target']
-        position, results = protect(position, market['tick'], self._trade, spec)
+        position, results = protect(position, market['tick'], trade, spec)
         row['position'] = position
         if position['exit_target'] != previous_target:
             position.pop('manual_close_mode', None)
@@ -1239,13 +1260,13 @@ class DsvSession:
             reason = result['reason']
             if 'remaining' in result:
                 position['entry_stopped'] = True
-            if reason == 'PROTECTION_ACTIVATED' and self._trade['protect_stop_day']:
+            if reason == 'PROTECTION_ACTIVATED' and trade['protect_stop_day']:
                 row['day_stop'] = True
-            if reason == 'TRAILING_STOP' and self._trade['stop_day_on_trailing']:
+            if reason == 'TRAILING_STOP' and trade['stop_day_on_trailing']:
                 row['day_stop'] = True
             if reason == 'STOP_LOSS':
                 row['stop_streak'] = row.get('stop_streak', 0) + 1
-                if position.get('entry_kind') == 'CONTINUATION_ENTRY' and self._trade['cont_stop_day_stop']:
+                if position.get('entry_kind') == 'CONTINUATION_ENTRY' and trade['cont_stop_day_stop']:
                     row.update(continuation_stopped=True, day_stop=True)
                 self._record_stop_cooldown(row, position, market, frame, timing)
             if result.get('remaining') == 0:
@@ -1255,7 +1276,7 @@ class DsvSession:
                     # not the quote that may have jumped through it. Keep source
                     # float operation order; native fills and prices are untouched.
                     theory = float(position['theory'])
-                    distance = float(position['profit']) * (float(self._trade['protect_keep_ratio']) or 0.5)
+                    distance = float(position['profit']) * (float(trade['protect_keep_ratio']) or 0.5)
                     level = theory + distance if position['direction'] == 'LONG' else theory - distance
                     reference = decimal_text(Decimal(str(level)))
                     nominal_move = str(level - theory if position['direction'] == 'LONG' else theory - level)
@@ -1526,14 +1547,21 @@ class DsvSession:
                 position['rollback_exit'] = {'reason': 'MANUAL_EXIT', 'at': None, 'price': None, 'slip': None}
             return [{'reason': 'USER_REDUCE', 'remaining': target, 'rule_ids': ['I01', 'I02']}], []
         if action in {'REDUCE_ALL', 'FLATTEN_STOP'}:
-            if not state['synchronized']:
+            current = {row['position']['id']: row['position'] for row in state['symbols'].values()
+                       if row['position'] is not None
+                       and (action == 'FLATTEN_STOP' or row['position']['owned'])}
+            unresolved_orders = any(not terminal(order) for order in state['orders'].values())
+            conflicts = any(
+                row.get('native_conflicts') or row.get('detached_positions')
+                for row in state['symbols'].values()
+            )
+            if not state['synchronized'] and (
+                action == 'REDUCE_ALL' or current or unresolved_orders or conflicts
+            ):
                 raise TraderError('E_DSV_SYNC', 'A complete broker snapshot is required before flattening owned targets')
             requested = command.get('position_ids')
             if type(requested) is not list or len(requested) != len(set(requested)):
                 raise TraderError('E_DSV_COMMAND', 'Flattening requires unique current strategy position identities')
-            current = {row['position']['id']: row['position'] for row in state['symbols'].values()
-                       if row['position'] is not None
-                       and (action == 'FLATTEN_STOP' or row['position']['owned'])}
             if set(requested) != set(current):
                 raise TraderError('E_DSV_OWNERSHIP', 'The current owned target set changed before flattening')
             expected_revisions = command.get('expected_target_revisions')
@@ -1579,6 +1607,32 @@ class DsvSession:
             state['owner_fault_code'] = None
             return [{'reason': 'BROKER_FACTS_RECONCILED', 'sequence': state['sequence'],
                      'rule_ids': ['I01', 'I02']}], []
+        if action == 'SAVE_PARAMETERS':
+            if not state['synchronized']:
+                raise TraderError('E_DSV_SYNC', 'Wait for a synchronized broker frame before saving parameters')
+            candidate = DsvProfile.from_record(command['profile'])
+            settings = candidate.to_record()['settings']
+            previous = self._profile.to_record()['settings']
+            if {item['code'] for item in settings['symbols']} != set(self._symbols):
+                raise TraderError('E_DSV_SCOPE', '运行中只能调整当前已授权合约的参数。')
+            if settings['schedule'] != previous['schedule'] or any(
+                settings['trade'][field] != previous['trade'][field] for field in ('holidays', 'night_session_close')
+            ):
+                raise TraderError('E_DSV_SCOPE', '交易日历和定时设置需在下次启动时生效。')
+            if candidate.content_hash == self._profile.content_hash:
+                return [{'reason': 'PARAMETERS_UNCHANGED', 'rule_ids': ['D14']}], []
+            for row in state['symbols'].values():
+                position = row.get('position')
+                if position is not None:
+                    self._position_configs.setdefault(
+                        position['id'], (copy.deepcopy(self._trade), copy.deepcopy(self._symbols)))
+            next_revision = str(int(state.get('config_revision') or 1) + 1)
+            state['config_revision'] = next_revision
+            state['profile_hash'] = candidate.content_hash
+            self._journal.event('DSV_PARAMETERS_SAVED', {
+                'profile_hash': candidate.content_hash, 'config_revision': next_revision})
+            return [{'reason': 'DSV_PARAMETERS_SAVED', 'profile_hash': candidate.content_hash,
+                     'config_revision': next_revision, 'rule_ids': ['D14']}], []
         if action == 'REDUCE_DETACHED':
             row = state['symbols'].get(command['contract_id'])
             identity = identifier(command['position_id'])

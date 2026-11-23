@@ -10,18 +10,23 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
-from online_trader.contracts.codec import strict_loads
+from online_trader.contracts.codec import content_hash, strict_loads
+from online_trader.contracts.validation import validate_message
 from online_trader.dsv_runtime.controller import ExplicitOrderController, SendNotAttempted, terminal
 from online_trader.dsv_runtime.order_diagnostics import attach_order_blocking_log, classify_broker_rejection
+from online_trader.dsv_runtime.owner_binding import StandaloneOwnerBinding
 from online_trader.dsv_runtime.runner import DsvSession, initial_state
 from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
+from online_trader.dsv_runtime.standalone_owner import StandaloneDsvOwner
 from online_trader.dsv_runtime.standalone_projection import workbench_view
 from online_trader.dsv_storage.journal import Journal
 from online_trader.errors import TraderError
 from online_trader.runtime.account_cache import BrokerHistoryWriter
 from online_trader.runtime.target_owner_startup import (
-    classify_owner_tick_error, execute_owner_tick, resolve_active_trading_day,
+    _resolve_trusted_pid, classify_owner_tick_error, execute_owner_tick,
+    resolve_active_trading_day, run_target_owner,
 )
 from online_trader.transport.status_client import StatusClient
 from qa.target_owner.offline_runtime import CONTRACT, DAY, OfflineTargetRuntime, frame, order_fact, profile
@@ -344,7 +349,9 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
         self.assertEqual(view['configuration']['execution_core'], 'DSV_TARGET_EXECUTION')
         self.assertEqual(view['configuration']['rule_set_id'], 'DSV_TARGET_EXECUTION')
         self.assertEqual({row['policy_kind'] for row in view['policies']}, {'AUTHORITY', 'EXECUTION'})
-        self.assertEqual(len({row['operation'] for row in view['capabilities']['operations']}), 9)
+        self.assertEqual(len({row['operation'] for row in view['capabilities']['operations']}), 10)
+        self.assertTrue(view['configuration']['live_parameter_save'])
+        self.assertIn('SAVE_DSV_PARAMETERS', {row['operation'] for row in view['capabilities']['operations']})
         self.assertFalse(view['truncated'])
 
     def test_new_boot_uses_a_new_ledger_and_does_not_inherit_runtime_commands(self):
@@ -403,6 +410,29 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
         self.runtime.submit(frame(3, facts=[order_fact(child, 'CANCELLED')]))
         self.runtime.thread.join(5)
         self.assertFalse(self.runtime.thread.is_alive())
+
+    def test_flatten_then_stop_shuts_down_flat_runtime_even_when_unsynchronized(self):
+        import subprocess
+        from online_trader.runtime.shutdown import pid_alive, wait_pid_exit
+
+        initial = self.client.workbench()
+        self.assertFalse(initial['connection']['synchronized'])
+        self.assertTrue(next(
+            row for row in initial['capabilities']['operations']
+            if row['operation'] == 'FLATTEN_THEN_STOP')['allowed'])
+        receipt = self.client.command(
+            'FLATTEN_THEN_STOP', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'execution_policy_id': 'target-execution-current-boot'},
+            expected_config_revision='1')
+        self.assertEqual(receipt['status'], 'SUCCEEDED')
+        self.runtime.thread.join(5)
+        self.assertFalse(self.runtime.thread.is_alive())
+
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.2)'])
+        self.assertTrue(pid_alive(child.pid))
+        self.assertTrue(wait_pid_exit(child.pid, timeout=5.0))
+        child.wait(timeout=2)
+        self.assertFalse(pid_alive(child.pid))
 
     def test_history_cache_failure_does_not_change_target_authority(self):
         self.synchronize()
@@ -539,6 +569,52 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
              'expected_target_revisions': {cycle_id: rev}},
             expected_config_revision='1')
         self.assertEqual(receipt['status'], 'SUCCEEDED')
+
+    def test_live_save_dsv_parameters_updates_revision_triggers_and_preserves_scope(self):
+        before = self.synchronize()
+        self.assertTrue(before['configuration']['live_parameter_save'])
+        self.assertEqual(before['configuration']['config_revision'], '1')
+        saved_profiles = []
+        self.runtime.call_owner(lambda owner: setattr(owner, 'on_parameters_saved', saved_profiles.append))
+
+        updated = profile().to_record()
+        updated['settings']['symbols'][0]['open_offset'] = '90'
+        updated['settings']['symbols'][0]['stop_offset'] = '10'
+        updated['settings']['symbols'][0]['profit_offset'] = '200'
+        receipt = self.client.command(
+            'SAVE_DSV_PARAMETERS', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'profile': updated}, expected_config_revision='1')
+        self.assertEqual(receipt['status'], 'SUCCEEDED')
+        self.assertEqual(len(saved_profiles), 1)
+        self.assertEqual(saved_profiles[0].to_record()['settings']['symbols'][0]['open_offset'], '90')
+
+        after = self.wait_view(
+            lambda value: value['configuration']['config_revision'] == '2'
+            and value['configuration']['strategy_symbols'][0]['open_offset'] == '90')
+        self.assertEqual(after['configuration']['strategy_profile_hash'], saved_profiles[0].content_hash)
+
+        with self.assertRaises(TraderError) as stale:
+            self.client.command(
+                'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                {'authority_policy_id': 'target-authority-current-boot',
+                 'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
+                expected_config_revision='1')
+        self.assertEqual(stale.exception.code, 'E_REVISION_CONFLICT')
+
+        bad_scope = copy.deepcopy(updated)
+        bad_scope['settings']['symbols'][0]['code'] = 'DCE.l2701'
+        with self.assertRaises(TraderError) as wrong_scope:
+            self.client.command(
+                'SAVE_DSV_PARAMETERS', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                {'profile': bad_scope}, expected_config_revision='2')
+        self.assertEqual(wrong_scope.exception.code, 'E_SCOPE')
+
+        armed = self.client.command(
+            'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'authority_policy_id': 'target-authority-current-boot',
+             'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '2'},
+            expected_config_revision='2')
+        self.assertEqual(armed['status'], 'SUCCEEDED')
 
     def test_persistent_disarm_blocks_auto_recovery_and_requires_reconciliation(self):
         # Transient disconnect preserves running state while persistent disarm clears it
@@ -1009,6 +1085,369 @@ class TargetOwnerExecutionReliabilityTests(unittest.TestCase):
         self.assertEqual(blocked[0]['contract_id'], shfe)
         self.assertEqual(blocked[0]['effect'], 'REDUCE')
         self.assertIn(blocked[0]['detail'], {'E_OWNERSHIP', 'E_FACT_BARRIER', 'EMPTY_CLOSE_ROUTES'})
+
+
+class TargetOwnerWorkbenchProjectionTests(unittest.TestCase):
+    """Cross-platform unit tests for Target Owner Workbench projections, bars, and fill/order metadata."""
+
+    @staticmethod
+    def _make_adapter():
+        bars = [
+            {'datetime': 0, 'open': 100.0, 'high': 101.0, 'low': 99.0, 'close': 100.0},
+            {'datetime': 1762740000_000_000_000, 'open': 100.0, 'high': 101.0, 'low': 105.0, 'close': 102.0},
+            {'datetime': 1762740060_000_000_000, 'open': 100.0, 'high': 104.0, 'low': 99.0, 'close': 102.0},
+        ]
+        serial = SimpleNamespace(tail=lambda count: SimpleNamespace(to_dict=lambda _mode: bars[-count:]))
+        adapter = DsvSdkAdapter.__new__(DsvSdkAdapter)
+        adapter.owner = get_ident()
+        adapter.enabled = True
+        adapter.synchronized = True
+        adapter.account_key = 'DEV:proj-test'
+        adapter.provider = 'OFFLINE'
+        adapter.epoch = 'epoch-proj'
+        adapter.contracts = (CONTRACT,)
+        adapter.api = SimpleNamespace(is_serial_ready=lambda s: s is serial)
+        adapter.connection = SimpleNamespace(
+            broker_connected=True,
+            rollover_market_facts=lambda code, day: {'main_contract': code, 'expiry_date': '2027-01-15'} if day == DAY else None,
+        )
+        adapter.calendar = SimpleNamespace(
+            session_times=lambda code, day: [['2026-11-13T01:00:00Z', '2026-11-13T02:15:00Z']],
+        )
+        adapter.grant = SimpleNamespace(value={'calendar_hash': 'cal-hash-1', 'contracts': [CONTRACT]})
+        adapter.quotes = {
+            CONTRACT: SimpleNamespace(
+                open=1025.0, pre_settlement=1030.0, settlement=None, volume=1234,
+                open_interest=5678, bid_volume1=10, ask_volume1=12, commission=2.5,
+            ),
+        }
+        adapter.minutes = {CONTRACT: serial}
+        adapter._minute_chart_sample_at = None
+        adapter._minute_chart_cache = {}
+        adapter._health = {'reference_status': 'OBSERVED_OK', 'protection_ready': True}
+        adapter.quote_observations = {}
+        adapter._local_returns = set()
+        adapter.flat_confirmed = False
+        adapter.dispatch_market = {
+            CONTRACT: {
+                'long_qty': 0, 'short_qty': 0, 'multiplier': '10', 'margin_per_lot': '4500',
+                'market_session_active': True,
+            },
+        }
+        return adapter
+
+    def test_workbench_view_projects_market_triggers_reasons_day_stop_and_minute_bars(self):
+        adapter = self._make_adapter()
+        prof = profile()
+        snapshot = {
+            'scope': {'account_key': 'DEV:proj-test', 'runtime_boot_id': 'runtime-boot-1'},
+            'sequence': 7,
+            'projection_seq': 7,
+            'trading_day': DAY,
+            'session_id': 'sess-1',
+            'running': False,
+            'synchronized': True,
+            'orders': {},
+            'runtime_commands': [],
+            'runtime_identity': {'engine_kind': 'DSV_TARGET_EXECUTION', 'entry_point': 'online-trader-desktop'},
+            'run_directory': 'E:/tmp/run-1',
+            'latest_decisions': {
+                CONTRACT: {
+                    'decision_time_utc': '2026-11-13T01:10:05Z',
+                    'decisions': [{'reason': 'GEOMETRY_BLOCK'}],
+                },
+            },
+            'symbols': {
+                CONTRACT: {
+                    'position': None,
+                    'day_stop': True,
+                    'day_stop_reason': '止盈触发',
+                    'net_loss': '-20',
+                    'target_count': 1,
+                    'market_session_active': True,
+                    'tick': {
+                        'last': '1060', 'bid1': '1059', 'ask1': '1061',
+                        'day_high': '1088', 'day_low': '1020', 'tick_size': '1',
+                        'upper_limit': '1200', 'lower_limit': '900',
+                        'native_time': '2026-11-13T01:10:05Z',
+                    },
+                    'quote_observation': {
+                        'age_quality': 'VALID',
+                        'source_time_raw': '2026-11-13 09:10:05.000000',
+                        'source_age_raw_ns': '5000000',
+                        'reason': None,
+                    },
+                },
+            },
+        }
+        view = workbench_view(snapshot, profile=prof, adapter=adapter, configuration_revision='1')
+        validate_message(StatusClient._message('WorkbenchSnapshot', {'payload': view, 'content_hash': content_hash(view)}))
+
+        self.assertEqual(view['entry_authority'], 'DISARMED')
+        self.assertEqual(view['minute_bars'][CONTRACT], [[29379001, '100', '104', '99', '102']])
+        market = view['markets'][0]
+        self.assertTrue(market['enabled'])
+        self.assertEqual(market['day_stop_reason'], '止盈触发')
+        self.assertEqual(market['entry_reasons'], ['GEOMETRY_BLOCK'])
+        self.assertEqual(market['decision_time_utc'], '2026-11-13T01:10:05Z')
+        self.assertEqual(market['trigger_prices'], {'LONG': '1060', 'SHORT': '1048'})
+        self.assertEqual(market['margin'], '4500')
+        self.assertEqual(market['volume_multiple'], '10')
+        self.assertEqual(market['upper_limit'], '1200')
+        self.assertEqual(market['lower_limit'], '900')
+        self.assertEqual(market['open'], '1025')
+        self.assertEqual(market['volume'], '1234')
+        self.assertEqual(market['rollover'], {'main_contract': CONTRACT, 'expiry_date': '2027-01-15'})
+        config = view['configuration']
+        self.assertEqual(config['run_directory'], 'E:/tmp/run-1')
+        self.assertEqual(config['runtime_identity']['engine_kind'], 'DSV_TARGET_EXECUTION')
+        self.assertEqual(config['schedule_display']['trading_day'], DAY)
+        self.assertEqual(config['strategy_diagnostics']['ntp'], 'NTP_ALIGNED')
+        self.assertEqual(view['contract_catalog']['contracts'], [CONTRACT])
+
+        # Disconnecting clears the minute-bar cache.
+        adapter.profile = prof
+        adapter.session = SimpleNamespace(
+            _closed=False, _failed=False,
+            _controller=SimpleNamespace(port=adapter),
+            snapshot=lambda: {'scope': {
+                'account_key': 'DEV:proj-test', 'provider': 'OFFLINE',
+                'configuration_id': prof.content_hash,
+            }},
+            disconnect=lambda _r: None,
+        )
+        adapter.disconnect(adapter.session)
+        self.assertIsNone(adapter._minute_chart_sample_at)
+        self.assertEqual(adapter._minute_chart_cache, {})
+
+    def test_workbench_view_projects_cycle_protection_order_and_fill_timestamps(self):
+        adapter = self._make_adapter()
+        prof = profile()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        scope = {'account_key': 'DEV:proj-test', 'provider': 'OFFLINE',
+                 'trading_day': DAY, 'configuration_id': prof.content_hash}
+        state = initial_state(DAY, [CONTRACT])
+        journal = Journal(Path(temp.name) / 'facts.db', scope, state)
+        self.addCleanup(journal.close)
+        controller = ExplicitOrderController(scope, journal, adapter)
+        pos = {
+            'id': 'pos-proj-1', 'contract_id': CONTRACT, 'direction': 'LONG',
+            'quantity': 5, 'owned': 0, 'entry_filled': 0, 'entry_notional': '0',
+            'children': [], 'entry_stopped': False, 'exit_target': None,
+            'target_id': 'pos-proj-1', 'target_revision': 2, 'exit_revision': 0,
+            'mode': 'ACTIVE', 'cap': '1065', 'context_at': '0',
+            'theory': '1060', 'stop': '8', 'profit': '20', 'peak': '14',
+            'half_stage': 1, 'protected': False, 'entry_kind': 'NORMAL_ENTRY',
+            'open_day': DAY, 'fills': [],
+        }
+        state['symbols'][CONTRACT]['position'] = pos
+        market = {'contract_id': CONTRACT, 'tick': {'last': '1060'}, 'long_qty': 0, 'short_qty': 0}
+        with journal.transaction():
+            open_eff = controller.new_order(state, pos, market, 'OPEN', 5, '1060', 'OPEN')
+            child_id = open_eff['child_order_id']
+            controller.accept_native(state, [
+                {
+                    'kind': 'ORDER', 'child_order_id': child_id, 'native_order_id': 'nat-open-1',
+                    'status': 'FILLED', 'filled_qty': 5, 'source_time_ns': '1762740000100000000',
+                    'native_message': '全部成交',
+                },
+                {
+                    'kind': 'TRADE', 'child_order_id': child_id, 'native_order_id': 'nat-open-1',
+                    'native_trade_id': 'trd-open-1', 'quantity': 5, 'price': '1060',
+                    'fill_day': DAY, 'source_time_ns': '1762740000200000000',
+                },
+            ])
+            pos.update(exit_target=3, exit_manual_takeover=True,
+                       rollback_exit={'reason': 'STOP_LOSS', 'price': '1052'})
+            journal.save(state)
+        snapshot = {
+            'scope': {'account_key': 'DEV:proj-test', 'runtime_boot_id': 'runtime-boot-1'},
+            'sequence': 9,
+            'projection_seq': 9,
+            'trading_day': DAY,
+            'session_id': 'sess-1',
+            'running': True,
+            'synchronized': True,
+            'orders': state['orders'],
+            'runtime_commands': [],
+            'symbols': {
+                CONTRACT: {
+                    'position': pos,
+                    'target_execution': {'reduce_needed_qty': 3, 'reduce_pending_qty': 0, 'status': 'BLOCKED',
+                                         'decision_reason': 'EXIT_MANUAL_TAKEOVER_REQUIRED'},
+                    'day_stop': False,
+                    'net_loss': '0',
+                    'target_count': 1,
+                    'tick': {'last': '1058', 'day_high': '1088', 'day_low': '1020', 'tick_size': '1',
+                             'native_time': '2026-11-13T01:12:00Z'},
+                    'quote_observation': {'age_quality': 'VALID'},
+                },
+            },
+        }
+        view = workbench_view(snapshot, profile=prof, adapter=adapter, configuration_revision='1')
+        validate_message(StatusClient._message('WorkbenchSnapshot', {'payload': view, 'content_hash': content_hash(view)}))
+        cycle = view['cycles'][0]
+        self.assertEqual(cycle['initial_open_confirmation'], {'status': 'CONFIRMED', 'quantity': 5, 'value': '5300'})
+        self.assertEqual(cycle['phase1_status'], 'DONE')
+        self.assertEqual(cycle['phase2_status'], 'NOT_TRIGGERED')
+        self.assertEqual(cycle['phase1_target'], 3)
+        self.assertEqual(cycle['max_favorable_move'], '14')
+        self.assertEqual(cycle['exit_reason'], 'STOP_LOSS')
+        self.assertEqual(cycle['exit_reasons'], ['STOP_LOSS'])
+        self.assertEqual(cycle['exit_reference_price'], '1052')
+        self.assertEqual(cycle['exit_wait_reason'], 'EXIT_MANUAL_INTERVENTION_REQUIRED')
+        self.assertEqual(view['orders'][0]['source_time_ns'], '1762740000100000000')
+        self.assertEqual(view['orders'][0]['native_message'], '全部成交')
+        self.assertEqual(view['trades'][0]['native_trade_id'], 'trd-open-1')
+        self.assertEqual(view['trades'][0]['source_time_ns'], '1762740000200000000')
+
+    def test_standalone_owner_retains_latest_decisions_and_run_directory(self):
+        adapter = self._make_adapter()
+        prof = profile()
+        adapter.step = lambda _session, **_kwargs: {
+            'evaluated_at': '2026-11-13T01:15:00Z',
+            'decisions': [{'contract_id': CONTRACT, 'reason': 'GEOMETRY_BLOCK'}],
+        }
+        binding = StandaloneOwnerBinding('runtime-owner-1', 'DEV:proj-test', 'OFFLINE', object(), object())
+        fake_session = SimpleNamespace(
+            _check_owner=lambda: None,
+            _state={'retired_positions': {}},
+            _failed=False,
+            snapshot=lambda: {
+                'scope': {'account_key': 'DEV:proj-test', 'runtime_boot_id': 'runtime-owner-1'},
+                'sequence': 1,
+                'trading_day': DAY,
+                'session_id': 'sess-1',
+                'running': False,
+                'synchronized': True,
+                'orders': {},
+                'runtime_identity': {'engine_kind': 'DSV_TARGET_EXECUTION', 'entry_point': 'runtime run'},
+                'symbols': {
+                    CONTRACT: {
+                        'position': None, 'day_stop': False, 'net_loss': '0', 'target_count': 0,
+                        'tick': {'last': '1060', 'day_high': '1088', 'day_low': '1020', 'tick_size': '1',
+                                 'native_time': '2026-11-13T01:15:00Z'},
+                        'quote_observation': {'age_quality': 'VALID'},
+                    },
+                },
+            },
+            prepare_shutdown=lambda: {'ready': True},
+            close=lambda: None,
+        )
+        owner = StandaloneDsvOwner(fake_session, adapter, adapter.connection, prof, binding, '1')
+        owner.run_directory = 'E:/tmp/owner-run'
+        owner.step(trading_day=DAY, complete=True)
+        view = owner.workbench()
+        self.assertEqual(view['configuration']['run_directory'], 'E:/tmp/owner-run')
+        self.assertEqual(view['markets'][0]['decision_time_utc'], '2026-11-13T01:15:00Z')
+        self.assertEqual(view['markets'][0]['entry_reasons'], ['GEOMETRY_BLOCK'])
+
+    def test_run_target_owner_accepts_callable_trusted_control_pid_and_preserves_dynamic_lookup(self):
+        self.assertIsNone(_resolve_trusted_pid(None))
+        self.assertIsNone(_resolve_trusted_pid(True))
+        self.assertEqual(_resolve_trusted_pid(-1), -1)
+        self.assertEqual(_resolve_trusted_pid(lambda: 4321), 4321)
+
+        class _FakeViewProcess:
+            def __init__(self, pid):
+                self._pid = pid
+
+            def trusted_pid(self):
+                return self._pid
+
+        prof = profile()
+        calendar = SimpleNamespace(content_hash='cal-hash-1')
+        binding = StandaloneOwnerBinding('boot-1', 'DEV:pid-test', 'OFFLINE', object(), object())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ledger = root / 'ledger.db'
+            grant = SimpleNamespace(
+                replacement=False,
+                manual_workbench=False,
+                automatic_offsets=False,
+                account_key='DEV:pid-test',
+                provider='OFFLINE',
+                content_hash='grant-hash-1',
+                value={'ledger_path': str(ledger), 'contracts': [CONTRACT], 'trading_day': DAY},
+            )
+            session_storage = SimpleNamespace(
+                ledger=ledger.resolve(),
+                owner_binding=lambda _rl, _al, **_kw: binding,
+            )
+            fake_connection = SimpleNamespace(
+                source_epoch='feed-epoch-1',
+                broker_connected=True,
+                configure_calendar=lambda _cal: None,
+                complete=lambda: True,
+                close=lambda: None,
+            )
+            fake_owner = SimpleNamespace(
+                session=SimpleNamespace(runtime_identity=None, prepare_shutdown=lambda: {'ready': True}),
+                stop_event=SimpleNamespace(),
+                authority_generation=1,
+                run_directory=None,
+                snapshot=lambda: {'trading_day': DAY},
+                close=lambda: None,
+            )
+            captured_clients = []
+
+            class _FakeControlServer:
+                def __init__(self, owner, pipe, *, trusted_client_pid=None):
+                    captured_clients.append((owner, pipe, trusted_client_pid))
+
+                def serve(self, **_kwargs):
+                    return None
+
+            view_process = _FakeViewProcess(4321)
+            output_one = root / 'run-positive'
+            output_one.mkdir()
+            with (
+                patch('online_trader.runtime.target_owner_startup.strategy_port',
+                      return_value=SimpleNamespace(connect=lambda *_args: fake_connection)),
+                patch('online_trader.runtime.target_owner_startup.create_standalone_owner',
+                      return_value=fake_owner),
+                patch('online_trader.runtime.target_owner_startup.BrokerHistoryWriter',
+                      return_value=SimpleNamespace(close=lambda: None)),
+                patch('online_trader.runtime.target_owner_startup.ControlServer', _FakeControlServer),
+            ):
+                rc = run_target_owner(
+                    grant=grant, profile=prof, calendar=calendar, credentials='unused',
+                    output=output_one, pipe=r'\\.\pipe\test-pid-positive',
+                    session_storage=session_storage, runtime_lock=object(), account_lock=object(),
+                    clock=SimpleNamespace(epoch='clock-epoch-1'),
+                    trusted_control_pid=view_process.trusted_pid,
+                    history_cache=root / 'history.db',
+                )
+            self.assertEqual(rc, 0)
+            identity_one = strict_loads((output_one / 'runtime-identity.json').read_bytes())
+            self.assertEqual(identity_one['entry_point'], 'online-trader-desktop')
+            self.assertEqual(captured_clients[-1][2], view_process.trusted_pid)
+
+            inactive_process = _FakeViewProcess(-1)
+            output_two = root / 'run-negative'
+            output_two.mkdir()
+            with (
+                patch('online_trader.runtime.target_owner_startup.strategy_port',
+                      return_value=SimpleNamespace(connect=lambda *_args: fake_connection)),
+                patch('online_trader.runtime.target_owner_startup.create_standalone_owner',
+                      return_value=fake_owner),
+                patch('online_trader.runtime.target_owner_startup.BrokerHistoryWriter',
+                      return_value=SimpleNamespace(close=lambda: None)),
+                patch('online_trader.runtime.target_owner_startup.ControlServer', _FakeControlServer),
+            ):
+                rc_two = run_target_owner(
+                    grant=grant, profile=prof, calendar=calendar, credentials='unused',
+                    output=output_two, pipe=r'\\.\pipe\test-pid-negative',
+                    session_storage=session_storage, runtime_lock=object(), account_lock=object(),
+                    clock=SimpleNamespace(epoch='clock-epoch-1'),
+                    trusted_control_pid=inactive_process.trusted_pid,
+                    history_cache=root / 'history.db',
+                )
+            self.assertEqual(rc_two, 0)
+            identity_two = strict_loads((output_two / 'runtime-identity.json').read_bytes())
+            self.assertEqual(identity_two['entry_point'], 'runtime run')
+            self.assertEqual(captured_clients[-1][2], inactive_process.trusted_pid)
 
 
 if __name__ == '__main__':

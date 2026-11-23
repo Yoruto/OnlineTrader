@@ -69,7 +69,7 @@ class WorkbenchTray(QObject):
             self.menu = QMenu(self.window)
             restore = self.menu.addAction('显示窗口', self.show_window)
             self.menu.setDefaultAction(restore)
-            self.menu.addAction('退出工作台', self.close_window)
+            self.menu.addAction('退出 OnlineTrader', self.close_window)
             self.icon.setContextMenu(self.menu)
             self.icon.activated.connect(self.on_activate)
             self._render_status()
@@ -104,6 +104,10 @@ class WorkbenchTray(QObject):
         self.window.show()
         self.window.raise_()
         self.window.activateWindow()
+
+    def cancel_exit(self):
+        self.exit_requested = False
+        self.sync_icon()
 
     def close_window(self):
         self.exit_requested = True

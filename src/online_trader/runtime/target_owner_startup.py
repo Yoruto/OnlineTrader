@@ -5,18 +5,24 @@ profile and calendar scope used by the current Runtime.  Construction is
 DISARMED and the first complete native frame remains mandatory.
 """
 
+from datetime import datetime, timezone
 from pathlib import Path
 import time
 
 from online_trader.contracts.codec import canonical_bytes
-from online_trader.configuration.files import publish_replace_bytes
+from online_trader.configuration.files import publish_new_bytes, publish_replace_bytes
 from online_trader.dsv_runtime.order_diagnostics import attach_order_blocking_log
 from online_trader.dsv_runtime.standalone_owner import create_standalone_owner
 from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.simnow import strategy_port
 from online_trader.kernel.server import ControlServer
 from online_trader.runtime.account_cache import BrokerHistoryWriter
+from online_trader.runtime.identity import runtime_identity
 from online_trader.scheduling.clock import utc_text
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
 _TRANSIENT_TICK_CODES = frozenset({
@@ -125,6 +131,7 @@ def execute_owner_tick(owner, *, binding, current_trading_day, is_complete,
             'error_category': category,
             'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
             'diagnostic': code,
+            'observed_at_utc': _utc_now(),
             'exception': exception_record(error),
         }), diagnostics_path)
         current = {
@@ -136,6 +143,7 @@ def execute_owner_tick(owner, *, binding, current_trading_day, is_complete,
                 **current,
                 'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
                 'execution_core': 'DSV_TARGET_EXECUTION',
+                'observed_at_utc': _utc_now(),
             }), status_path)
             loop_state['last_status'] = current
         sleep_fn(0.1)
@@ -152,14 +160,21 @@ def execute_owner_tick(owner, *, binding, current_trading_day, is_complete,
             **current,
             'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
             'execution_core': 'DSV_TARGET_EXECUTION',
+            'observed_at_utc': _utc_now(),
         }), status_path)
         loop_state['last_status'] = current
+
+
+def _resolve_trusted_pid(trusted_control_pid):
+    """Resolve a static or dynamically queried trusted control PID."""
+    pid = trusted_control_pid() if callable(trusted_control_pid) else trusted_control_pid
+    return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
 
 
 def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                      session_storage, runtime_lock, account_lock, clock,
                      trusted_control_pid, history_cache, arm=False,
-                     configuration_revision='1'):
+                     configuration_revision='1', entry_point=None, configured_store=None):
     """Run the single target owner on the calling Runtime thread."""
     if grant.replacement or grant.manual_workbench:
         raise TraderError('E_ONLINE_SCOPE', 'Standalone target execution requires a strategy desktop scope')
@@ -194,17 +209,55 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             session_storage.ledger, binding=binding, connection=connection,
             profile=profile, calendar=calendar, clock=clock,
             configuration_revision=configuration_revision)
+        if configured_store is not None:
+            owner.on_parameters_saved = configured_store.save_profile
+        resolved_pid = _resolve_trusted_pid(trusted_control_pid)
+        resolved_entry_point = entry_point or (
+            'online-trader-desktop'
+            if resolved_pid is not None and resolved_pid > 0
+            else 'runtime run'
+        )
+        identity = runtime_identity(
+            resolved_entry_point,
+            'DSV_TARGET_EXECUTION',
+            getattr(clock, 'epoch', '0'),
+            getattr(connection, 'source_epoch', '0'),
+            binding.boot_id,
+            calendar=calendar,
+            profile=profile,
+            grant=grant,
+        )
+        owner.session.runtime_identity = identity
+        try:
+            publish_new_bytes(canonical_bytes(identity), output / 'runtime-identity.json')
+        except (OSError, TraderError):
+            pass
+        run_identity = {
+            'schema_version': 'DSV_RUN_IDENTITY/1',
+            'account_key': binding.account_key,
+            'kernel_boot_id': binding.boot_id,
+            'scope_hash': grant.content_hash,
+            'run_directory': str(output),
+        }
+        try:
+            publish_new_bytes(canonical_bytes(run_identity), output / 'run-identity.json')
+        except (OSError, TraderError):
+            owner.run_directory = None
+        else:
+            owner.run_directory = str(output)
         history_writer = BrokerHistoryWriter(
             history_cache, binding.account_key, binding.provider,
             on_error=lambda error: publish_replace_bytes(canonical_bytes({
                 'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
                 'execution_core': 'DSV_TARGET_EXECUTION', 'authority_effect': 'NONE',
                 'diagnostic': getattr(error, 'code', 'E_HISTORY_CACHE_WRITE'),
+                'observed_at_utc': _utc_now(),
             }), diagnostics))
         publish_replace_bytes(canonical_bytes({
             'phase': 'WAITING_FOR_NATIVE_SYNC', 'runtime_boot_id': binding.boot_id,
             'account_key': binding.account_key, 'entry_authority': 'DISARMED',
             'execution_core': 'DSV_TARGET_EXECUTION',
+            'observed_at_utc': _utc_now(),
         }), status)
         server = ControlServer(owner, pipe, trusted_client_pid=trusted_control_pid)
         loop_state = {
@@ -239,13 +292,16 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             'phase': 'STOPPED', 'runtime_boot_id': binding.boot_id,
             'account_key': binding.account_key, 'entry_authority': 'DISARMED',
             'execution_core': 'DSV_TARGET_EXECUTION', 'shutdown': shutdown,
+            'observed_at_utc': _utc_now(),
         }), status)
         return 0
     except Exception as error:
         publish_replace_bytes(canonical_bytes({
             'phase': 'NEEDS_REVIEW', 'account_key': grant.account_key,
+            'runtime_boot_id': binding.boot_id,
             'entry_authority': 'DISARMED', 'execution_core': 'DSV_TARGET_EXECUTION',
             'error_code': getattr(error, 'code', 'E_DSV_SDK_RUNTIME'),
+            'observed_at_utc': _utc_now(),
             'exception': exception_record(error),
         }), status)
         raise

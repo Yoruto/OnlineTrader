@@ -4,6 +4,8 @@ This is an in-process adapter.  It does not create a second pipe or expose the
 Replacement/offline protocol to the product UI.
 """
 
+from online_trader.configuration.dsv import DsvProfile
+from online_trader.configuration.offsets import dsv_startup_profile
 from online_trader.domain.values import identifier, sequence
 from online_trader.dsv_runtime.controller import terminal
 from online_trader.errors import TraderError
@@ -152,6 +154,15 @@ def translate_workbench_command(body, snapshot, *, runtime_boot_id, configuratio
         return common | {'action': 'FLATTEN_STOP' if operation == 'FLATTEN_THEN_STOP' else 'REDUCE_ALL',
                          'position_ids': list(current), 'price_mode': _price_mode(parameters),
                          **(({'expected_target_revisions': current_revisions}) if operation == 'MANUAL_CLOSE_ALL' else {})}
+    if operation == 'SAVE_DSV_PARAMETERS':
+        _account_scope(scope)
+        if set(parameters) != {'profile'} or type(parameters['profile']) is not dict:
+            raise TraderError('E_SCHEMA', 'Saving live parameters requires a DSV profile payload')
+        candidate = dsv_startup_profile(DsvProfile.from_record(parameters['profile']))
+        symbols = candidate.to_record()['settings']['symbols']
+        if {row['code'] for row in symbols} != set(snapshot['symbols']):
+            raise TraderError('E_SCOPE', '运行中只能调整当前已授权合约的参数。')
+        return common | {'action': 'SAVE_PARAMETERS', 'profile': candidate.to_record()}
     if operation == 'REQUEST_RECONCILIATION':
         _account_scope(scope)
         if set(parameters) - {'requested_scope', 'position_cycle_id', 'clock_recovery_id'}:
