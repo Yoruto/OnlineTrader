@@ -17,9 +17,9 @@ documents:
     evidence:
       design: USER_DIRECTED_REVIEWED
       source: DEFAULT_STANDALONE_COLD_SWITCHED_TO_TARGET_OWNER
-      tests: INDEPENDENT_OFFLINE_FULL_1931_OF_1931_PASS_WITH_PROCESS_HARNESS
+      tests: OFFLINE_UNITTEST_FULL_1935_OF_1935_PASS
       product_acceptance: ONLINE_AND_ARTIFACT_NOT_RUN
-    notes: Target ownership, pending/UNKNOWN accounting, temporary-boot boundary, version-owned single-core cold cutover, 3-tier tick error classification, authority-generation-bound auto-arm, mixed-session trading day, and manual-close target_revision OCC.
+    notes: Target ownership, pending/UNKNOWN accounting, temporary-boot boundary, version-owned single-core cold cutover, 3-tier tick error classification, authority-generation-bound auto-arm, mixed-session trading day, manual-close target_revision OCC, pre-queue SDK send refusal, UNKNOWN negative reconciliation, tiered exit rejection retry, and order-blocking diagnostics.
 
   - path: docs/refactor/testing-system-redesign-20261121.md
     scope: testing/static-manifest-and-offline-profile-selection
@@ -54,16 +54,32 @@ documents:
       product_acceptance: NOT_RUN
     notes: Current user entry, state ownership, lifecycle, command, failure, diagnostic and acceptance routing for Runtime Workbench work.
 
-  - path: docs/refactor/testing-and-portable-delivery-pipeline-optimization-20261120.md
-    scope: delivery/testing-and-portable-pipeline
+  - path: docs/refactor/testing-and-portable-delivery-pipeline-v2-20261123.md
+    scope: delivery/testing-and-portable-pipeline-v2
     status: CANDIDATE
     verified_at_sha: WORKTREE
     evidence:
-      design: REVIEWED_WITH_CONFLICTS_RESOLVED
-      source: IMPLEMENTED_CANDIDATE
+      design: REVIEWED_REVISED_V2
+      source: BATCH_1_IMPLEMENTED_IN_WORKTREE
       tests: NOT_RUN
       product_acceptance: NOT_RUN
-    notes: Fast preflight, cached TEST-ONLY freeze and clean configured Runtime delivery pipeline; no Generic deliverable.
+    notes: >-
+      V2 pipeline spec: unified candidate hash and real config preflight (Batch 1),
+      immutable source snapshot without editable backflow, split Base/Delivery/Qualification
+      manifests, verified ReleaseClean base cache, and FullOffline fail-closed rule.
+
+  - path: docs/refactor/testing-and-portable-delivery-pipeline-optimization-20261120.md
+    scope: delivery/testing-and-portable-pipeline
+    status: SUPERSEDED
+    superseded_by:
+      - docs/refactor/testing-and-portable-delivery-pipeline-v2-20261123.md
+    verified_at_sha: WORKTREE
+    evidence:
+      design: SUPERSEDED_BY_V2
+      source: BATCHES_1_TO_3_PARTIALLY_IMPLEMENTED
+      tests: NOT_RUN
+      product_acceptance: NOT_RUN
+    notes: Superseded by V2 pipeline spec after second-round architecture review; retained for V1 baseline context.
 
   - path: docs/refactor/runtime-manual-only-cleanup-20261120.md
     scope: standalone/manual-start-and-local-user-control

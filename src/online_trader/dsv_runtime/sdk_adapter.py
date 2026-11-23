@@ -11,6 +11,7 @@ from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.rollover import expiry_date
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
 from online_trader.dsv_runtime.controller import CancelNotAttempted, SendNotAttempted, legal_price, terminal
+from online_trader.dsv_runtime.order_diagnostics import OrderDiagnosticTracker, classify_broker_rejection
 from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.dsv_facts import native_integer, utc
 from online_trader.gateway.native_days import native_day
@@ -110,6 +111,8 @@ class DsvSdkAdapter:
         self._foreign_trades = None
         self._legacy_native_orders = _legacy_native_orders or {}
         self._native_fact_cache = {}
+        self._unknown_snapshots = {}
+        self._diagnostics = OrderDiagnosticTracker(account_key=account_key)
         self.quotes = {code: api.get_quote(code) for code in self.contracts}
         self.minutes = {code: api.get_kline_serial(code, 60, data_length=500) for code in self.contracts}
 
@@ -277,6 +280,7 @@ class DsvSdkAdapter:
                 self._native_fact_cache[key] = fact
             self.metrics.update(session.round_timing)
             state = session.snapshot()
+            self._record_unknown_snapshots(state)
             self.synchronized = state['synchronized']
             self.flat_confirmed = self.synchronized and not self.metrics['native_fill_waiting_day_contracts'] and all(
                 row['long_qty'] == row['short_qty'] == 0 and not row['external_orders'] for row in market.values())
@@ -348,6 +352,11 @@ class DsvSdkAdapter:
         self.metrics['native_fill_waiting_day_contracts'] = len(deferred)
         reconcile = (not state['synchronized'] or day != state['trading_day']
                      or state.get('clock_recovery_required') or self._health.get('reason'))
+        self._record_unknown_snapshots(state)
+        snapshot_complete = (bool(self.connection.broker_connected and self.connection.complete())
+                             if self.connection is not None else True)
+        absent_orders = self._absent_unknown_orders(
+            state, orders, trades, native, reconcile=bool(reconcile), snapshot_complete=snapshot_complete)
         coverage = [fact['child_order_id'] for fact in native if fact['kind'] == 'ORDER']
         if not reconcile:
             coverage = []
@@ -378,8 +387,69 @@ class DsvSdkAdapter:
                  'trading_days': self.trading_days, 'calendar_hash': self.calendar.content_hash,
                  'synchronized': True, 'market': markets,
                  'sync_orders': coverage,
+                 'broker_order_snapshot_complete': bool(reconcile and snapshot_complete),
+                 'absent_orders': absent_orders,
                  'native': changes}
         return frame, {row['contract_id']: row for row in markets}
+
+    def _diag(self):
+        tracker = getattr(self, '_diagnostics', None)
+        if tracker is None:
+            tracker = OrderDiagnosticTracker(account_key=getattr(self, 'account_key', None))
+            self._diagnostics = tracker
+        return tracker
+
+    def _unknown_cache(self):
+        cache = getattr(self, '_unknown_snapshots', None)
+        if cache is None:
+            cache = {}
+            self._unknown_snapshots = cache
+        return cache
+
+    def _current_source_epoch(self):
+        if getattr(self, 'connection', None) is None:
+            return None
+        return getattr(self.connection, 'source_epoch', None)
+
+    def _record_unknown_snapshots(self, state):
+        cache = self._unknown_cache()
+        current_epoch = self._current_source_epoch()
+        adapter_epoch = getattr(self, 'epoch', None)
+        active_unknown = set()
+        for child_id, order in state.get('orders', {}).items():
+            if order.get('send_state') == 'UNKNOWN' and not terminal(order):
+                active_unknown.add(child_id)
+                cache.setdefault(child_id, {'source_epoch': current_epoch, 'adapter_epoch': adapter_epoch})
+        for child_id in list(cache):
+            if child_id not in active_unknown:
+                cache.pop(child_id, None)
+
+    def _absent_unknown_orders(self, state, orders, trades, native, *, reconcile, snapshot_complete):
+        if not reconcile or not snapshot_complete:
+            return []
+        cache = self._unknown_cache()
+        current_epoch = self._current_source_epoch()
+        adapter_epoch = getattr(self, 'epoch', None)
+        seen_children = {fact['child_order_id'] for fact in native}
+        trade_orders = {getattr(trade, 'order_id', None) for trade in trades.values()}
+        absent = []
+        for child_id, order in state.get('orders', {}).items():
+            if (order.get('send_state') != 'UNKNOWN' or terminal(order)
+                    or order.get('native_id') is not None or order.get('filled_qty')):
+                continue
+            recorded = cache.get(child_id)
+            if recorded is None:
+                continue
+            if getattr(self, 'connection', None) is not None and recorded.get('source_epoch') is not None:
+                fresh_snapshot = current_epoch is not None and current_epoch > recorded['source_epoch']
+            else:
+                fresh_snapshot = adapter_epoch is not None and adapter_epoch != recorded.get('adapter_epoch')
+            if not fresh_snapshot or child_id in seen_children:
+                continue
+            native_id = self.order_id(child_id)
+            if native_id not in orders and native_id not in trade_orders:
+                absent.append(child_id)
+        return absent
 
     def _order_facts(self, orders, bindings):
         result = []
@@ -418,7 +488,16 @@ class DsvSdkAdapter:
                       ) if order.status == 'FINISHED' else 'ALIVE'
             self._local_returns.discard(binding['child_order_id'])
             temporal = {'source_time_ns': str(stamp)} if type(stamp) is int and stamp > 0 else {}
-            result.append(self._fact('ORDER', binding, native_id) | {'status': status, 'filled_qty': filled} | temporal)
+            rejection = {}
+            if status == 'REJECTED':
+                category, detail = classify_broker_rejection(getattr(order, 'last_msg', None))
+                rejection = {'rejection_category': category, 'rejection_detail': detail}
+            elif status == 'CANCELLED':
+                category, detail = classify_broker_rejection(getattr(order, 'last_msg', None))
+                if category != 'UNCLASSIFIED':
+                    rejection = {'rejection_category': category, 'rejection_detail': detail}
+            result.append(self._fact('ORDER', binding, native_id)
+                          | {'status': status, 'filled_qty': filled} | temporal | rejection)
         return result
 
     def _trade_facts(self, trades, bindings, day, accepted, *, needs_recovery, day_held=False):
@@ -785,13 +864,93 @@ class DsvSdkAdapter:
                            offset=effect['native_offset'], volume=quantity(effect['quantity'], positive=True),
                            limit_price=float(Decimal(effect['limit_price'])), order_id=native, account=self.account)
         except Exception as error:
-            return SendNotAttempted(effect['id'], getattr(error, 'code', 'E_DSV_PRE_SEND'),
+            error_code = getattr(error, 'code', 'E_DSV_PRE_SEND')
+            self._diag().emit(
+                'PRE_SEND_VALIDATION_REFUSED',
+                contract_id=effect['contract_id'],
+                child_order_id=effect['child_order_id'],
+                effect_id=effect['id'],
+                native_offset=effect.get('native_offset'),
+                error_code=error_code,
+                reason=rejection_reason,
+                detail=type(error).__name__,
+            )
+            return SendNotAttempted(effect['id'], error_code,
                                     exception_record(error), rejection_reason)
         self._seen_effects.add(effect['id'])
-        # Never turn an exception from inside insert_order into unsent proof,
-        # even if it has the same error code as a local validation failure.
-        self.api.insert_order(**request)
+        # Only exact pre-queue SDK validation/risk refusals proven to occur before
+        # _send_pack may become SendNotAttempted; any other failure stays UNKNOWN.
+        try:
+            self.api.insert_order(**request)
+        except Exception as error:
+            refusal = self._sdk_send_refused_before_queue(error)
+            if refusal is not None:
+                error_code, sdk_reason = refusal
+                self._diag().emit(
+                    'SDK_SEND_REFUSED_BEFORE_QUEUE',
+                    contract_id=effect['contract_id'],
+                    child_order_id=effect['child_order_id'],
+                    effect_id=effect['id'],
+                    native_offset=effect.get('native_offset'),
+                    error_code=error_code,
+                    reason=sdk_reason,
+                    detail=type(error).__name__,
+                )
+                return SendNotAttempted(effect['id'], error_code, exception_record(error), sdk_reason)
+            self._diag().emit(
+                'SDK_SEND_UNCERTAIN_EXCEPTION',
+                contract_id=effect['contract_id'],
+                child_order_id=effect['child_order_id'],
+                effect_id=effect['id'],
+                native_offset=effect.get('native_offset'),
+                error_code=getattr(error, 'code', 'E_DSV_PORT_CALL'),
+                reason='INSERT_ORDER_EXCEPTION_UNKNOWN',
+                detail=type(error).__name__,
+            )
+            raise
         self._local_returns.add(effect['child_order_id'])
+        return None
+
+    def _sdk_send_refused_before_queue(self, error):
+        """Recognize synchronous SDK insert_order refusals proven before _send_pack."""
+        try:
+            from tqsdk.api import TqApi
+            from tqsdk.auth import TqAuth
+            from tqsdk.exceptions import TqRiskRuleError
+            from tqsdk.risk_manager import TqRiskManager
+        except ImportError:
+            return None
+        if getattr(self.api.insert_order, '__func__', None) is not TqApi.insert_order:
+            return None
+        loop = getattr(self.api, '_loop', None)
+        is_running = getattr(loop, 'is_running', None)
+        if callable(is_running) and is_running():
+            return None
+        pack_codes = {
+            TqApi._get_insert_order_future_pack.__code__,
+            TqApi._get_insert_order_stock_pack.__code__,
+        }
+        traceback = error.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code is TqApi.insert_order.__code__:
+                refusal = traceback.tb_next
+                if refusal is None:
+                    return ('E_DSV_SDK_SEND_VALIDATION', 'SDK_PRE_SEND_REFUSED')
+                code = refusal.tb_frame.f_code
+                if code is TqAuth._has_td_grants.__code__ and refusal.tb_next is None:
+                    return ('E_DSV_SDK_SEND_VALIDATION', 'SDK_PERMISSION_REFUSED')
+                if code is TqApi._ensure_symbol.__code__ and refusal.tb_next is None:
+                    return ('E_DSV_SDK_SEND_VALIDATION', 'SDK_SYMBOL_REFUSED')
+                if code in pack_codes:
+                    nested = refusal.tb_next
+                    if nested is None:
+                        return ('E_DSV_SDK_SEND_VALIDATION', 'SDK_PRE_SEND_REFUSED')
+                    if (type(error) is TqRiskRuleError
+                            and nested.tb_frame.f_code is TqRiskManager._could_insert_order.__code__
+                            and nested.tb_next is None):
+                        return ('E_DSV_SDK_SEND_RISK', 'SDK_RISK_RULE_REFUSED')
+                return None
+            traceback = traceback.tb_next
         return None
 
     def cancel(self, effect):

@@ -131,4 +131,10 @@ Broker Fact Frame
   - `execute_owner_tick()` 与 `ControlServer` 落实三档异常分类（瞬断保授权、事实/所有权/范围/时钟故障持久 `DISARMED + recovery_required`、存储/未知 Python 异常 `FAIL_STOP` 并关闭 peer）；
   - `MANUAL_CLOSE` / `MANUAL_CLOSE_ALL` 强制校验 `target_revision` 乐观并发控制；`WorkbenchSounds` 改为按不可变成交身份去重；合并平仓交易所由 `ExplicitOrderController` 显式启用 `historical_first_on_combined=True`；
   - 本机 `FullOffline` 静态清单回归（含 `OfflineTargetOwnerProcess` 子进程生命周期与命名管道控制测试）`1931/1931 PASS`；
+- 截至 2026-11-23（当前 `WORKTREE` 候选）：
+  - `DsvSdkAdapter.send()` 新增 `_sdk_send_refused_before_queue()`，仅对同步 `TqApi.insert_order` 在 `_send_pack` 之前抛出的 `TqRiskRuleError` 或 SDK 前置校验异常返回 `SendNotAttempted`（`DEFINITELY_NOT_SENT`），避免 `UNKNOWN` 虚假占量；
+  - `DsvSdkAdapter` + `DsvSession` + `ExplicitOrderController.confirm_absent()` 建立基于完整柜台快照水位（`broker_order_snapshot_complete=True` + `source_epoch` 推进后缺席证明 `absent_orders`）的 `UNKNOWN` 权威负向核对；
+  - `ExplicitOrderController._retry_broker_exit_failure()` 结合 `classify_broker_rejection()` 将平仓拒单区分为结构性（立即转人工接管）、瞬态（指数退避重试，上限 20 次）和未分类（保留 3 次门槛）；`_reduction_routes()` 不可用时显式投影 `REDUCTION_ROUTE_UNAVAILABLE`；
+  - 新增 `order_diagnostics.py` 与运行目录 `order-blocking-log.jsonl`，记录去重后的未下单/拦截/解除事件；
+  - 新增 4 项 `TargetOwnerExecutionReliabilityTests` 并同步注册 `qa/test_manifest.json`（133 模块 1935 用例清单有效），完整源码离线回归 `python -X utf8 -m unittest discover -s tests -v`（`PYTHONPATH=src`）`1935/1935 PASS`（0 FAIL / 0 ERROR / 0 SKIP）；
 - 真实柜台、多物理机同账号、自然订单和最终制品仍未验证；发行隔离和旧 Kernel 生产依赖闭包退役尚未完成。

@@ -22,6 +22,12 @@ import traceback
 
 from test_registry import MANIFEST, ROOT, TEST_ROOT, RegistryError, discover_case_data, load_manifest, validate_manifest
 
+SCRIPTS_ROOT = ROOT / "scripts"
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
+
+from candidate_identity import CANDIDATE_TREE_ALGORITHM, compute_candidate_identity
+
 
 PROFILES = ("Quick", "Affected", "Trading", "Runtime", "FullOffline")
 NON_PASS = {"FAIL", "ERROR", "SKIP", "BLOCKED", "NOT_RUN"}
@@ -35,22 +41,10 @@ def _git(*args: str) -> bytes:
 
 def _candidate_identity() -> tuple[str, str]:
     try:
-        commit = _git("rev-parse", "HEAD").decode("ascii").strip()
-        paths = set(_git("ls-files", "-z").decode("utf-8", "surrogateescape").split("\0"))
-        paths.update(_git("ls-files", "--others", "--exclude-standard", "-z").decode("utf-8", "surrogateescape").split("\0"))
-    except (OSError, subprocess.CalledProcessError) as error:
+        identity = compute_candidate_identity(ROOT, include_entries=False)
+    except (OSError, subprocess.CalledProcessError, ValueError) as error:
         raise RegistryError(f"Cannot identify the candidate tree: {error}") from None
-    digest = hashlib.sha256()
-    for relative in sorted(path for path in paths if path):
-        path = ROOT / relative
-        if not path.is_file():
-            continue
-        payload = path.read_bytes()
-        digest.update(relative.replace("\\", "/").encode("utf-8", "surrogateescape"))
-        digest.update(b"\0")
-        digest.update(len(payload).to_bytes(8, "big"))
-        digest.update(hashlib.sha256(payload).digest())
-    return commit, digest.hexdigest()
+    return str(identity["head"]), str(identity["tree_sha256"])
 
 
 def _changed_paths(base_ref: str | None) -> list[str]:
@@ -229,6 +223,7 @@ def _test_asset_hashes(records: list[dict[str, object]]) -> dict[str, str]:
         "qa/test_runner.py": ROOT / "qa" / "test_runner.py",
         "qa/test_registry.py": ROOT / "qa" / "test_registry.py",
         "qa/test_manifest.json": MANIFEST,
+        "scripts/candidate_identity.py": SCRIPTS_ROOT / "candidate_identity.py",
     }
     for module in sorted({str(row["module"]) for row in records}):
         path = TEST_ROOT.joinpath(*module.split(".")).with_suffix(".py")
@@ -296,6 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     environment = _environment()
     environment.update({"candidate_commit": candidate_commit,
                         "candidate_tree_sha256": candidate_tree_sha256,
+                        "candidate_identity_algorithm": CANDIDATE_TREE_ALGORITHM,
                         "entry_point": "qa/test_runner.py"})
     (output / "environment.json").write_text(json.dumps(environment, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -343,6 +339,7 @@ def main(argv: list[str] | None = None) -> int:
         "run_id": run_id,
         "candidate_commit": candidate_commit,
         "candidate_tree_sha256": candidate_tree_sha256,
+        "candidate_identity_algorithm": CANDIDATE_TREE_ALGORITHM,
         "final_candidate_commit": final_commit,
         "final_candidate_tree_sha256": final_tree_sha256,
         "candidate_changed_during_run": candidate_changed,
@@ -366,6 +363,7 @@ def main(argv: list[str] | None = None) -> int:
     (output / "evidence-hashes.json").write_text(json.dumps({
         "candidate_commit": candidate_commit,
         "candidate_tree_sha256": candidate_tree_sha256,
+        "candidate_identity_algorithm": CANDIDATE_TREE_ALGORITHM,
         "final_candidate_commit": final_commit,
         "final_candidate_tree_sha256": final_tree_sha256,
         "manifest_sha256": _sha256(MANIFEST),
@@ -376,6 +374,7 @@ def main(argv: list[str] | None = None) -> int:
         "profile": args.profile,
         "candidate_commit": candidate_commit,
         "candidate_tree_sha256": candidate_tree_sha256,
+        "candidate_identity_algorithm": CANDIDATE_TREE_ALGORITHM,
         "counts": report["counts"],
         "selected_cases": len(records),
     }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

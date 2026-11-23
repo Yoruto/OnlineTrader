@@ -17,6 +17,7 @@ from online_trader.dsv_core.month_stop import observe_month_stop
 from online_trader.dsv_core.transition import continuation_entry, ordinary_entry, price_value, protect
 from online_trader.dsv_core.price_rules import scheduled_close_mode
 from online_trader.dsv_runtime.controller import ExplicitOrderController, terminal, tighten_target
+from online_trader.dsv_runtime.order_diagnostics import OrderDiagnosticTracker
 from online_trader.dsv_runtime.owner_binding import StandaloneOwnerBinding
 from online_trader.dsv_storage.journal import Journal
 from online_trader.dsv_storage.workbench_evidence import WorkbenchEvidence
@@ -129,6 +130,10 @@ class DsvSession:
                 if position is not None and 'fills' not in position:
                     position.update(open_day=trading_day, legacy_owned=position['owned'], fills=[])
             self._controller = ExplicitOrderController(self._scope, self._journal, port)
+            self._diagnostics = OrderDiagnosticTracker(
+                account_key=account_key,
+                boot_id=_owner_binding.boot_id if isinstance(_owner_binding, StandaloneOwnerBinding) else None,
+            )
         except BaseException:
             if hasattr(self, '_journal'):
                 self._journal.close()
@@ -478,6 +483,18 @@ class DsvSession:
         if 'sync_orders' in frame and (type(frame['sync_orders']) is not list or
                                        len(set(frame['sync_orders'])) != len(frame['sync_orders'])):
             raise TraderError('E_DSV_ROUND', 'Expected an ordered unique list of synchronized child IDs')
+        if ('broker_order_snapshot_complete' in frame
+                and type(frame['broker_order_snapshot_complete']) is not bool):
+            raise TraderError('E_DSV_ROUND', 'Broker snapshot completeness must be explicit')
+        if 'absent_orders' in frame:
+            absent = frame['absent_orders']
+            if type(absent) is not list or len(set(absent)) != len(absent):
+                raise TraderError('E_DSV_ROUND', 'Expected an ordered unique list of negative-reconciled child IDs')
+            for child_id in absent:
+                identifier(child_id)
+            if absent and not (frame.get('synchronized') is True
+                               and frame.get('broker_order_snapshot_complete') is True):
+                raise TraderError('E_DSV_ROUND', 'Negative reconciliation requires a complete broker order snapshot')
         mono = frame['monotonic_ms']
         if type(mono) not in (str, int) or not str(mono).isascii() or not str(mono).isdecimal() or len(str(mono)) > 19:
             raise TraderError('E_DSV_ROUND', 'A round needs explicit nonnegative monotonic milliseconds')
@@ -588,6 +605,12 @@ class DsvSession:
         needs_sync = not state['synchronized']
         pending = {child for child, order in state['orders'].items() if not terminal(order)} if needs_sync else set()
         self._controller.accept_native(state, frame['native'])
+        if frame.get('absent_orders'):
+            native_seen = {fact['child_order_id'] for fact in frame['native']}
+            for child_id in frame['absent_orders']:
+                if child_id in native_seen:
+                    raise TraderError('E_DSV_NATIVE_FACT', 'Negative reconciliation contradicts native facts in this round')
+                self._controller.confirm_absent(state, child_id, frame=frame)
         if frame.get('synchronized') is False:
             self._mark_unsynchronized(state)
         if needs_sync and frame.get('synchronized') is True:
@@ -630,6 +653,9 @@ class DsvSession:
                 row['calendar_reason'] = market.get('calendar_reason')
                 row['market_session_active'] = market.get('market_session_active')
             if not state['synchronized']:
+                self._diag().observe_block(
+                    ('session_gate', contract), active=True, contract_id=contract,
+                    reason='AWAITING_NATIVE_SYNC', detail='NOT_SYNCHRONIZED')
                 decisions.append({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:0",
                                   'reason': 'AWAITING_NATIVE_SYNC', 'rule_ids': ['I01', 'I02']})
                 continue
@@ -667,6 +693,7 @@ class DsvSession:
                 observed['quote_age_seconds'] = quote_age
             values = self._evaluate_symbol(state, row, observed, symbol_frame, spec, timing=timing)
             self._update_stops(row, contract, day, spec, frame.get('trading_days', []))
+            self._record_evaluation_diagnostics(row, observed, values, timing=timing)
             if timing:
                 self._plan_timed_symbol(state, row, observed, timing, values, effects)
             decisions.extend({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:{i}",
@@ -674,6 +701,7 @@ class DsvSession:
             if timing:
                 continue
             if self._in_session(symbol_frame, observed):
+                self._diag().observe_block(('exit_session_gate', contract), active=False, contract_id=contract)
                 now = _utc(observed.get('wall_reads', {}).get('pending', symbol_frame['wall_time'])).timestamp()
                 if tick is None:
                     self._controller.settle(state, row)
@@ -681,8 +709,21 @@ class DsvSession:
                     gap = row['position'] and row['position'].get('gap_exit')
                     if gap and not self._fresh_after_gap(observed, gap):
                         observed = observed | {'allow_new_order': False}
+                        self._diag().observe_block(
+                            ('gap_gate', contract), active=True, contract_id=contract,
+                            position_id=row['position']['id'], reason='GAP_WAIT_FRESH_TICK',
+                            detail='STALE_AFTER_GAP')
+                    else:
+                        self._diag().observe_block(('gap_gate', contract), active=False, contract_id=contract)
                     effects.extend(self._controller.plan(state, row, observed, now))
             else:
+                if row['position'] is not None and row['position']['owned']:
+                    self._diag().observe_block(
+                        ('exit_session_gate', contract), active=True, contract_id=contract,
+                        position_id=row['position']['id'], reason='OUTSIDE_SESSION',
+                        detail='POSITION_WAITING_FOR_MARKET')
+                else:
+                    self._diag().observe_block(('exit_session_gate', contract), active=False, contract_id=contract)
                 if self._sdk_port is not None:
                     position = row['position']
                     if position is not None and position['entry_stopped'] and not position.get('preserve_open_on_stop'):
@@ -750,6 +791,14 @@ class DsvSession:
             elif market['tick'] is None or not market.get('allow_protective_exit', market.get('allow_new_order')):
                 reason = 'EXIT_WAITING_FOR_PRICE'
         row['exit_wait_reason'] = reason
+        self._diag().observe_block(
+            ('timed_exit_gate', market['contract_id']),
+            active=bool(reason),
+            contract_id=market['contract_id'],
+            position_id=None if position is None else position.get('id'),
+            effect='REDUCE' if reason else None,
+            reason=reason,
+        )
         if reason:
             values.append({'reason': reason, 'rule_ids': ['D06', 'I02']})
         unresolved = [timer['kind'] for responsibility in (row, row['position']) if responsibility
@@ -867,12 +916,66 @@ class DsvSession:
             night['high'] = decimal_text(max(Decimal(high), Decimal(night['high'])))
             night['low'] = decimal_text(min(Decimal(low), Decimal(night['low'])))
 
+    def _diag(self):
+        tracker = getattr(self, '_diagnostics', None)
+        if tracker is None:
+            scope = getattr(self, '_scope', {}) or {}
+            tracker = OrderDiagnosticTracker(
+                account_key=scope.get('account_key'),
+                boot_id=scope.get('runtime_boot_id'),
+            )
+            self._diagnostics = tracker
+        return tracker
+
+    def _record_evaluation_diagnostics(self, row, market, values, *, timing=None):
+        contract = market['contract_id']
+        position = row.get('position')
+        position_id = None if position is None else position.get('id')
+        blocking_reasons = {
+            'LATE_FILL_OWNERSHIP_REVIEW', 'UNRESOLVED_PRIOR_CHILD', 'USER_STOPPED',
+            'OUTSIDE_SESSION', 'QUOTE_UNAVAILABLE', 'QUOTE_AGE',
+            'E_FOREIGN_ACTIVE_ORDER', 'EXTERNAL_POSITION_PRESENT', 'UNOWNED_POSITION',
+            'MINUTE_BAR_UNAVAILABLE', 'POSITION_WAITING_FOR_MARKET', 'DATA_GAP_EXIT_PENDING',
+            'DATA_GAP_EXIT', 'GEOMETRY_BLOCK',
+        }
+        chosen = None
+        for value in values:
+            reason = value.get('reason')
+            if not reason:
+                continue
+            if reason in blocking_reasons or reason.startswith('SCOPE_'):
+                chosen = value
+                break
+        if chosen is not None:
+            detail = None
+            if chosen['reason'] == 'QUOTE_AGE':
+                obs = market.get('quote_observation') or {}
+                detail = f"age_quality={obs.get('age_quality')},obs_reason={obs.get('reason')}"
+            elif chosen['reason'] == 'QUOTE_UNAVAILABLE':
+                obs = market.get('quote_observation') or {}
+                detail = market.get('calendar_reason') or obs.get('reason') or 'NO_TICK'
+            self._diag().observe_block(
+                ('session_gate', contract), active=True, contract_id=contract,
+                position_id=position_id, reason=chosen['reason'], detail=detail)
+        else:
+            self._diag().observe_block(
+                ('session_gate', contract), active=False, contract_id=contract,
+                position_id=position_id)
+
     def _synchronize(self, state, frame, pending):
         seen = {fact['child_order_id'] for fact in frame['native'] if fact['kind'] == 'ORDER'}
         claimed = set(frame.get('sync_orders', []))
         if not claimed <= seen:
             raise TraderError('E_DSV_SYNC', 'Synchronization lists an order without an original snapshot in this round')
-        if any(child not in claimed and not terminal(state['orders'][child]) for child in pending):
+        missing = sorted(child for child in pending if child not in claimed and not terminal(state['orders'][child]))
+        if missing:
+            unknown_missing = [child for child in missing if state['orders'][child]['send_state'] == 'UNKNOWN']
+            self._diag().observe_block(
+                ('synchronize', 'ACCOUNT'),
+                active=True,
+                reason='SYNCHRONIZE_PENDING_CHILDREN_MISSING',
+                detail=f'missing={",".join(missing)};unknown={",".join(unknown_missing)}',
+            )
             return
         for market in frame['market']:
             row = state['symbols'][market['contract_id']]
@@ -887,7 +990,18 @@ class DsvSession:
                     row.pop('ownership_conflict', None)
                 continue
             if position is not None and not self._controller.proves_position(state, position, market):
+                self._diag().observe_block(
+                    ('synchronize', market['contract_id']),
+                    active=True,
+                    contract_id=market['contract_id'],
+                    position_id=position['id'],
+                    reason='SYNCHRONIZE_POSITION_MISMATCH',
+                    detail=self._controller._position_proof_reason(state, position, market),
+                )
                 return
+            self._diag().observe_block(('synchronize', market['contract_id']), active=False,
+                                       contract_id=market['contract_id'])
+        self._diag().observe_block(('synchronize', 'ACCOUNT'), active=False)
         state['synchronized'] = True
 
     @staticmethod

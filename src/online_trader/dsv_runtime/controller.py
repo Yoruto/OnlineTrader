@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from decimal import Decimal, localcontext
+import logging
 import sqlite3
 import time
 from uuid import uuid4
@@ -11,6 +12,7 @@ from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text, quantity
 from online_trader.dsv_core.price_rules import strategy_price
 from online_trader.dsv_core.transition import entry_price, price_value
+from online_trader.dsv_runtime.order_diagnostics import OrderDiagnosticTracker
 from online_trader.dsv_runtime.target_execution import account_target
 from online_trader.errors import TraderError, exception_record
 from online_trader.execution.close_routes import close_routes, replay_lots
@@ -122,6 +124,56 @@ class ExplicitOrderController:
         self.scope = scope
         self.journal = journal
         self.port = port
+        self._diagnostics = OrderDiagnosticTracker(account_key=scope.get('account_key'))
+
+    def _diag(self):
+        tracker = getattr(self, '_diagnostics', None)
+        if tracker is None:
+            scope = getattr(self, 'scope', {}) or {}
+            tracker = OrderDiagnosticTracker(account_key=scope.get('account_key'))
+            self._diagnostics = tracker
+        return tracker
+
+    def confirm_absent(self, state, child_id, *, frame):
+        """Release an UNKNOWN child after a complete broker snapshot proves absence."""
+        order = state['orders'].get(child_id)
+        if order is None:
+            raise TraderError('E_DSV_NATIVE_ID', 'Negative reconciliation references an unknown child')
+        if (order['send_state'] != 'UNKNOWN' or order.get('native_id') is not None
+                or order['filled_qty'] or order['terminal_confirmed']):
+            raise TraderError('E_DSV_NATIVE_FACT', 'Negative reconciliation contradicts an active or bound child')
+        order['send_state'] = 'DEFINITELY_NOT_SENT'
+        order['local_send_rejection'] = {
+            'effect_id': child_id + '-send',
+            'stage': 'BROKER_NEGATIVE_RECONCILIATION',
+            'error_code': 'E_DSV_BROKER_ORDER_ABSENT',
+            'rejection_reason': 'BROKER_NEGATIVE_RECONCILED',
+            'frame_id': frame['id'],
+            'sequence': frame['sequence'],
+        }
+        if order['effect'] == 'OPEN':
+            row = state['symbols'].get(order['contract_id'])
+            position = None if row is None else row.get('position')
+            if position is not None and position['id'] == order['position_id']:
+                position.update(entry_stopped=True, preserve_open_on_stop=False,
+                                execution_reason='BROKER_NEGATIVE_RECONCILED')
+        self.journal.event('UNKNOWN_NEGATIVE_RECONCILED', {
+            'child_order_id': child_id,
+            'contract_id': order['contract_id'],
+            'effect': order['effect'],
+            'frame_id': frame['id'],
+            'sequence': frame['sequence'],
+        })
+        self._diag().emit(
+            'UNKNOWN_NEGATIVE_RECONCILED',
+            level=logging.INFO,
+            contract_id=order['contract_id'],
+            position_id=order['position_id'],
+            child_order_id=child_id,
+            effect=order['effect'],
+            reason='BROKER_NEGATIVE_RECONCILED',
+            sequence=frame['sequence'],
+        )
 
     def child_orders(self, state, position, effect=None):
         return [state['orders'][child] for child in position['children']
@@ -181,6 +233,10 @@ class ExplicitOrderController:
         if status != 'ALIVE' and filled < max(order['filled_qty'], order['reported_fill_qty'] or 0):
             raise TraderError('E_DSV_NATIVE_FACT', 'Terminal quantity contradicts accepted fills')
         order.update(broker_state=status, terminal_confirmed=status != 'ALIVE', reported_fill_qty=filled)
+        if fact.get('rejection_category') is not None:
+            order['broker_rejection_category'] = fact['rejection_category']
+        if fact.get('rejection_detail') is not None:
+            order['broker_rejection_detail'] = fact['rejection_detail']
         if order.get('terminal_conflict') and terminal(order):
             order.pop('terminal_conflict')
 
@@ -408,29 +464,45 @@ class ExplicitOrderController:
         return effect
 
     @staticmethod
-    def proves_position(state, position, market, *, for_effect=None):
+    def _position_proof_reason(state, position, market, *, for_effect=None):
         own = 'long_qty' if position['direction'] == 'LONG' else 'short_qty'
         other = 'short_qty' if own == 'long_qty' else 'long_qty'
         if market.get('standalone_external_model'):
             if for_effect == 'REDUCE':
                 if market[own] < position['owned']:
-                    return False
+                    return f'OWN_QTY_UNDERCOVERED({position["owned"]}>{market[own]})'
                 if not position['owned']:
-                    return True
-                return bool(ExplicitOrderController._reduction_routes(
-                    state, position, market, position['owned'], include_pending_orders=False))
-            if market[own] != position['owned'] or market[other] or market.get('external_active_orders'):
-                return False
+                    return None
+                routes, reason = ExplicitOrderController._reduction_routes_with_reason(
+                    state, position, market, position['owned'], include_pending_orders=False)
+                return None if routes else (reason or 'REDUCTION_ROUTES_EMPTY')
+            if market[own] != position['owned']:
+                return f'OWN_QTY_MISMATCH({position["owned"]}!={market[own]})'
+            if market[other]:
+                return f'OPPOSITE_SIDE_PRESENT({market[other]})'
+            if market.get('external_active_orders'):
+                return 'EXTERNAL_ACTIVE_ORDERS'
             if not position['owned']:
-                return True
-            return bool(ExplicitOrderController._reduction_routes(
-                state, position, market, position['owned'], include_pending_orders=False))
-        if market[own] != position['owned'] or market[other] or market.get('external_orders'):
-            return False
+                return None
+            routes, reason = ExplicitOrderController._reduction_routes_with_reason(
+                state, position, market, position['owned'], include_pending_orders=False)
+            return None if routes else (reason or 'REDUCTION_ROUTES_EMPTY')
+        if market[own] != position['owned']:
+            return f'OWN_QTY_MISMATCH({position["owned"]}!={market[own]})'
+        if market[other]:
+            return f'OPPOSITE_SIDE_PRESENT({market[other]})'
+        if market.get('external_orders'):
+            return 'EXTERNAL_ORDERS'
         if not position['owned']:
-            return True
-        return bool(ExplicitOrderController._reduction_routes(
-            state, position, market, position['owned'], include_pending_orders=False))
+            return None
+        routes, reason = ExplicitOrderController._reduction_routes_with_reason(
+            state, position, market, position['owned'], include_pending_orders=False)
+        return None if routes else (reason or 'REDUCTION_ROUTES_EMPTY')
+
+    @staticmethod
+    def proves_position(state, position, market, *, for_effect=None):
+        return ExplicitOrderController._position_proof_reason(
+            state, position, market, for_effect=for_effect) is None
 
     @staticmethod
     def _position_fills(position, contract):
@@ -453,14 +525,14 @@ class ExplicitOrderController:
         return {'today': today, 'historical': sum(lot['quantity'] for lot in lots) - today}
 
     @staticmethod
-    def _reduction_routes(state, position, market, needed, *, include_pending_orders=True):
+    def _reduction_routes_with_reason(state, position, market, needed, *, include_pending_orders=True):
         day = state['trading_day']
         side = position['direction'].lower()
         today = market.get(f'{side}_today')
         historical = market.get(f'{side}_historical')
         if today is None or historical is None:
             if position['open_day'] != day or any(fill['trading_day'] != day for fill in position['fills']):
-                return []
+                return [], 'MISSING_TODAY_HIS_BUCKETS'
             today, historical = position['owned'], 0
         fills = ExplicitOrderController._position_fills(position, market['contract_id'])
         pending_orders = []
@@ -483,9 +555,17 @@ class ExplicitOrderController:
                                   historical_first_on_combined=True)
         except TraderError as error:
             if error.code in {'E_OWNERSHIP', 'E_FACT_BARRIER'}:
-                return []
+                return [], error.code
             raise
-        return result['routes']
+        if not result['routes']:
+            return [], 'EMPTY_CLOSE_ROUTES'
+        return result['routes'], None
+
+    @staticmethod
+    def _reduction_routes(state, position, market, needed, *, include_pending_orders=True):
+        routes, _ = ExplicitOrderController._reduction_routes_with_reason(
+            state, position, market, needed, include_pending_orders=include_pending_orders)
+        return routes
 
     def plan_detached(self, state, row, market, wall_time):
         positions = [state['retired_positions'][identity] for identity in row.get('detached_positions', [])]
@@ -509,7 +589,8 @@ class ExplicitOrderController:
             if old and old[-1]['filled_qty'] < old[-1]['original_qty']:
                 last = old[-1]
                 newer_target = position.get('exit_revision', 0) > last.get('exit_revision', 0)
-                rejected_retry = self._retry_broker_exit_failure(position, last, market, newer_target)
+                rejected_retry = self._retry_broker_exit_failure(
+                    position, last, market, newer_target, wall_time=wall_time)
                 if not rejected_retry and not self._retry_unsent_exit(last, market, newer_target) and (
                         last['broker_state'] != 'CANCELLED' or not newer_target):
                     continue
@@ -559,7 +640,7 @@ class ExplicitOrderController:
             return False
         return cls._has_fresh_quote_for_order(order, market)
 
-    def _retry_broker_exit_failure(self, position, order, market, newer_target):
+    def _retry_broker_exit_failure(self, position, order, market, newer_target, *, wall_time=None):
         if order['effect'] != 'REDUCE' or not terminal(order):
             return False
         is_rejected = order['broker_state'] == 'REJECTED'
@@ -570,14 +651,59 @@ class ExplicitOrderController:
             position['consecutive_exit_rejections'] = 0
             position.pop('exit_manual_takeover', None)
             return True
+        category = order.get('broker_rejection_category') or (
+            'TRANSIENT' if is_exchange_cancel else 'UNCLASSIFIED')
+        detail = order.get('broker_rejection_detail') or (
+            'EXCHANGE_CANCELLED' if is_exchange_cancel else 'UNCLASSIFIED_BROKER_REJECT')
         if not order.get('exit_failure_counted'):
             order['exit_failure_counted'] = True
+            if wall_time is not None:
+                order['exit_failure_at'] = str(wall_time)
             position['consecutive_exit_rejections'] = position.get('consecutive_exit_rejections', 0) + 1
-        if position.get('consecutive_exit_rejections', 0) >= 3:
+            self._diag().emit(
+                'EXIT_FAILURE_CLASSIFIED',
+                contract_id=order['contract_id'],
+                position_id=position['id'],
+                child_order_id=order['child_order_id'],
+                effect='REDUCE',
+                broker_state=order['broker_state'],
+                category=category,
+                detail=detail,
+                attempt=position['consecutive_exit_rejections'],
+            )
+        count = position.get('consecutive_exit_rejections', 0)
+        if category == 'STRUCTURAL':
             position['exit_manual_takeover'] = True
             position['execution_reason'] = 'EXIT_MANUAL_TAKEOVER_REQUIRED'
             return False
-        return self._has_fresh_quote_for_order(order, market)
+        if category == 'TRANSIENT':
+            if count > 20:
+                position['exit_manual_takeover'] = True
+                position['execution_reason'] = 'EXIT_MANUAL_TAKEOVER_REQUIRED'
+                return False
+            schedule = (0, 1, 2, 4, 8, 15, 30)
+            delay = schedule[min(max(0, count - 1), len(schedule) - 1)]
+            failed_at = order.get('exit_failure_at')
+            if wall_time is not None and failed_at is not None and float(wall_time) - float(failed_at) < delay:
+                position['execution_reason'] = 'EXIT_TRANSIENT_RETRY_BACKOFF'
+                return False
+            fresh = self._has_fresh_quote_for_order(order, market)
+            if not fresh:
+                position['execution_reason'] = 'EXIT_WAIT_FRESH_QUOTE'
+            return fresh
+        if count >= 3:
+            position['exit_manual_takeover'] = True
+            position['execution_reason'] = 'EXIT_MANUAL_TAKEOVER_REQUIRED'
+            return False
+        delay = 0 if count <= 1 else 1
+        failed_at = order.get('exit_failure_at')
+        if wall_time is not None and failed_at is not None and float(wall_time) - float(failed_at) < delay:
+            position['execution_reason'] = 'EXIT_TRANSIENT_RETRY_BACKOFF'
+            return False
+        fresh = self._has_fresh_quote_for_order(order, market)
+        if not fresh:
+            position['execution_reason'] = 'EXIT_WAIT_FRESH_QUOTE'
+        return fresh
 
     @staticmethod
     def _desired(position, market, effect, wall_time):
@@ -672,13 +798,15 @@ class ExplicitOrderController:
                       else 'CANCEL_PENDING')
         elif opening.excess_pending_qty or reducing.excess_pending_qty:
             status, reason = 'CANCELLING', 'TARGET_REDUCED'
+        elif (opening.needed_qty or reducing.needed_qty) and position.get('execution_reason') in {
+                'POSITION_CHANGED', 'NO_LEGAL_PRICE', 'EXIT_MANUAL_TAKEOVER_REQUIRED',
+                'E_ENTRY_PRICE_CAP', 'REDUCTION_ROUTE_UNAVAILABLE'}:
+            status, reason = 'BLOCKED', position['execution_reason']
         elif opening.pending_qty or reducing.pending_qty:
             status, reason = 'WORKING', 'WORKING_ORDER_COVERS_TARGET'
         elif opening.needed_qty or reducing.needed_qty:
             reason = position.get('execution_reason') or 'TARGET_GAP'
-            status = ('BLOCKED' if reason in {
-                'POSITION_CHANGED', 'NO_LEGAL_PRICE', 'EXIT_MANUAL_TAKEOVER_REQUIRED', 'E_ENTRY_PRICE_CAP'
-            } else 'READY')
+            status = 'READY'
         else:
             status, reason = 'DONE', 'TARGET_ALREADY_COVERED'
         target_owned = position['exit_target']
@@ -757,11 +885,26 @@ class ExplicitOrderController:
         effects = []
         for effect in ('OPEN', 'REDUCE'):
             opening = effect == 'OPEN'
+            contract_id = market['contract_id']
+            diag = self._diag()
+            block_key = ('controller', contract_id, effect)
             if opening and not market.get('allow_new_entry', market.get('allow_new_order', True)):
+                accounting = self.target_accounting(state, position, effect)
+                diag.observe_block(
+                    block_key, active=accounting.needed_qty > 0, contract_id=contract_id,
+                    position_id=position['id'], effect=effect, reason='ENTRY_NOT_ALLOWED',
+                    detail='ALLOW_NEW_ENTRY_FALSE', needed_qty=accounting.needed_qty)
                 continue
             if not opening and not market.get('allow_protective_exit', market.get('allow_new_order', True)):
+                accounting = self.target_accounting(state, position, effect)
+                diag.observe_block(
+                    block_key, active=accounting.needed_qty > 0, contract_id=contract_id,
+                    position_id=position['id'], effect=effect, reason='PROTECTIVE_EXIT_NOT_ALLOWED',
+                    detail='ALLOW_PROTECTIVE_EXIT_FALSE', needed_qty=accounting.needed_qty)
                 continue
             proven_position = self.proves_position(state, position, market, for_effect=effect)
+            proof_reason = (None if proven_position else
+                            self._position_proof_reason(state, position, market, for_effect=effect))
             previous = self.child_orders(state, position, effect)
             outstanding = [order for order in previous if not terminal(order)]
             accounting = self.target_accounting(state, position, effect)
@@ -786,16 +929,45 @@ class ExplicitOrderController:
                         position['execution_reason'] = 'PRICE_REPRICE_REQUIRED'
             if not proven_position:
                 position['execution_reason'] = 'POSITION_CHANGED'
+                diag.observe_block(
+                    block_key, active=needed > 0, contract_id=contract_id,
+                    position_id=position['id'], effect=effect, reason='POSITION_CHANGED',
+                    detail=proof_reason, needed_qty=needed)
             elif desired is None:
                 position['execution_reason'] = 'NO_LEGAL_PRICE'
+                diag.observe_block(
+                    block_key, active=needed > 0, contract_id=contract_id,
+                    position_id=position['id'], effect=effect, reason='NO_LEGAL_PRICE',
+                    detail='TICK_OR_LIMIT_INVALID', needed_qty=needed)
             if (not proven_position or desired is None or accounting.cancel_pending_children
                     or accounting.uncertain_children or repricing):
+                if proven_position and desired is not None and needed > 0:
+                    if accounting.uncertain_children:
+                        diag.observe_block(
+                            block_key, active=True, contract_id=contract_id,
+                            position_id=position['id'], effect=effect, reason='SEND_RESULT_UNKNOWN',
+                            detail=','.join(accounting.uncertain_children), needed_qty=needed)
+                    elif accounting.cancel_pending_children or repricing:
+                        diag.observe_block(
+                            block_key, active=True, contract_id=contract_id,
+                            position_id=position['id'], effect=effect,
+                            reason='PRICE_REPRICE_REQUIRED' if repricing else 'CANCEL_PENDING',
+                            detail=','.join(accounting.cancel_pending_children) or None,
+                            needed_qty=needed)
                 continue
             if needed <= 0:
+                diag.observe_block(block_key, active=False, contract_id=contract_id,
+                                   position_id=position['id'], effect=effect)
                 continue
             maximum = market.get('max_order_qty', 2_147_483_647)
-            if opening and not market.get('min_order_qty', 1) <= needed <= maximum:
+            minimum = market.get('min_order_qty', 1)
+            if opening and not minimum <= needed <= maximum:
                 position['entry_stopped'] = True
+                position['execution_reason'] = 'QUANTITY_OUT_OF_RANGE'
+                diag.observe_block(
+                    block_key, active=True, contract_id=contract_id,
+                    position_id=position['id'], effect=effect, reason='QUANTITY_OUT_OF_RANGE',
+                    detail=f'needed={needed},min={minimum},max={maximum}', needed_qty=needed)
                 continue
             # Reconciliation proves completion independently of the result of the cancel call.
             if previous and not outstanding and previous[-1]['filled_qty'] < previous[-1]['original_qty']:
@@ -804,9 +976,22 @@ class ExplicitOrderController:
                 rolled_exit = not opening and old['native_trading_day'] != state['trading_day']
                 newer_target = not opening and position.get('exit_revision', 0) > old.get('exit_revision', 0)
                 local_retry = self._retry_unsent_open(old, market) if opening else self._retry_unsent_exit(old, market, newer_target)
-                rejected_retry = not opening and self._retry_broker_exit_failure(position, old, market, newer_target)
+                rejected_retry = not opening and self._retry_broker_exit_failure(
+                    position, old, market, newer_target, wall_time=wall_time)
                 if not rejected_retry and not local_retry and (old['broker_state'] != 'CANCELLED' or not (
                         allowed_retry or newer_target or rolled_exit and old['cancel_reason'] != 'USER_CANCEL')):
+                    block_reason = position.get('execution_reason') or (
+                        'OPEN_NOT_RETRYABLE' if opening else 'EXIT_RETRY_BLOCKED')
+                    local_reason = (old.get('local_send_rejection') or {}).get('rejection_reason')
+                    block_detail = (
+                        f"send_state={old['send_state']},broker_state={old['broker_state']},"
+                        f"cancel_reason={old['cancel_reason']},local_reason={local_reason},"
+                        f"broker_detail={old.get('broker_rejection_detail')}"
+                    )
+                    diag.observe_block(
+                        block_key, active=True, contract_id=contract_id,
+                        position_id=position['id'], child_order_id=old['child_order_id'],
+                        effect=effect, reason=block_reason, detail=block_detail, needed_qty=needed)
                     continue
                 if opening and local_retry and position.get('cap') is not None:
                     cap = Decimal(str(position['cap']))
@@ -815,31 +1000,77 @@ class ExplicitOrderController:
                     if exceeds:
                         position.update(entry_stopped=True, preserve_open_on_stop=False,
                                         execution_reason='E_ENTRY_PRICE_CAP')
+                        diag.observe_block(
+                            block_key, active=True, contract_id=contract_id,
+                            position_id=position['id'], child_order_id=old['child_order_id'],
+                            effect=effect, reason='E_ENTRY_PRICE_CAP',
+                            detail=f'proposed={desired},cap={position["cap"]}', needed_qty=needed)
                         continue
             if opening:
+                diag.observe_block(block_key, active=False, contract_id=contract_id,
+                                   position_id=position['id'], effect=effect)
                 effects.append(self.new_order(state, position, market, effect, needed, desired, 'OPEN'))
             else:
                 routes = self._reduction_routes(state, position, market, needed)
                 if routes:
+                    diag.observe_block(block_key, active=False, contract_id=contract_id,
+                                       position_id=position['id'], effect=effect)
                     route = routes[0]
                     previous_offsets = {order['native_offset'] for order in previous}
                     if previous_offsets and route['native_offset'] not in previous_offsets:
                         position['execution_reason'] = 'OFFSET_ROUTE_CHANGED'
                     effects.append(self.new_order(state, position, market, effect,
                                                   min(route['quantity'], maximum), desired, route['native_offset']))
+                else:
+                    _, route_reason = self._reduction_routes_with_reason(state, position, market, needed)
+                    position['execution_reason'] = 'REDUCTION_ROUTE_UNAVAILABLE'
+                    diag.observe_block(
+                        block_key, active=True, contract_id=contract_id,
+                        position_id=position['id'], effect=effect,
+                        reason='REDUCTION_ROUTE_UNAVAILABLE', detail=route_reason or 'EMPTY_CLOSE_ROUTES',
+                        needed_qty=needed)
         return effects
 
     def plan(self, state, row, market, wall_time):
         if row.get('position') is not None:
             row['position'].pop('execution_reason', None)
         maintenance, can_price = self.plan_maintenance(state, row, market)
-        if (can_price and market.get('tick') is None
-                and any(self.target_accounting(state, row['position'], effect).needed_qty
-                        for effect in ('OPEN', 'REDUCE'))):
-            row['position']['execution_reason'] = 'NO_LEGAL_PRICE'
+        contract_id = market['contract_id']
+        diag = self._diag()
+        pos = row.get('position')
         allow_any = (market.get('allow_new_order', True)
                      or market.get('allow_new_entry', False)
                      or market.get('allow_protective_exit', False))
+        if pos is not None:
+            pending_needed = {
+                eff: self.target_accounting(state, pos, eff).needed_qty
+                for eff in ('OPEN', 'REDUCE')
+            }
+            if can_price and market.get('tick') is None and any(pending_needed.values()):
+                pos['execution_reason'] = 'NO_LEGAL_PRICE'
+                diag.observe_block(
+                    ('plan_gate', contract_id), active=True, contract_id=contract_id,
+                    position_id=pos['id'], reason='NO_LEGAL_PRICE', detail='TICK_MISSING',
+                    open_needed=pending_needed['OPEN'], reduce_needed=pending_needed['REDUCE'])
+            elif not can_price and any(pending_needed.values()):
+                diag.observe_block(
+                    ('plan_gate', contract_id), active=True, contract_id=contract_id,
+                    position_id=pos['id'], reason='MAINTENANCE_GATE_BLOCKED',
+                    detail='PRIOR_OR_CONFLICT_OR_DAY_ROLLOVER',
+                    open_needed=pending_needed['OPEN'], reduce_needed=pending_needed['REDUCE'])
+            elif can_price and not allow_any and any(pending_needed.values()):
+                diag.observe_block(
+                    ('plan_gate', contract_id), active=True, contract_id=contract_id,
+                    position_id=pos['id'], reason='ORDER_POLICY_DISALLOWED',
+                    detail='ALLOW_NEW_ORDER_FALSE',
+                    open_needed=pending_needed['OPEN'], reduce_needed=pending_needed['REDUCE'])
+            else:
+                diag.observe_block(('plan_gate', contract_id), active=False,
+                                   contract_id=contract_id, position_id=pos['id'])
+        else:
+            diag.observe_block(('plan_gate', contract_id), active=False, contract_id=contract_id)
+            for eff in ('OPEN', 'REDUCE'):
+                diag.observe_block(('controller', contract_id, eff), active=False, contract_id=contract_id)
         if can_price and market.get('tick') is not None and allow_any:
             maintenance.extend(self.plan_priced_effects(state, row, market, wall_time))
         if can_price and not row.get('detached_positions'):
@@ -913,9 +1144,33 @@ class ExplicitOrderController:
                     retryable_open_race = (
                         order['effect'] == 'OPEN'
                         and details.get('rejection_reason') in {'QUOTE_REVISION_CHANGED', 'NATIVE_QUOTE_NOT_CURRENT'})
+                    stopped_open = False
                     if (position is not None and position['id'] == order['position_id']
                             and order['effect'] == 'OPEN' and not retryable_open_race):
                         position.update(entry_stopped=True, preserve_open_on_stop=False)
+                        stopped_open = True
+                    self._diag().emit(
+                        'EFFECT_DISPATCH_DEFINITELY_NOT_SENT',
+                        contract_id=order['contract_id'],
+                        position_id=order['position_id'],
+                        child_order_id=order['child_order_id'],
+                        effect=order['effect'],
+                        stage=details.get('stage'),
+                        error_code=details.get('error_code'),
+                        reason=details.get('rejection_reason') or details.get('error_code'),
+                        entry_stopped=stopped_open,
+                    )
+                elif result == 'UNKNOWN':
+                    self._diag().emit(
+                        'EFFECT_DISPATCH_UNKNOWN',
+                        contract_id=order['contract_id'],
+                        position_id=order['position_id'],
+                        child_order_id=order['child_order_id'],
+                        effect=order['effect'],
+                        stage=details.get('stage'),
+                        error_code=details.get('error_code'),
+                        reason='SEND_RESULT_UNKNOWN',
+                    )
             else:
                 if result == 'DEFINITELY_NOT_SENT':
                     order['cancel_status'] = None

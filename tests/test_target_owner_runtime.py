@@ -1,14 +1,23 @@
 """Public-entry acceptance for the isolated Standalone target owner."""
 
+from datetime import datetime, timezone
+import json
 from pathlib import Path
-from types import SimpleNamespace
+from threading import get_ident
+from types import MethodType, SimpleNamespace
 import copy
 import sys
 import tempfile
 import time
 import unittest
 
+from online_trader.contracts.codec import strict_loads
+from online_trader.dsv_runtime.controller import ExplicitOrderController, SendNotAttempted, terminal
+from online_trader.dsv_runtime.order_diagnostics import attach_order_blocking_log, classify_broker_rejection
+from online_trader.dsv_runtime.runner import DsvSession, initial_state
+from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
 from online_trader.dsv_runtime.standalone_projection import workbench_view
+from online_trader.dsv_storage.journal import Journal
 from online_trader.errors import TraderError
 from online_trader.runtime.account_cache import BrokerHistoryWriter
 from online_trader.runtime.target_owner_startup import (
@@ -611,6 +620,390 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
             self.assertIsNotNone(stopped)
             self.assertEqual(stopped['event_type'], 'OWNER_STOPPED')
             self.assertTrue(stopped['ledger_removed'])
+
+
+class TargetOwnerExecutionReliabilityTests(unittest.TestCase):
+    """Cross-platform tests for SDK pre-queue refusals, negative reconciliation, exit retry tiers, and diagnostics."""
+
+    def _make_controller(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        path = Path(temp.name) / 'facts.db'
+        scope = {'account_key': 'DEV:reliability', 'provider': 'OFFLINE',
+                 'trading_day': DAY, 'configuration_id': 'profile-1'}
+        state = initial_state(DAY, [CONTRACT])
+        journal = Journal(path, scope, state)
+        self.addCleanup(journal.close)
+        adapter = DsvSdkAdapter.__new__(DsvSdkAdapter)
+        adapter.owner = get_ident()
+        adapter.enabled = True
+        adapter.account_key = scope['account_key']
+        adapter.provider = 'OFFLINE'
+        adapter.account = object()
+        adapter.epoch = 'epoch-1'
+        adapter.connection = None
+        adapter.session = SimpleNamespace(_closed=False, _journal=journal)
+        adapter._seen_effects = set()
+        adapter._local_returns = set()
+        adapter._unknown_snapshots = {}
+        adapter.dispatch_market = {
+            CONTRACT: {
+                'ticks': [{'last': '100', 'bid1': '100', 'ask1': '100',
+                           'day_high': '120', 'day_low': '80', 'tick_size': '1',
+                           'lower_limit': '50', 'upper_limit': '200',
+                           'native_time': DAY + 'T01:10:00Z', 'candle_id': 'bar-1'}],
+                'external_orders': False,
+            },
+        }
+        adapter.clock = lambda: (datetime(2026, 11, 13, 1, 10, tzinfo=timezone.utc), 0)
+        adapter.grant = SimpleNamespace(
+            value={'contracts': [CONTRACT]},
+            permits_day=lambda day: day == DAY,
+            in_window=lambda now: True,
+        )
+        controller = ExplicitOrderController(scope, journal, adapter)
+        return Path(temp.name), state, journal, adapter, controller
+
+    @staticmethod
+    def _tick(ts_sec=0, price='100'):
+        return {
+            'last': price, 'bid1': price, 'ask1': price,
+            'day_high': '120', 'day_low': '80', 'tick_size': '1',
+            'lower_limit': '50', 'upper_limit': '200',
+            'native_time': f'{DAY}T01:10:{ts_sec:02d}Z',
+            'candle_id': 'bar-1',
+        }
+
+    @staticmethod
+    def _position(owned=5, exit_target=0):
+        return {
+            'id': 'position-1', 'contract_id': CONTRACT, 'direction': 'LONG',
+            'quantity': 5, 'owned': owned, 'entry_filled': 5, 'entry_notional': '500',
+            'children': [], 'entry_stopped': True, 'exit_target': exit_target,
+            'exit_revision': 1, 'mode': 'ACTIVE', 'cap': '100', 'context_at': '0',
+            'theory': '100', 'open_day': DAY,
+            'fills': [{'event_seq': 1, 'contract_id': CONTRACT, 'child_order_id': 'open-1',
+                       'direction': 'LONG', 'trade_key': [DAY, 'native-open', 'trade-open'],
+                       'trading_day': DAY, 'quantity': 5, 'price': '100',
+                       'effect': 'OPEN', 'offset_kind': 'OPEN'}],
+        }
+
+    def test_sdk_pre_queue_risk_refusal_returns_definitely_not_sent_without_unknown_occupation(self):
+        from tqsdk.api import TqApi
+        from tqsdk.exceptions import TqRiskRuleError
+        from tqsdk.risk_manager import TqRiskManager
+
+        _tmp, state, journal, adapter, controller = self._make_controller()
+
+        class DenyOpenCloseRule:
+            def _could_insert_order(self, _pack):
+                return False, '自成交/撤单次数风控拦截'
+
+            def _on_insert_order(self, _pack):
+                pass
+
+        risk_manager = TqRiskManager()
+        risk_manager.append(DenyOpenCloseRule())
+        sent_packs = []
+
+        api = SimpleNamespace(
+            _loop=SimpleNamespace(is_running=lambda: False),
+            _account=SimpleNamespace(
+                _check_valid=lambda acct: acct,
+                _is_stock_type=lambda _acct: False,
+                _get_account_key=lambda _acct: 'acc-key',
+                _get_account_id=lambda _acct: 'acc-id',
+            ),
+            _data={'quotes': {CONTRACT: SimpleNamespace(ins_class='FUTURE')}},
+            _auth=SimpleNamespace(_has_td_grants=lambda _symbol: True),
+            _ensure_symbol=lambda _symbol: True,
+            _ensure_shfe_ine_combination_supported=lambda *_args: None,
+            _risk_manager=risk_manager,
+            _send_pack=lambda pack: sent_packs.append(pack),
+            get_order=lambda *_args, **_kwargs: {},
+        )
+        api._get_insert_order_future_pack = MethodType(TqApi._get_insert_order_future_pack, api)
+        api.insert_order = MethodType(TqApi.insert_order, api)
+        adapter.api = api
+
+        # 1. REDUCE order refused by TqRiskRuleError before _send_pack -> DEFINITELY_NOT_SENT, target stays free.
+        row = state['symbols'][CONTRACT]
+        pos = self._position(owned=5, exit_target=0)
+        row['position'] = pos
+        with journal.transaction():
+            effect = controller.new_order(
+                state, pos, {'contract_id': CONTRACT, 'tick': self._tick(0)}, 'REDUCE', 5, '100', 'CLOSE')
+            journal.save(state)
+        controller.dispatch(state, [effect])
+        self.assertEqual(sent_packs, [])
+        order = state['orders'][effect['child_order_id']]
+        self.assertEqual(order['send_state'], 'DEFINITELY_NOT_SENT')
+        self.assertTrue(terminal(order))
+        self.assertEqual(order['local_send_rejection']['error_code'], 'E_DSV_SDK_SEND_RISK')
+        self.assertEqual(order['local_send_rejection']['rejection_reason'], 'SDK_RISK_RULE_REFUSED')
+        accounting = controller.target_accounting(state, pos, 'REDUCE')
+        self.assertEqual(accounting.needed_qty, 5)
+        self.assertEqual(accounting.uncertain_children, ())
+
+        # Fresh quote retries cleanly once risk rule clears.
+        risk_manager.clear()
+        market = {'contract_id': CONTRACT, 'tick': self._tick(1),
+                  'long_qty': 5, 'short_qty': 0, 'long_today': 5, 'long_historical': 0,
+                  'short_today': 0, 'short_historical': 0, 'external_orders': False}
+        with journal.transaction():
+            next_effects = controller.plan(state, row, market, 100.0)
+            journal.save(state)
+        self.assertEqual(len(next_effects), 1)
+        controller.dispatch(state, next_effects)
+        self.assertEqual(len(sent_packs), 1)
+        self.assertEqual(state['orders'][next_effects[0]['child_order_id']]['send_state'], 'CALL_RETURNED')
+
+        # 2. Exception from _send_pack itself is NOT pre-queue -> stays UNKNOWN (no false positive).
+        def fail_send_pack(_pack):
+            raise TqRiskRuleError('unexpected after pack built')
+
+        api._send_pack = fail_send_pack
+        with journal.transaction():
+            uncertain_effect = controller.new_order(
+                state, pos, {'contract_id': CONTRACT, 'tick': self._tick(2)}, 'REDUCE', 5, '100', 'CLOSE')
+            journal.save(state)
+        controller.dispatch(state, [uncertain_effect])
+        self.assertEqual(state['orders'][uncertain_effect['child_order_id']]['send_state'], 'UNKNOWN')
+        self.assertFalse(terminal(state['orders'][uncertain_effect['child_order_id']]))
+
+    def test_unknown_negative_reconciliation_releases_reduce_target_and_unblocks_sync_after_complete_snapshot(self):
+        _tmp, state, journal, adapter, controller = self._make_controller()
+        row = state['symbols'][CONTRACT]
+        pos = self._position(owned=5, exit_target=0)
+        row['position'] = pos
+        adapter.connection = SimpleNamespace(
+            broker_connected=True,
+            source_epoch=1,
+            complete=lambda: True,
+        )
+        adapter.api = SimpleNamespace(
+            insert_order=SimpleNamespace(),
+            get_order=lambda **_kw: {},
+            get_trade=lambda **_kw: {},
+        )
+
+        def raise_oserror(**_kw):
+            raise OSError('network glitch during insert_order')
+
+        adapter.api.insert_order = raise_oserror
+        with journal.transaction():
+            effect = controller.new_order(
+                state, pos, {'contract_id': CONTRACT, 'tick': self._tick(0)}, 'REDUCE', 5, '100', 'CLOSE')
+            journal.save(state)
+        child_id = effect['child_order_id']
+        controller.dispatch(state, [effect])
+        adapter._record_unknown_snapshots(state)
+        self.assertEqual(state['orders'][child_id]['send_state'], 'UNKNOWN')
+        self.assertEqual(controller.target_accounting(state, pos, 'REDUCE').needed_qty, 0)
+
+        # Same epoch disconnect cannot falsely clear UNKNOWN.
+        DsvSession._mark_unsynchronized(state)
+        same_epoch_absent = adapter._absent_unknown_orders(
+            state, {}, {}, [], reconcile=True, snapshot_complete=True)
+        self.assertEqual(same_epoch_absent, [])
+
+        runtime = DsvSession.__new__(DsvSession)
+        runtime._controller = controller
+        runtime._journal = journal
+        runtime._scope = controller.scope
+        pending = {child_id}
+        runtime._synchronize(state, {'native': [], 'sync_orders': [],
+                                     'market': [{'contract_id': CONTRACT, 'long_qty': 5, 'short_qty': 0,
+                                                 'long_today': 5, 'long_historical': 0,
+                                                 'short_today': 0, 'short_historical': 0}]}, pending)
+        self.assertFalse(state['synchronized'])
+
+        # Fail-closed validation: absent_orders without broker_order_snapshot_complete is rejected.
+        bad_frame = {
+            'id': 'f-bad', 'sequence': 1, 'session_id': 's1', 'wall_time': f'{DAY}T01:10:01Z',
+            'monotonic_ms': 1000, 'synchronized': True, 'sync_orders': [], 'absent_orders': [child_id],
+            'market': [{'contract_id': CONTRACT, 'ticks': [self._tick(1)], 'opening_session': True,
+                        'session_open': f'{DAY}T01:00:00Z', 'session_close': f'{DAY}T02:15:00Z',
+                        'long_qty': 5, 'short_qty': 0}],
+            'native': [],
+        }
+        runtime._symbols = {CONTRACT: {}}
+        with self.assertRaises(TraderError) as bad_err:
+            runtime._validate_frame(bad_frame)
+        self.assertEqual(bad_err.exception.code, 'E_DSV_ROUND')
+
+        # Reconnect advances source_epoch and complete snapshot proves absence -> confirm_absent + sync.
+        adapter.connection.source_epoch = 2
+        absent = adapter._absent_unknown_orders(
+            state, {}, {}, [], reconcile=True, snapshot_complete=True)
+        self.assertEqual(absent, [child_id])
+        reconcile_frame = {
+            'id': 'f-reconcile', 'sequence': 2, 'session_id': 's2',
+            'wall_time': f'{DAY}T01:10:02Z', 'monotonic_ms': 2000,
+            'synchronized': True, 'broker_order_snapshot_complete': True,
+            'absent_orders': absent, 'sync_orders': [], 'native': [],
+            'market': [{'contract_id': CONTRACT, 'ticks': [self._tick(2)], 'opening_session': True,
+                        'session_open': f'{DAY}T01:00:00Z', 'session_close': f'{DAY}T02:15:00Z',
+                        'long_qty': 5, 'short_qty': 0, 'long_today': 5, 'long_historical': 0,
+                        'short_today': 0, 'short_historical': 0}],
+        }
+        runtime._validate_frame(reconcile_frame)
+        with journal.transaction():
+            for absent_id in reconcile_frame['absent_orders']:
+                controller.confirm_absent(state, absent_id, frame=reconcile_frame)
+            runtime._synchronize(state, reconcile_frame, pending)
+            journal.save(state)
+        self.assertTrue(state['synchronized'])
+        self.assertEqual(state['orders'][child_id]['send_state'], 'DEFINITELY_NOT_SENT')
+        self.assertTrue(terminal(state['orders'][child_id]))
+        self.assertEqual(controller.target_accounting(state, pos, 'REDUCE').needed_qty, 5)
+        event_row = journal._db.execute(
+            "SELECT payload FROM events WHERE kind='UNKNOWN_NEGATIVE_RECONCILED'").fetchone()
+        self.assertIsNotNone(event_row)
+        self.assertEqual(strict_loads(event_row[0])['child_order_id'], child_id)
+
+        # Plan immediately emits replacement REDUCE child on fresh quote.
+        market = {'contract_id': CONTRACT, 'tick': self._tick(2),
+                  'long_qty': 5, 'short_qty': 0, 'long_today': 5, 'long_historical': 0,
+                  'short_today': 0, 'short_historical': 0, 'external_orders': False}
+        with journal.transaction():
+            replacement = controller.plan(state, row, market, 200.0)
+            journal.save(state)
+        self.assertEqual(len(replacement), 1)
+        self.assertEqual(replacement[0]['kind'], 'SEND')
+        self.assertEqual(replacement[0]['quantity'], 5)
+
+    def test_exit_broker_rejection_classifies_structural_vs_transient_with_backoff(self):
+        self.assertEqual(classify_broker_rejection('平仓量超过持仓'), ('STRUCTURAL', 'INSUFFICIENT_CLOSE_POSITION'))
+        self.assertEqual(classify_broker_rejection('无交易权限'), ('STRUCTURAL', 'NO_TRADING_PERMISSION'))
+        self.assertEqual(classify_broker_rejection('柜台系统繁忙，流控限制'), ('TRANSIENT', 'BROKER_RATE_LIMITED'))
+        self.assertEqual(classify_broker_rejection('未连接交易前置，超时'), ('TRANSIENT', 'BROKER_DISCONNECTED'))
+
+        _tmp, state, journal, _adapter, controller = self._make_controller()
+        row = state['symbols'][CONTRACT]
+        market = {'contract_id': CONTRACT, 'tick': self._tick(0),
+                  'long_qty': 5, 'short_qty': 0, 'long_today': 5, 'long_historical': 0,
+                  'short_today': 0, 'short_historical': 0, 'external_orders': False}
+
+        # 1. Transient rejections retry beyond 3 attempts using backoff schedule.
+        pos = self._position(owned=5, exit_target=0)
+        row['position'] = pos
+        now = 1000.0
+        with journal.transaction():
+            current_eff = controller.new_order(state, pos, market, 'REDUCE', 5, '100', 'CLOSE')
+            journal.save(state)
+        for idx in range(4):
+            child = current_eff['child_order_id']
+            state['orders'][child].update(
+                send_state='NATIVE_SEEN', native_id=f'nat-tr-{idx}',
+                broker_state='REJECTED', terminal_confirmed=True,
+                reported_fill_qty=0, broker_rejection_category='TRANSIENT',
+                broker_rejection_detail='BROKER_BUSY')
+            market['tick'] = self._tick(idx + 1)
+            with journal.transaction():
+                first_try = controller.plan(state, row, market, now)
+                if idx == 0:
+                    self.assertEqual(len(first_try), 1)
+                    current_eff = first_try[0]
+                else:
+                    self.assertEqual(first_try, [])
+                    self.assertEqual(pos.get('execution_reason'), 'EXIT_TRANSIENT_RETRY_BACKOFF')
+                    now += 10.0
+                    after_backoff = controller.plan(state, row, market, now)
+                    self.assertEqual(len(after_backoff), 1)
+                    current_eff = after_backoff[0]
+                journal.save(state)
+            self.assertFalse(pos.get('exit_manual_takeover', False))
+
+        # 2. Structural rejection enters EXIT_MANUAL_TAKEOVER_REQUIRED immediately on 1st failure.
+        _tmp2, state2, journal2, _adapter2, controller2 = self._make_controller()
+        row2 = state2['symbols'][CONTRACT]
+        pos2 = self._position(owned=5, exit_target=0) | {'id': 'position-2'}
+        row2['position'] = pos2
+        with journal2.transaction():
+            eff2 = controller2.new_order(state2, pos2, market, 'REDUCE', 5, '100', 'CLOSE')
+            state2['orders'][eff2['child_order_id']].update(
+                send_state='NATIVE_SEEN', native_id='nat-struct',
+                broker_state='REJECTED', terminal_confirmed=True,
+                reported_fill_qty=0, broker_rejection_category='STRUCTURAL',
+                broker_rejection_detail='INSUFFICIENT_CLOSE_POSITION')
+            market['tick'] = self._tick(10)
+            blocked = controller2.plan(state2, row2, market, 2000.0)
+            journal2.save(state2)
+        self.assertEqual(blocked, [])
+        self.assertTrue(pos2.get('exit_manual_takeover'))
+        self.assertEqual(pos2.get('execution_reason'), 'EXIT_MANUAL_TAKEOVER_REQUIRED')
+        self.assertEqual(controller2.target_projection(state2, row2)['status'], 'BLOCKED')
+
+        # 3. Unclassified rejection preserves 3-attempt threshold.
+        _tmp3, state3, journal3, _adapter3, controller3 = self._make_controller()
+        row3 = state3['symbols'][CONTRACT]
+        pos3 = self._position(owned=5, exit_target=0) | {'id': 'position-3'}
+        row3['position'] = pos3
+        with journal3.transaction():
+            eff3 = controller3.new_order(state3, pos3, market, 'REDUCE', 5, '100', 'CLOSE')
+            journal3.save(state3)
+        for idx in range(3):
+            state3['orders'][eff3['child_order_id']].update(
+                send_state='NATIVE_SEEN', native_id=f'nat-uncls-{idx}',
+                broker_state='REJECTED', terminal_confirmed=True, reported_fill_qty=0)
+            market['tick'] = self._tick(15 + idx)
+            with journal3.transaction():
+                res = controller3.plan(state3, row3, market, 3000.0 + idx * 5.0)
+                journal3.save(state3)
+            if idx < 2:
+                if idx == 1:
+                    self.assertEqual(res, [])
+                    self.assertEqual(pos3.get('execution_reason'), 'EXIT_TRANSIENT_RETRY_BACKOFF')
+                    with journal3.transaction():
+                        res = controller3.plan(state3, row3, market, 3000.0 + idx * 5.0 + 2.0)
+                        journal3.save(state3)
+                self.assertEqual(len(res), 1)
+                eff3 = res[0]
+                self.assertFalse(pos3.get('exit_manual_takeover', False))
+            else:
+                self.assertEqual(res, [])
+                self.assertTrue(pos3.get('exit_manual_takeover'))
+                self.assertEqual(pos3.get('execution_reason'), 'EXIT_MANUAL_TAKEOVER_REQUIRED')
+
+    def test_reduction_route_unavailable_sets_explicit_block_reason_and_diagnostics_log(self):
+        tmp, state, journal, _adapter, controller = self._make_controller()
+        shfe = 'SHFE.rb2701'
+        state['symbols'][shfe] = {'position': None}
+        row = state['symbols'][shfe]
+        with attach_order_blocking_log(tmp) as log_path:
+            pos = self._position(owned=5, exit_target=0) | {'contract_id': shfe}
+            pos['fills'][0]['contract_id'] = shfe
+            row['position'] = pos
+            market = {'contract_id': shfe, 'tick': self._tick(0),
+                      'long_qty': 5, 'short_qty': 0, 'long_today': 5, 'long_historical': 0,
+                      'short_today': 0, 'short_historical': 0, 'external_orders': False}
+            # SHFE with today=5, his=0: proves_position (include_pending=False) succeeds,
+            # while pending CLOSE (historical) of 2 lots causes close_routes to fail E_OWNERSHIP.
+            fake_pending_id = 'child-pending-bad'
+            pos['children'].append(fake_pending_id)
+            state['orders'][fake_pending_id] = {
+                'child_order_id': fake_pending_id, 'intent_id': 'i-bad', 'attempt_id': fake_pending_id,
+                'effect': 'REDUCE', 'original_qty': 2, 'filled_qty': 0, 'reported_fill_qty': 0,
+                'limit_price': '100', 'native_offset': 'CLOSE', 'native_trading_day': DAY,
+                'send_state': 'NATIVE_SEEN', 'broker_state': 'ALIVE', 'cancel_status': None,
+                'terminal_confirmed': False, 'contract_id': shfe, 'direction': 'SELL',
+                'position_id': pos['id'], 'native_id': 'nat-bad', 'cancel_reason': None,
+            }
+            with journal.transaction():
+                self.assertEqual(controller.plan(state, row, market, 100.0), [])
+                self.assertEqual(controller.plan(state, row, market, 101.0), [])
+                journal.save(state)
+            self.assertEqual(pos.get('execution_reason'), 'REDUCTION_ROUTE_UNAVAILABLE')
+            self.assertEqual(controller.target_projection(state, row)['status'], 'BLOCKED')
+
+        records = [json.loads(line) for line in log_path.read_text(encoding='utf-8').splitlines() if line.strip()]
+        blocked = [r for r in records if r.get('event') == 'ORDER_BLOCKED'
+                   and r.get('reason') == 'REDUCTION_ROUTE_UNAVAILABLE']
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]['contract_id'], shfe)
+        self.assertEqual(blocked[0]['effect'], 'REDUCE')
+        self.assertIn(blocked[0]['detail'], {'E_OWNERSHIP', 'E_FACT_BARRIER', 'EMPTY_CLOSE_ROUTES'})
 
 
 if __name__ == '__main__':

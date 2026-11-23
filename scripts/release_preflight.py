@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import hashlib
 import importlib.metadata
 import json
 from pathlib import Path
@@ -14,6 +13,12 @@ import struct
 import subprocess
 import sys
 import tomllib
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from candidate_identity import compute_candidate_identity, sha256_file
 
 
 SCHEMA = "ONLINE_TRADER_RELEASE_PREFLIGHT/1"
@@ -38,50 +43,43 @@ REQUIRED_TOOLCHAIN = {
     "jsonschema": "4.26.0",
     "referencing": "0.37.0",
 }
+_CONFIG_PARSER_PROBE = """
+import json
+from pathlib import Path
+import sys
 
+src_root = Path(sys.argv[1]).resolve()
+config_dir = Path(sys.argv[2]).resolve()
+sys.modules["PySide6"] = None
+sys.modules["tqsdk"] = None
+sys.path.insert(0, str(src_root))
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+import online_trader
+if not Path(online_trader.__file__).resolve().is_relative_to(src_root):
+    raise SystemExit("online_trader imported outside candidate source root")
 
+from online_trader.errors import TraderError
+from online_trader.runtime.portable_config import PortableAccountStore
 
-def _git(root: Path, *arguments: str) -> bytes:
-    return subprocess.run(
-        ["git", *arguments], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    ).stdout
+try:
+    store = PortableAccountStore(config_dir)
+    state = store.read()
+    for row in state["accounts"]:
+        store.credential_reference(row["account_id"]).resolve()
+    profile = store.profile()
+except (TraderError, OSError, ValueError, KeyError, TypeError) as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(2)
 
-
-def candidate_identity(root: Path) -> dict[str, object]:
-    head = _git(root, "rev-parse", "HEAD").decode("ascii").strip()
-    tracked = _git(root, "ls-files", "-z").split(b"\0")
-    untracked = _git(root, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
-    paths = sorted({item.decode("utf-8", "surrogateescape") for item in (*tracked, *untracked) if item})
-    tree = hashlib.sha256()
-    entries = []
-    for relative in paths:
-        path = root / relative
-        normalized = relative.replace("\\", "/")
-        if path.is_file():
-            file_hash = _sha256(path)
-            marker = "file"
-        elif path.is_symlink():
-            file_hash = hashlib.sha256(path.readlink().as_posix().encode("utf-8")).hexdigest()
-            marker = "symlink"
-        else:
-            file_hash = "-"
-            marker = "missing"
-        record = f"{marker}\0{normalized}\0{file_hash}\n".encode("utf-8", "surrogateescape")
-        tree.update(record)
-        entries.append({"path": normalized, "kind": marker, "sha256": file_hash})
-    return {
-        "head": head,
-        "tree_sha256": tree.hexdigest(),
-        "entry_count": len(entries),
-        "entries": entries,
-    }
+print(json.dumps({
+    "parser_verified": True,
+    "account_count": len(state["accounts"]),
+    "providers": sorted({row["provider"] for row in state["accounts"]}),
+    "selected_account_id": state["selected_id"],
+    "has_overrides": (config_dir / "OnlineTrader-overrides.json").is_file(),
+    "profile_hash": profile.content_hash,
+}, sort_keys=True))
+""".strip()
 
 
 def source_version(root: Path) -> str:
@@ -96,12 +94,46 @@ def source_version(root: Path) -> str:
     raise ValueError("src/online_trader/__init__.py has no literal __version__ assignment")
 
 
-def validate_runtime_config(directory: Path) -> dict[str, str]:
+def _validate_config_with_product_parser(directory: Path, source_root: Path) -> dict[str, object]:
+    source_src = source_root / "src"
+    if not (source_src / "online_trader").is_dir():
+        raise ValueError(f"Candidate source is missing src/online_trader: {source_root}")
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-c", _CONFIG_PARSER_PROBE, str(source_src), str(directory)],
+            cwd=source_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError("Runtime configuration parser probe timed out.") from None
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        message = detail[-1] if detail else f"exit code {completed.returncode}"
+        raise ValueError(f"Runtime configuration failed product validation: {message}")
+    try:
+        summary = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        raise ValueError("Runtime configuration parser probe returned invalid JSON.") from None
+    if not isinstance(summary, dict) or summary.get("parser_verified") is not True:
+        raise ValueError("Runtime configuration parser probe returned an invalid summary.")
+    return summary
+
+
+def validate_runtime_config(directory: Path, source_root: Path) -> tuple[dict[str, str], dict[str, object]]:
     directory = directory.resolve()
     if not directory.is_dir():
         raise ValueError(f"Runtime config directory does not exist: {directory}")
     allowed = set(REQUIRED_RUNTIME_FILES) | set(OPTIONAL_RUNTIME_FILES)
-    files = sorted(path for path in directory.rglob("*") if path.is_file())
+    files: list[Path] = []
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink() or path.is_junction():
+            raise ValueError(f"Runtime config contains a link: {path.relative_to(directory).as_posix()}")
+        if path.is_file():
+            files.append(path)
     relative = {path.relative_to(directory).as_posix() for path in files}
     missing = set(REQUIRED_RUNTIME_FILES) - relative
     unexpected = relative - allowed
@@ -109,7 +141,7 @@ def validate_runtime_config(directory: Path) -> dict[str, str]:
         raise ValueError("Runtime config is missing: " + ", ".join(sorted(missing)))
     if unexpected:
         raise ValueError("Runtime config contains unexpected files: " + ", ".join(sorted(unexpected)))
-    for name in relative:
+    for name in sorted(relative):
         lowered = name.casefold()
         parts = {part.casefold() for part in Path(name).parts}
         if Path(name).name.casefold() in RETIRED_NAMES or parts & RETIRED_PARTS or lowered.endswith(DATABASE_SUFFIXES):
@@ -121,7 +153,9 @@ def validate_runtime_config(directory: Path) -> dict[str, str]:
         serialized = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
         if "白银" in serialized or SILVER.search(serialized):
             raise ValueError(f"Runtime config contains a silver contract: {name}")
-    return {name: _sha256(directory / name) for name in sorted(relative)}
+    file_hashes = {name: sha256_file(directory / name) for name in sorted(relative)}
+    summary = _validate_config_with_product_parser(directory, source_root)
+    return file_hashes, summary
 
 
 def main() -> int:
@@ -153,19 +187,22 @@ def main() -> int:
             root / "release" / "OnlineTrader.spec",
             root / "release" / "entry.py",
             root / "scripts" / "build-portable.ps1",
+            root / "scripts" / "candidate_identity.py",
+            root / "scripts" / "freeze-portable.ps1",
             root / "scripts" / "portable_delivery.py",
         )
         absent = [path.relative_to(root).as_posix() for path in required_paths if not path.is_file()]
         if absent:
             raise ValueError("Missing release inputs: " + ", ".join(absent))
+        config_files, config_summary = validate_runtime_config(args.config_directory, root)
         report.update(
             result="PASS",
-            candidate=candidate_identity(root),
+            candidate=compute_candidate_identity(root),
             version=actual,
             platform={"python": platform.python_version(), "architecture": platform.machine()},
             toolchain=installed,
-            release_inputs={path.relative_to(root).as_posix(): _sha256(path) for path in required_paths},
-            configuration={"mode": args.delivery_mode, "files": validate_runtime_config(args.config_directory)},
+            release_inputs={path.relative_to(root).as_posix(): sha256_file(path) for path in required_paths},
+            configuration={"mode": args.delivery_mode, "files": config_files, "validated_summary": config_summary},
         )
     except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         report["errors"] = [str(error)]

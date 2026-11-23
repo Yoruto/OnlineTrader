@@ -10,6 +10,7 @@ import time
 
 from online_trader.contracts.codec import canonical_bytes
 from online_trader.configuration.files import publish_replace_bytes
+from online_trader.dsv_runtime.order_diagnostics import attach_order_blocking_log
 from online_trader.dsv_runtime.standalone_owner import create_standalone_owner
 from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.simnow import strategy_port
@@ -231,7 +232,8 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                 loop_state=loop_state,
             )
 
-        server.serve(stop_event=owner.stop_event, owner_tick=tick, publish_workbench=True)
+        with attach_order_blocking_log(output):
+            server.serve(stop_event=owner.stop_event, owner_tick=tick, publish_workbench=True)
         shutdown = owner.session.prepare_shutdown()
         publish_replace_bytes(canonical_bytes({
             'phase': 'STOPPED', 'runtime_boot_id': binding.boot_id,
