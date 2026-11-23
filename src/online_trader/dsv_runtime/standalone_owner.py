@@ -26,6 +26,10 @@ from online_trader.errors import TraderError
 from online_trader.runtime.startup_metadata import SDK_VERSION
 
 
+def _parameters_saved(receipt):
+    return any(item.get('reason') == 'DSV_PARAMETERS_SAVED' for item in receipt.get('decisions', ()))
+
+
 class StandaloneDsvOwner:
     """One-thread facade consumed by the existing Standalone lifecycle."""
 
@@ -33,7 +37,10 @@ class StandaloneDsvOwner:
         self.session, self.adapter, self.connection = session, adapter, connection
         self.profile, self.binding = profile, binding
         self.configuration_revision = str(configuration_revision)
+        # Persist hook: receives the validated candidate before it is applied and
+        # returns a token that ``on_parameters_restore`` uses to undo the write.
         self.on_parameters_saved = None
+        self.on_parameters_restore = None
         self.closed = False
         self.runtime_protocol = 'DSV_TARGET/1'
         self.kernel_epoch = 1
@@ -132,23 +139,56 @@ class StandaloneDsvOwner:
         command = translate_workbench_command(
             body, self.session.snapshot(), runtime_boot_id=self.boot_id,
             configuration_revision=self.configuration_revision)
-        receipt = self.adapter.command(self.session, command)
+        if command['action'] == 'SAVE_PARAMETERS':
+            receipt = self._save_parameters(command)
+        else:
+            receipt = self.adapter.command(self.session, command)
         if command['action'] in {'START', 'STOP', 'FLATTEN_STOP'}:
             self._authority_generation += 1
         if command['action'] == 'FLATTEN_STOP':
             self._shutdown_after_flatten = True
-        if command['action'] == 'SAVE_PARAMETERS' and any(
-            item.get('reason') == 'DSV_PARAMETERS_SAVED' for item in receipt.get('decisions', ())
-        ):
-            updated = DsvProfile.from_record(command['profile'])
-            self.profile = updated
+        if command['action'] == 'SAVE_PARAMETERS' and _parameters_saved(receipt):
+            self.profile = DsvProfile.from_record(command['profile'])
             self.configuration_revision = str(int(self.configuration_revision) + 1)
-            if callable(self.on_parameters_saved):
-                self.on_parameters_saved(updated)
         self._projection_seq += 1
         self._commit_views.append(self.snapshot())
         self._update_stop_ready()
         return receipt
+
+    def _save_parameters(self, command):
+        """Persist the user configuration first, then apply it in this owner turn.
+
+        A validation or file failure leaves the active profile, configuration
+        revision, ledger and trading engine unchanged.  If the engine refuses the
+        candidate after the file was written, the previous file is restored; an
+        unrestorable or partially applied save fails the owner closed.
+        """
+        candidate = self.session.check_parameter_save(command)
+        if candidate is None or not callable(self.on_parameters_saved):
+            return self.adapter.command(self.session, command)
+        restore_token = self.on_parameters_saved(candidate)
+        try:
+            receipt = self.adapter.command(self.session, command)
+        except BaseException as error:
+            if self.session._state.get('profile_hash') == candidate.content_hash:
+                raise TraderError(
+                    'E_DSV_OWNER',
+                    '参数已提交执行账本但未能完整应用；Runtime 停止以免参数事实分裂。') from error
+            self._restore_parameters(restore_token)
+            raise
+        if not _parameters_saved(receipt):
+            self._restore_parameters(restore_token)
+        return receipt
+
+    def _restore_parameters(self, token):
+        if not callable(self.on_parameters_restore):
+            return
+        try:
+            self.on_parameters_restore(token)
+        except Exception as error:
+            raise TraderError(
+                'E_DSV_OWNER',
+                '参数未生效，但本地参数文件未能恢复；Runtime 停止以免下次启动使用未生效的参数。') from error
 
     def start_confirmed(self):
         """Enable entries after the desktop request and first complete frame."""
@@ -263,7 +303,7 @@ class StandaloneDsvOwner:
                   'receipt_revision': '1', 'tx_id': 'target-' + content_hash(command_id)[:40],
                   'event_seq': seq, 'durable_seq': seq, 'state_revision': seq,
                   'error_code': 'NONE',
-                  'reason': ('参数已保存，下一笔新鲜行情使用新参数；已有持仓维持原保护参数。'
+                  'reason': ('参数已保存并生效，下一笔新鲜行情使用新参数。'
                              if body['operation'] == 'SAVE_DSV_PARAMETERS'
                              else 'Target execution command committed'),
                   'evidence_ids': [dsv_receipt['state_after_digest'][:32]]}

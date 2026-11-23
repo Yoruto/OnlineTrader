@@ -385,6 +385,7 @@ open_offset > (day_high − day_low + stop_offset) / 2
    - `StandaloneDsvOwner.step()` 在 `adapter.contracts` 缺失时回退到 `self.profile` 合约集合，兼容 `OfflineAdapter`；`standalone_projection.py` 在已有 `EXTERNAL_POSITION_PRESENT` 时去除重复的 `UNOWNED_POSITION`。
 3. **Target Owner 运行中热保存（`SAVE_DSV_PARAMETERS`）**：
    - 打通 `standalone_commands.py`、`runner.py`、`sdk_adapter.py`、`standalone_owner.py`、`standalone_projection.py`、`desktop_bootstrap.py`、`target_owner_startup.py`、`operator_api.py`：开放 `live_parameter_save=True` 与 `SAVE_DSV_PARAMETERS` 能力，在 `Journal` 事务内原子提交 `DSV_PARAMETERS_SAVED`、递增 `config_revision`，并通过 `configured_store.save_profile` 持久化至 `OnlineTrader-overrides.json`；保存前已持仓位继续冻结开仓时的保护规则（`_position_configs`）。
+     - **2026-11-23 审核修订（取代上句后半）**：上述 `_position_configs` 只冻结了止损/止盈，定时平仓、断流强平、滑点退出与冷却仍读当前参数，且覆盖文件写入发生在内存生效之后。现改为：① 存在自有持仓、待核对仓位或未终结委托时拒绝运行中保存（`E_DSV_SCOPE`），`_position_configs` 已删除；② `StandaloneDsvOwner._save_parameters` 先只读预检（`DsvSession.check_parameter_save`），再经 `replace_profile` 写覆盖文件，最后在同一 Owner 回合提交账本并替换内存参数；写文件失败时参数、`config_revision` 与引擎均不变；引擎拒绝时经 `restore_overrides` 恢复原文件，恢复失败或账本已提交但应用不完整时以 `E_DSV_OWNER` fail-closed。仅编译验证，未新增/运行测试。
 4. **`0.1.0.dev39` 离线回归与便携构建**：
    - 全量 `unittest discover -s tests -v`（非沙箱本机，`PYTHONPATH=src`）：**1941 PASS / 0 FAIL / 0 SKIP**；基于隔离测试配置完成 `ReleaseClean` 构建（`tree_sha256=bf739614d3a97dd073cb2ef02bedd0f09907c914e6555903765610c9dea7581a`，`ZIP SHA-256=b107a6443b49d82593219ed500f9c59c1721ff9198a33c8a5b2d36d407a000a2`）。
 5. **退出面板后受控安全全进程退出（post-`dev39` 工作树）**：

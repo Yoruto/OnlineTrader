@@ -311,6 +311,7 @@ class ControlServer:
             "E_DSV_OWNERSHIP":"E_REVISION_CONFLICT",
             "E_CAPABILITY":"E_NOT_READY",
             "E_CONFIG_EDIT":"E_REVISION_CONFLICT",
+            "E_CONFIG_FILE":"E_STORAGE",
         }
         raw_code=getattr(error,"code","E_INTERNAL")
         code=mapped.get(raw_code,raw_code)

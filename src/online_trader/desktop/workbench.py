@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 import uuid
-from PySide6.QtCore import QEvent,QItemSelectionModel,QSettings,QStandardPaths,Qt,QThread,QTimer,Signal
+from PySide6.QtCore import QEvent,QEventLoop,QItemSelectionModel,QSettings,QStandardPaths,Qt,QThread,QTimer,Signal
 from PySide6.QtWidgets import (QApplication,QLabel,QLineEdit,QPushButton,QTableWidget,
     QTableWidgetItem,QInputDialog,QFileDialog,QMessageBox,QProgressDialog)
 
@@ -29,6 +29,27 @@ OWNER_RECHECK_OPERATIONS = frozenset({
     'STOP_DSV_STRATEGY', 'PAUSE_NEW_ENTRIES', 'CANCEL_SELECTED', 'CANCEL_OWNED',
     'MANUAL_CLOSE', 'MANUAL_CLOSE_ALL', 'FLATTEN_THEN_STOP', 'REQUEST_RECONCILIATION',
 })
+
+
+class _RuntimeShutdownWorker(QThread):
+    completed = Signal(bool, object)
+
+    def __init__(self, shutdown_fn, pipe_name, *, pid, view, timeout):
+        super().__init__()
+        self._shutdown_fn = shutdown_fn
+        self._pipe_name = pipe_name
+        self._pid = pid
+        self._view = view
+        self._timeout = timeout
+
+    def run(self):
+        try:
+            ok, error = self._shutdown_fn(
+                self._pipe_name, pid=self._pid, view=self._view, timeout=self._timeout
+            )
+            self.completed.emit(bool(ok), error)
+        except Exception as error:
+            self.completed.emit(False, str(error))
 
 
 class _WorkbenchRequest(QThread):
@@ -168,6 +189,7 @@ class WorkbenchWindow(StatusWindow):
         super().__init__(pipe_name,client_factory=client_factory)
         self._runtime_mode = runtime_view
         self._runtime_shutdown_verified = False
+        self._runtime_shutdown_in_progress = False
         self._runtime_client_store = None
         self._runtime_coordinator = None
         self._runtime_command_bus = None
@@ -1717,13 +1739,35 @@ class WorkbenchWindow(StatusWindow):
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.show()
-        QApplication.processEvents()
+        self._runtime_shutdown_in_progress = True
+        outcome = [False, None]
+        done = [False]
+        loop = QEventLoop(self)
+        worker = _RuntimeShutdownWorker(
+            shutdown_runtime_and_wait, self.pipe_name, pid=pid, view=view, timeout=20.0
+        )
+
+        def finished(ok, stop_error):
+            outcome[0] = ok
+            outcome[1] = stop_error
+            done[0] = True
+            loop.quit()
+
+        worker.completed.connect(finished)
+        worker.finished.connect(loop.quit)
         try:
-            ok, stop_error = shutdown_runtime_and_wait(
-                self.pipe_name, pid=pid, view=view, timeout=20.0
-            )
+            worker.start()
+            while not done[0]:
+                loop.exec()
+                if not done[0] and worker.isFinished():
+                    QApplication.processEvents()
+                    if not done[0]:
+                        break
+            worker.wait()
         finally:
+            self._runtime_shutdown_in_progress = False
             progress.close()
+        ok, stop_error = outcome
         if not ok:
             QMessageBox.critical(
                 self,
@@ -1735,6 +1779,9 @@ class WorkbenchWindow(StatusWindow):
         return True
 
     def closeEvent(self,event):
+        if self._runtime_shutdown_in_progress:
+            event.ignore()
+            return
         if self._strategy_starter is not None and self._strategy_starter.is_preparing():
             self._closing = True
             self.hide()

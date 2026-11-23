@@ -616,6 +616,65 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
             expected_config_revision='2')
         self.assertEqual(armed['status'], 'SUCCEEDED')
 
+    def test_live_save_dsv_parameters_persist_failure_leaves_runtime_unchanged(self):
+        self.synchronize()
+        original = profile()
+
+        def fail_persist(_candidate):
+            raise TraderError('E_CONFIG_FILE', 'Cannot replace the local configuration file')
+
+        self.runtime.call_owner(lambda owner: setattr(owner, 'on_parameters_saved', fail_persist))
+        updated = original.to_record()
+        updated['settings']['symbols'][0]['open_offset'] = '90'
+        updated['settings']['trade']['close_before_seconds'] = 300
+        with self.assertRaises(TraderError) as err:
+            self.client.command(
+                'SAVE_DSV_PARAMETERS', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                {'profile': updated}, expected_config_revision='1')
+        self.assertEqual(err.exception.code, 'E_STORAGE')
+
+        state = self.runtime.call_owner(lambda owner: {
+            'owner_hash': owner.profile.content_hash,
+            'revision': owner.configuration_revision,
+            'adapter_hash': (owner.adapter.profile.content_hash
+                             if hasattr(owner.adapter, 'profile') else original.content_hash),
+            'session_hash': owner.session._profile.content_hash,
+            'close_before': owner.session._trade['close_before_seconds'],
+        })
+        self.assertEqual(state['owner_hash'], original.content_hash)
+        self.assertEqual(state['revision'], '1')
+        self.assertEqual(state['adapter_hash'], original.content_hash)
+        self.assertEqual(state['session_hash'], original.content_hash)
+        self.assertEqual(state['close_before'], original.to_record()['settings']['trade']['close_before_seconds'])
+
+        saved_profiles = []
+        self.runtime.call_owner(lambda owner: setattr(owner, 'on_parameters_saved', saved_profiles.append))
+        retried = self.client.command(
+            'SAVE_DSV_PARAMETERS', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'profile': updated}, expected_config_revision='1')
+        self.assertEqual(retried['status'], 'SUCCEEDED')
+        self.assertEqual(len(saved_profiles), 1)
+        self.assertEqual(saved_profiles[0].to_record()['settings']['trade']['close_before_seconds'], 300)
+
+    def test_live_save_dsv_parameters_rejects_open_position(self):
+        self._open_working_position()
+        original = profile()
+        updated = original.to_record()
+        updated['settings']['trade']['close_before_seconds'] = 300
+        with self.assertRaises(TraderError) as err:
+            self.client.command(
+                'SAVE_DSV_PARAMETERS', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                {'profile': updated}, expected_config_revision='1')
+        self.assertEqual(err.exception.code, 'E_SCOPE')
+        state = self.runtime.call_owner(lambda owner: {
+            'owner_hash': owner.profile.content_hash,
+            'revision': owner.configuration_revision,
+            'close_before': owner.session._trade['close_before_seconds'],
+        })
+        self.assertEqual(state['owner_hash'], original.content_hash)
+        self.assertEqual(state['revision'], '1')
+        self.assertEqual(state['close_before'], original.to_record()['settings']['trade']['close_before_seconds'])
+
     def test_persistent_disarm_blocks_auto_recovery_and_requires_reconciliation(self):
         # Transient disconnect preserves running state while persistent disarm clears it
         # and blocks re-arming until explicit reconciliation.

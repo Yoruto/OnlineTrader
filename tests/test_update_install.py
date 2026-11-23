@@ -295,3 +295,60 @@ class UpdateInstallTests(unittest.TestCase):
             redirects.redirect_request(
                 req, io.BytesIO(b''), 302, 'Found', {}, 'https://untrusted.example.com/blob.zip'
             )
+
+    def test_publish_gitlab_update_uses_publish_token_when_read_token_absent(self):
+        import scripts.publish_gitlab_update as pub
+
+        archive = self.root / 'OnlineTrader-0.1.0.dev40-windows-x64.zip'
+        _write_payload_zip(archive, version='0.1.0.dev40')
+        token_file = self.root / 'publish-token.txt'
+        token_file.write_text('publish-rw-token\n', encoding='utf-8')
+
+        created_clients = []
+
+        class _FakeClient:
+            def __init__(self, project_id, *, host='gitlab.com', token=None):
+                self.project_id = project_id
+                self.host = host
+                self.token = token
+                self.api = f'https://{host}/api/v4/projects/{project_id}'
+                created_clients.append(self)
+
+            def pages(self, path, **_params):
+                return []
+
+            def metadata(self, version):
+                if self.token != 'publish-rw-token':
+                    raise AssertionError(f'Expected publish token for read-back, got {self.token!r}')
+                from online_trader.updates import Candidate
+                raw = archive.read_bytes()
+                return Candidate(version, len(raw), hashlib.sha256(raw).hexdigest())
+
+            def download(self, expected, dest):
+                if self.token != 'publish-rw-token':
+                    raise AssertionError(f'Expected publish token for download, got {self.token!r}')
+                dest.write_bytes(archive.read_bytes())
+
+        class _UploadReply:
+            status = 201
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+
+        class _Opener:
+            def open(self, req, timeout=300):
+                return _UploadReply()
+
+        with (patch.object(pub, 'GitLab', _FakeClient),
+              patch.object(pub, 'build_opener', return_value=_Opener())):
+            rc = pub.main([
+                '--host', 'jihulab.com',
+                '--version', '0.1.0.dev40',
+                '--archive', str(archive),
+                '--project-id', '389806',
+                '--ref', 'main',
+                '--token-file', str(token_file),
+                '--publish',
+            ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(created_clients), 1)
+        self.assertEqual(created_clients[0].token, 'publish-rw-token')

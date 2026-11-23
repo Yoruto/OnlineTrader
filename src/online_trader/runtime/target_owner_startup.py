@@ -210,7 +210,8 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             profile=profile, calendar=calendar, clock=clock,
             configuration_revision=configuration_revision)
         if configured_store is not None:
-            owner.on_parameters_saved = configured_store.save_profile
+            owner.on_parameters_saved = configured_store.replace_profile
+            owner.on_parameters_restore = configured_store.restore_overrides
         resolved_pid = _resolve_trusted_pid(trusted_control_pid)
         resolved_entry_point = entry_point or (
             'online-trader-desktop'

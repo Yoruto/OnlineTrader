@@ -93,7 +93,9 @@ def main(argv=None):
                 raise UpdateError('发布需要项目 ID、ref 和发布令牌')
             read_token = _read_secret_file(args.read_token_file) or args.read_token
             publisher = GitLab(args.project_id, host=args.host, token=token)
-            reader = GitLab(args.project_id, host=args.host, token=read_token)
+            # Without a separate read-only token, verify with the publish token
+            # so private projects do not fall back to anonymous read-back.
+            reader = GitLab(args.project_id, host=args.host, token=read_token) if read_token else None
             publish(publisher, args.archive, expected, args.ref, token, reader=reader)
         print(json.dumps({'host': args.host, 'version': expected.version, 'size': expected.size,
                           'sha256': expected.sha256, 'published': args.publish}))

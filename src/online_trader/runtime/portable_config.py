@@ -147,6 +147,27 @@ class PortableAccountStore(AccountStore):
         publish_replace_bytes(canonical_bytes(value), self.directory / _OVERRIDES_FILE)
         return value
 
+    def replace_profile(self, profile):
+        """Persist ``profile`` and return the previous overrides bytes (``None`` when absent)."""
+        path = self.directory / _OVERRIDES_FILE
+        try:
+            previous = path.read_bytes() if path.exists() else None
+        except OSError as error:
+            raise TraderError('E_CONFIG_FILE', 'Cannot read the current parameter overrides') from error
+        self.save_profile(profile)
+        return previous
+
+    def restore_overrides(self, previous):
+        """Undo ``replace_profile`` with the bytes it returned."""
+        path = self.directory / _OVERRIDES_FILE
+        if previous is None:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as error:
+                raise TraderError('E_CONFIG_FILE', 'Cannot restore the parameter overrides') from error
+            return
+        publish_replace_bytes(previous, path)
+
     def history_path(self, row):
         base = self.directory / 'data'
         if row['provider'] == 'TQ_SIMNOW':

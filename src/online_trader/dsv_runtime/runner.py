@@ -114,7 +114,6 @@ class DsvSession:
             self._scope.update(owner_mode='STANDALONE', runtime_boot_id=_owner_binding.boot_id)
         settings = profile.to_record()['settings']
         self._profile = profile
-        self._position_configs = {}
         self._trade = settings['trade']
         self._symbols = {item['code']: item for item in settings['symbols']}
         initial = initial_state(trading_day, self._symbols)
@@ -396,11 +395,48 @@ class DsvSession:
         except (KeyError, TypeError, AttributeError) as error:
             raise TraderError('E_DSV_ROUND', 'Malformed offline round or native fact') from error
 
-    def _position_profile(self, position, contract, fallback_spec):
-        if position is not None and position['id'] in self._position_configs:
-            trade, symbols = self._position_configs[position['id']]
-            return trade, symbols.get(contract, fallback_spec)
-        return self._trade, fallback_spec
+    def check_parameter_save(self, command):
+        """Validate a live parameter save against committed state without changing it.
+
+        Returns the candidate profile, or ``None`` when it equals the active profile.
+        The caller persists the user configuration before submitting the command.
+        """
+        self._check_owner()
+        try:
+            return self._parameter_save_candidate(self._state, command)
+        except (KeyError, TypeError) as error:
+            raise TraderError('E_DSV_COMMAND', 'Malformed offline command') from error
+
+    def _parameter_save_candidate(self, state, command):
+        if not state['synchronized']:
+            raise TraderError('E_DSV_SYNC', 'Wait for a synchronized broker frame before saving parameters')
+        candidate = DsvProfile.from_record(command['profile'])
+        settings = candidate.to_record()['settings']
+        previous = self._profile.to_record()['settings']
+        if {item['code'] for item in settings['symbols']} != set(self._symbols):
+            raise TraderError('E_DSV_SCOPE', '运行中只能调整当前已授权合约的参数。')
+        if settings['schedule'] != previous['schedule'] or any(
+            settings['trade'][field] != previous['trade'][field] for field in ('holidays', 'night_session_close')
+        ):
+            raise TraderError('E_DSV_SCOPE', '交易日历和定时设置需在下次启动时生效。')
+        if candidate.content_hash == self._profile.content_hash:
+            return None
+        # Position lifetime rules (protection, timed/stale close, slip abort, cooldown)
+        # read the active profile.  Until a complete per-position policy snapshot
+        # exists, live changes are accepted only without owned exposure or work.
+        if self._position_sensitive_activity(state):
+            raise TraderError('E_DSV_SCOPE',
+                              '存在自有持仓、待核对仓位或未终结委托时不能在运行中修改参数；'
+                              '请在全部平仓且委托终结后再保存。')
+        return candidate
+
+    @staticmethod
+    def _position_sensitive_activity(state):
+        if any(not terminal(order) for order in state['orders'].values()):
+            return True
+        return any(row.get('position') is not None or row.get('detached_positions')
+                   or row.get('native_conflicts') or row.get('ownership_conflict')
+                   for row in state['symbols'].values())
 
     def command(self, command):
         self._check_owner()
@@ -1033,7 +1069,7 @@ class DsvSession:
         if row.get('detached_positions') or row.get('native_conflicts'):
             return [{'reason': 'LATE_FILL_OWNERSHIP_REVIEW', 'rule_ids': ['I01', 'I02']}]
         if position is not None:
-            pos_trade, pos_spec = self._position_profile(position, market['contract_id'], spec)
+            pos_trade, pos_spec = self._trade, spec
             if (timing and tick is not None and position['owned'] and (row.get('last_stop') or {}).get('until') is not None
                     and (position.get('rollback_exit') or {}).get('reason') == 'STOP_LOSS'
                     and self._in_session(frame, market)
@@ -1608,24 +1644,9 @@ class DsvSession:
             return [{'reason': 'BROKER_FACTS_RECONCILED', 'sequence': state['sequence'],
                      'rule_ids': ['I01', 'I02']}], []
         if action == 'SAVE_PARAMETERS':
-            if not state['synchronized']:
-                raise TraderError('E_DSV_SYNC', 'Wait for a synchronized broker frame before saving parameters')
-            candidate = DsvProfile.from_record(command['profile'])
-            settings = candidate.to_record()['settings']
-            previous = self._profile.to_record()['settings']
-            if {item['code'] for item in settings['symbols']} != set(self._symbols):
-                raise TraderError('E_DSV_SCOPE', '运行中只能调整当前已授权合约的参数。')
-            if settings['schedule'] != previous['schedule'] or any(
-                settings['trade'][field] != previous['trade'][field] for field in ('holidays', 'night_session_close')
-            ):
-                raise TraderError('E_DSV_SCOPE', '交易日历和定时设置需在下次启动时生效。')
-            if candidate.content_hash == self._profile.content_hash:
+            candidate = self._parameter_save_candidate(state, command)
+            if candidate is None:
                 return [{'reason': 'PARAMETERS_UNCHANGED', 'rule_ids': ['D14']}], []
-            for row in state['symbols'].values():
-                position = row.get('position')
-                if position is not None:
-                    self._position_configs.setdefault(
-                        position['id'], (copy.deepcopy(self._trade), copy.deepcopy(self._symbols)))
             next_revision = str(int(state.get('config_revision') or 1) + 1)
             state['config_revision'] = next_revision
             state['profile_hash'] = candidate.content_hash
