@@ -41,9 +41,14 @@ class StandaloneDsvOwner:
         self._command_receipts = {}
         self._latest_account_snapshot = None
         self._projection_seq = 1
+        self._authority_generation = 0
         self._commit_views = [self.snapshot()]
         self.stop_event = Event()
         self._shutdown_after_flatten = False
+
+    @property
+    def authority_generation(self):
+        return self._authority_generation
 
     @property
     def revisions(self):
@@ -121,6 +126,8 @@ class StandaloneDsvOwner:
             body, self.session.snapshot(), runtime_boot_id=self.boot_id,
             configuration_revision=self.configuration_revision)
         receipt = self.adapter.command(self.session, command)
+        if command['action'] in {'START', 'STOP', 'FLATTEN_STOP'}:
+            self._authority_generation += 1
         if command['action'] == 'FLATTEN_STOP':
             self._shutdown_after_flatten = True
         self._projection_seq += 1
@@ -134,6 +141,7 @@ class StandaloneDsvOwner:
             'id': 'standalone-confirmed-start-' + self.boot_id,
             'action': 'START',
         })
+        self._authority_generation += 1
         self._projection_seq += 1
         self._commit_views.append(self.snapshot())
         return receipt
@@ -151,6 +159,8 @@ class StandaloneDsvOwner:
 
     def disconnect_for_error(self, reason, *, disarm=False, fault_code=None):
         receipt = self.session.disconnect(reason, disarm=disarm, fault_code=fault_code)
+        if disarm:
+            self._authority_generation += 1
         self._projection_seq += 1
         self._commit_views.append(self.snapshot())
         self._update_stop_ready()

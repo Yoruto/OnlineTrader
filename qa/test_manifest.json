@@ -4698,6 +4698,7 @@
       "requirements": [],
       "timeout_seconds": 30,
       "cases": [
+        "TargetOwnerPureLogicTests.test_incomplete_calendar_window_holds_current_trading_day_even_when_other_contract_is_active",
         "TargetOwnerPureLogicTests.test_initial_auto_arm_survives_transient_error_and_confirms_once_while_persistent_disarm_cancels_it",
         "TargetOwnerPureLogicTests.test_market_break_retains_current_trading_day_until_next_session_is_active",
         "TargetOwnerPureLogicTests.test_mixed_night_and_day_sessions_advance_trading_day_when_active_contracts_agree_and_fail_closed_on_conflict",

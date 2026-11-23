@@ -46,9 +46,11 @@ def resolve_active_trading_day(calendar, contracts, current_day, now=None, *, cl
     if not now_utc:
         return current_day
     windows = [calendar.query(code, now_utc) for code in contracts]
+    if any(not window.get('complete') for window in windows):
+        return current_day
     active_windows = [
         window for window in windows
-        if window.get('complete') and window.get('is_trading') and window.get('session')
+        if window.get('is_trading') and window.get('session')
     ]
     if not active_windows:
         return current_day
@@ -84,10 +86,14 @@ def execute_owner_tick(owner, *, binding, current_trading_day, is_complete,
     try:
         receipt = owner.step(trading_day=current_trading_day, complete=is_complete)
         state = owner.snapshot()
-        if loop_state.get('initial_start_pending') and state['synchronized'] and not state.get('owner_fault_code'):
-            owner.start_confirmed()
-            loop_state['initial_start_pending'] = False
-            state = owner.snapshot()
+        if loop_state.get('initial_start_pending'):
+            expected_gen = loop_state.get('initial_arm_generation', 0)
+            if getattr(owner, 'authority_generation', 0) != expected_gen:
+                loop_state['initial_start_pending'] = False
+            elif state['synchronized'] and not state.get('owner_fault_code'):
+                owner.start_confirmed()
+                loop_state['initial_start_pending'] = False
+                state = owner.snapshot()
         now = time.monotonic()
         if history_writer is not None and now - loop_state.get('last_history_capture', 0.0) >= 10:
             snapshot = owner.native_account_snapshot()
@@ -204,6 +210,7 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             'last_status': {'phase': 'WAITING_FOR_NATIVE_SYNC', 'entry_authority': 'DISARMED'},
             'last_history_capture': 0.0,
             'initial_start_pending': bool(arm),
+            'initial_arm_generation': getattr(owner, 'authority_generation', 0),
         }
 
         contracts = tuple(grant.value.get('contracts', ()))

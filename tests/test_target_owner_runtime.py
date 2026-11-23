@@ -99,6 +99,32 @@ class TargetOwnerPureLogicTests(unittest.TestCase):
                 conflicting, ('DCE.p2701', 'SHFE.rb2701'), DAY, '2026-11-13T13:01:00Z')
         self.assertEqual(conflict_err.exception.code, 'E_DSV_SCOPE')
 
+    def test_incomplete_calendar_window_holds_current_trading_day_even_when_other_contract_is_active(self):
+        class IncompleteCalendar:
+            def __init__(self):
+                self.windows = {
+                    'DCE.p2701': {
+                        'complete': True,
+                        'is_trading': True,
+                        'session': {'trading_day': '2026-11-16'},
+                    },
+                    'SHFE.rb2701': {
+                        'complete': False,
+                        'is_trading': False,
+                        'session': None,
+                    },
+                }
+
+            def query(self, code, _now_utc):
+                return dict(self.windows[code])
+
+        cal = IncompleteCalendar()
+        self.assertEqual(
+            resolve_active_trading_day(
+                cal, ('DCE.p2701', 'SHFE.rb2701'), DAY, '2026-11-13T13:01:00Z'),
+            DAY,
+        )
+
     def test_owner_tick_error_classification_rules(self):
         self.assertEqual(classify_owner_tick_error(OSError('pipe timeout')), 'TRANSIENT_DISCONNECT')
         self.assertEqual(
@@ -132,6 +158,7 @@ class TargetOwnerPureLogicTests(unittest.TestCase):
                 self.state = {'synchronized': False, 'running': False, 'owner_fault_code': None}
                 self.start_confirmed_calls = 0
                 self.disconnect_calls = []
+                self.authority_generation = 0
 
             def step(self, **_kwargs):
                 outcome = self.outcomes.pop(0)
@@ -203,6 +230,36 @@ class TargetOwnerPureLogicTests(unittest.TestCase):
             self.assertFalse(owner2.state['running'])
             self.assertFalse(loop_state2['initial_start_pending'])
 
+            # 3. User STOP/PAUSE during a transient outage before first sync revokes pending auto-arm.
+            owner3 = StubOwner([
+                TraderError('E_DSV_SDK_SYNC', 'transient gateway sync loss'),
+                {'synchronized': True},
+            ])
+            loop_state3 = {
+                'last_status': {'phase': 'WAITING_FOR_NATIVE_SYNC', 'entry_authority': 'DISARMED'},
+                'last_history_capture': 0.0,
+                'initial_start_pending': True,
+                'initial_arm_generation': owner3.authority_generation,
+            }
+            execute_owner_tick(
+                owner3, binding=binding, current_trading_day=DAY, is_complete=lambda: True,
+                history_writer=None, status_path=root / 'status3.json',
+                diagnostics_path=root / 'diag3.json', loop_state=loop_state3,
+                sleep_fn=lambda _s: None,
+            )
+            self.assertTrue(loop_state3['initial_start_pending'])
+            # User explicitly stops/pauses while waiting for sync recovery.
+            owner3.authority_generation += 1
+            execute_owner_tick(
+                owner3, binding=binding, current_trading_day=DAY, is_complete=lambda: True,
+                history_writer=None, status_path=root / 'status3.json',
+                diagnostics_path=root / 'diag3.json', loop_state=loop_state3,
+                sleep_fn=lambda _s: None,
+            )
+            self.assertEqual(owner3.start_confirmed_calls, 0)
+            self.assertFalse(owner3.state['running'])
+            self.assertFalse(loop_state3['initial_start_pending'])
+
 
 @unittest.skipUnless(sys.platform == 'win32', 'Named-pipe Runtime acceptance requires Windows')
 class TargetOwnerRuntimeTests(unittest.TestCase):
@@ -242,6 +299,7 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
 
     def test_public_pipe_command_is_bound_idempotent_and_conflicting_content_is_rejected(self):
         self.synchronize()
+        before_gen = self.runtime.call_owner(lambda owner: owner.authority_generation)
         scope = {'scope_type': 'ACCOUNT', 'scope_ids': []}
         command_id = 'qa-command-idempotent'
         pause = {'cancel_owned_entry_remainders': False}
@@ -250,6 +308,8 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
         second = self.client.command('PAUSE_NEW_ENTRIES', scope, pause, command_id=command_id,
                                      expected_config_revision='1')
         self.assertEqual(first, second)
+        after_gen = self.runtime.call_owner(lambda owner: owner.authority_generation)
+        self.assertEqual(after_gen, before_gen + 1)
         with self.assertRaises(TraderError) as error:
             self.client.command('REQUEST_RECONCILIATION', scope,
                                 {'requested_scope': 'FULL_ACCOUNT', 'position_cycle_id': None},
