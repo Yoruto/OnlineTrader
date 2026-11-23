@@ -4917,8 +4917,11 @@
       "requirements": [],
       "timeout_seconds": 30,
       "cases": [
+        "UpdateInstallTests.test_extract_bundle_rejects_missing_payload_marker_and_root_configs",
         "UpdateInstallTests.test_failed_start_rolls_back_to_original_portable_program",
         "UpdateInstallTests.test_first_launch_selects_original_portable_program",
+        "UpdateInstallTests.test_jihulab_source_client_and_redirect_token_isolation",
+        "UpdateInstallTests.test_payload_guard_blocks_standalone_execution_and_allows_offline_smoke",
         "UpdateInstallTests.test_process_or_account_lock_defers_update",
         "UpdateInstallTests.test_verified_update_preserves_portable_program_and_preferences"
       ],

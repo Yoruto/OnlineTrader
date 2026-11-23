@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 from online_trader.errors import TraderError
 from online_trader.runtime.instance import AccountLock
 from online_trader.update_install import active_version, pending_candidate, quiescent_installation
-from online_trader.updates import UpdateError, atomic_json, check_and_download
+from online_trader.updates import UpdateError, atomic_json, check_and_download, load_update_source
 
 
 def offline_smoke():
@@ -51,15 +51,7 @@ class ManagedUpdateController(QObject):
         QTimer.singleShot(0, self.start_on_open)
 
     def _source(self):
-        with (self.root / 'update-source.json').open('rb') as stream:
-            raw = stream.read(65_537)
-        if len(raw) > 65_536:
-            raise UpdateError('更新来源配置过大')
-        value = json.loads(raw.decode('utf-8-sig'))
-        channel = value.get('channel') if isinstance(value, dict) else None
-        if channel not in {'preview', 'stable'}:
-            raise UpdateError('更新渠道无效')
-        return channel
+        return load_update_source(self.root)['channel']
 
     def _candidate(self):
         return pending_candidate(self.root, active_version(self.root))

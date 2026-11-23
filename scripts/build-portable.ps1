@@ -4,7 +4,11 @@ param(
     [ValidateSet('RuntimeConfigured')][string]$DeliveryMode = 'RuntimeConfigured',
     [Parameter(Mandatory=$true)][string]$DeliveryConfigDirectory,
     [string]$Archive,
-    [string]$EvidenceDirectory
+    [string]$EvidenceDirectory,
+    [string]$UpdateHost,
+    [int]$UpdateProjectId,
+    [string]$UpdateChannel,
+    [string]$UpdateReadTokenFile
 )
 $ErrorActionPreference = 'Stop'
 $project = Split-Path -Parent $PSScriptRoot
@@ -43,7 +47,12 @@ try {
     $baseManifest | Add-Member -NotePropertyName preflight_sha256 -NotePropertyValue ((Get-FileHash -Algorithm SHA256 -LiteralPath $preflight).Hash.ToLowerInvariant()) -Force
     $baseManifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 -LiteralPath $baseManifestPath
     Get-ChildItem -LiteralPath (Join-Path $project 'release/runtime-portable') -File | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $base }
-    & $interpreter -I (Join-Path $PSScriptRoot 'portable_delivery.py') --bundle $base --archive $archivePath --output $destination --config-directory $config --runtime-kind fresh --performance-report (Join-Path $evidence 'delivery-performance.json')
+    $deliveryArgs = @('--bundle', $base, '--archive', $archivePath, '--output', $destination, '--config-directory', $config, '--runtime-kind', 'fresh', '--performance-report', (Join-Path $evidence 'delivery-performance.json'))
+    if ($UpdateHost) { $deliveryArgs += @('--update-host', $UpdateHost) }
+    if ($UpdateProjectId) { $deliveryArgs += @('--update-project-id', "$UpdateProjectId") }
+    if ($UpdateChannel) { $deliveryArgs += @('--update-channel', $UpdateChannel) }
+    if ($UpdateReadTokenFile) { $deliveryArgs += @('--update-read-token-file', (Resolve-Path -LiteralPath $UpdateReadTokenFile).Path) }
+    & $interpreter -I (Join-Path $PSScriptRoot 'portable_delivery.py') @deliveryArgs
     if ($LASTEXITCODE -ne 0) { throw "Portable assembly or verification failed. Inspect $evidence" }
 }
 finally {

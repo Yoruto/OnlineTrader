@@ -25,8 +25,9 @@ def console_main(argv):
 
 if __name__ == '__main__':
     from online_trader.errors import TraderError
-    from online_trader.update_install import (RESTART_FOR_UPDATE, active_version, launch_managed,
-                                               managed_bootstrap, managed_root, program_directory, runtime_lease)
+    from online_trader.update_install import (RESTART_FOR_UPDATE, active_version, assert_payload_managed_launch,
+                                               launch_managed, managed_bootstrap, managed_root,
+                                               program_directory, runtime_lease)
     from online_trader.updates import UpdateError
 
     arguments = sys.argv[1:]
@@ -45,6 +46,7 @@ if __name__ == '__main__':
         if arguments[:1] == ['--verify-runtime']:
             raise SystemExit(console_main(arguments))
         try:
+            assert_payload_managed_launch(executable, arguments)
             with runtime_lease(root) if root else nullcontext():
                 if portable_entry and (root / 'active.json').exists():
                     selected = program_directory(root, active_version(root))
@@ -52,7 +54,7 @@ if __name__ == '__main__':
                         raise SystemExit(subprocess.call([str(selected / executable.name), *arguments],
                                                          env=environment))
                 raise SystemExit(console_main(arguments))
-        except (UpdateError, OSError, ValueError, KeyError, TypeError) as error:
+        except (UpdateError, TraderError, OSError, ValueError, KeyError, TypeError) as error:
             print(error, file=sys.stderr)
             raise SystemExit(2)
     from online_trader.desktop.entrypoint import main
@@ -60,6 +62,7 @@ if __name__ == '__main__':
         from online_trader.desktop.update_ui import offline_smoke
         raise SystemExit(offline_smoke())
     try:
+        assert_payload_managed_launch(executable, arguments)
         ready = Path(os.environ.get('ONLINETRADER_UPDATE_READY', '')).resolve()
         is_child = ready.name == 'ready' and ready.parent.parent == root and ready.parent.name.startswith('.launch-')
         if portable_entry and not is_child and arguments in ([], ['--autostart']):

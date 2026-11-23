@@ -78,7 +78,8 @@ def main(argv=None):
     try:
         update_root = None
         if getattr(sys, 'frozen', False):
-            from online_trader.update_install import managed_root
+            from online_trader.update_install import assert_payload_managed_launch, managed_root
+            assert_payload_managed_launch(sys.executable, sys.argv[1:] if argv is None else argv)
             update_root = managed_root(sys.executable)
         runtime_root = args.runtime_root
         if (runtime_root is None and args.simnow_packet is None and args.account_store is None

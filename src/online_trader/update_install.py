@@ -17,11 +17,37 @@ from online_trader.accounts import AccountStore
 from online_trader.configuration.files import publish_replace_bytes
 from online_trader.errors import TraderError
 from online_trader.runtime.instance import AccountLock, RuntimeLock
-from online_trader.updates import (Candidate, MAX_BUNDLE, SHA256, UpdateError, atomic_json,
-                                   extract_bundle, version_key)
+from online_trader.updates import (Candidate, MAX_BUNDLE, PAYLOAD_MARKER, SHA256, UpdateError, atomic_json,
+                                   extract_bundle, verify_payload_marker, version_key)
 
 
 RESTART_FOR_UPDATE = 36
+
+
+def assert_payload_managed_launch(executable, arguments=()):
+    """Refuse standalone execution of an update payload outside a configured root."""
+    exe = Path(executable).resolve()
+    marker = exe.parent / PAYLOAD_MARKER
+    if not marker.is_file():
+        return
+    try:
+        metadata = verify_payload_marker(exe.parent)
+    except UpdateError as error:
+        raise TraderError('E_RUNTIME_CONFIG', str(error)) from None
+    argv = list(arguments or ())
+    if exe.stem.casefold() == 'onlinetradercli' and argv[:1] == ['--verify-runtime']:
+        return
+    if exe.stem.casefold() == 'onlinetrader' and argv[:1] == ['--update-smoke']:
+        return
+    root = managed_root(exe)
+    expected = (root / 'versions' / metadata['version']).resolve() if root is not None else None
+    if (root is None or exe.parent != expected
+            or not (root / 'update-source.json').is_file()
+            or not (root / 'runtime' / 'runtime.json').is_file()):
+        raise TraderError(
+            'E_RUNTIME_CONFIG',
+            '此程序为受控更新载荷，不能单独启动；请从已安装的 OnlineTrader 配置根目录启动。',
+        )
 
 
 def managed_root(executable):
@@ -174,7 +200,7 @@ def apply_pending(root, current):
             with tempfile.TemporaryDirectory(dir=versions, prefix='.staging-') as scratch:
                 staged = Path(scratch) / 'bundle'
                 staged.mkdir()
-                extract_bundle(archive, staged)
+                extract_bundle(archive, staged, expected_version=candidate.version)
                 _offline_check(staged, candidate.version)
                 if target.exists():
                     if target.is_symlink() or target.is_junction() or _tree_hashes(target) != _tree_hashes(staged):

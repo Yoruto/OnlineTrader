@@ -161,10 +161,14 @@ def validate_runtime_config(directory: Path, source_root: Path) -> tuple[dict[st
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-source", type=Path, default=Path.cwd())
-    parser.add_argument("--delivery-mode", choices=("RuntimeConfigured",), required=True)
-    parser.add_argument("--config-directory", type=Path, required=True)
+    parser.add_argument("--delivery-mode", choices=("RuntimeConfigured", "UpdatePayload"), required=True)
+    parser.add_argument("--config-directory", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.delivery_mode == "RuntimeConfigured" and args.config_directory is None:
+        parser.error("--config-directory is required for RuntimeConfigured")
+    if args.delivery_mode == "UpdatePayload" and args.config_directory is not None:
+        parser.error("--config-directory must not be supplied for UpdatePayload")
     root = args.candidate_source.resolve()
     report: dict[str, object] = {"schema_version": SCHEMA, "result": "FAIL", "errors": []}
     try:
@@ -194,7 +198,15 @@ def main() -> int:
         absent = [path.relative_to(root).as_posix() for path in required_paths if not path.is_file()]
         if absent:
             raise ValueError("Missing release inputs: " + ", ".join(absent))
-        config_files, config_summary = validate_runtime_config(args.config_directory, root)
+        if args.delivery_mode == "RuntimeConfigured":
+            config_files, config_summary = validate_runtime_config(args.config_directory, root)
+            config_block: dict[str, object] = {
+                "mode": args.delivery_mode,
+                "files": config_files,
+                "validated_summary": config_summary,
+            }
+        else:
+            config_block = {"mode": args.delivery_mode, "standalone": False, "files": {}}
         report.update(
             result="PASS",
             candidate=compute_candidate_identity(root),
@@ -202,7 +214,7 @@ def main() -> int:
             platform={"python": platform.python_version(), "architecture": platform.machine()},
             toolchain=installed,
             release_inputs={path.relative_to(root).as_posix(): sha256_file(path) for path in required_paths},
-            configuration={"mode": args.delivery_mode, "files": config_files, "validated_summary": config_summary},
+            configuration=config_block,
         )
     except (OSError, ValueError, KeyError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         report["errors"] = [str(error)]

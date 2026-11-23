@@ -58,6 +58,26 @@ boundaries:
     must_not_own:
       - order sending
       - position authority
+
+  - id: standalone-managed-updates
+    route: STANDALONE_UPDATES
+    entries:
+      - src/online_trader/updates.py
+      - src/online_trader/update_install.py
+      - src/online_trader/desktop/update_ui.py
+    collaborators:
+      - release/entry.py
+      - src/online_trader/desktop/entrypoint.py
+      - scripts/portable_delivery.py
+      - scripts/build-update-payload.ps1
+      - scripts/publish_gitlab_update.py
+    owns:
+      - GitLab and JiHuLab release discovery and Range download with redirect token isolation
+      - ONLINE_TRADER_UPDATE_PAYLOAD/1 non-standalone payload enforcement and standalone execution guard
+      - quiescent version switching under versions/ while preserving root runtime configuration and preferences
+    must_not_own:
+      - SDK order sending or trading authority
+      - mutating or relocating root runtime/ accounts, overrides or historical ledgers
       - execution responsibility
 
   - id: dsv-replacement

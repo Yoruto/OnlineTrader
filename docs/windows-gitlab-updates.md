@@ -12,11 +12,13 @@
 
 ## 制品和发布
 
-1. 分发项目为 [Yoruto/OnlineTrader-Releases](https://gitlab.com/Yoruto/onlinetrader-releases)，项目 ID 为 `89047383`，默认分支为 `main`。首发前确认 Package Registry 可匿名读取，并核对 Generic Package 重复文件设置。固定同一版本对应的构建目录、ZIP 和 SHA256。
-2. 旧的公开 Generic 更新 ZIP 已停用：它缺少接收方配置，不能作为完整软件制品发布。正式便携制品使用 `scripts/build-portable.ps1 -DeliveryMode RuntimeConfigured -DeliveryConfigDirectory <confirmed-config>`，只通过获准承载该配置的私有渠道交付。若后续需要恢复公共更新，必须先另行批准并实现“不可独立启动的程序更新载荷”合同；不得把无配置基础程序主体改名为更新 ZIP。首次安装仍使用 `release/installer.iss` 并提供 `AppVersion` 和已验收的完整 `BundleDir`。
-3. 使用 `python scripts/publish_gitlab_update.py --version <版本> --archive <ZIP>` 检查本地制品。实际发布时增传 `--publish --project-id 89047383 --ref main`，发布端通过环境变量提供 `GITLAB_TOKEN`。脚本将 ZIP 上传到 `online-trader-windows-x64`，匿名回读文件大小、摘要及完整 ZIP 后，才创建 `onlinetrader-<版本>` Release。首个带更新器的安装版与用于验收的下一版应使用不同版本号。
+1. 默认历史公开项目为 `gitlab.com` 的 [Yoruto/OnlineTrader-Releases](https://gitlab.com/Yoruto/onlinetrader-releases)（项目 ID `89047383`）；中国大陆受控分发优先使用 **极狐 GitLab（`jihulab.com`）** 私有项目（如 `x3185248/onlinetrader-releases`，项目 ID `389806`，默认分支 `main`）。`update-source.json` 支持 `host`（`gitlab.com` / `jihulab.com`，默认 `gitlab.com`）、`project_id`、`channel`（`preview` / `stable`）、`portable_version` 与可选只读 `read_token`（仅用于私有更新源认证，禁止携带写权限令牌，且严禁跨域名跳转透传）。
+2. 旧的无标记通用 ZIP 已停用：它缺少接收方配置且可被误当作独立程序启动。当前支持两类明确区分的制品：
+   - **首次/全量私有交付**：`scripts/build-portable.ps1 -DeliveryMode RuntimeConfigured -DeliveryConfigDirectory <confirmed-config>`，产出完整 `*-Runtime-Configured.zip`（含 `runtime/` 与已确认配置，可通过 `-UpdateHost` / `-UpdateProjectId` / `-UpdateChannel` / `-UpdateReadTokenFile` 绑定受控更新源），只通过获准私有渠道交付。
+   - **不可独立启动的程序更新载荷（`ONLINE_TRADER_UPDATE_PAYLOAD/1`）**：`scripts/build-update-payload.ps1`（或 `scripts/portable_delivery.py --update-payload`）产出的 `OnlineTrader-<版本>-windows-x64.zip`。ZIP 根包含程序本体与 `update-payload.json`（`{"schema_version":"ONLINE_TRADER_UPDATE_PAYLOAD/1","version":"<版本>","standalone":false,"requires_managed_root":true}`），**严禁包含** `runtime/`、`OnlineTrader-defaults.json`、`OnlineTrader-parameters.json`、`OnlineTrader-overrides.json`、`update-source.json`、`active.json`、`OnlineTrader.ini` 及任何历史预设；除安装期 `_offline_check`（`--verify-runtime` / `--update-smoke`）外，单独解压后直接双击或启动 `OnlineTrader.exe` / `OnlineTraderCLI.exe` 一律 fail-closed 拒绝运行（必须由已有受管理根目录通过 `versions/<版本>/` 启动并沿用根目录既有 `runtime/`）。不得把无配置基础程序主体改名为更新 ZIP。
+3. 使用 `python scripts/publish_gitlab_update.py --host <jihulab.com|gitlab.com> --version <版本> --archive <ZIP>` 检查本地载荷与 `update-payload.json`。实际发布时增传 `--publish --project-id <ID> --ref main`（发布端通过 `GITLAB_TOKEN` 或 `--token-file` 提供发布令牌，私有仓库回读校验可传 `--read-token` / `--read-token-file`）。脚本将 ZIP 上传到 `online-trader-windows-x64`，按客户端同款逻辑回读摘要、验证文件大小、校验完整 ZIP 后才创建 `onlinetrader-<版本>` Release。
 
-上线验证使用干净 Windows 和两个实包，核对任务守护、Qt 可见窗口、实际执行文件路径、已有账户数据及回退。源码样本可以验证 GitLab 请求契约与切换控制，实包路径仍需在获准出包后验证。
+上线验证使用干净 Windows 和两个实包，核对任务守护、Qt 可见窗口、实际执行文件路径、已有 `runtime/` 配置数据保留、退出全进程关闭及回退。源码样本可以验证请求契约、域名白名单、非独立载荷阻断与切换控制，实包路径仍需在获准出包后验证。
 
 ## 指定设备的配置版
 
@@ -26,7 +28,7 @@
 
 ## Standalone Trading Runtime 更新接入
 
-默认 Runtime 桌面入口也使用同一套受管理安装根。第一处既有差异是：Legacy 工作台通过 `run(..., update_root=...)` 安装更新菜单，而 `--runtime-root` 分支直接创建 `WorkbenchWindow`，因此没有自动检查、手动入口或更新状态页。Runtime 更新复用现有 GitLab 下载、ZIP 路径限制、大小和 SHA-256 校验、版本目录、启动检查及回退机制，不在 Qt 或 Runtime owner 中新增下载器或第二套安装状态。
+默认 Runtime 桌面入口也使用同一套受管理安装根：`src/online_trader/desktop/entrypoint.py` 在 `resolved_runtime_root` 位于 `managed_root(sys.executable)` 下时，向 `WorkbenchWindow(..., runtime_view=True, update_root=..., update_restart=...)` 注入受管理更新控制器。Runtime 更新复用现有下载、ZIP 路径与非独立载荷限制、大小和 SHA-256 校验、`versions/<版本>/` 目录、启动检查、安全停机退出及回退机制，不在 Qt 或 Runtime owner 中新增第二套下载器或安装状态。
 
 ```mermaid
 flowchart TD
@@ -86,3 +88,10 @@ sequenceDiagram
 失败处理保持 fail-closed：网络或 GitLab 故障不阻止当前版本运行；下载中断可续传；安装锁、账户锁、账本核对或离线检查失败均保留当前版本；新版在工作台就绪期限内失败则回退 `previous`。更新不会清除人工停开、策略日停、账本事实或 Runtime 配置。
 
 实现后的验收至少覆盖：启动自动检查、手动检查、无更新、断网、续传、摘要不符、Runtime 运行中延后、flat 且终态后切换、UNKNOWN 阻断、Qt 关闭但 owner 仍运行、更新后读取同一 Runtime 配置和账本、新版早期失败回退。源码编译不能替代这些 Windows 最终制品场景；未获本次测试和打包授权时统一记录为 `NOT_RUN`。
+
+## 2026-11-23 `0.1.0.dev40` 极狐接入与实包验证记录
+
+- **全量离线回归**：`qa/test_runner.py --profile FullOffline`（非沙箱本机，含 `tests.test_update_install` 7/7）**1948 PASS / 0 FAIL / 0 SKIP / 0 NOT_RUN**（归档 `output/tests/20261123T081808Z-42744639/test-results.json`）。
+- **私有首次配置包**：`OnlineTrader-0.1.0.dev40-windows-x64-Runtime-Configured.zip`（`124,158,673` 字节，`SHA-256: 987b793343cdca8f2b775b38d85b25a75432716005e80cd61ad8067098b60fbd`，预检候选 `tree_sha256: f1b3dc65a0d7c7b3ecd828a7630153909a39f726b1b9077de30a194bc9b4f00a`），已写入 `jihulab.com`（项目 `389806`、`preview` 渠道）与只读令牌，白银检查 PASS。
+- **非独立程序更新载荷**：`OnlineTrader-0.1.0.dev40-windows-x64.zip`（`123,993,880` 字节，`SHA-256: bc6899f3a5d877712d2148b1593188e01104912da2a8127eebc54a8bb899a01e`，预检候选 `tree_sha256: 1879ff6d45190cb7cd949ec2a5740ad62ef7f78aca4a897d9e132be5f0d77187`），已上传极狐项目 `389806` 并创建 Release `onlinetrader-0.1.0.dev40`。
+- **实包独立核验**：载荷解包通过 `--verify-runtime 0.1.0.dev40` 与 `--update-smoke 0.1.0.dev40`；单独执行 `OnlineTraderCLI.exe runtime run` 触发 fail-closed 拦截（退出码 2）。模拟 `0.1.0.dev39` 根目录直连极狐下载 `0.1.0.dev40` 通过，在隔离中绕过本机既有历史 `dev39` 实例锁后完成 `apply_pending` 与 `active.json` 切换，根目录 6 份配置与偏好文件 SHA-256 全量保留。真实期货柜台与远程目标机交互升级为 `NOT_RUN`。

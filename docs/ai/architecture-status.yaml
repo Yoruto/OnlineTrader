@@ -61,7 +61,7 @@ documents:
     evidence:
       design: APPROVED_AND_IMPLEMENTED
       source: IMPLEMENTED_CONTROLLED_SAFE_SHUTDOWN
-      tests: TARGETED_TRAY_AND_OWNER_EXIT_PASS
+      tests: FULL_OFFLINE_1948_OF_1948_PASS
       product_acceptance: NOT_RUN
     notes: Closing window hides to tray while Runtime keeps running; explicit Tray Exit or opt-out window close triggers controlled FLATTEN_THEN_STOP and waits for Owner + runtime-view PID exit before closing Qt.
 
@@ -72,9 +72,20 @@ documents:
     evidence:
       design: ROOT_CAUSE_AND_FIX_RECORDED
       source: IMPLEMENTED_IN_WORKTREE
-      tests: TARGETED_56_OF_56_PASS_AFTER_FINAL_EDIT
+      tests: FULL_OFFLINE_1948_OF_1948_PASS
       product_acceptance: NOT_RUN
-    notes: Records 2026-11-23 Target Owner Workbench projection/log repairs, trusted_control_pid callable fix, live SAVE_DSV_PARAMETERS hot-save, dev39 portable build (1941/1941 offline), and subsequent controlled full-process exit remediation.
+    notes: Records 2026-11-23 Target Owner Workbench projection/log repairs, trusted_control_pid callable fix, live SAVE_DSV_PARAMETERS hot-save, dev39 portable build (1941/1941 offline), controlled full-process exit remediation, and dev40 FullOffline 1948/1948 pass.
+
+  - path: docs/windows-gitlab-updates.md
+    scope: delivery/windows-gitlab-and-jihulab-updates
+    status: CURRENT
+    verified_at_sha: WORKTREE
+    evidence:
+      design: APPROVED_AND_IMPLEMENTED
+      source: IMPLEMENTED_JIHULAB_AND_NON_STANDALONE_PAYLOAD
+      tests: FULL_OFFLINE_1948_OF_1948_PASS
+      product_acceptance: ISOLATED_PACKAGE_UPGRADE_PASS_REMOTE_NOT_RUN
+    notes: Supports gitlab.com and jihulab.com with optional read-only token isolation, enforces ONLINE_TRADER_UPDATE_PAYLOAD/1 non-standalone program update payloads, preserves root runtime/config files across upgrades, and verified dev40 publish + download + switch on JiHuLab project 389806.
 
   - path: docs/refactor/testing-and-portable-delivery-pipeline-v2-20261123.md
     scope: delivery/testing-and-portable-pipeline-v2

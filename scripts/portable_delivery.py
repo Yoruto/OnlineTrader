@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import shutil
 import sys
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from time import perf_counter
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -17,6 +17,14 @@ from online_trader.errors import TraderError
 from online_trader.configuration.baseline import APPROVAL_RESOURCE, BASELINE_RESOURCE
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.runtime.portable_config import PortableAccountStore
+from online_trader.updates import (
+    PAYLOAD_MARKER,
+    PAYLOAD_SCHEMA,
+    UpdateError,
+    archive_name,
+    extract_bundle,
+    load_update_source,
+)
 
 
 DEFAULTS = 'OnlineTrader-defaults.json'
@@ -188,50 +196,160 @@ def build_archive(bundle, destination, *, configured, output=None, important_mem
         staging.unlink(missing_ok=True)
 
 
+def apply_update_source(bundle, *, version=None, host=None, project_id=None, channel=None, read_token_file=None):
+    source_path = bundle / 'update-source.json'
+    document = json.loads(source_path.read_text(encoding='utf-8-sig')) if source_path.is_file() else {}
+    if not isinstance(document, dict):
+        raise ValueError('Base update-source.json must be a JSON object.')
+    if version is not None:
+        document['portable_version'] = version
+    if host is not None:
+        document['host'] = host
+    if project_id is not None:
+        document['project_id'] = project_id
+    if channel is not None:
+        document['channel'] = channel
+    if read_token_file is not None:
+        token = Path(read_token_file).read_text(encoding='utf-8-sig').strip()
+        if not token:
+            raise ValueError('Read token file must not be empty.')
+        document['read_token'] = token
+    source_path.write_text(json.dumps(document, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
+    load_update_source(bundle)
+
+
+def prepare_update_payload(bundle, version):
+    for rel in (
+        'OnlineTrader.ini',
+        'update-source.json',
+        'active.json',
+        'base-build-manifest.json',
+        DEFAULTS,
+        PARAMETERS,
+        PARAMETER_OVERRIDES,
+        *RUNTIME_STARTUP_FILES,
+    ):
+        target = bundle / rel
+        if target.is_file():
+            target.unlink()
+    for folder in ('runtime', 'updates', 'versions'):
+        target = bundle / folder
+        if target.is_dir():
+            shutil.rmtree(target)
+    if not all((bundle / name).is_file() for name in EXECUTABLES) or not (bundle / '_internal').is_dir():
+        raise ValueError('Update payload bundle is missing required executables or _internal.')
+    resources = bundle / '_internal' / 'online_trader' / 'resources'
+    if (not (resources / APPROVAL_RESOURCE).is_file()
+            or any(path.name.casefold() == BASELINE_RESOURCE.casefold() for path in bundle.rglob('*'))):
+        raise ValueError('Update payload must contain the DSV approval with no historical trading preset.')
+    marker = bundle / PAYLOAD_MARKER
+    marker.write_text(
+        json.dumps(
+            {
+                'schema_version': PAYLOAD_SCHEMA,
+                'version': version,
+                'standalone': False,
+                'requires_managed_root': True,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ) + '\n',
+        encoding='utf-8',
+    )
+    for path in sorted(bundle.rglob('*.json')):
+        if path.relative_to(bundle).parts[0].casefold() == '_internal':
+            continue
+        reject_silver_in_config(path.read_bytes(), path.relative_to(bundle).as_posix())
+    return (PAYLOAD_MARKER,)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config-directory', type=Path)
     parser.add_argument('--runtime-kind', choices=('fresh',))
+    parser.add_argument('--update-payload', action='store_true')
+    parser.add_argument('--version')
     parser.add_argument('--bundle', type=Path)
     parser.add_argument('--archive', type=Path)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--performance-report', type=Path)
+    parser.add_argument('--update-host')
+    parser.add_argument('--update-project-id', type=int)
+    parser.add_argument('--update-channel')
+    parser.add_argument('--update-read-token-file', type=Path)
     args = parser.parse_args()
     if args.output is not None and (args.bundle is None or args.archive is None):
         parser.error('--output requires both --bundle and --archive')
-    if args.runtime_kind is not None and args.config_directory is None:
-        parser.error('--runtime-kind requires --config-directory')
-    if args.bundle is not None and args.runtime_kind is None:
-        parser.error('assembled delivery bundles require --runtime-kind fresh')
+    if args.update_payload:
+        if args.bundle is None or args.archive is None or not args.version:
+            parser.error('--update-payload requires --bundle, --archive, and --version')
+        if args.runtime_kind is not None or args.config_directory is not None:
+            parser.error('--update-payload cannot be combined with --runtime-kind or --config-directory')
+    else:
+        if args.runtime_kind is not None and args.config_directory is None:
+            parser.error('--runtime-kind requires --config-directory')
+        if args.bundle is not None and args.runtime_kind is None:
+            parser.error('assembled delivery bundles require --runtime-kind fresh')
     metrics = {'schema_version': 'ONLINE_TRADER_DELIVERY_PERFORMANCE/1', 'result': 'FAIL'}
     total_started = perf_counter()
     try:
-        if args.runtime_kind is not None:
+        if args.update_payload:
             assembly_started = perf_counter()
-            names = _runtime_files(args.config_directory, args.runtime_kind)
-            if args.bundle is not None:
-                for name in names:
-                    destination = args.bundle / 'runtime' / name
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(args.config_directory / name, destination)
-                update_build_manifest(
-                    args.bundle, args.config_directory, names, deliverable=args.archive is not None
-                )
+            if args.archive.name != archive_name(args.version):
+                raise ValueError(f'Update payload archive must be named {archive_name(args.version)}.')
+            important = prepare_update_payload(args.bundle, args.version)
             metrics['assembly_seconds'] = round(perf_counter() - assembly_started, 6)
-        if args.bundle is None:
-            if args.runtime_kind is None:
-                validate_config(args.config_directory)
-        else:
+            archive_sha256 = build_archive(
+                args.bundle,
+                args.archive,
+                output=args.output,
+                configured=False,
+                important_members=important,
+                metrics=metrics,
+            )
             verify_started = perf_counter()
-            important = verify_bundle(args.bundle, args.config_directory, args.runtime_kind)
+            with TemporaryDirectory(prefix='.verify-payload-') as verify_dir:
+                extract_bundle(args.archive, Path(verify_dir), expected_version=args.version)
             metrics['bundle_verify_seconds'] = round(perf_counter() - verify_started, 6)
-            if args.archive is not None:
-                archive_sha256 = build_archive(args.bundle, args.archive, output=args.output,
-                                               configured=args.config_directory is not None,
-                                               important_members=important or (), metrics=metrics)
-                print(f'ZIP SHA-256: {archive_sha256}')
+            print(f'ZIP SHA-256: {archive_sha256}')
+        else:
+            if args.runtime_kind is not None:
+                assembly_started = perf_counter()
+                names = _runtime_files(args.config_directory, args.runtime_kind)
+                if args.bundle is not None:
+                    for name in names:
+                        destination = args.bundle / 'runtime' / name
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(args.config_directory / name, destination)
+                    if any(
+                        value is not None
+                        for value in (args.update_host, args.update_project_id, args.update_channel, args.update_read_token_file)
+                    ):
+                        apply_update_source(
+                            args.bundle,
+                            host=args.update_host,
+                            project_id=args.update_project_id,
+                            channel=args.update_channel,
+                            read_token_file=args.update_read_token_file,
+                        )
+                    update_build_manifest(
+                        args.bundle, args.config_directory, names, deliverable=args.archive is not None
+                    )
+                metrics['assembly_seconds'] = round(perf_counter() - assembly_started, 6)
+            if args.bundle is None:
+                if args.runtime_kind is None:
+                    validate_config(args.config_directory)
+            else:
+                verify_started = perf_counter()
+                important = verify_bundle(args.bundle, args.config_directory, args.runtime_kind)
+                metrics['bundle_verify_seconds'] = round(perf_counter() - verify_started, 6)
+                if args.archive is not None:
+                    archive_sha256 = build_archive(args.bundle, args.archive, output=args.output,
+                                                   configured=args.config_directory is not None,
+                                                   important_members=important or (), metrics=metrics)
+                    print(f'ZIP SHA-256: {archive_sha256}')
         metrics['result'] = 'PASS'
-    except (OSError, ValueError, TraderError) as error:
+    except (OSError, ValueError, TraderError, UpdateError) as error:
         print(error, file=sys.stderr)
         return 2
     finally:

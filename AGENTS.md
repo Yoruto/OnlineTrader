@@ -84,8 +84,15 @@ and leaves entry authority DISARMED. A CSV/export/preview alone is not a registr
 
 Tests and QA are outside the production wheel. After routine changes, run compilation only.
 Do not add, adjust, or run tests without an explicit request for testing or packaging.
-Before authorized packaging, independently run global product tests, then independently
-verify the final artifact after building. When full source regression is in scope, run
+For every authorized packaging request, ask the user before testing or building whether to run
+the full test suite for that package. If the user approves full testing, independently run global
+product tests before building and independently verify the final artifact after building. If the
+user explicitly declines testing, packaging and handoff may proceed without pre-build tests or
+post-build functional/independent acceptance; clearly label the artifact as untested, list the
+omitted checks, and do not claim that testing or acceptance passed. Non-test artifact integrity,
+configuration-content, forbidden-silver, and SHA-256 checks still apply. A prior packaging or
+testing choice does not answer this question for a later packaging request. When full source
+regression is in scope, run
 `.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v` with `PYTHONPATH=src`.
 Use `.venv\Scripts\python.exe -X utf8 -m compileall -q src tests qa` for source compilation.
 Follow the global independent-testing instructions for delivery acceptance and use the actual
