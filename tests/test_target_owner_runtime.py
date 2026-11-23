@@ -374,7 +374,12 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
              'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
             expected_config_revision='1')
         self.runtime.submit(frame(2, owned=2))
-        view = self.wait_view(lambda value: value['checkpoint_event_seq'] == '2')
+        view = self.wait_view(
+            lambda value: value['markets'][0]['entry_reasons'] == ['EXTERNAL_POSITION_PRESENT']
+            and value['external_positions'] == [{
+                'contract_id': CONTRACT, 'direction': 'LONG', 'quantity': 2,
+                'classification': 'UNOWNED_BROKER_POSITION',
+            }])
         self.assertEqual(view['cycles'], [])
         self.assertEqual(view['orders'], [])
         self.assertEqual(self.runtime.adapter.orders, [])

@@ -165,7 +165,7 @@ def workbench_positions(snapshot, after=None):
 def workbench_view(snapshot, *, profile, adapter, configuration_revision):
     scope = snapshot['scope']
     boot = scope['runtime_boot_id']
-    revision = str(snapshot['sequence'])
+    revision = str(max(1, int(snapshot.get('projection_seq') or snapshot.get('sequence') or 0)))
     settings = profile.to_record()['settings']
     symbols = {item['code']: item for item in settings['symbols']}
     markets, cycles, orders, trades, external_positions = [], [], [], [], []
