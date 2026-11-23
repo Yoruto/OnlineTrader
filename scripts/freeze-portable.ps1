@@ -43,8 +43,16 @@ try {
     }
     $buildLog = if ($PerformanceReport) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PerformanceReport) + '.pyinstaller.log' } else { Join-Path $staging 'pyinstaller.log' }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $buildLog) | Out-Null
-    & $interpreter -I -m PyInstaller --noconfirm --workpath $workPath --distpath (Join-Path $staging 'dist') (Join-Path $release 'OnlineTrader.spec') 2>&1 | Tee-Object -FilePath $buildLog
-    if ($LASTEXITCODE -ne 0) { throw "Portable freeze failed. Inspect $buildLog" }
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $interpreter -I -m PyInstaller --noconfirm --workpath $workPath --distpath (Join-Path $staging 'dist') (Join-Path $release 'OnlineTrader.spec') 2>&1 | Tee-Object -FilePath $buildLog
+        $pyinstallerExit = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    if ($pyinstallerExit -ne 0) { throw "Portable freeze failed. Inspect $buildLog" }
     $bundle = Join-Path $staging 'dist/OnlineTrader'
     if (-not (Test-Path -LiteralPath (Join-Path $bundle 'OnlineTrader.exe') -PathType Leaf) -or -not (Test-Path -LiteralPath (Join-Path $bundle '_internal') -PathType Container)) { throw "Portable layout is incomplete. Inspect $buildLog" }
     Get-ChildItem -LiteralPath (Join-Path $release 'portable') | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $bundle -Recurse }
