@@ -16,6 +16,11 @@ Use the Standalone Trading Runtime unless the user explicitly selects another ex
 - The Workbench is a read/control client. Its CommandBus keeps pending correlation only for the current process; Runtime revalidates every command.
 - Qt and runtime-view failures must not create another SDK sender or transfer execution ownership.
 - Trading controls are manual-only through the same interactive Windows user's Workbench channel. CLI/API/delegated tools are read-only; legacy schedule, operator grant, watchdog and handoff files are ignored.
+- Pending initial auto-arm (`arm=True`) is bound to `authority_generation`: explicit user `STOP`/`PAUSE` or persistent disarm revokes it, while transient sync/network disconnects preserve it.
+- `resolve_active_trading_day()` advances the cabinet day only when all scoped calendars are `complete=True` and active contracts agree on the trading day (conflicting active days fail closed with `E_DSV_SCOPE`).
+- Owner `tick()` classifies errors into `TRANSIENT_DISCONNECT`, `PERSISTENT_DISARM` (`NEEDS_REVIEW` + `recovery_required`), or `FAIL_STOP`; `ControlServer` closes peers on unexpected Python errors and fails closed on storage/owner invariant faults.
+- `MANUAL_CLOSE` and `MANUAL_CLOSE_ALL` enforce optimistic concurrency on `target_revision` (`E_SCHEMA` when missing, `E_REVISION_CONFLICT` when stale).
+- Combined-exchange `CLOSE` routes (`DCE`/`CZCE`/`CFFEX`/`GFEX`) use explicit `historical_first_on_combined=True` in `ExplicitOrderController` so multi-cycle clipping protects other cycles' historical lots.
 
 Use [module boundaries](../../../docs/ai/module-boundaries.yaml) to locate the initial source set. For state, persistence, recovery, IPC or command work, read the current owning contracts named by `architecture-status.yaml`; do not implement from a `SUPERSEDED` scope.
 
@@ -27,6 +32,6 @@ Use [module boundaries](../../../docs/ai/module-boundaries.yaml) to locate the i
 4. Keep commands bound to account, Runtime boot, configuration revision and the original `command_id`. A timeout is not permission to resend; a new process does not inherit old pending responsibility.
 5. Preserve correlated diagnostics for decisions, external calls, exact failed predicates and follow-on responsibility without exposing credentials or account plaintext.
 6. Update the current contract owner and navigation when guidance changes. Keep dated evidence as historical and never relabel old results as current validation.
-7. After routine changes, run only the repository compilation check. Run tests, broker connections or packaging only when the current request explicitly authorizes them.
+7. After routine changes, run only the repository compilation check. Run tests, broker connections or packaging only when the current request explicitly authorizes them. When adding or renaming unittest cases, update `qa/test_manifest.json` and verify with `.venv\Scripts\python.exe -X utf8 qa\test_registry.py`; run `.venv\Scripts\python.exe -X utf8 qa\test_runner.py --profile FullOffline` when full offline regression is authorized.
 
 If current source conflicts with a current contract, report `CONFLICT / NEEDS_REVIEW` and resolve the owning design before expanding the change. Order and send safety remain mandatory through `AGENTS.md`; they are not optional Skill behavior.

@@ -1,7 +1,7 @@
 # Testing System PR2：Standalone Target Owner 子进程 Harness
 
-> 状态：`REVIEWED DESIGN / IMPLEMENTATION CANDIDATE`
-> 日期：2026-11-21
+> 状态：`CURRENT DESIGN / PROCESS LIFECYCLE OFFLINE-VERIFIED`
+> 日期：2026-11-21（2026-11-23 补跑生命周期回归）
 > 范围：仅 `qa/target_owner/` 的离线 Owner 进程、父进程 Fake Broker、事实驱动通道、产品 Named Pipe 客户端路径与事件证据。
 > 边界：不改生产 Runtime、SDK、Target Controller 或产品 IPC；不接真实账户、不发送真实订单、不打包。
 
@@ -9,7 +9,7 @@
 
 PR2 的关键目标是把当前 `OfflineTargetRuntime` 从“测试进程内的 Owner 线程”提升为独立 Owner 子进程，同时保持其通过真实产品 `ControlServer` Named Pipe 提供 Workbench 投影。父测试进程不能读取 Owner 对象或执行器内部数量；它只能给 QA 事实适配器送入明确的离线事件，并通过产品客户端观察结果。
 
-此路径可复用 `StandaloneDsvOwner`、`DsvSession`、`ControlServer` 和现有 `StatusClient`，无需给生产 Runtime 增加假事实入口。子进程宿主和单合约父进程 Fake Broker 状态模型已进入候选工作树；它们可支持进程隔离、公共 IPC、Owner 生命周期和明确事实顺序。5 手开仓、3+2 成交、撤单和退出仍须补场景驱动与独立验收。
+此路径可复用 `StandaloneDsvOwner`、`DsvSession`、`ControlServer` 和现有 `StatusClient`，无需给生产 Runtime 增加假事实入口。子进程宿主和单合约父进程 Fake Broker 状态模型已进入候选工作树，且 `tests/test_target_owner_runtime.py::test_process_runtime_harness_lifecycle_and_public_pipe_control` 已在本机 Windows 离线回归中验证进程隔离、公共 Named Pipe 控制、fact 帧应用和正常 teardown 清理。5 手开仓、3+2 成交、撤单和退出仍须补更多场景驱动与独立验收。
 
 ## 2. 架构与信任边界
 

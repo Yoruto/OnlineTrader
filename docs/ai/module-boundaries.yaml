@@ -1,6 +1,6 @@
 schema_version: ONLINE_TRADER_MODULE_BOUNDARIES/1
 verified_at_sha: WORKTREE
-verified_on: "2026-11-21"
+verified_on: "2026-11-23"
 note: Static navigation aid only. Dynamic Qt, IPC and SDK relationships still require source review.
 
 current_workbench_contract: docs/refactor/runtime-workbench-current-20261120.md
@@ -121,6 +121,9 @@ boundaries:
       - qa/target_owner/offline_runtime.py
       - qa/target_owner/process_runtime.py
       - qa/target_owner/fake_broker.py
+      - qa/test_manifest.json
+      - qa/test_registry.py
+      - qa/test_runner.py
       - src/online_trader/dsv_runtime/offline_endpoint.py
     owns:
       - frozen fixtures and bounded offline replay

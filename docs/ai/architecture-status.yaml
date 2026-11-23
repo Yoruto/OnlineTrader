@@ -1,6 +1,6 @@
 schema_version: ONLINE_TRADER_ARCHITECTURE_STATUS/1
 reviewed_at_sha: WORKTREE
-reviewed_on: "2026-11-21"
+reviewed_on: "2026-11-23"
 rules:
   identity: path_and_scope
   conflict_result: CONFLICT_NEEDS_REVIEW
@@ -17,31 +17,31 @@ documents:
     evidence:
       design: USER_DIRECTED_REVIEWED
       source: DEFAULT_STANDALONE_COLD_SWITCHED_TO_TARGET_OWNER
-      tests: INDEPENDENT_OFFLINE_37_OF_37_TARGETED_138_OF_138_FULL_1919_OF_1919_PASS
+      tests: INDEPENDENT_OFFLINE_FULL_1931_OF_1931_PASS_WITH_PROCESS_HARNESS
       product_acceptance: ONLINE_AND_ARTIFACT_NOT_RUN
-    notes: Target ownership, pending/UNKNOWN accounting, temporary-boot boundary and version-owned single-core cold cutover contract.
+    notes: Target ownership, pending/UNKNOWN accounting, temporary-boot boundary, version-owned single-core cold cutover, 3-tier tick error classification, authority-generation-bound auto-arm, mixed-session trading day, and manual-close target_revision OCC.
 
   - path: docs/refactor/testing-system-redesign-20261121.md
     scope: testing/static-manifest-and-offline-profile-selection
-    status: CANDIDATE
+    status: CURRENT
     verified_at_sha: WORKTREE
     evidence:
       design: REVIEWED_REVISED_AFTER_TARGET_OWNER_COLD_CUTOVER
-      source: PR1_RUNNER_MANIFEST_AND_PR2_HARNESS_CANDIDATE
-      tests: MANIFEST_1919_OF_1919_AND_LIST_ONLY_PROFILES_PASS_BEHAVIOR_NOT_RUN
+      source: PR1_RUNNER_MANIFEST_AND_PR2_HARNESS_IMPLEMENTED
+      tests: FULL_OFFLINE_1931_OF_1931_PASS
       product_acceptance: NOT_APPLICABLE
     notes: Affected fails closed to FullOffline until dependency mapping is independently justified; online and release profiles are not exposed by PR1. OFFLINE is manifest-only and no OS network sandbox is installed.
 
   - path: docs/refactor/testing-system-pr2-harness-20261121.md
     scope: testing/qa-only-standalone-owner-process-harness
-    status: CANDIDATE
+    status: CURRENT
     verified_at_sha: WORKTREE
     evidence:
       design: REVIEWED_PROCESS_AND_FACT_CHANNEL_CONTRACT
-      source: QA_OWNER_PROCESS_AND_FAKE_BROKER_CANDIDATE
-      tests: COMPILE_PASS_BEHAVIOR_NOT_RUN
+      source: QA_OWNER_PROCESS_AND_FAKE_BROKER_IMPLEMENTED
+      tests: PROCESS_LIFECYCLE_AND_PUBLIC_PIPE_TESTS_PASS
       product_acceptance: NOT_APPLICABLE
-    notes: Separate QA fact channel and product Named Pipe; parent Fake Broker is single-contract and flat-start only. Trading scenarios, teardown and Windows cleanup still require independent behavior acceptance.
+    notes: Separate QA fact channel and product Named Pipe; parent Fake Broker is single-contract and flat-start only. OfflineTargetOwnerProcess lifecycle and public pipe control pass offline; multi-round trading scenarios and Windows package acceptance remain separate.
 
   - path: docs/refactor/runtime-workbench-current-20261120.md
     scope: standalone/workbench-current-overview

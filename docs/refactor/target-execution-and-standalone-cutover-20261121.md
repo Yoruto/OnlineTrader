@@ -125,4 +125,10 @@ Broker Fact Frame
 - 目标 Owner 已通过版本固定的内部冷切换点成为 Standalone 默认核心；不向用户暴露双内核开关，回退仍以完整已知版本进行；自动 offset 保持发送前计算合同；
 - 离线公共 Runtime/pipe 夹具已覆盖完整/不完整基线、命令绑定与幂等、未归属柜台持仓、flatten-stop、history cache 故障、容量边界和 fresh boot 临时 Journal；受影响离线范围 37/37 通过；
 - 冷切换后定向回归 138/138 通过；默认 Standalone bootstrap 探针确认 Target Owner 1 次、Legacy Owner 0 次，并使用 fresh Journal；完整源码回归 1919/1919 通过，无 FAIL、SKIP 或 NOT_RUN；
+- 截至 2026-11-23（`643dcec` / `ff92aed` / `ae9a386` 候选）：
+  - `resolve_active_trading_day()` 仅在所有受控合约日历 `complete=True` 且当前活跃合约交易日一致时推进柜台日（混合夜盘+日盘合约不再互相否决，活跃合约日冲突触发 `E_DSV_SCOPE` fail-closed）；
+  - `StandaloneDsvOwner.authority_generation` 绑定启动自动 ARM 意图：瞬断保留 `initial_start_pending`，人工 `PAUSE_NEW_ENTRIES` / `STOP_DSV_STRATEGY` / `FLATTEN_THEN_STOP` 或 `PERSISTENT_DISARM` 撤销 pending 自动启动；
+  - `execute_owner_tick()` 与 `ControlServer` 落实三档异常分类（瞬断保授权、事实/所有权/范围/时钟故障持久 `DISARMED + recovery_required`、存储/未知 Python 异常 `FAIL_STOP` 并关闭 peer）；
+  - `MANUAL_CLOSE` / `MANUAL_CLOSE_ALL` 强制校验 `target_revision` 乐观并发控制；`WorkbenchSounds` 改为按不可变成交身份去重；合并平仓交易所由 `ExplicitOrderController` 显式启用 `historical_first_on_combined=True`；
+  - 本机 `FullOffline` 静态清单回归（含 `OfflineTargetOwnerProcess` 子进程生命周期与命名管道控制测试）`1931/1931 PASS`；
 - 真实柜台、多物理机同账号、自然订单和最终制品仍未验证；发行隔离和旧 Kernel 生产依赖闭包退役尚未完成。
