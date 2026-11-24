@@ -14,6 +14,7 @@
 - [Standalone Trading Runtime 设计](refactor/standalone-trading-runtime-20261119.md)
 - [Runtime 本机单实例与柜台权威设计](refactor/runtime-broker-authority-single-instance-20261120.md)
 - [Configuration、Persistence 与 Runtime 基础架构与生命周期解耦设计 V1.1](refactor/configuration-persistence-runtime-architecture-20261124.md)（运行模式、账户切换、更新协调及数据连续性；待评审，未实施）
+  - [最小实现规格 V1.0：Runtime 生命周期、Configuration 与 Persistence](refactor/configuration-persistence-runtime-implementation-20261124.md)（PR0–PR6 编码规格，待评审，未实施）
 - [2026-11-20 独立全量复测缺陷修正记录](refactor/runtime-full-retest-remediation-20261120.md)
 - [Runtime / Workbench 架构收敛与安全改造计划](refactor/runtime-architecture-hardening-plan-20261120.md)
   - [执行路径与 Ledger Lineage 事实矩阵](refactor/runtime-execution-ledger-lineage-20261120.md)
