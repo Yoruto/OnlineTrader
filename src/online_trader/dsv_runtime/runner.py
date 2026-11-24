@@ -19,6 +19,7 @@ from online_trader.dsv_core.price_rules import scheduled_close_mode
 from online_trader.dsv_runtime.controller import ExplicitOrderController, terminal, tighten_target
 from online_trader.dsv_runtime.order_diagnostics import OrderDiagnosticTracker
 from online_trader.dsv_runtime.owner_binding import StandaloneOwnerBinding
+from online_trader.dsv_runtime.startup_inference import infer_startup_symbol_state
 from online_trader.dsv_storage.journal import Journal
 from online_trader.dsv_storage.workbench_evidence import WorkbenchEvidence
 from online_trader.errors import TraderError
@@ -110,6 +111,7 @@ class DsvSession:
         self._scope = {'account_key': account_key, 'provider': provider, 'trading_day': trading_day,
                        'configuration_id': profile.content_hash}
         self._owner_binding = _owner_binding
+        self._standalone_convergence = isinstance(_owner_binding, StandaloneOwnerBinding)
         if isinstance(_owner_binding, StandaloneOwnerBinding):
             self._scope.update(owner_mode='STANDALONE', runtime_boot_id=_owner_binding.boot_id)
         settings = profile.to_record()['settings']
@@ -126,6 +128,11 @@ class DsvSession:
             self._state.setdefault('synchronized', True)
             self._state.setdefault('owner_fault_code', None)
             self._state.setdefault('retired_positions', {})
+            if self._standalone_convergence:
+                self._state.setdefault('startup_inferred', False)
+                self._state.setdefault('startup_inference', {})
+                self._state.setdefault('convergence_cancels', {})
+                self._state.setdefault('convergence_status', {})
             for row in self._state['symbols'].values():
                 position = row['position']
                 if position is not None and 'fills' not in position:
@@ -633,6 +640,36 @@ class DsvSession:
                     _day(fact[key])
             if any(key in fact and fact[key] != self._scope[key] for key in ('account_key', 'provider')):
                 raise TraderError('E_DSV_SCOPE', 'Native facts must match the account, provider and cabinet day')
+        if 'unconfigured_markets' in frame:
+            unconf = frame['unconfigured_markets']
+            if type(unconf) is not list:
+                raise TraderError('E_DSV_ROUND', 'Unconfigured markets must be an ordered list')
+            seen_unconf = set()
+            for market in unconf:
+                cid = market.get('contract_id')
+                if not cid or cid in self._symbols or cid in seen_unconf:
+                    raise TraderError('E_DSV_SCOPE', 'Unconfigured market must uniquely identify an unconfigured contract')
+                seen_unconf.add(cid)
+                for key in ('long_qty', 'short_qty'):
+                    quantity(market[key])
+                if any(key in market for key in _BUCKETS):
+                    for key in _BUCKETS:
+                        quantity(market[key])
+                for tick in market.get('ticks', ()):
+                    _utc(tick['native_time'])
+                    for key in _PRICE_FIELDS:
+                        if tick.get(key) not in (None, 'NaN'):
+                            decimal_value(tick[key])
+        if 'non_strategy_orders' in frame:
+            ext_orders = frame['non_strategy_orders']
+            if type(ext_orders) is not list:
+                raise TraderError('E_DSV_ROUND', 'Non-strategy orders must be a list')
+            for ext in ext_orders:
+                if not ext.get('native_order_id') or not ext.get('contract_id'):
+                    raise TraderError('E_DSV_ROUND', 'Non-strategy order requires native_order_id and contract_id')
+                if ext.get('direction') not in {'BUY', 'SELL'}:
+                    raise TraderError('E_DSV_ROUND', 'Non-strategy order direction must be BUY or SELL')
+                quantity(ext.get('volume_left'), positive=True)
 
     def _evaluate(self, state, frame, *, timing=None):
         mono = str(frame['monotonic_ms'])
@@ -678,6 +715,11 @@ class DsvSession:
             self._mark_unsynchronized(state)
         if needs_sync and frame.get('synchronized') is True:
             self._synchronize(state, frame, pending)
+        if getattr(self, '_standalone_convergence', False) and state['synchronized']:
+            if not state.get('startup_inferred'):
+                self._infer_startup_targets(state, frame, day)
+            elif not state['running']:
+                self._sync_disarmed_inferred_positions(state, frame)
         state.update(sequence=frame['sequence'], monotonic_ms=mono, session_id=frame['session_id'])
         if timing:
             self._observe_clock(state, frame, timing)
@@ -707,6 +749,7 @@ class DsvSession:
                     if position := row['position']:
                         position.update(entry_stopped=True, preserve_open_on_stop=False)
         market_rows = {market['contract_id']: market for market in frame['market']}
+        observed_configured = {}
         decisions, effects = [], []
         for contract, spec in self._symbols.items():
             row = state['symbols'][contract]
@@ -757,11 +800,15 @@ class DsvSession:
             values = self._evaluate_symbol(state, row, observed, symbol_frame, spec, timing=timing)
             self._update_stops(row, contract, day, spec, frame.get('trading_days', []))
             self._record_evaluation_diagnostics(row, observed, values, timing=timing)
+            observed_configured[contract] = observed
+            frozen_plan_b = bool(row['position'] is not None and row['position'].get('awaiting_start_arm')
+                                 and not state['running'])
             if timing:
-                self._plan_timed_symbol(state, row, observed, timing, values, effects)
+                if not frozen_plan_b:
+                    self._plan_timed_symbol(state, row, observed, timing, values, effects)
             decisions.extend({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:{i}",
                               **value} for i, value in enumerate(values))
-            if timing:
+            if timing or frozen_plan_b:
                 continue
             if self._in_session(symbol_frame, observed):
                 self._diag().observe_block(('exit_session_gate', contract), active=False, contract_id=contract)
@@ -794,7 +841,203 @@ class DsvSession:
                             if request := self._controller.cancel(order, 'TARGET_REDUCED'):
                                 effects.append(request)
                 self._controller.settle(state, row)
+        if getattr(self, '_standalone_convergence', False) and state['synchronized']:
+            unconfigured_observed = []
+            for um in frame.get('unconfigured_markets', ()):
+                uticks = um.get('ticks') or ()
+                utick = uticks[-1] if (uticks and um.get('market_session_active', True)) else None
+                unconfigured_observed.append(um | {'tick': utick})
+            ext_orders = frame.get('non_strategy_orders', ())
+            if state['running']:
+                conv_effects, conv_status, conv_events = self._controller.plan_convergence(
+                    state, observed_configured, unconfigured_observed, ext_orders,
+                    _utc(frame['wall_time']).timestamp())
+                effects.extend(conv_effects)
+                state['convergence_status'] = conv_status
+                self._emit_convergence_diagnostics(conv_status, conv_events)
+            else:
+                state['convergence_status'] = self._compute_convergence_preview(
+                    state, observed_configured, unconfigured_observed, ext_orders)
         return decisions, effects
+
+    def _infer_startup_targets(self, state, frame, day):
+        market_rows = {m['contract_id']: m for m in frame['market']}
+        all_facts = frame.get('startup_account_facts') or {}
+        inferred = {}
+        for contract, spec in sorted(self._symbols.items()):
+            row = state['symbols'][contract]
+            market = market_rows[contract]
+            facts = all_facts.get(contract) or {}
+            res = infer_startup_symbol_state(
+                contract_id=contract,
+                spec=spec,
+                trade_settings=self._trade,
+                trading_day=day,
+                market=market,
+                today_trades=facts.get('today_trades'),
+                minute_bars=facts.get('minute_bars'),
+                has_prior_day_force_close=bool(facts.get('has_prior_day_force_close', True)),
+            )
+            inferred[contract] = {k: v for k, v in res.items() if k != 'proved_position'} | {
+                'has_proved_position': res['proved_position'] is not None,
+            }
+            row['target_count'] = max(int(row.get('target_count') or 0), int(res['target_count']))
+            if Decimal(res['net_loss']) > Decimal(row.get('net_loss') or '0'):
+                row['net_loss'] = res['net_loss']
+            row['stop_streak'] = max(int(row.get('stop_streak') or 0), int(res['stop_streak']))
+            if res['day_stop'] and not row.get('day_stop'):
+                row['day_stop'] = True
+                row['day_stop_reason'] = res['day_stop_reason']
+            if res['last_signal_bar'] is not None and row.get('last_signal_bar') is None:
+                row['last_signal_bar'] = res['last_signal_bar']
+            proved = res.get('proved_position')
+            if proved is not None and row['position'] is None:
+                qty = int(proved['quantity'])
+                pos_id = f'planb-{uuid4().hex[:12]}'
+                position = {
+                    'id': pos_id,
+                    'target_id': f'target-{uuid4().hex[:12]}',
+                    'target_revision': 1,
+                    'target_reason': 'STARTUP_PLAN_B_PROVED',
+                    'target_fact_sequence': frame['sequence'],
+                    'contract_id': contract,
+                    'direction': proved['direction'],
+                    'quantity': qty,
+                    'owned': qty,
+                    'entry_filled': qty,
+                    'legacy_owned': qty,
+                    'entry_notional': decimal_text(Decimal(proved['entry_avg']) * qty),
+                    'theory': proved['theory'],
+                    'cap': proved['theory'],
+                    'stop': proved['stop'],
+                    'profit': proved['profit'],
+                    'mode': 'ACTIVE',
+                    'order_ms': proved['entry_ms'],
+                    'submitted_at': proved['entry_at'],
+                    'context_at': proved['entry_at'],
+                    'children': [],
+                    'entry_stopped': True,
+                    'preserve_open_on_stop': False,
+                    'entry_slip_checked': True,
+                    'inferred_from_startup': True,
+                    'awaiting_start_arm': True,
+                    'peak': proved['peak'],
+                    'protected': bool(proved['protected']),
+                    'half_stage': int(proved['half_stage']),
+                    'exit_target': None,
+                    'open_day': day,
+                    'fills': [],
+                    'entry_kind': 'STARTUP_PLAN_B_PROVED',
+                    'multiplier': market.get('multiplier'),
+                }
+                if self._sdk_port is not None and market.get('multiplier') is not None:
+                    position['sdk_multiplier'] = market['multiplier']
+                row['position'] = position
+            self._diag().emit(
+                'STARTUP_TARGET_INFERENCE',
+                contract_id=contract,
+                trading_day=day,
+                actual_long=res['actual_long'],
+                actual_short=res['actual_short'],
+                target_long=res['target_long'],
+                target_short=res['target_short'],
+                target_count=res['target_count'],
+                day_stop=res['day_stop'],
+                reason=res['reason'],
+            )
+        state['startup_inference'] = inferred
+        state['startup_inferred'] = True
+
+    def _sync_disarmed_inferred_positions(self, state, frame):
+        market_rows = {m['contract_id']: m for m in frame['market']}
+        for contract, row in state['symbols'].items():
+            pos = row.get('position')
+            if pos is None or not pos.get('awaiting_start_arm') or pos.get('children'):
+                continue
+            market = market_rows.get(contract) or {}
+            own_key = 'long_qty' if pos['direction'] == 'LONG' else 'short_qty'
+            actual_own = int(market.get(own_key) or 0)
+            if actual_own <= 0:
+                row['position'] = None
+                row.pop('ownership_conflict', None)
+            elif actual_own < pos['owned']:
+                avg_px = Decimal(pos['entry_notional']) / Decimal(pos['entry_filled']) if pos.get('entry_filled') else Decimal(pos['theory'])
+                pos.update(
+                    owned=actual_own,
+                    legacy_owned=actual_own,
+                    quantity=actual_own,
+                    entry_filled=actual_own,
+                    entry_notional=decimal_text(avg_px * actual_own),
+                )
+                row.pop('ownership_conflict', None)
+
+    @staticmethod
+    def _compute_convergence_preview(state, configured_markets, unconfigured_markets, non_strategy_orders):
+        ext_contracts = {o['contract_id'] for o in (non_strategy_orders or ())}
+        preview = {}
+        for cid in sorted(configured_markets):
+            m = configured_markets[cid]
+            pos = state['symbols'][cid]['position']
+            t_long = pos['owned'] if (pos is not None and pos['direction'] == 'LONG') else 0
+            t_short = pos['owned'] if (pos is not None and pos['direction'] == 'SHORT') else 0
+            a_long = int(m.get('long_qty') or 0)
+            a_short = int(m.get('short_qty') or 0)
+            ex_long = max(0, a_long - t_long)
+            ex_short = max(0, a_short - t_short)
+            has_ext = cid in ext_contracts
+            preview[cid] = {
+                'configured': True,
+                'status': 'PREVIEW_NEEDS_CONVERGENCE' if (ex_long or ex_short or has_ext) else 'ALIGNED',
+                'actual_long': a_long,
+                'actual_short': a_short,
+                'target_long': t_long,
+                'target_short': t_short,
+                'excess_long': ex_long,
+                'excess_short': ex_short,
+            }
+        for m in sorted(unconfigured_markets, key=lambda item: item['contract_id']):
+            cid = m['contract_id']
+            a_long = int(m.get('long_qty') or 0)
+            a_short = int(m.get('short_qty') or 0)
+            has_ext = cid in ext_contracts
+            preview[cid] = {
+                'configured': False,
+                'status': 'PREVIEW_NEEDS_CONVERGENCE' if (a_long or a_short or has_ext) else 'ALIGNED',
+                'actual_long': a_long,
+                'actual_short': a_short,
+                'target_long': 0,
+                'target_short': 0,
+                'excess_long': a_long,
+                'excess_short': a_short,
+            }
+        return preview
+
+    def _emit_convergence_diagnostics(self, statuses, events):
+        diag = self._diag()
+        deferred_active = set()
+        for ev in events:
+            if ev['event'] == 'CONVERGENCE_ACTION':
+                payload = {k: v for k, v in ev.items() if k != 'event'}
+                diag.emit('CONVERGENCE_ACTION', **payload)
+            elif ev['event'] == 'CONVERGENCE_DEFERRED':
+                key = ('convergence_defer', ev['contract_id'], ev.get('side', 'ALL'))
+                deferred_active.add(key)
+                diag.observe_block(
+                    key,
+                    active=True,
+                    contract_id=ev['contract_id'],
+                    side=ev.get('side'),
+                    reason=ev['reason'],
+                    excess_long=ev.get('excess_long'),
+                    excess_short=ev.get('excess_short'),
+                    excess_qty=ev.get('excess_qty'),
+                )
+        for cid, st in statuses.items():
+            if not str(st.get('status', '')).startswith('DEFERRED_') and st.get('status') != 'CANCELLING_NON_STRATEGY_ORDERS':
+                for side in ('ALL', 'LONG', 'SHORT'):
+                    key = ('convergence_defer', cid, side)
+                    if key not in deferred_active:
+                        diag.observe_block(key, active=False, contract_id=cid)
 
     def _observe_clock(self, state, frame, timing):
         state.update(time_semantics_version=TIME_SEMANTICS, time_sample=frame['time_sample'],
@@ -997,7 +1240,8 @@ class DsvSession:
         blocking_reasons = {
             'LATE_FILL_OWNERSHIP_REVIEW', 'UNRESOLVED_PRIOR_CHILD', 'USER_STOPPED',
             'FEED_HEALTH_BLOCK', 'OUTSIDE_SESSION', 'QUOTE_UNAVAILABLE', 'QUOTE_AGE',
-            'E_FOREIGN_ACTIVE_ORDER', 'EXTERNAL_POSITION_PRESENT', 'UNOWNED_POSITION',
+            'CONVERGENCE_FLATTEN_PENDING', 'E_FOREIGN_ACTIVE_ORDER', 'EXTERNAL_POSITION_PRESENT',
+            'UNOWNED_POSITION',
             'MINUTE_BAR_UNAVAILABLE', 'POSITION_WAITING_FOR_MARKET', 'DATA_GAP_EXIT_PENDING',
             'DATA_GAP_EXIT', 'GEOMETRY_BLOCK',
         }
@@ -1079,6 +1323,8 @@ class DsvSession:
         if row.get('detached_positions') or row.get('native_conflicts'):
             return [{'reason': 'LATE_FILL_OWNERSHIP_REVIEW', 'rule_ids': ['I01', 'I02']}]
         if position is not None:
+            if position.get('awaiting_start_arm') and not state['running']:
+                return [{'reason': 'STARTUP_PROVED_AWAITING_START', 'rule_ids': ['D14']}]
             pos_trade, pos_spec = self._trade, spec
             if (timing and tick is not None and position['owned'] and (row.get('last_stop') or {}).get('until') is not None
                     and (position.get('rollback_exit') or {}).get('reason') == 'STOP_LOSS'
@@ -1095,10 +1341,18 @@ class DsvSession:
                 if wait is not None:
                     return [wait]
             return self._maintain_position(row, position, market, frame, pos_spec, timing=timing, trade=pos_trade)
-        if any(order['contract_id'] == market['contract_id'] and not terminal(order) for order in state['orders'].values()):
+        if any(order['contract_id'] == market['contract_id'] and not terminal(order)
+               and not order.get('convergence_order') for order in state['orders'].values()):
             return [{'reason': 'UNRESOLVED_PRIOR_CHILD', 'rule_ids': ['I02']}]
         if not state['running']:
             return [{'reason': 'USER_STOPPED', 'rule_ids': ['D14']}]
+        if market.get('standalone_external_model'):
+            has_conv_pending = any(
+                o.get('convergence_order') and o['contract_id'] == market['contract_id'] and not terminal(o)
+                for o in state['orders'].values()
+            )
+            if has_conv_pending:
+                return [{'reason': 'CONVERGENCE_FLATTEN_PENDING', 'rule_ids': ['I01', 'I02']}]
         if tick is None:
             return [{'reason': 'QUOTE_UNAVAILABLE', 'rule_ids': ['D01']}]
         if timing:
@@ -1118,10 +1372,12 @@ class DsvSession:
         if frame.get('feed_entry_blocked'):
             return [{'reason': 'FEED_HEALTH_BLOCK', 'rule_ids': ['D01', 'I02']}]
         if market.get('standalone_external_model'):
-            if market.get('external_active_orders'):
-                return [{'reason': 'E_FOREIGN_ACTIVE_ORDER', 'rule_ids': ['I01', 'I02']}]
-            if market['long_qty'] or market['short_qty']:
-                return [{'reason': 'EXTERNAL_POSITION_PRESENT', 'rule_ids': ['I01', 'I02']}]
+            has_conv_pending = any(
+                o.get('convergence_order') and o['contract_id'] == market['contract_id'] and not terminal(o)
+                for o in state['orders'].values()
+            )
+            if market.get('external_active_orders') or market['long_qty'] or market['short_qty'] or has_conv_pending:
+                return [{'reason': 'CONVERGENCE_FLATTEN_PENDING', 'rule_ids': ['I01', 'I02']}]
         elif market['long_qty'] or market['short_qty'] or market.get('external_orders'):
             return [{'reason': 'UNOWNED_POSITION', 'rule_ids': ['I01', 'I02']}]
         if 'quote_age_seconds' in market:
@@ -1521,6 +1777,10 @@ class DsvSession:
             if action == 'START' and self._sdk_port is not None:
                 self._sdk_port.check_start(state)
             state['running'] = action == 'START'
+            if action == 'START':
+                for row in state['symbols'].values():
+                    if row['position'] is not None:
+                        row['position'].pop('awaiting_start_arm', None)
             effects = []
             if action == 'STOP':
                 for row in state['symbols'].values():

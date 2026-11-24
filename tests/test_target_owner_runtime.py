@@ -380,23 +380,44 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
         self.assertEqual(current['commands'], [])
         self.assertFalse(old_ledger.exists())
 
-    def test_external_broker_position_is_not_claimed_or_extended(self):
+    def test_external_broker_position_is_flattened_only_after_arm_not_claimed(self):
         self.synchronize()
+        self.runtime.submit(frame(2, owned=2))
+        disarmed_view = self.wait_view(
+            lambda value: (value.get('connection') or {}).get('account_positions') == [{
+                'contract_id': CONTRACT,
+                'name': '豆油2601',
+                'configured': True,
+                'actual_long': 2,
+                'actual_short': 0,
+                'target_long': 0,
+                'target_short': 0,
+                'excess_long': 2,
+                'excess_short': 0,
+                'status': 'PREVIEW_NEEDS_CONVERGENCE',
+                'startup_reason': 'UNPROVED_NO_TODAY_FILL',
+                'market_session_active': True,
+            }] or (value.get('connection') or {}).get('account_positions', [{}])[0].get('actual_long') == 2)
+        self.assertEqual(disarmed_view['external_positions'], [])
+        self.assertEqual(disarmed_view['orders'], [])
+        self.assertEqual(self.runtime.adapter.orders, [])
         self.client.command(
             'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
             {'authority_policy_id': 'target-authority-current-boot',
              'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
             expected_config_revision='1')
-        self.runtime.submit(frame(2, owned=2))
-        view = self.wait_view(
-            lambda value: value['markets'][0]['entry_reasons'] == ['EXTERNAL_POSITION_PRESENT']
-            and value['external_positions'] == [{
-                'contract_id': CONTRACT, 'direction': 'LONG', 'quantity': 2,
-                'classification': 'UNOWNED_BROKER_POSITION',
-            }])
-        self.assertEqual(view['cycles'], [])
-        self.assertEqual(view['orders'], [])
-        self.assertEqual(self.runtime.adapter.orders, [])
+        self.runtime.submit(frame(3, owned=2))
+        armed_view = self.wait_view(
+            lambda value: len(value['orders']) == 1
+            and value['markets'][0]['entry_reasons'] == ['CONVERGENCE_FLATTEN_PENDING'])
+        self.assertEqual(armed_view['external_positions'], [])
+        self.assertEqual(armed_view['cycles'], [])
+        self.assertEqual(armed_view['orders'][0]['effect'], 'REDUCE')
+        self.assertEqual(armed_view['orders'][0]['original_qty'], 2)
+        self.assertEqual(armed_view['orders'][0]['order_source'], 'CONVERGENCE')
+        self.assertEqual(len(self.runtime.adapter.orders), 1)
+        self.assertEqual(self.runtime.adapter.orders[0]['native_offset'], 'CLOSE')
+        self.assertEqual(self.runtime.adapter.orders[0]['direction'], 'SELL')
 
     def test_flatten_then_stop_waits_for_original_child_terminal_fact(self):
         self.synchronize()
@@ -1459,7 +1480,7 @@ class TargetOwnerWorkbenchProjectionTests(unittest.TestCase):
             captured_clients = []
 
             class _FakeControlServer:
-                def __init__(self, owner, pipe, *, trusted_client_pid=None):
+                def __init__(self, owner, pipe, *, trusted_client_pid=None, diagnostic_sink=None):
                     captured_clients.append((owner, pipe, trusted_client_pid))
 
                 def serve(self, **_kwargs):

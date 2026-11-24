@@ -59,6 +59,7 @@ E2E_PROFILES: dict[str, tuple[str, ...]] = {
     ),
     "TradingE2E": (
         "smoke/entry_001_5lot_partial_stop_loss.py",
+        "convergence/convergence_001_account_target.py",
         "unknown/unknown_001_ack_loss_and_reconcile.py",
         "unknown/unknown_002_negative_reconcile.py",
         "cancel/cancel_001_reprice_and_late_fill.py",

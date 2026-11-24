@@ -154,7 +154,12 @@ class OfflineAdapter(RecordingPort):
             current['sequence'] = expected_seq
 
         self.dispatch_market = {row['contract_id']: row for row in current.get('market', ())}
-        contracts = self.contracts or list(self.dispatch_market.keys())
+        if getattr(session, '_standalone_convergence', False):
+            for row in current.get('market', ()):
+                row.setdefault('standalone_external_model', True)
+            for um in current.get('unconfigured_markets', ()):
+                self.dispatch_market[um['contract_id']] = um
+        contracts = self.contracts or [row['contract_id'] for row in current.get('market', ())]
         max_age = self._max_quote_age_seconds()
         if contracts:
             pre_health = evaluate_market_health(
@@ -222,7 +227,7 @@ class OfflineTargetRuntime:
                 account = 'DEV:target-owner-' + uuid4().hex
                 binding = StandaloneOwnerBinding(
                     storage.boot_id, account, 'OFFLINE', object(), object())
-                self.adapter = OfflineAdapter(self.frames)
+                self.adapter = OfflineAdapter(self.frames, profile=profile())
                 session = DsvSession(
                     storage.ledger, account_key=account, provider='OFFLINE',
                     trading_day=DAY, profile=profile(), port=self.adapter,

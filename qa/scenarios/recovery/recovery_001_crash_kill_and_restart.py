@@ -113,9 +113,12 @@ def run(work_dir: Path) -> dict[str, object]:
 
         wb_sync = client2.workbench()
         assert_entry_authority(wb_sync, "DISARMED")
-        ext = wb_sync.get("external_positions") or []
-        if not ext or int(ext[0]["quantity"]) != 5:
-            raise AssertionError(f"INV-008 failure: restarted boot did not surface 5-lot broker position: {ext}")
+        if wb_sync.get("external_positions"):
+            raise AssertionError(f"Unexpected legacy external_positions in Standalone convergence mode: {wb_sync.get('external_positions')}")
+        acc_positions = (wb_sync.get("connection") or {}).get("account_positions") or []
+        matching = [item for item in acc_positions if item.get("contract_id") == CONTRACT]
+        if not matching or int(matching[0].get("actual_long") or 0) != 5:
+            raise AssertionError(f"INV-008 failure: restarted boot did not surface 5-lot account position: {acc_positions}")
         # Verify no extra open orders emitted on restart even at trigger price 1061
         extra_sends = [ev for ev in proc2.events if ev.get("event_type") == "OUTBOUND_SEND"]
         if extra_sends:

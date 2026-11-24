@@ -548,6 +548,36 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         self.assertIsInstance(started[0][1]['store'], PortableAccountStore)
         self.assertTrue(started[0][1]['catalog'])
 
+    def test_home_attention_preserves_command_issue_when_view_is_none(self):
+        self.window.view = None
+        self.window.home_issue = '命令结果待核对，请查看交易详情中的命令回执'
+        self.window.dashboard.render_home()
+        self.assertFalse(self.window.dashboard.home_attention.isHidden())
+        self.assertIn('命令结果待核对', self.window.dashboard.home_pending.text())
+        self.assertFalse(self.window.dashboard.home_detail_button.isHidden())
+        self.assertTrue(self.window.dashboard.home_reconcile_button.isHidden())
+
+    def test_home_attention_shows_generic_recovery_fallback_while_honoring_capability_gate(self):
+        view = runtime_view()
+        view['connection']['recovery_required'] = True
+        view['blocks'] = []
+        view['capabilities'] = {
+            'revision': '2',
+            'observed_at_utc': '2026-11-24T01:00:00Z',
+            'operations': [
+                {'operation': 'REQUEST_RECONCILIATION', 'scope_type': 'ACCOUNT',
+                 'allowed': False, 'reason': 'RECONCILE_TEMPORARILY_UNAVAILABLE'},
+            ],
+        }
+        self.window.view = view
+        self.window.render_view()
+        dashboard = self.window.dashboard
+        self.assertFalse(dashboard.home_attention.isHidden())
+        self.assertIn('需要人工核对', dashboard.home_pending.text())
+        self.assertFalse(dashboard.home_detail_button.isHidden())
+        self.assertFalse(dashboard.home_reconcile_button.isHidden())
+        self.assertFalse(dashboard.home_reconcile_button.isEnabled())
+
 
 if __name__ == '__main__':
     unittest.main()

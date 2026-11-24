@@ -55,6 +55,8 @@ ENTRY_MESSAGES = {
     'TAKE_PROFIT_OUTSIDE_PRICE_LIMIT': '理论止盈超过涨跌停',
     'LAST_NEAR_PRICE_LIMIT': '最新价接近涨跌停',
     'SAME_DIRECTION_WITHIN_ONE_SECOND': '同方向报单间隔不足 1 秒',
+    'CONVERGENCE_FLATTEN_PENDING': '正在将账号持仓与委托收敛至策略目标',
+    'STARTUP_PROVED_AWAITING_START': '启动前已识别策略持仓，等待点击启动',
 }
 ACTIVATION_MESSAGES = {
     'LONG:NO_CHASE_AFTER_ACT': '当日行情已越过多头不追价线',
@@ -854,7 +856,7 @@ class WorkbenchLayout:
         _, self.diagnostic_sections = self.section('日志与诊断')
         self.log_tab = self.add_page(self.diagnostic_sections, '运行事件', self.logs_page)
         self.monitor_tab = self.add_page(self.diagnostic_sections, '连接与行情', self.monitor_page, scroll=True)
-        self.add_page(self.diagnostic_sections, '命令回执', self.receipts_page)
+        self.receipts_tab = self.add_page(self.diagnostic_sections, '命令回执', self.receipts_page)
 
         _, self.account_sections = self.section('账户与设置')
         self.account_tab = self.add_page(self.account_sections, '账户', self.account_page, scroll=True)
@@ -1100,15 +1102,30 @@ class WorkbenchLayout:
             self.tabs.setCurrentWidget(self.home_tab)
             self.home_sections.setCurrentWidget(self.position_tab)
             self.monitor_details.setCurrentWidget(self.external_positions_tab)
+        elif self._home_detail_target == 'blocks':
+            self.tabs.setCurrentWidget(self.home_tab)
+            self.home_sections.setCurrentWidget(self.position_tab)
+            self.monitor_details.setCurrentWidget(self.tables['blocks'])
         elif self._home_detail_target == 'orders':
             self.tabs.setCurrentWidget(self.order_sections.parentWidget())
             self.order_sections.setCurrentWidget(self.order_tab)
+        elif self._home_detail_target == 'receipts':
+            self.tabs.setCurrentWidget(self.diagnostic_sections.parentWidget())
+            self.diagnostic_sections.setCurrentWidget(self.receipts_tab)
         elif self._home_detail_target == 'markets':
             self.tabs.setCurrentWidget(self.home_tab)
             self.home_sections.setCurrentWidget(self.market_tab)
 
     def home_attention_summary(self, view, pending, *, stale, truncated):
         if view is None:
+            if self.window.home_issue:
+                return {
+                    'title': '命令结果待核对',
+                    'items': [self.window.home_issue],
+                    'reconcile': False,
+                    'detail_target': 'receipts',
+                    'detail_text': '查看命令回执',
+                }
             return None
         connection = view['connection']
         connected = connection.get('broker_connected', False)
@@ -1133,16 +1150,27 @@ class WorkbenchLayout:
             result.update(title='运行存储异常', items=['Runtime 已禁止继续交易；请保留现场并查看运行事件（E_STORAGE）'])
         elif connection.get('clock_fault'):
             result.update(title='需要校准时间并核对', reconcile=True,
+                          detail_target='blocks', detail_text='查看阻挡详情',
                           items=['先修复 Windows 时间或交易日证据，再点击“重新核对”；不会重发订单'])
         elif owner_faults:
             result.update(title='需要人工核对', reconcile=True,
+                          detail_target='blocks', detail_text='查看阻挡详情',
                           items=[f'{OWNER_RECOVERY_MESSAGES[code]}（{code}）' for code in owner_faults])
-        elif connection.get('recovery_required') and fallback_faults:
-            suffix = '、'.join(str(code) for code in fallback_faults)
+        elif connection.get('recovery_required') and (fallback_faults or (connected and synchronized)):
+            if fallback_faults:
+                suffix = '、'.join(str(code) for code in fallback_faults)
+                item = f'Runtime 已停开并等待当前柜台事实复核（{suffix}）'
+            else:
+                item = 'Runtime 存在未归类的持久核对异常，请查看阻挡详情或命令回执'
             result.update(title='需要人工核对', reconcile=True,
-                          items=[f'Runtime 已停开并等待当前柜台事实复核（{suffix}）'])
+                          detail_target='blocks', detail_text='查看阻挡详情',
+                          items=[item])
         elif not connected:
-            return None
+            if self.window.home_issue:
+                result.update(title='命令结果待核对', detail_target='receipts', detail_text='查看命令回执',
+                              items=[self.window.home_issue])
+            else:
+                return None
         elif not synchronized:
             result.update(title='柜台自动同步中',
                           items=['系统正在同步持仓、委托和成交，无需人工核对或重复启动'])
@@ -1151,17 +1179,15 @@ class WorkbenchLayout:
             result.update(title='委托结果核对中', detail_target='orders', detail_text='查看委托',
                           items=[f'{len(unknown_orders)} 笔、{contracts} 个合约的报单或撤单结果尚未确认；'
                                  '系统会自动对照完整柜台快照，数量仍保留，请勿重复下单'])
-        elif 'E_FOREIGN_ACTIVE_ORDER' in blocks:
-            result.update(title='外部活动委托冲突', detail_target='markets', detail_text='查看受影响合约',
-                          items=['其他电脑或人工终端存在活动委托，已阻止本机同合约冲突发送；'
-                                 '可等待委托结束，或到产生委托的终端处理'])
-        elif external:
+        elif connection.get('execution_mode') != 'STANDALONE' and 'E_FOREIGN_ACTIVE_ORDER' in blocks:
+            result.update(title='存在未归属活动委托', detail_target='markets', detail_text='查看受影响合约',
+                          items=['当前存在未纳入本周期的活动委托，等待其完结后继续。'])
+        elif connection.get('execution_mode') != 'STANDALONE' and external:
             contracts = len({row.get('contract_id') for row in external})
             quantity = sum(int(row.get('quantity') or 0) for row in external)
-            result.update(title='账号存在非本机策略持仓（无需本机处理）',
+            result.update(title='存在未归属持仓（Legacy 模式不主动平仓）',
                           detail_target='external', detail_text='查看持仓差异',
-                          items=[f'{contracts} 个合约、共 {quantity} 手由其他电脑或人工产生；本机策略不会接管。'
-                                 '如需消除提示，请在产生持仓的终端处理'])
+                          items=[f'{contracts} 个合约、共 {quantity} 手不属于当前策略周期。'])
         elif self.window.home_issue:
             result.update(title='命令结果待核对', detail_target='orders', detail_text='查看当前委托',
                           items=[self.window.home_issue])
@@ -1407,12 +1433,24 @@ class WorkbenchLayout:
 
     def render_dashboard_markets(self, view, cycles, available):
         config = (view or {}).get('configuration', {})
+        connection = (view or {}).get('connection') or {}
+        is_standalone = connection.get('execution_mode') == 'STANDALONE'
+        account_positions = {
+            item['contract_id']: item for item in (connection.get('account_positions') or ())
+            if item.get('contract_id')
+        }
         markets = {item['contract_id']: item for item in (view or {}).get('markets', ())}
         symbols = config.get('strategy_symbols') or self.symbols
         names = {item['code']: item['name'] for item in symbols}
         codes = list(dict.fromkeys(config.get('scoped_contracts') or [*markets, *names]))
         if config.get('strategy_symbols') and not config.get('scoped_contracts'):
             codes = list(dict.fromkeys([*names, *markets]))
+        unconf_codes = [
+            cid for cid, item in sorted(account_positions.items())
+            if cid not in codes and (not item.get('configured', True))
+            and (item.get('actual_long') or item.get('actual_short') or item.get('status') not in {None, 'ALIGNED'})
+        ]
+        all_codes = codes + unconf_codes
         monitor = config.get('strategy_monitor') or {}
         owner_states = {item['contract_id']: item for item in monitor.get('symbols', ())}
         quote_states = market_quote_states(markets, codes, monitor)
@@ -1420,14 +1458,64 @@ class WorkbenchLayout:
                                  and self.window.snapshot_published_ns is not None)
         self.dashboard_market_rows = {}
         rows = []
-        for code in codes:
+        for code in all_codes:
+            if code not in codes:
+                acc = account_positions[code]
+                al, as_ = int(acc.get('actual_long') or 0), int(acc.get('actual_short') or 0)
+                parts = []
+                if al:
+                    parts.append(f'实际多 {al}')
+                if as_:
+                    parts.append(f'实际空 {as_}')
+                position = (' / '.join(parts) if parts else '0') + ' (目标 0)'
+                conv_state = acc.get('status') or 'PREVIEW_NEEDS_CONVERGENCE'
+                if not available:
+                    status = '状态待同步'
+                elif view['entry_authority'] != 'ARMED':
+                    status = '待清仓 (未启动)'
+                elif conv_state.startswith('DEFERRED_'):
+                    status = '休市待平' if 'SESSION' in conv_state else '待条件清仓'
+                elif conv_state == 'CANCELLING_NON_STRATEGY_ORDERS':
+                    status = '撤销委托中'
+                else:
+                    status = '清仓收敛中'
+                rows.append((
+                    f'{code} [非配置]',
+                    display_value(acc.get('last') if self.market_view_current(view) or previous_snapshot else None),
+                    '—',
+                    position,
+                    status,
+                ))
+                self.dashboard_market_rows[code] = (
+                    status,
+                    {'contract_id': code, 'last': acc.get('last'), 'configured': False},
+                    {},
+                    None,
+                    ['非本配置合约，点击启动策略后将自动清仓收敛至 0'],
+                    None,
+                )
+                continue
             quote = markets.get(code, {})
             report = owner_states.get(code, {})
+            acc = account_positions.get(code)
             owned = [cycle for cycle in cycles if cycle['contract_id'] == code]
-            quantities = {side: sum(cycle['remaining_quantity'] for cycle in owned if cycle['direction'] == direction)
-                          for side, direction in (('多', 'LONG'), ('空', 'SHORT'))}
-            position = ' / '.join(f'{side} {qty}' for side, qty in quantities.items() if qty) or (
-                '0' if available or previous_snapshot else '—')
+            if is_standalone and acc is not None:
+                al, as_ = int(acc.get('actual_long') or 0), int(acc.get('actual_short') or 0)
+                tl, ts = int(acc.get('target_long') or 0), int(acc.get('target_short') or 0)
+                if al == tl and as_ == ts:
+                    parts = ([f'多 {tl}'] if tl else []) + ([f'空 {ts}'] if ts else [])
+                    position = ' / '.join(parts) or ('0' if available or previous_snapshot else '—')
+                else:
+                    act_parts = ([f'实多 {al}'] if al else []) + ([f'实空 {as_}'] if as_ else [])
+                    tgt_parts = ([f'目标多 {tl}'] if tl else []) + ([f'目标空 {ts}'] if ts else [])
+                    act_txt = ' / '.join(act_parts) or '实0'
+                    tgt_txt = ' / '.join(tgt_parts) or '目标0'
+                    position = f'{act_txt} · {tgt_txt}'
+            else:
+                quantities = {side: sum(cycle['remaining_quantity'] for cycle in owned if cycle['direction'] == direction)
+                              for side, direction in (('多', 'LONG'), ('空', 'SHORT'))}
+                position = ' / '.join(f'{side} {qty}' for side, qty in quantities.items() if qty) or (
+                    '0' if available or previous_snapshot else '—')
             reasons = quote.get('entry_reasons', ())
             explanation = [self.entry_reason_text(reason) for reason in reasons
                            if reason != 'DUPLICATE_MARKET_EVENT']
@@ -1459,6 +1547,14 @@ class WorkbenchLayout:
                 )
             elif any(cycle.get('exit_pending') for cycle in owned) or report.get('state') == 'PENDING':
                 status = '平仓待确认'
+            elif 'CONVERGENCE_FLATTEN_PENDING' in reasons or (
+                    is_standalone and acc and (acc.get('excess_long') or acc.get('excess_short'))
+                    and view['entry_authority'] == 'ARMED'):
+                status = '收敛平仓中'
+            elif is_standalone and acc and (acc.get('excess_long') or acc.get('excess_short')) and view['entry_authority'] != 'ARMED':
+                status = '待收敛 (未启动)'
+            elif 'STARTUP_PROVED_AWAITING_START' in reasons:
+                status = '持仓待启动'
             elif quote.get('enabled') is False:
                 status = '已停用'
             elif quote.get('day_stop_reason') or report.get('state') == 'STOPPED':
@@ -1487,17 +1583,17 @@ class WorkbenchLayout:
                          display_value(last if self.market_view_current(view) or previous_snapshot else None),
                          focus, position, status))
             self.dashboard_market_rows[code] = (status, quote, lines, decision, explanation, nearby)
-        self.fill_selectable(self.dashboard_markets, rows, codes)
+        self.fill_selectable(self.dashboard_markets, rows, all_codes)
         pending_focus = getattr(self.window, '_pending_focus_contracts', ())
         if pending_focus:
-            target = next((code for code in pending_focus if code in codes), None)
+            target = next((code for code in pending_focus if code in all_codes), None)
             if target is not None:
                 self.window._pending_focus_contracts = ()
-                self.dashboard_markets.setCurrentCell(codes.index(target), 0)
+                self.dashboard_markets.setCurrentCell(all_codes.index(target), 0)
                 if self.candle_contract.findText(target) >= 0:
                     self.candle_contract.setCurrentText(target)
         table_height = (self.dashboard_markets.horizontalHeader().sizeHint().height()
-                        + max(1, min(6, len(codes)))
+                        + max(1, min(6, len(all_codes)))
                         * self.dashboard_markets.verticalHeader().defaultSectionSize() + 4)
         if self.dashboard_markets.height() != table_height:
             self.dashboard_markets.setFixedHeight(table_height)
@@ -1515,7 +1611,10 @@ class WorkbenchLayout:
                 position_item.setForeground(position_color)
             item = self.dashboard_markets.item(index, 4)
             color = ('#087453' if status == '持仓中' else '#965619'
-                     if status in {'平仓待确认', '行情滞后', '当日停开', '已停用'} else '#075de5')
+                     if status in {'平仓待确认', '收敛平仓中', '清仓收敛中', '撤销委托中',
+                                   '待收敛 (未启动)', '待清仓 (未启动)', '休市待平',
+                                   '待条件清仓', '持仓待启动', '行情滞后', '当日停开', '已停用'}
+                     else '#075de5')
             status_color = QColor(color)
             if item.foreground().color() != status_color:
                 item.setForeground(status_color)
@@ -1978,6 +2077,7 @@ class WorkbenchLayout:
                     text += f'；另有 {len(items) - 2} 项'
             self.home_pending.setText(text)
             self.home_pending.setToolTip('\n'.join([attention['title'], *items]))
+            self.home_pending.show()
             self.home_reconcile_button.setVisible(attention['reconcile'])
             self.home_reconcile_button.setEnabled(
                 attention['reconcile'] and connected and synced
@@ -1987,6 +2087,7 @@ class WorkbenchLayout:
             self.home_detail_button.setVisible(attention['detail_target'] is not None)
         else:
             self.home_pending.clear()
+            self.home_pending.hide()
             self.home_reconcile_button.hide()
             self.home_detail_button.hide()
             self._home_detail_target = None
@@ -2726,7 +2827,7 @@ class WorkbenchLayout:
         self.order_side = QComboBox()
         self.order_side.addItems(['全部方向','买','卖'])
         self.order_source = QComboBox()
-        self.order_source.addItems(['全部来源', '策略', '手动', '未知'])
+        self.order_source.addItems(['全部来源', '策略', '自动收敛', '手动', '未知'])
         self.order_source.currentTextChanged.connect(self.filter_orders)
         self.order_count = QLabel('等待柜台同步')
         self.order_contract.currentTextChanged.connect(self.filter_orders)
@@ -2984,7 +3085,8 @@ class WorkbenchLayout:
 
     @staticmethod
     def order_source_title(order):
-        return {'STRATEGY': '策略', 'MANUAL': '手动'}.get(order.get('order_source'), '未知')
+        return {'STRATEGY': '策略', 'CONVERGENCE': '自动收敛', 'MANUAL': '手动'}.get(
+            order.get('order_source'), '未知')
 
     def filter_orders(self, *_):
         if self.rendered_view is None:

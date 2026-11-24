@@ -234,6 +234,51 @@ class MarketCloseTriggerTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["trigger_key"], f"boot-late:2026-11-24:{cal.content_hash}")
 
+    def test_market_close_skips_historical_and_unobserved_calendar_days(self):
+        cal = TradingCalendar.from_record({
+            "schema_version": "TRADING_CALENDAR/1",
+            "calendar_id": "multi-day-cal",
+            "calendar_version": "test-1",
+            "complete": True,
+            "coverage_from_utc": "2026-11-23T01:00:00Z",
+            "coverage_to_utc": "2026-11-25T07:15:01Z",
+            "contracts": [{
+                "contract_id": "DCE.l2609",
+                "sessions": [
+                    {
+                        "session_id": "2026-11-23-day", "trading_day": "2026-11-23",
+                        "open_utc": "2026-11-23T01:00:00Z", "close_utc": "2026-11-23T07:00:00Z",
+                        "is_opening_session": True, "force_close_at_end": True,
+                    },
+                    {
+                        "session_id": "2026-11-24-day", "trading_day": "2026-11-24",
+                        "open_utc": "2026-11-24T01:00:00Z", "close_utc": "2026-11-24T07:00:00Z",
+                        "is_opening_session": True, "force_close_at_end": True,
+                    },
+                    {
+                        "session_id": "2026-11-25-day", "trading_day": "2026-11-25",
+                        "open_utc": "2026-11-25T01:00:00Z", "close_utc": "2026-11-25T07:00:00Z",
+                        "is_opening_session": True, "force_close_at_end": True,
+                    },
+                ],
+            }],
+        })
+        deadlines = _build_close_deadlines(cal, ("DCE.l2609",))
+        clock = _FakeClock(datetime(2026, 11, 24, 7, 5, 0, tzinfo=timezone.utc))
+        loop_state = {
+            "diagnostic_reported_close_keys": set(),
+            "diagnostic_close_check_monotonic": 0.0,
+        }
+        calls = []
+        fired = _maybe_request_market_close(
+            close_deadlines=deadlines, clock=clock, loop_state=loop_state,
+            boot_id="boot-multi", calendar_hash=cal.content_hash,
+            diagnostic_sink=None, diagnostic_report_request=lambda **kw: calls.append(kw),
+            now_monotonic=20.0, allowed_days={"2026-11-24"},
+        )
+        self.assertTrue(fired)
+        self.assertEqual([c["trigger_key"] for c in calls], [f"boot-multi:2026-11-24:{cal.content_hash}"])
+
 
 class ReporterEndToEndAndBudgetTests(unittest.TestCase):
     def setUp(self):
@@ -419,6 +464,169 @@ class ReporterEndToEndAndBudgetTests(unittest.TestCase):
         self.assertTrue(rt_stream["budget_trimmed"])
         self.assertTrue(rt_stream["source_sequence_complete"])
         self.assertEqual(manifest["capture_status"], "PARTIAL")
+
+    def test_oversized_single_segment_reads_tail_instead_of_head(self):
+        diagnostics = self.runtime_root / "diagnostics"
+        pad = "z" * 900
+        events = [
+            {"event_type": "RUNTIME_STARTED", "component": "LIFECYCLE",
+             "observed_at_utc": "2026-11-24T01:00:01.000000Z", "payload": {"tag": "old-head", "pad": pad}},
+            {"event_type": "TICK", "observed_at_utc": "2026-11-24T02:00:00.000000Z", "payload": {"tag": "mid-1", "pad": pad}},
+            {"event_type": "TICK", "observed_at_utc": "2026-11-24T03:00:00.000000Z", "payload": {"tag": "mid-2", "pad": pad}},
+            {"event_type": "OWNER_STOPPED", "component": "LIFECYCLE",
+             "observed_at_utc": "2026-11-24T06:59:59.000000Z", "payload": {"tag": "newest-tail"}},
+        ]
+        _write_synthetic_stream(
+            diagnostics / "runtime" / "rt-oversize",
+            stream_id="runtime:rt-oversize:events",
+            process_role="RUNTIME",
+            process_instance_id="rt-oversize",
+            boot_id="boot-oversize",
+            segments=[events],
+        )
+        req_path = reporter.create_report_request(
+            self.runtime_root,
+            report_reason="CONTROLLED_EXIT",
+            runtime_boot_id="boot-oversize",
+            clean_shutdown=True,
+            runtime_process_instance_id="rt-oversize",
+            runtime_view_expected=False,
+            workbench_expected=False,
+        )
+        with (
+            patch.object(reporter, "_MAX_SOURCE_FILE", 2500),
+            patch.object(reporter, "_MAX_BUNDLE_INPUT", 64 * 1024),
+            patch.object(reporter.time, "sleep", return_value=None),
+        ):
+            rc = reporter.report(self.runtime_root, req_path)
+        self.assertEqual(rc, 0)
+        bundle = next((diagnostics / "bundles").glob("*.zip"))
+        with ZipFile(bundle) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            rt_rows = [
+                json.loads(line)
+                for line in archive.read("runtime/rt-oversize/events-selected.ndjson").splitlines()
+            ]
+        tags = [row["payload"].get("tag") for row in rt_rows]
+        self.assertIn("newest-tail", tags)
+        self.assertNotIn("old-head", tags)
+        self.assertIn("runtime/rt-oversize/events-0001.ndjson:SIZE_LIMIT_TAIL", manifest["missing_sources"])
+
+    def test_historical_workbench_logs_do_not_consume_runtime_budget(self):
+        diagnostics = self.runtime_root / "diagnostics"
+        pad = "w" * 1600
+        # 2 old-boot Workbench streams totaling ~8 KB (> 4 KB reserve)
+        for idx in (1, 2):
+            _write_synthetic_stream(
+                diagnostics / "workbench" / f"wb-old-{idx}",
+                stream_id=f"workbench:wb-old-{idx}:events",
+                process_role="WORKBENCH",
+                process_instance_id=f"wb-old-{idx}",
+                boot_id="boot-old",
+                segments=[[
+                    {"event_type": "WORKBENCH_STARTED", "component": "LIFECYCLE",
+                     "payload": {"tag": f"old-{idx}-a", "pad": pad}},
+                    {"event_type": "WORKBENCH_STOPPED", "component": "LIFECYCLE",
+                     "payload": {"tag": f"old-{idx}-b", "pad": pad}},
+                ]],
+            )
+        # Current boot Runtime stream is ~9 KB (fits in 12 KB total, exceeds 8 KB if old WB ate 4 KB)
+        rt_events = [
+            {"event_type": "RUNTIME_STARTED", "component": "LIFECYCLE",
+             "payload": {"tag": f"rt-{i}", "pad": pad}}
+            for i in range(4)
+        ]
+        _write_synthetic_stream(
+            diagnostics / "runtime" / "rt-curr",
+            stream_id="runtime:rt-curr:events",
+            process_role="RUNTIME",
+            process_instance_id="rt-curr",
+            boot_id="boot-current",
+            segments=[rt_events],
+        )
+        req_path = reporter.create_report_request(
+            self.runtime_root,
+            report_reason="CONTROLLED_EXIT",
+            runtime_boot_id="boot-current",
+            clean_shutdown=True,
+            runtime_process_instance_id="rt-curr",
+            runtime_view_expected=False,
+            workbench_expected=False,
+        )
+        with (
+            patch.object(reporter, "_MAX_BUNDLE_INPUT", 12 * 1024),
+            patch.object(reporter, "_WORKBENCH_RESERVE", 4 * 1024),
+            patch.object(reporter.time, "sleep", return_value=None),
+        ):
+            rc = reporter.report(self.runtime_root, req_path)
+        self.assertEqual(rc, 0)
+        bundle = next((diagnostics / "bundles").glob("*.zip"))
+        with ZipFile(bundle) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            rt_rows = [
+                json.loads(line)
+                for line in archive.read("runtime/rt-curr/events-selected.ndjson").splitlines()
+            ]
+        self.assertEqual([row["payload"].get("tag") for row in rt_rows], ["rt-0", "rt-1", "rt-2", "rt-3"])
+        rt_stream = next(s for s in manifest["streams"] if s["process_role"] == "RUNTIME")
+        self.assertFalse(rt_stream["budget_trimmed"])
+
+    def test_key_event_priority_keeps_order_market_anomaly_and_command_events(self):
+        diagnostics = self.runtime_root / "diagnostics"
+        pad = "k" * 2600
+        rt_segments = [
+            [{"event_type": "RUNTIME_STARTED", "component": "LIFECYCLE",
+              "payload": {"tag": "seg1-start"}},
+             {"event_type": "TICK", "payload": {"tag": "seg1-pad", "pad": pad}}],
+            [{"event_type": "ORDER_BLOCKED", "component": "ORDER", "severity": "WARNING",
+              "payload": {"tag": "seg2-order-blocked"}},
+             {"event_type": "MARKET_ANOMALY", "component": "MARKET", "severity": "WARNING",
+              "payload": {"tag": "seg2-market-anomaly"}},
+             {"event_type": "MARKET_SUMMARY", "component": "MARKET", "severity": "INFO",
+              "payload": {"tag": "seg2-market-summary", "pad": pad}},
+             {"event_type": "RUNTIME_COMMAND_ACCEPTED", "component": "COMMAND", "severity": "INFO",
+              "payload": {"tag": "seg2-command"}}],
+            [{"event_type": "TICK", "payload": {"tag": "seg3-routine-a", "pad": pad}},
+             {"event_type": "TICK", "payload": {"tag": "seg3-routine-b", "pad": pad}}],
+            [{"event_type": "CLOSE_SCENE", "payload": {"tag": "seg4-newest-a", "pad": pad}},
+             {"event_type": "CLOSE_SCENE", "payload": {"tag": "seg4-newest-b", "pad": pad}}],
+        ]
+        _write_synthetic_stream(
+            diagnostics / "runtime" / "rt-key",
+            stream_id="runtime:rt-key:events",
+            process_role="RUNTIME",
+            process_instance_id="rt-key",
+            boot_id="boot-key",
+            segments=rt_segments,
+        )
+        req_path = reporter.create_report_request(
+            self.runtime_root,
+            report_reason="CONTROLLED_EXIT",
+            runtime_boot_id="boot-key",
+            clean_shutdown=True,
+            runtime_process_instance_id="rt-key",
+            runtime_view_expected=False,
+            workbench_expected=False,
+        )
+        with (
+            patch.object(reporter, "_MAX_BUNDLE_INPUT", 12 * 1024),
+            patch.object(reporter, "_HEAD_RESERVE", 1024),
+            patch.object(reporter, "_KEY_EVENT_RESERVE", 2500),
+            patch.object(reporter.time, "sleep", return_value=None),
+        ):
+            rc = reporter.report(self.runtime_root, req_path)
+        self.assertEqual(rc, 0)
+        bundle = next((diagnostics / "bundles").glob("*.zip"))
+        with ZipFile(bundle) as archive:
+            rt_rows = [
+                json.loads(line)
+                for line in archive.read("runtime/rt-key/events-selected.ndjson").splitlines()
+            ]
+        tags = [row["payload"].get("tag") for row in rt_rows]
+        self.assertIn("seg2-order-blocked", tags)
+        self.assertIn("seg2-market-anomaly", tags)
+        self.assertIn("seg2-command", tags)
+        self.assertNotIn("seg2-market-summary", tags)
 
 
 if __name__ == "__main__":

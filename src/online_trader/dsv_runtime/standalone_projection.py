@@ -263,6 +263,7 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
     latest_decisions = snapshot.get('latest_decisions') or {}
     if projection_inputs is not None:
         dispatch_markets = projection_inputs.get('dispatch_market') or {}
+        unconfigured_dispatch = projection_inputs.get('unconfigured_dispatch_market') or {}
         market_details_map = projection_inputs.get('market_details') or {}
         connected = bool(projection_inputs.get('broker_connected'))
         adapter_synchronized = bool(projection_inputs.get('adapter_synchronized'))
@@ -275,7 +276,9 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         else:
             minute_bars = format_minute_chart_bars(projection_inputs.get('minute_raw'))
     else:
-        dispatch_markets = getattr(adapter, 'dispatch_market', {}) or {}
+        raw_dispatch = getattr(adapter, 'dispatch_market', {}) or {}
+        dispatch_markets = {k: v for k, v in raw_dispatch.items() if k in symbols}
+        unconfigured_dispatch = {k: v for k, v in raw_dispatch.items() if k not in symbols}
         market_details_map = None
         detail_reader = getattr(adapter, 'display_market_details', None)
         connected = bool(adapter.connection and adapter.connection.broker_connected)
@@ -288,7 +291,9 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         minute_bars = bar_reader() if callable(bar_reader) else {}
     symbol_health_map = (market_health or {}).get('symbols') or {}
     feed_health_status = (market_health or {}).get('status')
-    markets, cycles, orders, trades, external_positions = [], [], [], [], []
+    startup_inference = snapshot.get('startup_inference') or {}
+    convergence_status = snapshot.get('convergence_status') or {}
+    markets, cycles, orders, trades, external_positions, account_positions = [], [], [], [], [], []
     seen_trade_positions = set()
     for contract, row in snapshot['symbols'].items():
         tick = row.get('tick') or {}
@@ -300,26 +305,38 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         fresh = bool(tick and quote.get('age_quality') == 'VALID'
                      and row.get('market_session_active') is not False)
         position = row.get('position')
-        owned_long = position['owned'] if position is not None and position['direction'] == 'LONG' else 0
-        owned_short = position['owned'] if position is not None and position['direction'] == 'SHORT' else 0
-        ext_long = max(0, int(market.get('long_qty', 0) or 0) - owned_long)
-        ext_short = max(0, int(market.get('short_qty', 0) or 0) - owned_short)
-        if ext_long > 0:
-            external_positions.append({
-                'contract_id': contract, 'direction': 'LONG', 'quantity': ext_long,
-                'classification': 'UNOWNED_BROKER_POSITION',
-            })
-        if ext_short > 0:
-            external_positions.append({
-                'contract_id': contract, 'direction': 'SHORT', 'quantity': ext_short,
-                'classification': 'UNOWNED_BROKER_POSITION',
-            })
-        if ext_long or ext_short:
+        actual_long = int(market.get('long_qty', 0) or 0)
+        actual_short = int(market.get('short_qty', 0) or 0)
+        target_long = position['owned'] if position is not None and position['direction'] == 'LONG' else 0
+        target_short = position['owned'] if position is not None and position['direction'] == 'SHORT' else 0
+        excess_long = max(0, actual_long - target_long)
+        excess_short = max(0, actual_short - target_short)
+        conv = convergence_status.get(contract) or {}
+        inf = startup_inference.get(contract) or {}
+        conv_state = conv.get('status') or (
+            'ALIGNED' if (actual_long == target_long and actual_short == target_short)
+            else ('PREVIEW_NEEDS_CONVERGENCE' if not snapshot['running'] else 'CONVERGING')
+        )
+        account_positions.append({
+            'contract_id': contract,
+            'name': symbols[contract]['name'],
+            'configured': True,
+            'actual_long': actual_long,
+            'actual_short': actual_short,
+            'target_long': target_long,
+            'target_short': target_short,
+            'excess_long': excess_long,
+            'excess_short': excess_short,
+            'status': conv_state,
+            'startup_reason': inf.get('reason'),
+            'market_session_active': market.get('market_session_active', True),
+        })
+        if actual_long or actual_short:
             decision_reasons = [
                 reason for reason in decision_reasons
-                if reason != 'UNOWNED_POSITION'
+                if reason not in {'UNOWNED_POSITION', 'EXTERNAL_POSITION_PRESENT'}
             ]
-        entry_reasons = (['EXTERNAL_POSITION_PRESENT'] if (ext_long or ext_short) else []) + decision_reasons
+        entry_reasons = decision_reasons
         day_stop_reason = ((row.get('day_stop_reason') or '当日已停止开仓')
                            if row.get('day_stop') else None)
         market_row = {
@@ -335,6 +352,12 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
             'quote_time_reason': quote.get('reason'),
             'fresh': fresh,
             'enabled': True,
+            'configured': True,
+            'actual_long': actual_long,
+            'actual_short': actual_short,
+            'target_long': target_long,
+            'target_short': target_short,
+            'convergence_status': conv_state,
             'day_stop_reason': day_stop_reason,
             'entry_reasons': list(dict.fromkeys(entry_reasons)),
             'trigger_prices': _trigger_lines(tick, symbols[contract]),
@@ -419,8 +442,41 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
             continue
         for fill in position.get('fills', ()):
             trades.append(dict(fill) | {'position_cycle_id': position['id']})
+    unconf_seen = set(unconfigured_dispatch) | {
+        cid for cid, conv in convergence_status.items() if conv.get('configured') is False
+    }
+    for cid in sorted(unconf_seen):
+        um = unconfigured_dispatch.get(cid) or {}
+        conv = convergence_status.get(cid) or {}
+        actual_long = int(um.get('long_qty', conv.get('actual_long', 0)) or 0)
+        actual_short = int(um.get('short_qty', conv.get('actual_short', 0)) or 0)
+        last_px = um.get('last_price')
+        if last_px is None and um.get('ticks'):
+            last_px = um['ticks'][-1].get('last')
+        conv_state = conv.get('status') or (
+            'ALIGNED' if (actual_long == 0 and actual_short == 0)
+            else ('PREVIEW_NEEDS_CONVERGENCE' if not snapshot['running'] else 'CONVERGING')
+        )
+        account_positions.append({
+            'contract_id': cid,
+            'name': cid,
+            'configured': False,
+            'actual_long': actual_long,
+            'actual_short': actual_short,
+            'target_long': 0,
+            'target_short': 0,
+            'excess_long': actual_long,
+            'excess_short': actual_short,
+            'last': last_px,
+            'status': conv_state,
+            'startup_reason': 'UNCONFIGURED_CONTRACT',
+            'market_session_active': um.get('market_session_active', True),
+        })
     trades.sort(key=lambda item: (int(item.get('event_seq') or 0), str(item.get('child_order_id') or '')))
     for child_id, order in snapshot['orders'].items():
+        if order.get('convergence_order'):
+            for cfill in order.get('convergence_fills', ()):
+                trades.append(dict(cfill))
         remaining = 0 if terminal(order) else max(0, order['original_qty'] - order['filled_qty'])
         strategy_direction = ('LONG' if (order['direction'] == 'BUY') == (order['effect'] == 'OPEN')
                               else 'SHORT')
@@ -432,7 +488,8 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
                'native_order_id': order.get('native_id'), 'direction': strategy_direction,
                'source_time_ns': order.get('native_order_time_ns'),
                'native_message': order.get('native_message'),
-               'potential_remaining': remaining, 'order_source': 'STRATEGY'})
+               'potential_remaining': remaining,
+               'order_source': order.get('order_source') or 'STRATEGY'})
     synchronized = connected and snapshot['synchronized'] and adapter_synchronized
     storage_failed = bool(snapshot.get('storage_failed', False))
     clock_fault = snapshot.get('clock_recovery_required')
@@ -522,8 +579,6 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         blocks.append({'reason_code': owner_fault, 'active': True})
     if isinstance(market_health, dict) and market_health.get('feed_entry_blocked') and synchronized and not clock_fault and not owner_fault:
         blocks.append({'reason_code': 'MARKET_FEED_' + str(market_health.get('status') or 'DEGRADED'), 'active': True})
-    if any(row.get('external_order_block') for row in snapshot['symbols'].values()):
-        blocks.append({'reason_code': 'E_FOREIGN_ACTIVE_ORDER', 'active': True})
     observed_at_utc = _utc_now()
     result = {
         'view_schema': 'workbench/1', 'account_key': scope['account_key'],
@@ -535,6 +590,9 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
                        'recovery_required': not synchronized or bool(owner_fault),
                        'storage_failed': storage_failed,
                        'clock_fault': clock_fault,
+                       'execution_mode': 'STANDALONE',
+                       'account_positions': account_positions,
+                       'non_strategy_orders_count': len(snapshot.get('convergence_cancels') or {}),
                        'pending_transactions': 0},
         'markets': markets, 'cycles': cycles, 'orders': orders, 'trades': trades,
         'minute_bars': minute_bars,

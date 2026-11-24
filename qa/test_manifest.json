@@ -10,6 +10,38 @@
     "Affected": "FullOffline until the path-to-suite dependency map has verified coverage"
   },
   "modules": {
+    "test_account_convergence": {
+      "tier": "T1",
+      "domains": [
+        "trading",
+        "runtime",
+        "desktop"
+      ],
+      "risk": "P1",
+      "profiles": [
+        "FullOffline",
+        "Trading",
+        "Runtime"
+      ],
+      "platform": [
+        "Windows"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": false,
+      "requirements": [
+        "PySide6"
+      ],
+      "timeout_seconds": 180,
+      "cases": [
+        "AccountConvergenceTests.test_convergence_unknown_send_reserves_capacity_without_duplicate_close",
+        "AccountConvergenceTests.test_opposite_short_flattens_before_opening_long_on_arm",
+        "AccountConvergenceTests.test_plastic_30_lot_external_holding_previews_disarmed_then_flattens_on_arm",
+        "AccountConvergenceTests.test_sdk_adapter_plan_b_startup_retains_proved_and_flattens_excess_only_on_arm",
+        "AccountConvergenceTests.test_standalone_ui_hides_external_banner_and_displays_account_target_delta",
+        "AccountConvergenceTests.test_unconfigured_contract_and_external_order_cancel_with_closed_session_isolation"
+      ],
+      "case_overrides": {}
+    },
     "test_account_providers": {
       "tier": "T2",
       "domains": [
@@ -568,6 +600,39 @@
         "DesktopStartupTests.test_one_main_button_click_uses_latest_parameters_and_starts_without_dialog",
         "DesktopStartupTests.test_parent_account_change_refuses_old_starter_before_launch",
         "DesktopStartupTests.test_quote_reference_updates_display_without_starting_strategy"
+      ],
+      "case_overrides": {}
+    },
+    "test_diagnostics_reporting": {
+      "tier": "T2",
+      "domains": [
+        "runtime",
+        "trading"
+      ],
+      "risk": "UNTRIAGED",
+      "profiles": [
+        "FullOffline",
+        "Runtime",
+        "Trading"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": null,
+      "requirements": [],
+      "timeout_seconds": 30,
+      "cases": [
+        "MarketCloseTriggerTests.test_market_close_skips_historical_and_unobserved_calendar_days",
+        "MarketCloseTriggerTests.test_triggers_even_when_started_after_calendar_coverage_without_seeing_active_session",
+        "MarketCloseTriggerTests.test_triggers_with_microseconds_and_past_calendar_coverage_with_10s_throttle",
+        "ReporterEndToEndAndBudgetTests.test_budget_prioritizes_newest_segments_preserves_head_key_events_and_workbench_reserve",
+        "ReporterEndToEndAndBudgetTests.test_controlled_exit_produces_complete_local_bundle",
+        "ReporterEndToEndAndBudgetTests.test_historical_workbench_logs_do_not_consume_runtime_budget",
+        "ReporterEndToEndAndBudgetTests.test_key_event_priority_keeps_order_market_anomaly_and_command_events",
+        "ReporterEndToEndAndBudgetTests.test_market_close_open_stream_is_partial_and_keeps_latest_event_coverage",
+        "ReporterEndToEndAndBudgetTests.test_oversized_single_segment_reads_tail_instead_of_head"
       ],
       "case_overrides": {}
     },
@@ -3936,6 +4001,8 @@
         "RuntimeWorkbenchTests.test_adding_silver_while_live_submits_hot_add_and_focuses_monitor",
         "RuntimeWorkbenchTests.test_command_bus_rejection_is_shown_without_a_receipt_identity",
         "RuntimeWorkbenchTests.test_frozen_runtime_account_display_is_used_by_header_and_picker",
+        "RuntimeWorkbenchTests.test_home_attention_preserves_command_issue_when_view_is_none",
+        "RuntimeWorkbenchTests.test_home_attention_shows_generic_recovery_fallback_while_honoring_capability_gate",
         "RuntimeWorkbenchTests.test_hot_add_rejection_offers_next_boot_overrides_without_interrupting_runtime",
         "RuntimeWorkbenchTests.test_new_workbench_process_starts_without_legacy_pending_state",
         "RuntimeWorkbenchTests.test_removing_contract_with_silver_while_armed_persists_next_boot_overrides_without_interrupting_runtime",
@@ -4330,6 +4397,37 @@
         "StartupEnvironmentTests.test_probe_exercises_same_source_runner_and_checks_resolved_package_identity",
         "StartupEnvironmentTests.test_process_state_reads_only_and_closes_handle_for_live_or_exited_process",
         "StartupEnvironmentTests.test_source_resolves_sdk_and_current_source_runner_without_spawning"
+      ],
+      "case_overrides": {}
+    },
+    "test_startup_inference": {
+      "tier": "T1",
+      "domains": [
+        "trading",
+        "runtime"
+      ],
+      "risk": "P1",
+      "profiles": [
+        "FullOffline",
+        "Trading",
+        "Runtime"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": false,
+      "requirements": [],
+      "timeout_seconds": 60,
+      "cases": [
+        "StartupInferencePlanBTests.test_flat_account_reconstructs_day_stop_from_today_trades",
+        "StartupInferencePlanBTests.test_overnight_historical_position_on_force_close_contract_returns_zero",
+        "StartupInferencePlanBTests.test_proved_entry_that_already_hit_stop_loss_returns_zero",
+        "StartupInferencePlanBTests.test_proved_half_close_stage_narrows_target",
+        "StartupInferencePlanBTests.test_proved_long_entry_and_partial_excess_flattening",
+        "StartupInferencePlanBTests.test_unproved_no_today_fill_returns_zero",
+        "StartupInferencePlanBTests.test_unproved_signal_mismatch_returns_zero"
       ],
       "case_overrides": {}
     },
@@ -4752,7 +4850,7 @@
         "TargetOwnerPureLogicTests.test_market_break_retains_current_trading_day_until_next_session_is_active",
         "TargetOwnerPureLogicTests.test_mixed_night_and_day_sessions_advance_trading_day_when_active_contracts_agree_and_fail_closed_on_conflict",
         "TargetOwnerPureLogicTests.test_owner_tick_error_classification_rules",
-        "TargetOwnerRuntimeTests.test_external_broker_position_is_not_claimed_or_extended",
+        "TargetOwnerRuntimeTests.test_external_broker_position_is_flattened_only_after_arm_not_claimed",
         "TargetOwnerRuntimeTests.test_flatten_then_stop_shuts_down_flat_runtime_even_when_unsynchronized",
         "TargetOwnerRuntimeTests.test_flatten_then_stop_waits_for_original_child_terminal_fact",
         "TargetOwnerRuntimeTests.test_history_cache_failure_does_not_change_target_authority",
@@ -4779,7 +4877,7 @@
         "TargetOwnerWorkbenchProjectionTests.test_workbench_view_projects_market_triggers_reasons_day_stop_and_minute_bars"
       ],
       "case_overrides": {
-        "TargetOwnerRuntimeTests.test_external_broker_position_is_not_claimed_or_extended": {
+        "TargetOwnerRuntimeTests.test_external_broker_position_is_flattened_only_after_arm_not_claimed": {
           "platform": [
             "Windows"
           ]

@@ -75,6 +75,7 @@ class FakeBroker:
         self.run_id = run_id or "qa-fake-broker"
         self._orders: dict[str, FakeBrokerOrder] = {}
         self._native_orders: dict[str, str] = {}
+        self._external_orders: dict[str, dict[str, object]] = {}
         self._trades: dict[str, dict[str, object]] = {}
         self._positions_by_contract: dict[str, dict[str, int]] = {
             code: {
@@ -142,6 +143,68 @@ class FakeBroker:
             if contract_id not in self._positions_by_contract:
                 raise FakeBrokerError(f"Unknown broker contract: {contract_id}")
             return self._position_snapshot(contract_id)
+
+    def seed_external_position(
+        self,
+        contract_id: str,
+        *,
+        long_today: int = 0,
+        long_historical: int = 0,
+        short_today: int = 0,
+        short_historical: int = 0,
+    ) -> dict[str, int]:
+        """Seed pre-existing broker holdings on a configured or unconfigured contract."""
+        with self._lock:
+            bucket = self._positions_by_contract.setdefault(contract_id, {
+                "long_today": 0, "long_historical": 0, "short_today": 0, "short_historical": 0,
+            })
+            bucket["long_today"] = self._quantity(long_today)
+            bucket["long_historical"] = self._quantity(long_historical)
+            bucket["short_today"] = self._quantity(short_today)
+            bucket["short_historical"] = self._quantity(short_historical)
+            self._record("EXTERNAL_POSITION_SEEDED", contract_id=contract_id, positions=dict(bucket))
+            return self._position_snapshot(contract_id)
+
+    def add_external_order(
+        self,
+        native_order_id: str,
+        contract_id: str,
+        direction: str,
+        native_offset: str,
+        volume_left: int,
+        *,
+        limit_price: str = "1060",
+    ) -> dict[str, object]:
+        """Register an active non-strategy broker order before a frame."""
+        with self._lock:
+            if not isinstance(native_order_id, str) or not native_order_id:
+                raise FakeBrokerError("External order requires a nonempty native_order_id")
+            if direction not in {"BUY", "SELL"}:
+                raise FakeBrokerError("Invalid external order direction")
+            record = {
+                "native_order_id": native_order_id,
+                "contract_id": contract_id,
+                "direction": direction,
+                "native_offset": native_offset,
+                "volume_left": self._quantity(volume_left, positive=True),
+                "limit_price": self._price(limit_price),
+                "status": "ALIVE",
+                "cancel_effect_ids": [],
+            }
+            self._external_orders[native_order_id] = record
+            self._record("EXTERNAL_ORDER_ADDED", **record)
+            return deepcopy(record)
+
+    def confirm_external_cancel(self, native_order_id: str) -> dict[str, object]:
+        """Mark a previously observed non-strategy active order CANCELLED at broker."""
+        with self._lock:
+            ext = self._external_orders.get(native_order_id)
+            if ext is None or not ext.get("cancel_effect_ids"):
+                raise FakeBrokerError("No outbound cancel was observed for this external order")
+            ext["status"] = "CANCELLED"
+            ext["volume_left"] = 0
+            self._record("EXTERNAL_ORDER_CANCELLED", native_order_id=native_order_id)
+            return deepcopy(ext)
 
     def roll_trading_day(self, new_trading_day: str) -> dict[str, int]:
         """Advance broker cabinet trading day, moving today positions to historical."""
@@ -244,6 +307,20 @@ class FakeBroker:
                 snapshot["broker_order_snapshot_complete"] = bool(broker_order_snapshot_complete)
             if absent_orders is not None:
                 snapshot["absent_orders"] = list(absent_orders)
+            alive_external = [
+                {
+                    "native_order_id": nid,
+                    "contract_id": ext["contract_id"],
+                    "direction": ext["direction"],
+                    "native_offset": ext["native_offset"],
+                    "volume_left": ext["volume_left"],
+                    "limit_price": ext["limit_price"],
+                }
+                for nid, ext in sorted(self._external_orders.items())
+                if ext["status"] == "ALIVE" and int(ext["volume_left"]) > 0
+            ]
+            if alive_external:
+                snapshot["non_strategy_orders"] = alive_external
             self._sequence = sequence
             self._inflight = {"id": frame_id, "sequence": sequence}
             self._inflight_fact_count = len(facts)
@@ -279,7 +356,8 @@ class FakeBroker:
                 raise FakeBrokerError("Outbound request lacks child and effect identities")
             if (request.get("account_key") != self.account_key or
                     request.get("provider") != self.provider or
-                    request.get("contract_id") not in self.contracts or
+                    (request.get("contract_id") not in self.contracts
+                     and request.get("contract_id") not in self._positions_by_contract) or
                     request.get("trading_day") != self.trading_day):
                 raise FakeBrokerError("Outbound request is outside this fake account scope")
 
@@ -312,6 +390,18 @@ class FakeBroker:
 
             if request.get("kind") != "CANCEL":
                 raise FakeBrokerError("Observed cancel does not contain a CANCEL effect")
+            if request.get("external_order"):
+                nid = str(request.get("native_order_id") or "")
+                ext = self._external_orders.get(nid)
+                if ext is None:
+                    raise FakeBrokerError("External cancel targets unknown native order id")
+                ext.setdefault("cancel_effect_ids", [])
+                if effect_id not in ext["cancel_effect_ids"]:
+                    ext["cancel_effect_ids"].append(effect_id)
+                self._record("OUTBOUND_EXTERNAL_CANCEL_OBSERVED", native_order_id=nid,
+                             effect_id=effect_id, adapter_result=event["adapter_result"],
+                             broker_state=ext["status"])
+                return
             order = self._orders.get(child_id)
             if order is None or order.native_order_id is None:
                 raise FakeBrokerError("Cancel request has no previously accepted fake order")
@@ -688,7 +778,8 @@ class FakeBroker:
                 raise FakeBrokerError("Close fill exceeds same-day broker position")
             contract_pos[key] -= qty
             return
-        if offset == "CLOSEYESTERDAY":
+        if offset == "CLOSEYESTERDAY" or (
+                offset == "CLOSE" and str(request["contract_id"]).split(".")[0] in {"SHFE", "INE"}):
             key = f"{side}_historical"
             if contract_pos[key] < qty:
                 raise FakeBrokerError("Close fill exceeds historical broker position")

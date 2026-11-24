@@ -25,18 +25,16 @@ OnlineTrader 不新增独立 Reconciler、OMS、事件总线或第二个交易�
 
 ## 3. Target 的所有权边界
 
-Target 不是整个期货账户的绝对目标，而是当前 Runtime 有证据承担的策略责任：
+> [!NOTE]
+> **Standalone 2026-11-24 规则修订**：经用户确认，Standalone 默认运行时下由 [runtime-account-target-convergence-20261124.md](runtime-account-target-convergence-20261124.md) 接替旧的“外部持仓禁止平仓/阻止新增”语义：`TargetOwnedPosition` 仍严格约束每次子单发送、撤单、保护平仓与 `UNKNOWN` 占量边界，但点击启动策略（`ARMED`）后，系统通过**账户目标持仓收敛**（按方案 B 严格证明的策略持仓 + 未配置/不可证/超额/反向持仓目标 0 + 先撤非策略活动委托）将整个期货账户收敛到策略目标状态；`DISARMED` 下保持只读预览，不发任何平仓或撤单委托。Replacement Candidate 仍保留原隔离边界直至另行切换。
+
+Target 本身（子单与退出执行器）不是凭空接管历史仓位的启发式认领器；Strategy-proved 持仓与退出目标仍必须拥有可证明的柜台事实依据：
 
 ```text
 BrokerAccountPosition
-  = RuntimeProvedPosition
-  + ExternalOrUnattributedPosition
-
-TargetOwnedPosition
-  只约束 RuntimeProvedPosition 及其未终态 child
+  = StrategyTargetDesiredPosition (strictly proved via live cycle or Plan B startup proof)
+  + ExcessOrOppositeOrUnconfiguredDelta (target = 0; flattened aggressively once ARMED in Standalone)
 ```
-
-不得按价格、数量或时间相似性认领另一台电脑或人工产生的仓位、订单。外部或无法归属的活动订单与当前目标冲突时，阻止新的冲突发送并进入柜台核对。账号级全部撤单或全部平仓只能由明确的用户操作触发。
 
 每个 Target 最少绑定 `target_id`、`target_revision`、合约、方向、目标责任数量、原因、策略/配置 revision、柜台日、有效窗口和输入事实水位。重复计算同一 revision 必须幂等；缩小、归零或反转必须形成更高 revision。
 

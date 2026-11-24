@@ -114,4 +114,6 @@ class FrameAssembler:
             frame["broker_order_snapshot_complete"] = broker_snap["broker_order_snapshot_complete"]
         if "absent_orders" in broker_snap:
             frame["absent_orders"] = broker_snap["absent_orders"]
+        if "non_strategy_orders" in broker_snap:
+            frame["non_strategy_orders"] = deepcopy(broker_snap["non_strategy_orders"])
         return frame

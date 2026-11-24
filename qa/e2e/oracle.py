@@ -17,10 +17,20 @@ def _strategy_direction(broker_direction: str, native_offset: str) -> str:
 
 
 def _same_decimal(left: object, right: object) -> bool:
+    if left is None or right is None or isinstance(left, bool) or isinstance(right, bool):
+        return False
     try:
         return Decimal(str(left)) == Decimal(str(right))
     except (InvalidOperation, ValueError):
-        return str(left) == str(right)
+        return False
+
+
+def _nonempty_str(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_int_value(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 class OracleViolation(AssertionError):
@@ -165,14 +175,32 @@ class ReferenceOracle:
         positions_by_contract = state.positions_by_contract
 
         # 1. Boot, authority & configuration identity checks (INV-009)
-        if self.expected_boot_id is not None and workbench_view.get("kernel_boot_id") != self.expected_boot_id:
+        actual_boot_id = workbench_view.get("kernel_boot_id")
+        if not _nonempty_str(actual_boot_id):
             raise OracleViolation(
                 "INV-009",
-                f"Workbench kernel_boot_id {workbench_view.get('kernel_boot_id')!r} "
+                f"Workbench kernel_boot_id is missing or empty: {actual_boot_id!r}",
+                round_seq=round_seq,
+                frame_id=frame_id,
+            )
+        if self.expected_boot_id is not None and actual_boot_id != self.expected_boot_id:
+            raise OracleViolation(
+                "INV-009",
+                f"Workbench kernel_boot_id {actual_boot_id!r} "
                 f"!= expected {self.expected_boot_id!r}",
                 round_seq=round_seq,
                 frame_id=frame_id,
             )
+        config_snapshot = workbench_view.get("config_snapshot")
+        if isinstance(config_snapshot, dict):
+            snap_boot = config_snapshot.get("kernel_boot_id")
+            if snap_boot is not None and snap_boot != actual_boot_id:
+                raise OracleViolation(
+                    "INV-009",
+                    f"Workbench config_snapshot kernel_boot_id {snap_boot!r} != {actual_boot_id!r}",
+                    round_seq=round_seq,
+                    frame_id=frame_id,
+                )
         if self.expected_entry_authority is not None:
             actual_auth = workbench_view.get("entry_authority")
             clock_fault = (workbench_view.get("connection") or {}).get("clock_fault")
@@ -184,12 +212,28 @@ class ReferenceOracle:
                     round_seq=round_seq,
                     frame_id=frame_id,
                 )
-        if self.expected_config_revision is not None:
-            actual_rev = (workbench_view.get("configuration") or {}).get("config_revision")
-            if str(actual_rev) != self.expected_config_revision:
+        config_section = workbench_view.get("configuration") or {}
+        actual_rev = config_section.get("config_revision")
+        if actual_rev is None or not _nonempty_str(str(actual_rev)):
+            raise OracleViolation(
+                "INV-009",
+                f"Workbench configuration.config_revision is missing or empty: {actual_rev!r}",
+                round_seq=round_seq,
+                frame_id=frame_id,
+            )
+        if self.expected_config_revision is not None and str(actual_rev) != self.expected_config_revision:
+            raise OracleViolation(
+                "INV-009",
+                f"Workbench config_revision {actual_rev!r} != expected {self.expected_config_revision!r}",
+                round_seq=round_seq,
+                frame_id=frame_id,
+            )
+        if isinstance(config_snapshot, dict) and config_snapshot.get("config_revision") is not None:
+            if str(config_snapshot.get("config_revision")) != str(actual_rev):
                 raise OracleViolation(
                     "INV-009",
-                    f"Workbench config_revision {actual_rev!r} != expected {self.expected_config_revision!r}",
+                    f"Workbench config_snapshot config_revision {config_snapshot.get('config_revision')!r} "
+                    f"!= {actual_rev!r}",
                     round_seq=round_seq,
                     frame_id=frame_id,
                 )
@@ -278,7 +322,8 @@ class ReferenceOracle:
                 close_totals[(side, "ALL")] += rem
                 if req["native_offset"] == "CLOSETODAY":
                     close_totals[(side, "TODAY")] += rem
-                elif req["native_offset"] == "CLOSEYESTERDAY":
+                elif req["native_offset"] == "CLOSEYESTERDAY" or (
+                        req["native_offset"] == "CLOSE" and contract.split(".")[0] in {"SHFE", "INE"}):
                     close_totals[(side, "HIST")] += rem
             closable_limits = (
                 ("LONG", "ALL", broker_long),
@@ -310,16 +355,23 @@ class ReferenceOracle:
         runtime_trades = workbench_view.get("trades") or []
         seen_runtime_trade_ids: set[str] = set()
         for trade in runtime_trades:
-            tid = str(trade.get("native_trade_id") or "")
-            if tid and tid in seen_runtime_trade_ids:
+            raw_tid = trade.get("native_trade_id")
+            if not _nonempty_str(raw_tid):
+                raise OracleViolation(
+                    "INV-015",
+                    f"Runtime trade missing native_trade_id: {trade!r}",
+                    round_seq=round_seq,
+                    frame_id=frame_id,
+                )
+            tid = str(raw_tid)
+            if tid in seen_runtime_trade_ids:
                 raise OracleViolation(
                     "INV-004",
                     f"Duplicate native_trade_id in Runtime projection: {tid}",
                     round_seq=round_seq,
                     frame_id=frame_id,
                 )
-            if tid:
-                seen_runtime_trade_ids.add(tid)
+            seen_runtime_trade_ids.add(tid)
 
         # 4. INV-015 / INV-006 / INV-007: Strict Broker <-> Runtime convergence when no facts are pending
         pending_fact_count = int(broker_snapshot.get("pending_fact_count", 0))
@@ -396,7 +448,26 @@ class ReferenceOracle:
                 )
 
             runtime_orders = workbench_view.get("orders") or []
-            runtime_orders_by_id = {str(row["child_order_id"]): row for row in runtime_orders if row.get("child_order_id")}
+            runtime_orders_by_id: dict[str, dict[str, object]] = {}
+            for row in runtime_orders:
+                cid_val = row.get("child_order_id")
+                if not _nonempty_str(cid_val):
+                    raise OracleViolation(
+                        "INV-015",
+                        f"Runtime order missing child_order_id: {row!r}",
+                        round_seq=round_seq,
+                        frame_id=frame_id,
+                    )
+                cid_key = str(cid_val)
+                if cid_key in runtime_orders_by_id:
+                    raise OracleViolation(
+                        "INV-004",
+                        f"Duplicate child_order_id in Runtime projection: {cid_key}",
+                        round_seq=round_seq,
+                        frame_id=frame_id,
+                    )
+                runtime_orders_by_id[cid_key] = row
+
             broker_active_ids = set(broker_snapshot["active_children"])
             runtime_active_ids = {
                 str(row["child_order_id"])
@@ -419,44 +490,174 @@ class ReferenceOracle:
                     round_seq=round_seq,
                     frame_id=frame_id,
                 )
+            history_omitted = workbench_view.get("history_omitted") or {}
+            orders_omitted = int(history_omitted.get("orders") or 0)
+            extra_runtime_orders = [
+                cid for cid, row in runtime_orders_by_id.items()
+                if row.get("order_source", "STRATEGY") == "STRATEGY" and cid not in state.orders
+            ]
+            if extra_runtime_orders:
+                raise OracleViolation(
+                    "INV-015",
+                    f"Unexpected strategy orders in Runtime projection: {sorted(extra_runtime_orders)}",
+                    round_seq=round_seq,
+                    frame_id=frame_id,
+                )
             for cid, broker_order in state.orders.items():
                 rt_order = runtime_orders_by_id.get(cid)
+                broker_status = str(broker_order["status"])
                 if rt_order is None:
-                    continue
+                    if orders_omitted > 0 and broker_status in {"FILLED", "CANCELLED", "REJECTED", "ABSENT"}:
+                        continue
+                    raise OracleViolation(
+                        "INV-015",
+                        f"Order {cid} (status={broker_status}) missing from Runtime projection",
+                        round_seq=round_seq,
+                        frame_id=frame_id,
+                    )
                 req = broker_order["request"]
                 expected_dir = _strategy_direction(str(req["direction"]), str(req["native_offset"]))
-                if rt_order.get("contract_id") is not None and rt_order.get("contract_id") != req["contract_id"]:
+                expected_effect = "OPEN" if req["native_offset"] == "OPEN" else "REDUCE"
+                if not _nonempty_str(rt_order.get("contract_id")) or rt_order.get("contract_id") != req["contract_id"]:
                     raise OracleViolation(
                         "INV-015",
                         f"Order {cid} contract_id {rt_order.get('contract_id')!r} != {req['contract_id']!r}",
                         round_seq=round_seq, frame_id=frame_id,
                     )
-                if rt_order.get("direction") is not None and rt_order.get("direction") != expected_dir:
+                if not _nonempty_str(rt_order.get("direction")) or rt_order.get("direction") != expected_dir:
                     raise OracleViolation(
                         "INV-015",
                         f"Order {cid} direction {rt_order.get('direction')!r} != {expected_dir!r}",
                         round_seq=round_seq, frame_id=frame_id,
                     )
-                if rt_order.get("original_qty") is not None and int(rt_order["original_qty"]) != int(req["quantity"]):
+                if not _nonempty_str(rt_order.get("effect")) or rt_order.get("effect") != expected_effect:
+                    raise OracleViolation(
+                        "INV-015",
+                        f"Order {cid} effect {rt_order.get('effect')!r} != {expected_effect!r}",
+                        round_seq=round_seq, frame_id=frame_id,
+                    )
+                if req.get("native_offset") is not None:
+                    rt_offset = rt_order.get("native_offset")
+                    if not _nonempty_str(rt_offset) or rt_offset != req["native_offset"]:
+                        raise OracleViolation(
+                            "INV-015",
+                            f"Order {cid} native_offset {rt_offset!r} != {req['native_offset']!r}",
+                            round_seq=round_seq, frame_id=frame_id,
+                        )
+                    exchange = str(req["contract_id"]).split(".")[0]
+                    if exchange in {"SHFE", "INE"} and expected_effect == "REDUCE" and rt_offset not in {
+                        "CLOSETODAY", "CLOSE", "CLOSEYESTERDAY"
+                    }:
+                        raise OracleViolation(
+                            "INV-015",
+                            f"Order {cid} on {exchange} requires CLOSETODAY/CLOSE/CLOSEYESTERDAY, got {rt_offset!r}",
+                            round_seq=round_seq, frame_id=frame_id,
+                        )
+                if not _is_int_value(rt_order.get("original_qty")) or int(rt_order["original_qty"]) <= 0:
+                    raise OracleViolation(
+                        "INV-015",
+                        f"Order {cid} original_qty missing or invalid: {rt_order.get('original_qty')!r}",
+                        round_seq=round_seq, frame_id=frame_id,
+                    )
+                if int(rt_order["original_qty"]) != int(req["quantity"]):
                     raise OracleViolation(
                         "INV-015",
                         f"Order {cid} original_qty {rt_order.get('original_qty')} != {req['quantity']}",
                         round_seq=round_seq, frame_id=frame_id,
                     )
-                if rt_order.get("filled_qty") is not None and int(rt_order["filled_qty"]) != int(broker_order["traded_qty"]):
+                if req.get("limit_price") is not None and not _same_decimal(rt_order.get("limit_price"), req["limit_price"]):
+                    raise OracleViolation(
+                        "INV-015",
+                        f"Order {cid} limit_price {rt_order.get('limit_price')!r} != {req['limit_price']!r}",
+                        round_seq=round_seq, frame_id=frame_id,
+                    )
+                if not _is_int_value(rt_order.get("filled_qty")) or int(rt_order["filled_qty"]) < 0:
+                    raise OracleViolation(
+                        "INV-015",
+                        f"Order {cid} filled_qty missing or invalid: {rt_order.get('filled_qty')!r}",
+                        round_seq=round_seq, frame_id=frame_id,
+                    )
+                if int(rt_order["filled_qty"]) != int(broker_order["traded_qty"]):
                     raise OracleViolation(
                         "INV-015",
                         f"Order {cid} filled_qty {rt_order.get('filled_qty')} != broker traded_qty {broker_order['traded_qty']}",
                         round_seq=round_seq, frame_id=frame_id,
                     )
-                broker_status = str(broker_order["status"])
-                if broker_status in {"ALIVE", "FILLED", "CANCELLED", "REJECTED"} and rt_order.get("broker_state") is not None:
+                if not _is_int_value(rt_order.get("potential_remaining")) or int(rt_order["potential_remaining"]) < 0:
+                    raise OracleViolation(
+                        "INV-015",
+                        f"Order {cid} potential_remaining missing or invalid: {rt_order.get('potential_remaining')!r}",
+                        round_seq=round_seq, frame_id=frame_id,
+                    )
+                is_terminal_broker = broker_status in {"FILLED", "CANCELLED", "REJECTED", "ABSENT"}
+                reported_consistent = (
+                    int(broker_order.get("reported_filled_qty", broker_order["traded_qty"]))
+                    == int(broker_order["traded_qty"])
+                )
+                expected_remaining = (
+                    0
+                    if (is_terminal_broker and reported_consistent)
+                    else max(0, int(req["quantity"]) - int(broker_order["traded_qty"]))
+                )
+                if int(rt_order["potential_remaining"]) != expected_remaining:
+                    raise OracleViolation(
+                        "INV-015",
+                        f"Order {cid} potential_remaining {rt_order.get('potential_remaining')} != {expected_remaining}",
+                        round_seq=round_seq, frame_id=frame_id,
+                    )
+                send_state = rt_order.get("send_state")
+                if not _nonempty_str(send_state):
+                    raise OracleViolation(
+                        "INV-015",
+                        f"Order {cid} send_state missing or empty: {send_state!r}",
+                        round_seq=round_seq, frame_id=frame_id,
+                    )
+                if broker_status == "SEND_REQUESTED":
+                    if send_state not in {"PREPARED", "CALL_RETURNED", "SEND_POSSIBLE", "UNKNOWN"}:
+                        raise OracleViolation(
+                            "INV-015",
+                            f"Order {cid} SEND_REQUESTED has invalid send_state {send_state!r}",
+                            round_seq=round_seq, frame_id=frame_id,
+                        )
+                elif broker_status == "ABSENT":
+                    if send_state != "DEFINITELY_NOT_SENT":
+                        raise OracleViolation(
+                            "INV-015",
+                            f"Order {cid} ABSENT expected send_state='DEFINITELY_NOT_SENT', got {send_state!r}",
+                            round_seq=round_seq, frame_id=frame_id,
+                        )
+                elif broker_status in {"ALIVE", "FILLED", "CANCELLED", "REJECTED"}:
+                    if send_state != "NATIVE_SEEN":
+                        raise OracleViolation(
+                            "INV-015",
+                            f"Order {cid} confirmed ({broker_status}) expected send_state='NATIVE_SEEN', got {send_state!r}",
+                            round_seq=round_seq, frame_id=frame_id,
+                        )
                     if rt_order.get("broker_state") != broker_status:
                         raise OracleViolation(
                             "INV-015",
                             f"Order {cid} broker_state {rt_order.get('broker_state')!r} != {broker_status!r}",
                             round_seq=round_seq, frame_id=frame_id,
                         )
+                    rt_native_id = rt_order.get("native_order_id")
+                    if not _nonempty_str(rt_native_id):
+                        raise OracleViolation(
+                            "INV-015",
+                            f"Order {cid} confirmed ({broker_status}) missing native_order_id",
+                            round_seq=round_seq, frame_id=frame_id,
+                        )
+                    if broker_order.get("native_order_id") is not None and rt_native_id != broker_order["native_order_id"]:
+                        raise OracleViolation(
+                            "INV-015",
+                            f"Order {cid} native_order_id {rt_native_id!r} != {broker_order['native_order_id']!r}",
+                            round_seq=round_seq, frame_id=frame_id,
+                        )
+                else:
+                    raise OracleViolation(
+                        "INV-015",
+                        f"Order {cid} has unsupported broker status {broker_status!r}",
+                        round_seq=round_seq, frame_id=frame_id,
+                    )
 
             broker_trade_ids = set(state.trades.keys())
             if broker_trade_ids != seen_runtime_trade_ids:
@@ -476,13 +677,13 @@ class ReferenceOracle:
                     str(broker_trade["direction"]), str(broker_trade["native_offset"])
                 )
                 expected_effects = {"OPEN"} if broker_trade["native_offset"] == "OPEN" else {"CLOSE", "REDUCE"}
-                if rt_trade.get("contract_id") != broker_trade["contract_id"]:
+                if not _nonempty_str(rt_trade.get("contract_id")) or rt_trade.get("contract_id") != broker_trade["contract_id"]:
                     raise OracleViolation(
                         "INV-015",
                         f"Trade {tid} contract_id {rt_trade.get('contract_id')!r} != {broker_trade['contract_id']!r}",
                         round_seq=round_seq, frame_id=frame_id,
                     )
-                if int(rt_trade.get("quantity") or 0) != int(broker_trade["quantity"]):
+                if not _is_int_value(rt_trade.get("quantity")) or int(rt_trade["quantity"]) != int(broker_trade["quantity"]):
                     raise OracleViolation(
                         "INV-015",
                         f"Trade {tid} quantity {rt_trade.get('quantity')} != {broker_trade['quantity']}",
@@ -494,23 +695,34 @@ class ReferenceOracle:
                         f"Trade {tid} price {rt_trade.get('price')!r} != {broker_trade['price']!r}",
                         round_seq=round_seq, frame_id=frame_id,
                     )
-                if rt_trade.get("direction") != expected_dir:
+                if not _nonempty_str(rt_trade.get("direction")) or rt_trade.get("direction") != expected_dir:
                     raise OracleViolation(
                         "INV-015",
                         f"Trade {tid} direction {rt_trade.get('direction')!r} != {expected_dir!r}",
                         round_seq=round_seq, frame_id=frame_id,
                     )
-                if rt_trade.get("effect") is not None and rt_trade.get("effect") not in expected_effects:
+                if not _nonempty_str(rt_trade.get("effect")) or rt_trade.get("effect") not in expected_effects:
                     raise OracleViolation(
                         "INV-015",
                         f"Trade {tid} effect {rt_trade.get('effect')!r} not in {sorted(expected_effects)}",
                         round_seq=round_seq, frame_id=frame_id,
                     )
-                if rt_trade.get("offset_kind") is not None and rt_trade.get("offset_kind") != broker_trade["native_offset"]:
-                    raise OracleViolation(
-                        "INV-015",
-                        f"Trade {tid} offset_kind {rt_trade.get('offset_kind')!r} != {broker_trade['native_offset']!r}",
-                        round_seq=round_seq, frame_id=frame_id,
-                    )
+                if broker_trade.get("native_offset") is not None:
+                    rt_offset = rt_trade.get("offset_kind")
+                    if not _nonempty_str(rt_offset) or rt_offset != broker_trade["native_offset"]:
+                        raise OracleViolation(
+                            "INV-015",
+                            f"Trade {tid} offset_kind {rt_offset!r} != {broker_trade['native_offset']!r}",
+                            round_seq=round_seq, frame_id=frame_id,
+                        )
+                    exchange = str(broker_trade["contract_id"]).split(".")[0]
+                    if exchange in {"SHFE", "INE"} and broker_trade["native_offset"] != "OPEN" and rt_offset not in {
+                        "CLOSETODAY", "CLOSE", "CLOSEYESTERDAY"
+                    }:
+                        raise OracleViolation(
+                            "INV-015",
+                            f"Trade {tid} on {exchange} requires CLOSETODAY/CLOSE/CLOSEYESTERDAY, got {rt_offset!r}",
+                            round_seq=round_seq, frame_id=frame_id,
+                        )
 
         return state

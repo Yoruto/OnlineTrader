@@ -275,6 +275,31 @@ class ExplicitOrderController:
             normalized['source_time_ns'] = fact['source_time_ns']
         if not self.journal.record_trade(order_day, native_id, trade_id, normalized):
             return
+        if order.get('convergence_order'):
+            if order['filled_qty'] + qty > order['original_qty']:
+                raise TraderError('E_DSV_NATIVE_FACT', 'Trade would exceed original child quantity')
+            order['filled_qty'] += qty
+            fills = order.setdefault('convergence_fills', [])
+            fills.append({
+                'event_seq': max(len(fills) + 1, int(state.get('sequence') or 0)),
+                'contract_id': order['contract_id'],
+                'child_order_id': order['child_order_id'],
+                'direction': order['convergence_side'],
+                'trade_key': [order_day, native_id, trade_id],
+                'native_trade_id': trade_id,
+                'source_time_ns': fact.get('source_time_ns'),
+                'trading_day': fill_day,
+                'quantity': qty,
+                'price': fact['price'],
+                'effect': 'REDUCE',
+                'offset_kind': order['native_offset'],
+                'position_cycle_id': order['position_id'],
+                'order_source': 'CONVERGENCE',
+            })
+            if order.get('terminal_conflict') and terminal(order):
+                order.pop('terminal_conflict')
+            self.journal.event('NATIVE_TRADE', fact)
+            return
         row = state['symbols'][order['contract_id']]
         position = row['position']
         limit = order['reported_fill_qty'] if order['terminal_confirmed'] else order['original_qty']
@@ -847,6 +872,7 @@ class ExplicitOrderController:
         prior = [
             order for order in state['orders'].values()
             if order['contract_id'] == market['contract_id'] and not terminal(order)
+            and not order.get('convergence_order')
             and (position is None or order['position_id'] != position['id'])]
         if prior:
             current = [] if position is None else self.child_orders(state, position)
@@ -1109,9 +1135,408 @@ class ExplicitOrderController:
                 state['retired_positions'][position['id']] = position
                 row['position'] = None
 
+    @staticmethod
+    def _convergence_limit_locked(tick, close_buy):
+        if tick is None:
+            return False
+        last = tick.get('last')
+        if price_value(last) is None:
+            return False
+        last_dec = Decimal(last)
+        if close_buy:
+            upper = tick.get('upper_limit')
+            if price_value(upper) is not None and last_dec >= Decimal(upper) and price_value(tick.get('ask1')) is None:
+                return True
+        else:
+            lower = tick.get('lower_limit')
+            if price_value(lower) is not None and last_dec <= Decimal(lower) and price_value(tick.get('bid1')) is None:
+                return True
+        return False
+
+    @staticmethod
+    def _convergence_close_price(market, pos_side):
+        ticks = market.get('ticks') or ()
+        tick = market.get('tick') or (ticks[-1] if ticks else None)
+        if tick is None:
+            return None, 'DEFERRED_QUOTE_UNAVAILABLE'
+        buy = pos_side == 'SHORT'
+        if ExplicitOrderController._convergence_limit_locked(tick, buy):
+            return None, 'DEFERRED_LIMIT_LOCKED'
+        quote = tick.get('ask1' if buy else 'bid1')
+        if price_value(quote) is None:
+            quote = tick.get('last')
+        if price_value(quote) is None:
+            return None, 'DEFERRED_NO_LEGAL_PRICE'
+
+        def positive(value):
+            return Decimal(value) if price_value(value) is not None else None
+
+        mode = market.get('close_price_mode') or 'MARKET'
+        if mode not in {'AGGR1', 'MARKET'}:
+            mode = 'MARKET'
+        raw = strategy_price(
+            'BUY' if buy else 'SELL',
+            mode,
+            opponent=positive(quote),
+            tick=positive(tick.get('tick_size')),
+            limit=positive(tick.get('upper_limit' if buy else 'lower_limit')),
+            reference=None,
+        )
+        if mode == 'AGGR1':
+            raw = _clamp_to_limits(tick, raw)
+        price = legal_price(tick, raw)
+        if price is None:
+            return None, 'DEFERRED_NO_LEGAL_PRICE'
+        return price, None
+
+    def new_convergence_order(self, state, contract_id, pos_side, market, qty, price, offset):
+        child_id = 'child-' + uuid4().hex
+        side = 'BUY' if pos_side == 'SHORT' else 'SELL'
+        chain = [
+            o for o in state['orders'].values()
+            if o.get('convergence_order') and o['contract_id'] == contract_id and o.get('convergence_side') == pos_side
+        ]
+        parent = chain[-1]['child_order_id'] if chain else None
+        order = OrderState(
+            child_id,
+            f'conv-{contract_id}-{pos_side.lower()}',
+            child_id,
+            'REDUCE',
+            qty,
+            price,
+            parent_child_order_id=parent,
+            ordinal=len(chain) + 1,
+            native_offset=offset,
+            native_trading_day=state['trading_day'],
+        ).to_dict()
+        order.update(
+            contract_id=contract_id,
+            direction=side,
+            position_id=f'conv-{contract_id}-{pos_side.lower()}',
+            native_id=None,
+            cancel_reason=None,
+            convergence_order=True,
+            convergence_side=pos_side,
+            order_source='CONVERGENCE',
+        )
+        ticks = market.get('ticks') or ()
+        tick = market.get('tick') or (ticks[-1] if ticks else None)
+        if tick is not None and tick.get('native_time') is not None:
+            order['quote_at'] = tick['native_time']
+        state['orders'][child_id] = order
+        return self._prepare(
+            order, 'SEND', quantity=qty, limit_price=price, native_offset=offset,
+            direction=side, order_source='CONVERGENCE',
+        )
+
+    def _cancel_non_strategy_order(self, state, ext_order):
+        native_id = str(ext_order['native_order_id'])
+        cancels = state.setdefault('convergence_cancels', {})
+        rec = cancels.get(native_id)
+        if rec is not None:
+            if rec.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}:
+                return None
+            if rec.get('local_cancel_rejection', {}).get('error_code') == 'E_DSV_SDK_CANCEL_RISK':
+                return None
+            if rec.get('cancel_attempt', 0) >= 3:
+                return None
+        attempt = (0 if rec is None else rec.get('cancel_attempt', 0)) + 1
+        effect_id = f'conv-cancel-{native_id}-{attempt}'
+        effect = {
+            'id': effect_id,
+            'kind': 'CANCEL',
+            'child_order_id': f'ext-{native_id}',
+            'contract_id': ext_order['contract_id'],
+            'account_key': self.scope['account_key'],
+            'provider': self.scope['provider'],
+            'trading_day': state['trading_day'],
+            'native_order_id': native_id,
+            'external_order': True,
+            'reason': 'CONVERGENCE_CANCEL_NON_STRATEGY',
+            'cancel_attempt': attempt,
+        }
+        self.journal.prepare(effect)
+        cancels[native_id] = {
+            'native_order_id': native_id,
+            'contract_id': ext_order['contract_id'],
+            'direction': ext_order.get('direction'),
+            'native_offset': ext_order.get('native_offset'),
+            'volume_left': ext_order.get('volume_left'),
+            'cancel_status': 'SEND_POSSIBLE',
+            'cancel_attempt': attempt,
+            'cancel_effect_id': effect_id,
+        }
+        return effect
+
+    def plan_convergence(self, state, configured_markets, unconfigured_markets, non_strategy_orders, wall_time):
+        """Plan non-blocking per-contract convergence orders and external cancellations (ARMED only)."""
+        effects = []
+        statuses = {}
+        events = []
+        active_ext_ids = {str(item['native_order_id']) for item in (non_strategy_orders or ())}
+        cancels = state.setdefault('convergence_cancels', {})
+        for nid in [k for k in cancels if k not in active_ext_ids]:
+            cancels.pop(nid, None)
+
+        ext_by_contract = {}
+        for item in (non_strategy_orders or ()):
+            cid = item['contract_id']
+            ext_by_contract.setdefault(cid, []).append(item)
+
+        # Cancel non-strategy active orders on contracts whose session permits it (or immediately).
+        for cid in sorted(ext_by_contract):
+            for ext_order in ext_by_contract[cid]:
+                req = self._cancel_non_strategy_order(state, ext_order)
+                if req is not None:
+                    effects.append(req)
+                    events.append({
+                        'event': 'CONVERGENCE_ACTION',
+                        'contract_id': cid,
+                        'action': 'CANCEL_NON_STRATEGY_ORDER',
+                        'native_order_id': req['native_order_id'],
+                        'direction': ext_order.get('direction'),
+                        'volume_left': ext_order.get('volume_left'),
+                    })
+
+        all_targets = []
+        for cid in sorted(configured_markets):
+            all_targets.append((cid, configured_markets[cid], True))
+        unconf_map = {m['contract_id']: m for m in (unconfigured_markets or ())}
+        for cid in sorted(unconf_map):
+            all_targets.append((cid, unconf_map[cid], False))
+
+        separated_exchanges = {'SHFE', 'INE'}
+        for cid, market, is_configured in all_targets:
+            pos = state['symbols'][cid]['position'] if (is_configured and cid in state['symbols']) else None
+            owned_long = pos['owned'] if (pos is not None and pos['direction'] == 'LONG') else 0
+            owned_short = pos['owned'] if (pos is not None and pos['direction'] == 'SHORT') else 0
+            actual_long = int(market.get('long_qty') or 0)
+            actual_short = int(market.get('short_qty') or 0)
+            excess_long = max(0, actual_long - owned_long)
+            excess_short = max(0, actual_short - owned_short)
+            conv_orders = [
+                o for o in state['orders'].values()
+                if o.get('convergence_order') and o['contract_id'] == cid and not terminal(o)
+            ]
+            has_ext = cid in ext_by_contract
+            if excess_long == 0 and excess_short == 0 and not has_ext:
+                statuses[cid] = {
+                    'configured': is_configured,
+                    'status': 'CONVERGING_FILL_PENDING' if conv_orders else 'ALIGNED',
+                    'actual_long': actual_long,
+                    'actual_short': actual_short,
+                    'target_long': owned_long,
+                    'target_short': owned_short,
+                    'excess_long': 0,
+                    'excess_short': 0,
+                }
+                continue
+            if has_ext:
+                statuses[cid] = {
+                    'configured': is_configured,
+                    'status': 'CANCELLING_NON_STRATEGY_ORDERS',
+                    'actual_long': actual_long,
+                    'actual_short': actual_short,
+                    'target_long': owned_long,
+                    'target_short': owned_short,
+                    'excess_long': excess_long,
+                    'excess_short': excess_short,
+                }
+                events.append({
+                    'event': 'CONVERGENCE_DEFERRED',
+                    'contract_id': cid,
+                    'reason': 'WAITING_NON_STRATEGY_CANCEL',
+                    'pending_orders': len(ext_by_contract[cid]),
+                })
+                continue
+
+            ticks = market.get('ticks') or ()
+            in_session = bool(market.get('market_session_active', True) and ticks)
+            if not in_session:
+                statuses[cid] = {
+                    'configured': is_configured,
+                    'status': 'DEFERRED_SESSION_OR_QUOTE',
+                    'actual_long': actual_long,
+                    'actual_short': actual_short,
+                    'target_long': owned_long,
+                    'target_short': owned_short,
+                    'excess_long': excess_long,
+                    'excess_short': excess_short,
+                }
+                events.append({
+                    'event': 'CONVERGENCE_DEFERRED',
+                    'contract_id': cid,
+                    'reason': 'OUTSIDE_SESSION_OR_NO_QUOTE',
+                    'excess_long': excess_long,
+                    'excess_short': excess_short,
+                })
+                continue
+
+            owned_today_bucket = owned_hist_bucket = 0
+            if pos is not None and pos['owned'] > 0:
+                try:
+                    pb = self.position_buckets(state, pos, cid)
+                    owned_today_bucket = int(pb.get('today', 0))
+                    owned_hist_bucket = int(pb.get('historical', 0))
+                except TraderError:
+                    owned_today_bucket = pos['owned']
+                    owned_hist_bucket = 0
+
+            contract_status = 'CONVERGING'
+            for pos_side, excess_qty in (('LONG', excess_long), ('SHORT', excess_short)):
+                if excess_qty <= 0:
+                    continue
+                side_orders = [o for o in conv_orders if o.get('convergence_side') == pos_side]
+                desired, price_reason = self._convergence_close_price(market, pos_side)
+                if desired is None:
+                    contract_status = price_reason
+                    events.append({
+                        'event': 'CONVERGENCE_DEFERRED',
+                        'contract_id': cid,
+                        'side': pos_side,
+                        'reason': price_reason,
+                        'excess_qty': excess_qty,
+                    })
+                    continue
+
+                uncertain = [
+                    o['child_order_id'] for o in side_orders
+                    if o['send_state'] == 'UNKNOWN' or o.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}
+                ]
+                pending_qty = sum(max(0, o['original_qty'] - o['filled_qty']) for o in side_orders)
+                if pending_qty > excess_qty and not uncertain:
+                    over = pending_qty - excess_qty
+                    for order in reversed(side_orders):
+                        if req := self.cancel(order, 'TARGET_REDUCED'):
+                            effects.append(req)
+                        over -= max(0, order['original_qty'] - order['filled_qty'])
+                        if over <= 0:
+                            break
+                    contract_status = 'CANCELLING_EXCESS_CLOSE'
+                    continue
+
+                repricing = False
+                if not uncertain:
+                    for order in side_orders:
+                        if order.get('native_id') is None or order['broker_state'] != 'ALIVE':
+                            continue
+                        cur_px = Decimal(order['limit_price'])
+                        prop_px = Decimal(desired)
+                        worse = prop_px > cur_px if order['direction'] == 'BUY' else prop_px < cur_px
+                        if worse and (req := self.cancel(order, 'REPRICE')):
+                            effects.append(req)
+                            repricing = True
+                if uncertain or repricing:
+                    contract_status = 'SEND_RESULT_UNKNOWN' if uncertain else 'REPRICING'
+                    continue
+
+                needed = max(0, excess_qty - pending_qty)
+                if needed <= 0:
+                    contract_status = 'CONVERGING_FILL_PENDING'
+                    continue
+
+                # Avoid tight-looping on repeated structural rejections for the same contract side.
+                recent_struct_rejects = sum(
+                    1 for o in state['orders'].values()
+                    if o.get('convergence_order') and o['contract_id'] == cid and o.get('convergence_side') == pos_side
+                    and terminal(o) and o['filled_qty'] == 0 and (
+                        o.get('broker_rejection_category') == 'STRUCTURAL'
+                        or o.get('local_send_rejection', {}).get('error_code') in {'E_DSV_SDK_SEND_VALIDATION'}
+                    )
+                )
+                if recent_struct_rejects >= 2:
+                    contract_status = 'DEFERRED_STRUCTURAL_REJECTION'
+                    events.append({
+                        'event': 'CONVERGENCE_DEFERRED',
+                        'contract_id': cid,
+                        'side': pos_side,
+                        'reason': 'STRUCTURAL_REJECTION_CAP',
+                        'excess_qty': needed,
+                    })
+                    continue
+
+                side_key = pos_side.lower()
+                actual_side_qty = actual_long if pos_side == 'LONG' else actual_short
+                m_today = int(market.get(f'{side_key}_today', actual_side_qty))
+                m_hist = int(market.get(f'{side_key}_historical', 0))
+                res_today = owned_today_bucket if (pos is not None and pos['direction'] == pos_side) else 0
+                res_hist = owned_hist_bucket if (pos is not None and pos['direction'] == pos_side) else 0
+                free_today = max(0, m_today - res_today)
+                free_hist = max(0, m_hist - res_hist)
+                for order in side_orders:
+                    rem = max(0, order['original_qty'] - order['filled_qty'])
+                    if order['native_offset'] == 'CLOSETODAY':
+                        free_today = max(0, free_today - rem)
+                    else:
+                        free_hist = max(0, free_hist - rem)
+                if free_today + free_hist < needed:
+                    # Fallback to remaining broker total if buckets shifted.
+                    rem_total = max(0, m_today + m_hist - pending_qty - (owned_long if pos_side == 'LONG' else owned_short))
+                    needed = min(needed, rem_total) if rem_total > 0 else 0
+                if needed <= 0:
+                    continue
+
+                min_qty = int(market.get('min_order_qty', 1))
+                max_qty = int(market.get('max_order_qty', 2_147_483_647))
+                is_sep = cid.split('.')[0] in separated_exchanges
+                if is_sep:
+                    if free_hist > 0:
+                        offset = 'CLOSE'
+                        send_qty = min(needed, free_hist, max_qty)
+                    elif free_today > 0:
+                        offset = 'CLOSETODAY'
+                        send_qty = min(needed, free_today, max_qty)
+                    else:
+                        offset = 'CLOSETODAY'
+                        send_qty = min(needed, max_qty)
+                else:
+                    offset = 'CLOSE'
+                    send_qty = min(needed, max_qty)
+                if send_qty < min_qty:
+                    contract_status = 'DEFERRED_BELOW_MIN_QTY'
+                    events.append({
+                        'event': 'CONVERGENCE_DEFERRED',
+                        'contract_id': cid,
+                        'side': pos_side,
+                        'reason': 'BELOW_MIN_ORDER_QTY',
+                        'needed': send_qty,
+                        'min_order_qty': min_qty,
+                    })
+                    continue
+
+                req = self.new_convergence_order(state, cid, pos_side, market, send_qty, desired, offset)
+                effects.append(req)
+                events.append({
+                    'event': 'CONVERGENCE_ACTION',
+                    'contract_id': cid,
+                    'action': 'CLOSE_EXCESS_OR_UNOWNED',
+                    'side': pos_side,
+                    'direction': req['direction'],
+                    'native_offset': offset,
+                    'quantity': send_qty,
+                    'limit_price': desired,
+                    'configured': is_configured,
+                })
+
+            statuses[cid] = {
+                'configured': is_configured,
+                'status': contract_status,
+                'actual_long': actual_long,
+                'actual_short': actual_short,
+                'target_long': owned_long,
+                'target_short': owned_short,
+                'excess_long': excess_long,
+                'excess_short': excess_short,
+            }
+        return effects, statuses, events
+
     def dispatch(self, state, effects):
         for effect in effects:
-            order = state['orders'][effect['child_order_id']]
+            is_ext_cancel = bool(effect.get('external_order'))
+            if is_ext_cancel:
+                order = state.setdefault('convergence_cancels', {})[effect['native_order_id']]
+            else:
+                order = state['orders'][effect['child_order_id']]
             sender = self.port.send if effect['kind'] == 'SEND' else self.port.cancel
             details = {'id': effect['id'], 'child_order_id': effect['child_order_id'],
                        'contract_id': effect['contract_id'],
@@ -1149,7 +1574,8 @@ class ExplicitOrderController:
                     # This is local proof, NOT a fabricated broker terminal or
                     # a cancelled order. Do not refund the consumed strategy target.
                     order['local_send_rejection'] = {'effect_id': effect['id'], **details}
-                    position = state['symbols'][order['contract_id']]['position']
+                    sym_row = state['symbols'].get(order['contract_id'])
+                    position = None if sym_row is None else sym_row['position']
                     retryable_open_race = (
                         order['effect'] == 'OPEN'
                         and details.get('rejection_reason') in {'QUOTE_REVISION_CHANGED', 'NATIVE_QUOTE_NOT_CURRENT'})
@@ -1186,6 +1612,8 @@ class ExplicitOrderController:
                     order['local_cancel_rejection'] = {'effect_id': effect['id'], **details}
                 else:
                     order['cancel_status'] = result
+                if is_ext_cancel and effect['kind'] == 'CANCEL':
+                    order['native_order_id'] = effect['native_order_id']
             details['returned_monotonic_ns'] = str(time.monotonic_ns())
             if 'error_code' in details:
                 order['last_dispatch_error'] = dict(details)

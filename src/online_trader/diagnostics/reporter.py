@@ -41,8 +41,32 @@ _WORKBENCH_RESERVE = _MAX_BUNDLE_INPUT - _RUNTIME_RESERVE
 _HEAD_RESERVE = 1 * 1024 * 1024
 _KEY_EVENT_RESERVE = 1 * 1024 * 1024
 _MAX_KEY_SCAN = 64 * 1024 * 1024
-_KEY_COMPONENTS = frozenset({"LIFECYCLE"})
+_MAX_WORKBENCH_SCAN = 64 * 1024 * 1024
+_MAX_WORKBENCH_SCAN_SECONDS = 3.0
+_KEY_COMPONENTS = frozenset({"LIFECYCLE", "OWNER", "STORAGE", "ORDER", "COMMAND"})
 _KEY_SEVERITIES = frozenset({"ERROR", "CRITICAL"})
+_KEY_EVENT_TYPES = frozenset({
+    "MARKET_ANOMALY",
+    "WORKBENCH_CONNECTION_CHANGED",
+    "WORKBENCH_SNAPSHOT_CHANGED",
+    "WORKBENCH_SNAPSHOT_EXPIRED",
+    "WORKBENCH_SNAPSHOT_RECOVERED",
+    "STARTUP_TARGET_INFERENCE",
+    "CONVERGENCE_ACTION",
+    "CONVERGENCE_DEFERRED",
+})
+_KEY_LINE_TOKENS = (
+    b'"LIFECYCLE"', b'"OWNER"', b'"STORAGE"', b'"ORDER"', b'"COMMAND"',
+    b'"ERROR"', b'"CRITICAL"',
+    b'"MARKET_ANOMALY"',
+    b'"WORKBENCH_CONNECTION_CHANGED"',
+    b'"WORKBENCH_SNAPSHOT_CHANGED"',
+    b'"WORKBENCH_SNAPSHOT_EXPIRED"',
+    b'"WORKBENCH_SNAPSHOT_RECOVERED"',
+    b'"STARTUP_TARGET_INFERENCE"',
+    b'"CONVERGENCE_ACTION"',
+    b'"CONVERGENCE_DEFERRED"',
+)
 _MAX_LOCAL_BYTES = 500 * 1024 * 1024
 _CONTEXT_EVENTS = frozenset({
     "WORKBENCH_STARTED", "WORKBENCH_STOPPED", "WORKBENCH_CONNECTION_CHANGED",
@@ -275,11 +299,12 @@ def _stage(staging: Path, target: str, raw: bytes, files: list):
 
 def _is_key_event(row) -> bool:
     return (row.get("component") in _KEY_COMPONENTS
-            or row.get("severity") in _KEY_SEVERITIES)
+            or row.get("severity") in _KEY_SEVERITIES
+            or row.get("event_type") in _KEY_EVENT_TYPES)
 
 
 def _scan_key_events(path: Path, budget: int):
-    """Stream one skipped segment and keep only bounded lifecycle/error lines."""
+    """Stream one skipped segment and keep only bounded key diagnostic lines."""
     kept = []
     used = 0
     scanned = 0
@@ -288,7 +313,7 @@ def _scan_key_events(path: Path, budget: int):
             scanned += len(line)
             if scanned > _MAX_SOURCE_FILE or not line.endswith(b"\n"):
                 break
-            if b'"LIFECYCLE"' not in line and b'"ERROR"' not in line and b'"CRITICAL"' not in line:
+            if not any(token in line for token in _KEY_LINE_TOKENS):
                 continue
             if used + len(line) > budget:
                 break
@@ -302,7 +327,7 @@ def _plan_sources(sources, budget):
 
     Returns ``(plan, key_budget)`` where ``plan`` maps a segment to
     ``("FULL"|"TAIL"|"HEAD", byte_limit)``; unplanned segments are skipped and
-    only scanned for key lifecycle/error events within ``key_budget``.
+    only scanned for key events within ``key_budget``.
     """
     plan = {}
     if not sources or budget <= 0:
@@ -315,7 +340,10 @@ def _plan_sources(sources, budget):
             sizes[source] = 0
     total_size = sum(min(size, _MAX_SOURCE_FILE) for size in sizes.values())
     if total_size <= budget:
-        return {source: ("FULL", _MAX_SOURCE_FILE) for source in sources}, 0
+        return {
+            source: ("FULL" if sizes[source] <= _MAX_SOURCE_FILE else "TAIL", _MAX_SOURCE_FILE)
+            for source in sources
+        }, 0
     multiple = len(sources) > 1
     head_reserve = min(_HEAD_RESERVE, budget // 8) if multiple else 0
     key_reserve = min(_KEY_EVENT_RESERVE, budget // 8) if len(sources) > 2 else 0
@@ -337,7 +365,8 @@ def _plan_sources(sources, budget):
     return plan, key_reserve
 
 
-def _collect_event_stream(staging, group, root, target_boot, budget, files, omissions):
+def _collect_event_stream(staging, group, root, target_boot, budget, files, omissions,
+                          *, max_selected_bytes=None):
     metadata = _json_snapshot(root / "metadata.json")
     health = _json_snapshot(root / "health.json")
     rows = []
@@ -442,12 +471,37 @@ def _collect_event_stream(staging, group, root, target_boot, budget, files, omis
         [*exact, *context], key=lambda row: int(row["event_seq"])
     )
     if group == "workbench" and not exact:
-        return None, raw_bytes
+        return None, raw_bytes, 0
     if group == "runtime" and not exact:
         omissions.append(f"runtime/{root.name}:NO_TARGET_BOOT_EVENTS")
+    staged_selected_bytes = 0
     if selected:
-        _stage(staging, f"{group}/{root.name}/events-selected.ndjson",
-               b"".join(canonical_bytes(row) + b"\n" for row in selected), files)
+        encoded = [canonical_bytes(row) + b"\n" for row in selected]
+        if max_selected_bytes is not None:
+            kept_rows = []
+            kept_encoded = []
+            kept_size = 0
+            for row, line in zip(reversed(selected), reversed(encoded)):
+                if kept_size + len(line) > max_selected_bytes and kept_encoded:
+                    budget_trimmed = True
+                    continue
+                if kept_size + len(line) > max_selected_bytes:
+                    budget_trimmed = True
+                    continue
+                kept_rows.append(row)
+                kept_encoded.append(line)
+                kept_size += len(line)
+            if len(kept_rows) < len(selected):
+                omissions.append(f"{group}/{root.name}:BUNDLE_LIMIT")
+                selected = list(reversed(kept_rows))
+                encoded = list(reversed(kept_encoded))
+                exact = [row for row in selected if row.get("runtime_boot_id") == target_boot]
+                if group == "workbench" and not exact:
+                    return None, raw_bytes, 0
+                context = [row for row in selected if row.get("runtime_boot_id") is None]
+        payload_bytes = b"".join(encoded)
+        staged_selected_bytes = len(payload_bytes)
+        _stage(staging, f"{group}/{root.name}/events-selected.ndjson", payload_bytes, files)
     if metadata is not None:
         _stage(staging, f"{group}/{root.name}/metadata.json", canonical_bytes(metadata), files)
     else:
@@ -495,7 +549,7 @@ def _collect_event_stream(staging, group, root, target_boot, budget, files, omis
         "dropped_events": dropped + retention_dropped,
         "write_failures": write_failures,
         "snapshot_available": bool((health or {}).get("snapshot_available")),
-    }, raw_bytes
+    }, raw_bytes, staged_selected_bytes
 
 
 def _collect_view_log(staging, runtime_root, request, coverage_start, files, omissions):
@@ -509,7 +563,7 @@ def _collect_view_log(staging, runtime_root, request, coverage_start, files, omi
             continue
         found = True
         try:
-            raw, _, limited, tail = _line_snapshot(path, limit=_MAX_SOURCE_FILE)
+            raw, _, limited, tail = _line_snapshot(path, limit=_MAX_SOURCE_FILE, from_end=True)
         except OSError:
             omissions.append(f"runtime-view/{path.name}:UNREADABLE")
             continue
@@ -556,7 +610,7 @@ def _collect_sources(staging: Path, runtime_root: Path, request: dict):
     files = []
     streams = []
     omissions = []
-    total = 0
+    target_boot = request.get("runtime_boot_id")
     runtime_id = request.get("runtime_process_instance_id")
     runtime_directory = diagnostics / "runtime" / str(runtime_id)
     workbench_root = diagnostics / "workbench"
@@ -573,25 +627,42 @@ def _collect_sources(staging: Path, runtime_root: Path, request: dict):
             reverse=True,
         )[:64]
 
-    def stream_bytes(directory):
-        total_bytes = 0
-        for path in directory.glob("events-*.ndjson"):
-            try:
-                total_bytes += min(path.stat().st_size, _MAX_SOURCE_FILE)
-            except OSError:
-                continue
-        return total_bytes
+    # Filter recent Workbench streams by target boot first within bounded scan
+    # caps so unrelated historical Workbench logs do not steal Runtime's budget.
+    wb_files = []
+    wb_streams = []
+    wb_omissions = []
+    wb_budget_remaining = min(_WORKBENCH_RESERVE, _MAX_BUNDLE_INPUT)
+    wb_used = 0
+    wb_scan_remaining = _MAX_WORKBENCH_SCAN
+    wb_scan_deadline = time.monotonic() + _MAX_WORKBENCH_SCAN_SECONDS
+    workbench_count = 0
+    for directory in workbench_candidates:
+        if wb_budget_remaining <= 0:
+            wb_omissions.append("workbench:BUNDLE_LIMIT")
+            break
+        if wb_scan_remaining <= 0 or time.monotonic() >= wb_scan_deadline:
+            wb_omissions.append("workbench:SCAN_LIMIT")
+            break
+        read_budget = min(wb_scan_remaining, _MAX_BUNDLE_INPUT)
+        row, raw_read, selected_used = _collect_event_stream(
+            staging, "workbench", directory, target_boot,
+            read_budget, wb_files, wb_omissions,
+            max_selected_bytes=wb_budget_remaining,
+        )
+        wb_scan_remaining = max(0, wb_scan_remaining - raw_read)
+        if row is not None:
+            wb_used += selected_used
+            wb_budget_remaining = max(0, wb_budget_remaining - selected_used)
+            wb_streams.append(row)
+            workbench_count += 1
 
-    # Workbench keeps its reservation only up to what it could use; the rest is
-    # shared with Runtime.  Runtime's unused bytes flow to Workbench below.
-    workbench_need = sum(stream_bytes(directory) for directory in workbench_candidates)
-    runtime_budget = _MAX_BUNDLE_INPUT - min(_WORKBENCH_RESERVE, workbench_need)
+    runtime_budget = max(0, _MAX_BUNDLE_INPUT - wb_used)
     if runtime_id and runtime_directory.is_dir():
-        row, used = _collect_event_stream(
-            staging, "runtime", runtime_directory, request.get("runtime_boot_id"),
+        row, _, _ = _collect_event_stream(
+            staging, "runtime", runtime_directory, target_boot,
             runtime_budget, files, omissions,
         )
-        total += used
         if row is not None:
             streams.append(row)
     elif request["expected_sources"]["runtime"]:
@@ -604,19 +675,9 @@ def _collect_sources(staging: Path, runtime_root: Path, request: dict):
     view_rows, workbench_expected = _collect_view_log(
         staging, runtime_root, request, coverage_start, files, omissions,
     )
-    workbench_count = 0
-    for directory in workbench_candidates:
-        if total >= _MAX_BUNDLE_INPUT:
-            omissions.append("workbench:BUNDLE_LIMIT")
-            break
-        row, used = _collect_event_stream(
-            staging, "workbench", directory, request.get("runtime_boot_id"),
-            _MAX_BUNDLE_INPUT - total, files, omissions,
-        )
-        if row is not None:
-            total += used
-            streams.append(row)
-            workbench_count += 1
+    files.extend(wb_files)
+    streams.extend(wb_streams)
+    omissions.extend(wb_omissions)
     workbench_expected = bool(request["expected_sources"]["workbench"] or workbench_expected)
     if workbench_expected and not workbench_count:
         omissions.append("workbench:MISSING_EXPECTED_SOURCE")

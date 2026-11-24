@@ -548,7 +548,9 @@ class DsvSdkAdapter:
             frame['feed_health_status'] = pre_health['status']
             frame['feed_entry_blocked'] = bool(pre_health['feed_entry_blocked'])
             self.enabled = True
-            self.dispatch_market = market
+            self.dispatch_market = dict(market)
+            for um in frame.get('unconfigured_markets', ()):
+                self.dispatch_market[um['contract_id']] = um
             receipt = session.apply_round(frame)
             for fact in frame['native']:
                 key = (fact['kind'], fact['child_order_id'], fact.get('native_trade_id'))
@@ -571,8 +573,15 @@ class DsvSdkAdapter:
             self._last_idle_signature = self._idle_state_signature(state, trading_day)
             self._record_unknown_snapshots(state)
             self.synchronized = state['synchronized']
-            self.flat_confirmed = self.synchronized and not self.metrics['native_fill_waiting_day_contracts'] and all(
-                row['long_qty'] == row['short_qty'] == 0 and not row['external_orders'] for row in market.values())
+            self.flat_confirmed = (
+                self.synchronized
+                and not self.metrics['native_fill_waiting_day_contracts']
+                and not frame.get('non_strategy_orders')
+                and all(row['long_qty'] == row['short_qty'] == 0 and not row['external_orders']
+                        for row in market.values())
+                and all(um['long_qty'] == um['short_qty'] == 0
+                        for um in frame.get('unconfigured_markets', ()))
+            )
             self._try_resume_clock_entries(session, state, market)
             return receipt
         except BaseException:
@@ -692,7 +701,222 @@ class DsvSdkAdapter:
                  'broker_order_snapshot_complete': bool(reconcile and snapshot_complete),
                  'absent_orders': absent_orders,
                  'native': changes}
+        if getattr(self, 'owner_mode', None) == 'STANDALONE':
+            non_strategy = self._collect_non_strategy_orders(orders, bindings)
+            frame['non_strategy_orders'] = non_strategy
+            frame['unconfigured_markets'] = self._collect_unconfigured_markets(
+                state, non_strategy, sample, day, funds)
+            if not state.get('startup_inferred'):
+                frame['startup_account_facts'] = self._collect_startup_facts(day, trades)
         return frame, {row['contract_id']: row for row in markets}
+
+    def _safe_all_positions(self):
+        try:
+            positions = self.api.get_position(account=self.account)
+        except TypeError:
+            return {}
+        if not hasattr(positions, 'items'):
+            return {}
+        result = {}
+        for code, pos in positions.items():
+            if isinstance(code, str) and '.' in code and hasattr(pos, 'pos_long'):
+                result[code] = pos
+        return result
+
+    def _collect_non_strategy_orders(self, orders, bindings):
+        if getattr(self, 'owner_mode', None) != 'STANDALONE':
+            return []
+        result = []
+        for native_id, order in sorted(orders.items()):
+            if (native_id not in bindings
+                    and native_id not in self._legacy_native_orders
+                    and getattr(order, 'status', None) == 'ALIVE'
+                    and native_integer(getattr(order, 'volume_left', 0)) > 0):
+                result.append({
+                    'native_order_id': str(native_id),
+                    'contract_id': self._contract(order),
+                    'direction': order.direction,
+                    'native_offset': order.offset,
+                    'volume_left': native_integer(order.volume_left, minimum=1),
+                    'limit_price': number(order.limit_price),
+                })
+        return result
+
+    def _collect_unconfigured_markets(self, state, non_strategy, sample, day, funds):
+        all_positions = self._safe_all_positions()
+        ext_codes = {item['contract_id'] for item in non_strategy}
+        conv_codes = {
+            o['contract_id'] for o in state['orders'].values()
+            if o.get('convergence_order') and not terminal(o) and o['contract_id'] not in self.contracts
+        }
+        target_codes = set(ext_codes - set(self.contracts)) | conv_codes
+        for code, pos in all_positions.items():
+            if code in self.contracts:
+                continue
+            if native_integer(getattr(pos, 'pos_long', 0)) > 0 or native_integer(getattr(pos, 'pos_short', 0)) > 0:
+                target_codes.add(code)
+        results = []
+        for code in sorted(target_codes):
+            pos = all_positions.get(code)
+            if pos is None:
+                try:
+                    pos = self.api.get_position(code, account=self.account)
+                except Exception:
+                    pos = None
+            quote = self.quotes.get(code)
+            if quote is None:
+                try:
+                    quote = self.api.get_quote(code)
+                    if quote is not None:
+                        self.quotes[code] = quote
+                except Exception:
+                    quote = None
+            window = None
+            cal_session_id = None
+            cal_reason = None
+            try:
+                window = self.calendar.query(code, sample.now_utc)
+            except TraderError:
+                window = None
+            if window is not None and window.get('complete') and window.get('is_trading') is not None:
+                active = bool(window['is_trading'] and window['trading_day'] == day)
+                session = window['session']
+                if session is None:
+                    cal_contracts = {
+                        c['contract_id']: c.get('sessions', ())
+                        for c in self.calendar.to_record().get('contracts', ())
+                    }
+                    periods = [p for p in cal_contracts.get(code, ()) if p.get('trading_day') == day]
+                    session = periods[0] if periods else {
+                        'session_id': f'{code}:{day}:closed',
+                        'open_utc': utc(sample.utc - timedelta(hours=1)),
+                        'close_utc': utc(sample.utc + timedelta(hours=1)),
+                        'is_opening_session': False,
+                        'force_close_at_end': False,
+                    }
+                if active:
+                    cal_session_id = session['session_id']
+                else:
+                    cal_reason = 'OUTSIDE_SESSION'
+                qt = self._observe_quote(code, sample, window, day)[0] if quote is not None else None
+            else:
+                qt = None
+                active = False
+                session = {
+                    'session_id': f'{code}:{day}:unconfigured',
+                    'open_utc': utc(sample.utc - timedelta(minutes=5)),
+                    'close_utc': utc(sample.utc + timedelta(hours=1)),
+                    'is_opening_session': False,
+                    'force_close_at_end': False,
+                }
+                if quote is not None and self._protection_clock_ready():
+                    try:
+                        moment = self._quote_time(quote)
+                    except (TypeError, ValueError, OverflowError):
+                        moment = None
+                    if moment is not None:
+                        raw = getattr(quote, 'datetime', None)
+                        age = source_age_ns(sample.utc, moment, raw)
+                        health = self.clock.health(sample) if hasattr(self.clock, 'health') else self._health
+                        if quote_age_quality(age, health)[0] != 'SOURCE_ANOMALY':
+                            qt = moment
+                            active = True
+                    if not active:
+                        cal_reason = 'UNCONFIGURED_QUOTE_UNAVAILABLE'
+                else:
+                    cal_reason = 'UNCONFIGURED_QUOTE_UNAVAILABLE'
+            tick = self._tick(code, quote, session, qt) if (active and quote is not None and qt is not None) else None
+            entry = {
+                'contract_id': code,
+                'configured': False,
+                'market_session_active': bool(active),
+                'native_coverage': window['complete'] if window is not None else True,
+                'calendar_reason': cal_reason,
+                'session_open': session['open_utc'],
+                'session_close': session['close_utc'],
+                'ticks': [] if tick is None else [tick],
+                'external_active_orders': code in ext_codes,
+                'standalone_external_model': True,
+                'long_qty': 0 if pos is None else native_integer(getattr(pos, 'pos_long', 0)),
+                'short_qty': 0 if pos is None else native_integer(getattr(pos, 'pos_short', 0)),
+                'long_today': 0 if pos is None else native_integer(getattr(pos, 'pos_long_today', 0)),
+                'long_historical': 0 if pos is None else native_integer(getattr(pos, 'pos_long_his', 0)),
+                'short_today': 0 if pos is None else native_integer(getattr(pos, 'pos_short_today', 0)),
+                'short_historical': 0 if pos is None else native_integer(getattr(pos, 'pos_short_his', 0)),
+            }
+            if cal_session_id is not None:
+                entry['calendar_session_id'] = cal_session_id
+            prof = getattr(self, 'profile', None)
+            if prof is not None:
+                entry['limit_fallback_ratio'] = str(
+                    prof.to_record()['settings']['trade'].get('limit_fallback_ratio', '0.01'))
+            for field, native_attr in (('min_order_qty', 'min_limit_order_volume'), ('max_order_qty', 'max_limit_order_volume')):
+                val = getattr(quote, native_attr, None) if quote is not None else None
+                if val is not None and active and not (type(val) is int and val == 0):
+                    entry[field] = native_integer(val, minimum=1)
+            results.append(entry)
+        return results
+
+    def _collect_startup_facts(self, day, trades):
+        facts = {code: {'today_trades': [], 'minute_bars': [], 'has_prior_day_force_close': True}
+                 for code in self.contracts}
+        for code in self.contracts:
+            periods = self.periods.get(code)
+            if periods:
+                facts[code]['has_prior_day_force_close'] = any(
+                    bool(p.get('force_close_at_end')) for p in periods if p.get('trading_day') == day)
+            serial = self.minutes.get(code)
+            if serial is not None:
+                ready = getattr(self.api, 'is_serial_ready', None)
+                try:
+                    if not callable(ready) or ready(serial):
+                        tail = serial.tail(400) if hasattr(serial, 'tail') else serial
+                        rows = self._extract_raw_bar_rows(tail)
+                        formatted_bars = []
+                        for r in rows:
+                            if not r or not r[0]:
+                                continue
+                            ohlc = [number(v) for v in r[1:5]]
+                            if len(ohlc) != 4 or any(v is None for v in ohlc):
+                                continue
+                            formatted_bars.append({
+                                'datetime_ns': str(int(r[0])),
+                                'open': ohlc[0],
+                                'high': ohlc[1],
+                                'low': ohlc[2],
+                                'close': ohlc[3],
+                            })
+                        facts[code]['minute_bars'] = formatted_bars
+                except (AttributeError, TypeError, ValueError, ArithmeticError):
+                    pass
+        for tr_id, tr in sorted((trades or {}).items()):
+            code = self._contract(tr)
+            if code not in facts:
+                continue
+            stamp = getattr(tr, 'trade_date_time', None)
+            if type(stamp) is int and stamp > 0:
+                try:
+                    if native_day(self.calendar, code, str(stamp))['trading_day'] != day:
+                        continue
+                except TraderError:
+                    pass
+            try:
+                qty = native_integer(getattr(tr, 'volume', 0), minimum=1)
+                px = number(getattr(tr, 'price', None))
+            except TraderError:
+                continue
+            if px is None:
+                continue
+            facts[code]['today_trades'].append({
+                'trade_id': str(getattr(tr, 'trade_id', tr_id)),
+                'order_id': str(getattr(tr, 'order_id', '')),
+                'direction': getattr(tr, 'direction', ''),
+                'offset': getattr(tr, 'offset', ''),
+                'quantity': qty,
+                'price': px,
+                'source_time_ns': None if stamp is None else str(stamp),
+            })
+        return facts
 
     def _diag(self):
         tracker = getattr(self, '_diagnostics', None)
@@ -768,6 +992,23 @@ class DsvSdkAdapter:
             for code in self.contracts
             if (q := self.quotes.get(code)) is not None
         )
+        standalone_sig = None
+        if getattr(self, 'owner_mode', None) == 'STANDALONE':
+            all_pos = self._safe_all_positions()
+            standalone_sig = (
+                bool(state.get('startup_inferred')),
+                len(state.get('convergence_cancels', {})),
+                tuple(sorted(
+                    (c, getattr(p, 'pos_long', 0), getattr(p, 'pos_short', 0))
+                    for c, p in all_pos.items()
+                    if getattr(p, 'pos_long', 0) or getattr(p, 'pos_short', 0)
+                )),
+                tuple(sorted(
+                    (nid, getattr(o, 'status', None), getattr(o, 'volume_left', 0))
+                    for nid, o in (self.api.get_order(account=self.account) or {}).items()
+                    if getattr(o, 'status', None) == 'ALIVE'
+                )),
+            )
         return (
             trading_day,
             bool(state.get('running')),
@@ -778,6 +1019,7 @@ class DsvSdkAdapter:
             len(self.api.get_order(account=self.account)),
             len(self.api.get_trade(account=self.account)),
             quotes_sig,
+            standalone_sig,
         )
 
     def _can_skip_idle_round(self, state, sample, trading_day, *, updated, timers, day_held):
@@ -787,6 +1029,16 @@ class DsvSdkAdapter:
             return False
         if trading_day != state.get('trading_day'):
             return False
+        if getattr(self, 'owner_mode', None) == 'STANDALONE':
+            if not state.get('startup_inferred'):
+                return False
+            if state.get('running'):
+                if any(getattr(o, 'status', None) == 'ALIVE' and getattr(o, 'volume_left', 0)
+                       for o in (self.api.get_order(account=self.account) or {}).values()):
+                    return False
+                if any(getattr(p, 'pos_long', 0) or getattr(p, 'pos_short', 0)
+                       for p in self._safe_all_positions().values()):
+                    return False
         health = self._health or {}
         if health.get('reason') or health.get('reference_status') != getattr(self, '_last_committed_ref_status', None):
             return False
@@ -833,7 +1085,13 @@ class DsvSdkAdapter:
             filled = binding['original_qty'] - native_integer(order.volume_left)
             rejected = getattr(order, 'is_error', None) is True
             if type(stamp) is int and stamp > 0:
-                actual = native_day(self.calendar, binding['contract_id'], str(stamp))['trading_day']
+                try:
+                    actual = native_day(self.calendar, binding['contract_id'], str(stamp))['trading_day']
+                except TraderError:
+                    if getattr(self, 'owner_mode', None) == 'STANDALONE' and binding['contract_id'] not in self.contracts:
+                        actual = binding['native_trading_day']
+                    else:
+                        raise
                 if actual != binding['native_trading_day']:
                     raise TraderError('E_DSV_SDK_FACT', 'SDK order belongs to a different cabinet day')
             elif not rejected:
@@ -910,7 +1168,13 @@ class DsvSdkAdapter:
                 raise TraderError('E_DSV_SDK_FACT', 'SDK trade needs an exact nanosecond timestamp')
             if stamp + 5_000_000_000 < int(ordered):
                 raise TraderError('E_DSV_SDK_FACT', 'Native trade precedes its original order timestamp')
-            proof = native_day(self.calendar, binding['contract_id'], str(stamp))
+            try:
+                proof = native_day(self.calendar, binding['contract_id'], str(stamp))
+            except TraderError:
+                if getattr(self, 'owner_mode', None) == 'STANDALONE' and binding['contract_id'] not in self.contracts:
+                    proof = {'trading_day': day}
+                else:
+                    raise
             if proof['trading_day'] > day:
                 if day_held:
                     deferred.add(binding['contract_id'])
@@ -1123,8 +1387,10 @@ class DsvSdkAdapter:
             return None
         native_time = utc(moment)
         stamp = quote.datetime
-        serial = self.minutes[code]
+        serial = self.minutes.get(code)
         try:
+            if serial is None:
+                raise KeyError(code)
             tail = serial.iloc[-1]['datetime']
             minute = int(tail)
             candle = str(minute) if minute > 0 and minute == tail else None
@@ -1227,6 +1493,23 @@ class DsvSdkAdapter:
             details = self.display_market_details(contract, trading_day, fresh=fresh)
             if details:
                 details_copy[contract] = details
+        unconfigured_dispatch = {}
+        configured_set = set(contracts)
+        for contract, market in self.dispatch_market.items():
+            if contract in configured_set:
+                continue
+            utick = (market.get('ticks') or [None])[-1]
+            unconfigured_dispatch[contract] = {
+                'long_qty': market.get('long_qty', 0),
+                'short_qty': market.get('short_qty', 0),
+                'long_today': market.get('long_today', 0),
+                'long_historical': market.get('long_historical', 0),
+                'short_today': market.get('short_today', 0),
+                'short_historical': market.get('short_historical', 0),
+                'market_session_active': market.get('market_session_active', True),
+                'last_price': None if utick is None else utick.get('last'),
+                'calendar_reason': market.get('calendar_reason'),
+            }
         sched_cache = getattr(self, '_schedule_display_cache', None)
         if sched_cache is None:
             sched_cache = {}
@@ -1244,6 +1527,7 @@ class DsvSdkAdapter:
             'market_health': _copy.deepcopy(getattr(self, 'market_health', None)),
             'schedule_display': sched_cache[sched_key],
             'dispatch_market': dispatch_copy,
+            'unconfigured_dispatch_market': unconfigured_dispatch,
             'market_details': details_copy,
             'minute_raw': self.minute_chart_raw_snapshot(),
         }
@@ -1281,6 +1565,8 @@ class DsvSdkAdapter:
                 or effect['id'] in self._seen_effects or
                 not self.session._journal.effect_is_prepared(effect)):
             raise TraderError('E_DSV_SDK_SCOPE', 'SDK dispatch requires an unreplayed committed effect')
+        if effect.get('external_order') and getattr(self, 'owner_mode', None) == 'STANDALONE':
+            return effect['native_order_id']
         return self.order_id(effect['child_order_id'])
 
     def opening_limit(self, state, market, spec, now):
@@ -1375,7 +1661,10 @@ class DsvSdkAdapter:
                     rejection_reason = 'QUOTE_AGE'
                     raise TraderError('E_DSV_SDK_SCOPE', 'The selected quote aged beyond its execution policy')
             if self.grant is not None:
-                if (effect['contract_id'] not in self.grant.value['contracts'] or
+                allow_unconf_reduce = bool(
+                    standalone_model and (effect.get('convergence_order') or effect['native_offset'] != 'OPEN')
+                )
+                if ((effect['contract_id'] not in self.grant.value['contracts'] and not allow_unconf_reduce) or
                         not self.grant.permits_day(effect['trading_day']) or
                         effect['native_offset'] == 'OPEN' and (
                             getattr(self.session, '_state', {}).get('scope_expired_at')
@@ -1482,6 +1771,11 @@ class DsvSdkAdapter:
                 raise TraderError('E_DSV_SDK_OWNER', 'SDK cancellation is waiting for the owner dispatch phase')
             if native != effect['native_order_id']:
                 raise TraderError('E_DSV_SDK_SCOPE', 'SDK cancellation requires the original native order identity')
+            if effect.get('external_order') and getattr(self, 'owner_mode', None) == 'STANDALONE':
+                live_orders = self.api.get_order(account=self.account) or {}
+                live = live_orders.get(native)
+                if live is None or getattr(live, 'status', None) != 'ALIVE' or native_integer(getattr(live, 'volume_left', 0)) <= 0:
+                    raise TraderError('E_DSV_SDK_SCOPE', 'Non-strategy order is already absent or terminal')
         except Exception as error:
             return CancelNotAttempted(effect['id'], effect['native_order_id'],
                                       getattr(error, 'code', 'E_DSV_PRE_CANCEL'), exception_record(error))

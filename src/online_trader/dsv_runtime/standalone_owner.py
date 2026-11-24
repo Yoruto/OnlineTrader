@@ -134,6 +134,23 @@ class StandaloneDsvOwner:
                 details = detail_reader(contract, snapshot.get('trading_day'), fresh=fresh)
                 if details:
                     details_copy[contract] = details
+        unconfigured_dispatch = {}
+        configured_set = set(contracts)
+        for contract, market in (getattr(adapter, 'dispatch_market', {}) or {}).items():
+            if contract in configured_set:
+                continue
+            utick = (market.get('ticks') or [None])[-1]
+            unconfigured_dispatch[contract] = {
+                'long_qty': market.get('long_qty', 0),
+                'short_qty': market.get('short_qty', 0),
+                'long_today': market.get('long_today', 0),
+                'long_historical': market.get('long_historical', 0),
+                'short_today': market.get('short_today', 0),
+                'short_historical': market.get('short_historical', 0),
+                'market_session_active': market.get('market_session_active', True),
+                'last_price': None if utick is None else utick.get('last'),
+                'calendar_reason': market.get('calendar_reason'),
+            }
         bar_reader = getattr(adapter, 'minute_chart_bars', None)
         minute_bars = bar_reader() if callable(bar_reader) else {}
         return {
@@ -145,6 +162,7 @@ class StandaloneDsvOwner:
             'market_health': copy.deepcopy(getattr(adapter, 'market_health', None)),
             'schedule_display': _schedule_display(adapter, snapshot.get('trading_day'), contracts),
             'dispatch_market': dispatch_copy,
+            'unconfigured_dispatch_market': unconfigured_dispatch,
             'market_details': details_copy,
             'minute_bars': minute_bars,
         }
@@ -275,7 +293,7 @@ class StandaloneDsvOwner:
         receipt = self.adapter.step(self.session, trading_day=trading_day, complete=complete)
         if receipt is not None:
             configured_contracts = getattr(self.adapter, 'contracts', None)
-            if configured_contracts is None:
+            if not configured_contracts:
                 configured_contracts = {
                     row['code']
                     for row in self.profile.to_record().get('settings', {}).get('symbols', ())

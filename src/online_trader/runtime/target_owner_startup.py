@@ -72,8 +72,11 @@ def _build_close_deadlines(calendar, contracts):
     """Map each trading day with complete contract coverage to its latest forced close."""
     if calendar is None or not contracts:
         return {}
+    to_record = getattr(calendar, 'to_record', None)
+    if not callable(to_record):
+        return {}
     close_schedule = {}
-    for row in calendar.to_record().get('contracts', ()):
+    for row in to_record().get('contracts', ()):
         code = row.get('contract_id')
         if code not in contracts:
             continue
@@ -94,8 +97,9 @@ def _build_close_deadlines(calendar, contracts):
 
 
 def _maybe_request_market_close(*, close_deadlines, clock, loop_state, boot_id, calendar_hash,
-                                diagnostic_sink, diagnostic_report_request, now_monotonic=None):
-    """Trigger one market-close diagnostic report per trading day once past its deadline."""
+                                diagnostic_sink, diagnostic_report_request, now_monotonic=None,
+                                allowed_days=None):
+    """Trigger one market-close diagnostic report per associated trading day once past its deadline."""
     if diagnostic_report_request is None:
         return False
     check_at = time.monotonic() if now_monotonic is None else float(now_monotonic)
@@ -109,6 +113,8 @@ def _maybe_request_market_close(*, close_deadlines, clock, loop_state, boot_id, 
     reported = loop_state['diagnostic_reported_close_keys']
     triggered = False
     for day, deadline in sorted(close_deadlines.items()):
+        if allowed_days is not None and day not in allowed_days:
+            continue
         if now < deadline:
             continue
         close_key = f'{boot_id}:{day}:{calendar_hash}'
@@ -264,6 +270,7 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             'diagnostic_reported_close_keys': set(),
             'diagnostic_close_check_monotonic': 0.0,
             'diagnostic_close_failure_recorded': False,
+            'diagnostic_observed_days': {grant.value['trading_day']},
         }
 
         contracts = tuple(grant.value.get('contracts', ()))
@@ -293,6 +300,9 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             if diagnostic_report_request is None:
                 return
             try:
+                active_day = owner.snapshot().get('trading_day')
+                if active_day:
+                    loop_state['diagnostic_observed_days'].add(active_day)
                 _maybe_request_market_close(
                     close_deadlines=close_deadlines,
                     clock=clock,
@@ -301,6 +311,7 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                     calendar_hash=calendar.content_hash,
                     diagnostic_sink=diagnostic_sink,
                     diagnostic_report_request=diagnostic_report_request,
+                    allowed_days=loop_state['diagnostic_observed_days'],
                 )
             except Exception as error:
                 if diagnostic_sink is not None and not loop_state['diagnostic_close_failure_recorded']:

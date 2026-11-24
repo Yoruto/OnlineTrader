@@ -179,10 +179,178 @@ def run(work_dir: Path) -> dict[str, object]:
         workbench_view=_base_workbench(
             owned=5,
             cycles=[{"contract_id": CONTRACT, "direction": "LONG", "remaining_quantity": 5}],
-            trades=[{"native_trade_id": "t-1", "contract_id": CONTRACT, "direction": "LONG", "quantity": 5, "price": "1065", "effect": "OPEN"}],
+            trades=[{
+                "native_trade_id": "t-1", "contract_id": CONTRACT, "direction": "LONG",
+                "quantity": 5, "price": "1065", "effect": "OPEN", "offset_kind": "OPEN",
+            }],
         ),
         round_seq=1, frame_id="f14",
     ))
 
-    trace.record("COMMAND", operation="NEGATIVE_CONTROL_14_INVARIANTS", receipt_status="PASS")
+    def _confirmed_broker_order(*, child_id="c-1", contract=CONTRACT, direction="BUY", offset="OPEN",
+                                qty=5, price="1060", status="ALIVE", traded=0, native_id="nat-1"):
+        return {
+            "request": {
+                "child_order_id": child_id, "contract_id": contract,
+                "direction": direction, "native_offset": offset,
+                "quantity": qty, "limit_price": price,
+            },
+            "status": status,
+            "traded_qty": traded,
+            "reported_filled_qty": traded,
+            "native_order_id": native_id,
+            "cancel_effect_ids": [],
+        }
+
+    def _valid_rt_order(*, child_id="c-1", contract=CONTRACT, direction="LONG", effect="OPEN",
+                        offset="OPEN", qty=5, price="1060", filled=0, remaining=5,
+                        send_state="NATIVE_SEEN", broker_state="ALIVE", native_id="nat-1",
+                        terminal_confirmed=False):
+        return {
+            "child_order_id": child_id,
+            "contract_id": contract,
+            "direction": direction,
+            "effect": effect,
+            "native_offset": offset,
+            "original_qty": qty,
+            "limit_price": price,
+            "filled_qty": filled,
+            "potential_remaining": remaining,
+            "send_state": send_state,
+            "broker_state": broker_state,
+            "native_order_id": native_id,
+            "terminal_confirmed": terminal_confirmed,
+            "order_source": "STRATEGY",
+        }
+
+    # Positive control: SEND_REQUESTED without native_order_id is allowed during pre-ack transition
+    o = ReferenceOracle()
+    o.set_boot_expectation("boot-1", config_revision="1")
+    o.set_target_expectation(CONTRACT, direction="LONG", quantity=5)
+    o.verify(
+        broker_snapshot=_base_broker(orders={
+            "c-pending": _confirmed_broker_order(
+                child_id="c-pending", status="SEND_REQUESTED", native_id=None,
+            )
+        }),
+        workbench_view=_base_workbench(orders=[
+            _valid_rt_order(
+                child_id="c-pending", send_state="CALL_RETURNED", broker_state=None, native_id=None,
+            )
+        ]),
+        round_seq=1, frame_id="f15-pre-ack-ok",
+    )
+
+    # INV-015: Order original_qty 5 -> 3 mismatch
+    o = ReferenceOracle()
+    o.set_target_expectation(CONTRACT, direction="LONG", quantity=5)
+    _expect_violation("INV-015", lambda: o.verify(
+        broker_snapshot=_base_broker(orders={"c-1": _confirmed_broker_order()}, active_children=["c-1"]),
+        workbench_view=_base_workbench(orders=[_valid_rt_order(qty=3, remaining=3)]),
+        round_seq=1, frame_id="f16-qty",
+    ))
+
+    # INV-015: Order limit_price mismatch
+    _expect_violation("INV-015", lambda: o.verify(
+        broker_snapshot=_base_broker(orders={"c-1": _confirmed_broker_order(price="1060")}, active_children=["c-1"]),
+        workbench_view=_base_workbench(orders=[_valid_rt_order(price="1062")]),
+        round_seq=1, frame_id="f17-price",
+    ))
+
+    # INV-015: Order remaining quantity (potential_remaining) mismatch
+    _expect_violation("INV-015", lambda: o.verify(
+        broker_snapshot=_base_broker(orders={"c-1": _confirmed_broker_order(qty=5, traded=2)}, active_children=["c-1"]),
+        workbench_view=_base_workbench(orders=[_valid_rt_order(qty=5, filled=2, remaining=5)]),
+        round_seq=1, frame_id="f18-rem",
+    ))
+
+    # INV-015: Close today misrecorded as close yesterday (SHFE CLOSETODAY vs CLOSEYESTERDAY)
+    shfe = "SHFE.ag2702"
+    shfe_broker = _base_broker(long_qty=5)
+    shfe_broker["contract_id"] = shfe
+    shfe_broker["contracts"] = [shfe]
+    shfe_broker["positions_by_contract"] = {
+        shfe: {"long_today": 5, "long_historical": 0, "short_today": 0, "short_historical": 0, "long_qty": 5, "short_qty": 0}
+    }
+    shfe_broker["orders"] = {
+        "c-close": _confirmed_broker_order(
+            child_id="c-close", contract=shfe, direction="SELL", offset="CLOSETODAY", qty=5, price="5000",
+        )
+    }
+    shfe_broker["active_children"] = ["c-close"]
+    _expect_violation("INV-015", lambda: o.verify(
+        broker_snapshot=shfe_broker,
+        workbench_view=_base_workbench(
+            owned=5,
+            cycles=[{"contract_id": shfe, "direction": "LONG", "remaining_quantity": 5}],
+            orders=[_valid_rt_order(
+                child_id="c-close", contract=shfe, direction="LONG", effect="REDUCE",
+                offset="CLOSEYESTERDAY", qty=5, price="5000",
+            )],
+        ),
+        round_seq=1, frame_id="f19-offset",
+    ))
+
+    # INV-015: Trade close today misrecorded as close yesterday
+    shfe_trade_broker = _base_broker(long_qty=0)
+    shfe_trade_broker["contract_id"] = shfe
+    shfe_trade_broker["contracts"] = [shfe]
+    shfe_trade_broker["positions_by_contract"] = {
+        shfe: {"long_today": 0, "long_historical": 0, "short_today": 0, "short_historical": 0, "long_qty": 0, "short_qty": 0}
+    }
+    shfe_trade_broker["trades"] = {
+        "t-close": {
+            "native_trade_id": "t-close", "contract_id": shfe, "direction": "SELL",
+            "native_offset": "CLOSETODAY", "quantity": 5, "price": "5000",
+        }
+    }
+    _expect_violation("INV-015", lambda: o.verify(
+        broker_snapshot=shfe_trade_broker,
+        workbench_view=_base_workbench(
+            trades=[{
+                "native_trade_id": "t-close", "contract_id": shfe, "direction": "LONG",
+                "quantity": 5, "price": "5000", "effect": "REDUCE", "offset_kind": "CLOSEYESTERDAY",
+            }],
+        ),
+        round_seq=1, frame_id="f20-trade-offset",
+    ))
+
+    # INV-015: Order direction LONG misrecorded as SHORT
+    _expect_violation("INV-015", lambda: o.verify(
+        broker_snapshot=_base_broker(orders={"c-1": _confirmed_broker_order()}, active_children=["c-1"]),
+        workbench_view=_base_workbench(orders=[_valid_rt_order(direction="SHORT")]),
+        round_seq=1, frame_id="f21-order-dir",
+    ))
+
+    # INV-015: Confirmed order missing required fields (native_order_id / broker_state / limit_price / effect)
+    for tag, drop_key in (
+        ("native_order_id", "native_order_id"),
+        ("broker_state", "broker_state"),
+        ("limit_price", "limit_price"),
+        ("effect", "effect"),
+        ("native_offset", "native_offset"),
+        ("potential_remaining", "potential_remaining"),
+    ):
+        bad_order = _valid_rt_order()
+        bad_order.pop(drop_key)
+        _expect_violation("INV-015", lambda bo=bad_order, t=tag: o.verify(
+            broker_snapshot=_base_broker(orders={"c-1": _confirmed_broker_order()}, active_children=["c-1"]),
+            workbench_view=_base_workbench(orders=[bo]),
+            round_seq=1, frame_id=f"f22-missing-{t}",
+        ))
+
+    # INV-009: Missing kernel_boot_id or config_revision even without explicit expectations
+    o_plain = ReferenceOracle()
+    _expect_violation("INV-009", lambda: o_plain.verify(
+        broker_snapshot=_base_broker(),
+        workbench_view=_base_workbench(boot_id=""),
+        round_seq=1, frame_id="f23-missing-boot",
+    ))
+    _expect_violation("INV-009", lambda: o_plain.verify(
+        broker_snapshot=_base_broker(),
+        workbench_view=_base_workbench(config_revision=""),
+        round_seq=1, frame_id="f24-missing-rev",
+    ))
+
+    trace.record("COMMAND", operation="NEGATIVE_CONTROL_24_INVARIANTS", receipt_status="PASS")
     return trace.finalize(passed=True)

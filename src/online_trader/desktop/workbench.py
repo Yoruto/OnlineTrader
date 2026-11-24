@@ -1630,7 +1630,10 @@ class WorkbenchWindow(StatusWindow):
     def flatten(self):
         def action():
             policy=self.policy('EXECUTION')
-            if QMessageBox.question(self,'平仓后停开','将当前账户所有自有周期的统一剩余目标设为0，并停止新增？外部持仓不会认领。')==QMessageBox.Yes:
+            is_standalone = bool(self.view and (self.view.get('connection') or {}).get('execution_mode') == 'STANDALONE')
+            prompt = ('将当前账户自有周期剩余目标设为0并停止策略？' if is_standalone
+                      else '将当前账户所有自有周期的统一剩余目标设为0，并停止新增？外部持仓不会认领。')
+            if QMessageBox.question(self,'平仓后停开',prompt)==QMessageBox.Yes:
                 self.send('FLATTEN_THEN_STOP',{'scope_type':'ACCOUNT','scope_ids':[]},{'execution_policy_id':policy})
         self._action(action)
 
@@ -2163,6 +2166,11 @@ class WorkbenchWindow(StatusWindow):
         active_orders = [row for row in (view or {}).get('orders', ()) if row.get('potential_remaining', 0) > 0]
         external_positions = (view or {}).get('external_positions') or []
         conn = (view or {}).get('connection') or {}
+        unaligned_positions = [
+            row for row in (conn.get('account_positions') or ())
+            if (not row.get('configured') and (row.get('actual_long') or row.get('actual_short')))
+            or row.get('excess_long') or row.get('excess_short')
+        ]
         armed = bool(view and view.get('entry_authority') == 'ARMED')
         busy_reasons = []
         if not fresh_view:
@@ -2173,8 +2181,8 @@ class WorkbenchWindow(StatusWindow):
             busy_reasons.append(f'存在 {len(open_cycles)} 个未平仓持仓周期')
         if active_orders:
             busy_reasons.append(f'存在 {len(active_orders)} 笔未终结委托')
-        if external_positions or conn.get('recovery_required') or conn.get('clock_fault'):
-            busy_reasons.append('存在待核对仓位或连接/时钟异常')
+        if external_positions or unaligned_positions or conn.get('recovery_required') or conn.get('clock_fault'):
+            busy_reasons.append('存在未收敛持仓或连接/时钟异常')
 
         if busy_reasons:
             box = QMessageBox(self)
