@@ -62,6 +62,40 @@
       ],
       "retirement_approved": false,
       "notes": "Retain file-restore failure injection unit test; E2E covers end-to-end pipe and disk atomicity."
+    },
+    {
+      "legacy_module": "tests.test_runtime_market_continuity",
+      "classification": "CURRENT_CRITICAL_AND_E2E_OVERLAP",
+      "replacement": [
+        "E2E-FAULT-001-multi-contract-stall-quiet",
+        "E2E-FAULT-002-sdk-pump-gap-diagnostics",
+        "E2E-FAULT-003-closed-session-and-offload",
+        "E2E-FAULT-004-disconnect-reconnect-recovery",
+        "E2E-TIMELINE-001-accelerated-35min"
+      ],
+      "retirement_approved": false,
+      "notes": "Retain unit contracts for market_health and TargetMarketDiagnostics; FaultE2E and timeline_001 cover multi-contract stall/quiet, disconnect/reconnect, 35-min accelerated session, pump gap, and projection offload."
+    },
+    {
+      "legacy_module": "tests.test_runtime_workbench",
+      "classification": "CURRENT_CRITICAL",
+      "replacement": [
+        "E2E-DESKTOP-001-workbench-lifecycle",
+        "E2E-DESKTOP-002-full-panel-consistency",
+        "E2E-COMMAND-001-idempotency-and-disconnect"
+      ],
+      "retirement_approved": false,
+      "notes": "Keep Qt workbench layout unit tests; DesktopE2E covers real Qt panel button interactions, panel-to-runtime consistency, command idempotency, and disconnect safety."
+    },
+    {
+      "legacy_module": "qa.e2e.oracle",
+      "classification": "PR4_STATEFUL_AND_NEGATIVE_CONTROL",
+      "replacement": [
+        "E2E-STATEFUL-001-seeded-faults",
+        "E2E-STATEFUL-002-oracle-negative-control"
+      ],
+      "retirement_approved": false,
+      "notes": "Deterministic seeded state-machine replay and oracle negative-control coverage."
     }
   ]
 }

@@ -37,7 +37,7 @@ class FakeBrokerOrder:
 
 
 class FakeBroker:
-    """One-contract offline broker model with separately ordered native facts.
+    """Offline broker model with separately ordered native facts across one or more contracts.
 
     The model starts flat. Call ``observe_adapter_event`` for Owner outputs,
     then explicitly call ``accept_order``, ``report_order``, ``report_trade``
@@ -46,14 +46,17 @@ class FakeBroker:
     """
 
     def __init__(self, *, account_key: str, contract: str = CONTRACT,
+                 contracts: list[str] | tuple[str, ...] | None = None,
                  trading_day: str = DAY, provider: str = "OFFLINE",
                  session_id: str = "qa-fake-broker-session",
                  trace_path: str | Path,
                  run_id: str | None = None):
         if not isinstance(account_key, str) or not account_key.startswith("DEV:"):
             raise FakeBrokerError("Fake Broker requires a DEV account key")
-        if not isinstance(contract, str) or "." not in contract:
-            raise FakeBrokerError("Fake Broker requires a valid exchange.symbol contract")
+        ordered_contracts = tuple(dict.fromkeys([contract, *(contracts or ())]))
+        for code in ordered_contracts:
+            if not isinstance(code, str) or "." not in code:
+                raise FakeBrokerError("Fake Broker requires valid exchange.symbol contracts")
         if not isinstance(trading_day, str) or len(trading_day) != 10:
             raise FakeBrokerError("Fake Broker requires an ISO trading_day YYYY-MM-DD")
         if provider != "OFFLINE":
@@ -65,6 +68,7 @@ class FakeBroker:
 
         self.account_key = account_key
         self.contract = contract
+        self.contracts = ordered_contracts
         self.trading_day = trading_day
         self.provider = provider
         self.session_id = session_id
@@ -72,10 +76,14 @@ class FakeBroker:
         self._orders: dict[str, FakeBrokerOrder] = {}
         self._native_orders: dict[str, str] = {}
         self._trades: dict[str, dict[str, object]] = {}
-        self._positions = {
-            "long_today": 0, "long_historical": 0,
-            "short_today": 0, "short_historical": 0,
+        self._positions_by_contract: dict[str, dict[str, int]] = {
+            code: {
+                "long_today": 0, "long_historical": 0,
+                "short_today": 0, "short_historical": 0,
+            }
+            for code in self.contracts
         }
+        self._positions = self._positions_by_contract[self.contract]
         self._pending_facts: list[dict[str, object]] = []
         self._sequence = 0
         self._last_monotonic_ms = -1
@@ -122,7 +130,18 @@ class FakeBroker:
     @property
     def positions(self) -> dict[str, int]:
         with self._lock:
-            return self._position_snapshot()
+            return self._position_snapshot(self.contract)
+
+    @property
+    def positions_by_contract(self) -> dict[str, dict[str, int]]:
+        with self._lock:
+            return {code: self._position_snapshot(code) for code in self.contracts}
+
+    def positions_for(self, contract_id: str) -> dict[str, int]:
+        with self._lock:
+            if contract_id not in self._positions_by_contract:
+                raise FakeBrokerError(f"Unknown broker contract: {contract_id}")
+            return self._position_snapshot(contract_id)
 
     def roll_trading_day(self, new_trading_day: str) -> dict[str, int]:
         """Advance broker cabinet trading day, moving today positions to historical."""
@@ -130,17 +149,19 @@ class FakeBroker:
             if not isinstance(new_trading_day, str) or new_trading_day <= self.trading_day:
                 raise FakeBrokerError("New trading_day must advance strictly forward")
             previous_day = self.trading_day
-            self._positions["long_historical"] += self._positions["long_today"]
-            self._positions["long_today"] = 0
-            self._positions["short_historical"] += self._positions["short_today"]
-            self._positions["short_today"] = 0
+            for bucket in self._positions_by_contract.values():
+                bucket["long_historical"] += bucket["long_today"]
+                bucket["long_today"] = 0
+                bucket["short_historical"] += bucket["short_today"]
+                bucket["short_today"] = 0
             self.trading_day = new_trading_day
-            snap = self._position_snapshot()
+            snap = self._position_snapshot(self.contract)
             self._record(
                 "BROKER_TRADING_DAY_ROLLED",
                 previous_day=previous_day,
                 new_trading_day=new_trading_day,
                 positions=snap,
+                positions_by_contract=self.positions_by_contract,
             )
             return snap
 
@@ -163,9 +184,11 @@ class FakeBroker:
                 "account_key": self.account_key,
                 "provider": self.provider,
                 "contract_id": self.contract,
+                "contracts": list(self.contracts),
                 "trading_day": self.trading_day,
                 "session_id": self.session_id,
-                "positions": self._position_snapshot(),
+                "positions": self._position_snapshot(self.contract),
+                "positions_by_contract": {code: self._position_snapshot(code) for code in self.contracts},
                 "orders": self.orders,
                 "active_children": active_children,
                 "trades": deepcopy(self._trades),
@@ -199,7 +222,8 @@ class FakeBroker:
                 synchronized = complete
             if type(synchronized) is not bool or (synchronized and not complete):
                 raise FakeBrokerError("An incomplete frame cannot claim synchronization")
-            position = self._position_snapshot()
+            position = self._position_snapshot(self.contract)
+            positions_by_contract = {code: self._position_snapshot(code) for code in self.contracts}
             facts = deepcopy(self._pending_facts) if complete else []
             active_children = [
                 child for child, order in self._orders.items()
@@ -213,6 +237,7 @@ class FakeBroker:
                 "synchronized": synchronized,
                 "sync_orders": active_children,
                 "positions": position,
+                "positions_by_contract": positions_by_contract,
                 "native": facts,
             }
             if broker_order_snapshot_complete is not None:
@@ -232,6 +257,7 @@ class FakeBroker:
                 complete=complete,
                 synchronized=synchronized,
                 positions=position,
+                positions_by_contract=positions_by_contract,
             )
             return deepcopy(snapshot)
 
@@ -253,7 +279,7 @@ class FakeBroker:
                 raise FakeBrokerError("Outbound request lacks child and effect identities")
             if (request.get("account_key") != self.account_key or
                     request.get("provider") != self.provider or
-                    request.get("contract_id") != self.contract or
+                    request.get("contract_id") not in self.contracts or
                     request.get("trading_day") != self.trading_day):
                 raise FakeBrokerError("Outbound request is outside this fake account scope")
 
@@ -379,7 +405,7 @@ class FakeBroker:
             self._pending_facts.append(deepcopy(fact))
             self._record("TRADE_FACT_CREATED", child_order_id=child_order_id,
                          native_order_id=order.native_order_id, fact=fact,
-                         positions=self._position_snapshot())
+                         positions=self._position_snapshot(str(order.request["contract_id"])))
             return deepcopy(fact)
 
     def fill(self, child_order_id: str, trade_qty: int, price: str | int | Decimal,
@@ -393,9 +419,11 @@ class FakeBroker:
             total = order.traded_qty + qty
             if total > int(order.request["quantity"]):
                 raise FakeBrokerError("Trade quantity exceeds the original order")
-            before = dict(self._positions)
+            contract_pos = self._positions_by_contract[str(order.request["contract_id"])]
+            before = dict(contract_pos)
             self._book_position(order, qty)
-            self._positions = before
+            contract_pos.clear()
+            contract_pos.update(before)
             order_fact = self._queue_order_fact(
                 order, "FILLED" if total == int(order.request["quantity"]) else "ALIVE",
                 max(order.reported_filled_qty, total))
@@ -429,9 +457,11 @@ class FakeBroker:
             total = order.traded_qty + qty
             if total > int(order.request["quantity"]):
                 raise FakeBrokerError("Late trade quantity exceeds the original order")
-            before = dict(self._positions)
+            contract_pos = self._positions_by_contract[str(order.request["contract_id"])]
+            before = dict(contract_pos)
             self._book_position(order, qty)
-            self._positions = before
+            contract_pos.clear()
+            contract_pos.update(before)
             order_fact = self._queue_order_fact(order, "CANCELLED", max(order.reported_filled_qty, total))
             trade_fact = self.report_trade(
                 child_order_id, qty, price, native_trade_id=native_trade_id)
@@ -475,23 +505,16 @@ class FakeBroker:
             last_text = self._price(last)
             bid_text = last_text if bid1 is None else self._price(bid1)
             ask_text = last_text if ask1 is None else self._price(ask1)
-            position = self._position_snapshot()
+            position = self._position_snapshot(self.contract)
+            positions_by_contract = {code: self._position_snapshot(code) for code in self.contracts}
             facts = deepcopy(self._pending_facts) if complete else []
             active_children = [child for child, order in self._orders.items()
                                if order.status == "ALIVE" and order.native_order_id is not None]
             sequence = self._sequence + 1
             frame_id = f"fake-broker-round-{sequence}"
-            frame = {
-                "id": frame_id,
-                "sequence": sequence,
-                "session_id": self.session_id,
-                "wall_time": stamp,
-                "monotonic_ms": monotonic_ms,
-                "complete": complete,
-                "synchronized": synchronized,
-                "sync_orders": active_children,
-                "market": [{
-                    "contract_id": self.contract,
+            market_rows = [
+                {
+                    "contract_id": code,
                     "ticks": [{
                         "native_time": stamp, "candle_id": candle_id, "last": last_text,
                         "day_low": "1020", "day_high": "1088", "bid1": bid_text,
@@ -501,10 +524,23 @@ class FakeBroker:
                     "opening_session": True,
                     "session_open": f"{self.trading_day}T01:00:00Z",
                     "session_close": f"{self.trading_day}T02:15:00Z",
-                    "long_qty": position["long_qty"], "short_qty": position["short_qty"],
+                    "long_qty": positions_by_contract[code]["long_qty"],
+                    "short_qty": positions_by_contract[code]["short_qty"],
                     "available": "100000", "margin_per_lot": "1000",
                     "external_orders": False,
-                }],
+                }
+                for code in self.contracts
+            ]
+            frame = {
+                "id": frame_id,
+                "sequence": sequence,
+                "session_id": self.session_id,
+                "wall_time": stamp,
+                "monotonic_ms": monotonic_ms,
+                "complete": complete,
+                "synchronized": synchronized,
+                "sync_orders": active_children,
+                "market": market_rows,
                 "native": facts,
             }
             self._sequence = sequence
@@ -516,7 +552,7 @@ class FakeBroker:
             self._record("BROKER_FRAME_PREPARED", frame_id=frame_id,
                          sequence=sequence, native_fact_count=len(facts),
                          complete=complete, synchronized=synchronized,
-                         positions=position)
+                         positions=position, positions_by_contract=positions_by_contract)
             return deepcopy(frame)
 
     def deliver_frame(self, owner_process, **frame_inputs) -> dict[str, object]:
@@ -628,7 +664,7 @@ class FakeBroker:
         return {
             "account_key": self.account_key,
             "provider": self.provider,
-            "contract_id": self.contract,
+            "contract_id": str(request["contract_id"]),
             "direction": request["direction"],
             "native_offset": request["native_offset"],
             "child_order_id": request["child_order_id"],
@@ -638,35 +674,37 @@ class FakeBroker:
 
     def _book_position(self, order: FakeBrokerOrder, qty: int) -> None:
         request = order.request
+        contract_pos = self._positions_by_contract[str(request["contract_id"])]
         offset = request["native_offset"]
         direction = request["direction"]
         if offset == "OPEN":
             side = "long" if direction == "BUY" else "short"
-            self._positions[f"{side}_today"] += qty
+            contract_pos[f"{side}_today"] += qty
             return
         side = "short" if direction == "BUY" else "long"
         if offset == "CLOSETODAY":
             key = f"{side}_today"
-            if self._positions[key] < qty:
+            if contract_pos[key] < qty:
                 raise FakeBrokerError("Close fill exceeds same-day broker position")
-            self._positions[key] -= qty
+            contract_pos[key] -= qty
             return
         if offset == "CLOSEYESTERDAY":
             key = f"{side}_historical"
-            if self._positions[key] < qty:
+            if contract_pos[key] < qty:
                 raise FakeBrokerError("Close fill exceeds historical broker position")
-            self._positions[key] -= qty
+            contract_pos[key] -= qty
             return
         today_key, historical_key = f"{side}_today", f"{side}_historical"
-        available = self._positions[today_key] + self._positions[historical_key]
+        available = contract_pos[today_key] + contract_pos[historical_key]
         if available < qty:
             raise FakeBrokerError("Close fill exceeds broker position")
-        from_today = min(qty, self._positions[today_key])
-        self._positions[today_key] -= from_today
-        self._positions[historical_key] -= qty - from_today
+        from_today = min(qty, contract_pos[today_key])
+        contract_pos[today_key] -= from_today
+        contract_pos[historical_key] -= qty - from_today
 
-    def _position_snapshot(self) -> dict[str, int]:
-        values = dict(self._positions)
+    def _position_snapshot(self, contract_id: str | None = None) -> dict[str, int]:
+        code = contract_id or self.contract
+        values = dict(self._positions_by_contract[code])
         values["long_qty"] = values["long_today"] + values["long_historical"]
         values["short_qty"] = values["short_today"] + values["short_historical"]
         return values

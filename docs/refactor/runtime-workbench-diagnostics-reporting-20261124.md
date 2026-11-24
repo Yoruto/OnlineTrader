@@ -1,10 +1,24 @@
 # Runtime & Workbench Diagnostics 诊断上报与运行证据系统实施设计
 
-2026-11-24 · `CANDIDATE / IMPLEMENTED_CANDIDATE`
+2026-11-24 · `CANDIDATE / IMPLEMENTED_REVISED_CANDIDATE`
 
 > 适用路径：Standalone Trading Runtime、runtime-view-process、Runtime Workbench 与开发端诊断工具。  
 > 本文定义架构、数据合同、生命周期、迁移、回退、诊断点和验收条件；对应源码候选已实现，但功能、实机、在线上报和制品验收仍为 `NOT_RUN`，本次实现不授权账户连接、交易、测试、构建或打包。
 > 当前权威仍是期货账户、当前 boot 的单一 Owner 与临时执行 Journal。诊断记录不是交易事实、恢复源、第二套状态机或跨设备交接介质。
+
+### 2026-11-24 简化评审覆盖
+
+用户复审后确认本节覆盖本文中更严格的冻结、水位和上传凭据草案：
+
+- 诊断允许丢失、重叠和单次上报失败；不建设跨进程屏障、可靠补传、遥测服务或新的诊断控制协议。
+- 收盘切片只在当前 boot 内按完整交易日历观察到“曾进入盘段，随后所有绑定合约结束最终适用盘段”时触发一次。日历不完整、冲突或 Runtime 在盘后才启动时不猜测、不补报。
+- Reporter 对活跃文件固定读取打开时观察到的字节长度，舍弃末尾不完整 JSON 行；不等待业务队列清空。任何必需活跃流都使包成为 `PARTIAL`。
+- Workbench 允许跨越多个 Runtime boot。Reporter 按事件 `runtime_boot_id` 选取目标 boot，只把同一进程的启动、连接和异常等 bootless 记录作为 `UNATTRIBUTED_PROCESS_CONTEXT`，且不以它们证明完整。
+- 统一桌面 bootstrap 显式声明本次预期 Workbench；若目标 boot 没有对应 Workbench 事件则包为 `PARTIAL`。运维 `runtime run` 不强行要求 Workbench，runtime-view 订阅日志只提供辅助发现。
+- runtime-view 复用现有有界日志，仅采集白名单解析后的启动、退出、重启、客户端连接和命令结果；无法归属的行只作上下文。
+- Reporter 只删除已经 finalize 的进程目录。每个 Sink 只淘汰自己最旧的已关闭分片；磁盘或诊断失败不传播到交易业务。
+- 不新增或修改行情、开仓、订单或保护门禁。诊断只观察现有裁决。
+- 新交付配置优先使用项目级 Deploy Token 的 `write_package_registry` 权限；旧 `/1` 私人 Token 配置只作兼容读取，不再作为配置工具默认输出。
 
 ## 1. 定位与目标
 
@@ -396,22 +410,22 @@ diagnostics/
 规则：
 
 - 不存入 `runtime/` 配置目录，不随配置快照复制，不进入交易账本。
-- 轮转只关闭完整 segment；Reporter 不复制仍在追加的文件尾。
+- 轮转只关闭完整 segment；Reporter 可按打开文件时的固定长度复制活跃前缀，舍弃末尾不完整行并把包标记为 `PARTIAL`。
 - 每个 segment 记录首尾 seq、字节数和 SHA-256。
-- 保留策略按 bundle、boot 和 segment 淘汰，不截断单条 JSON。
+- Reporter 只淘汰已 finalize 的 bundle/进程目录；活跃 Sink 只淘汰自己的最旧闭合 segment，不截断单条 JSON。
 - 旧 Runtime boot 的诊断文件可删除，不影响下次启动或交易恢复。
 
 ## 12. 截止水位、退出与 Reporter
 
 ### 12.1 诊断截止不是“最终业务结算”
 
-Runtime 可以产生 `REPORT_CUT_REQUEST`，内容包括各流已持久化水位和触发原因。它只表示“本包截至这里”，不表示交易日后续不再有迟到回报。
+Runtime 可以产生 `REPORT_CUT_REQUEST`，内容包括目标 boot、交易日、日历 hash 和触发原因。它只表示“尽力收集请求时已经持久化的前缀”，不表示队列已经刷新、交易日后续没有迟到回报或所有进程处于同一精确时刻。
 
-多合约存在不同收盘时间。第一版不新增交易日历：复用当前绑定日历，在所有当前 scope 合约的适用盘段结束且日历完整时请求收盘切片；无法证明统一收盘时不触发，等待正常退出或人工导出。
+多合约存在不同收盘时间。第一版不新增交易日历：复用当前绑定日历；当前 boot 必须先观察到该交易日的活动盘段，随后所有 scope 合约均越过该交易日最后一个 `force_close_at_end`，才以 `runtime_boot_id + trading_day + calendar_hash` 在进程内触发一次。无法证明时不触发，等待正常退出或人工导出。
 
 ### 12.2 临时 Journal 删除前的顺序
 
-正常受控退出必须遵守：
+正常受控退出仍先结束 Owner 责任并 finalize Runtime Sink；不再要求跨进程同步冻结或等待所有诊断队列：
 
 ```mermaid
 sequenceDiagram
@@ -422,15 +436,14 @@ sequenceDiagram
     participant R as Reporter
     D->>O: 安全停机
     O->>J: 提交最终责任/关闭事实
-    D->>S: finalize(cutoff_event_seq)
-    S->>J: 只读补齐允许导出的已提交事件
-    S-->>D: 已归档水位或缺口
+    D->>S: 有界 finalize
+    S-->>D: 已关闭 segment 或明确缺口
     D->>J: 关闭并删除临时 session
     D->>R: 启动独立 Reporter(report_id)
     R->>R: 按冻结水位打包/上报
 ```
 
-最终补齐有严格时间预算，失败时记录 gap 后继续退出。Reporter 在临时 Journal 删除后只读取已经归档的诊断 segment，不能接管或恢复 Journal。
+finalize 有严格时间预算，失败时记录 gap 后继续退出。Reporter 可读取闭合 segment 或活跃文件的固定前缀，不能接管、恢复或延长 Journal 生命周期。
 
 ### 12.3 唯一上报责任
 
@@ -501,7 +514,7 @@ Manifest 至少包括：
 - 用户已于 2026-11-24 明确授权：该单对单软件的极狐上传 Token 直接写入客户 Runtime 的私有交付配置并随包交付，不再以“凭据不能随包”为启用门槛。
 - 固定配置文件为 `private/diagnostics-upload.json`。它属于 Runtime 配置，不属于诊断目录、诊断包、配置摘要或日志采集范围；更新保留该文件，Reporter 只读取，不回显。
 - 固定 Backend 为极狐 Generic Package Registry：`jihulab.com`、Project ID `390001`、项目 `Yoruto/online-trader-diagnostics`。生产包名使用 `online-trader-diagnostics`，版本使用稳定 `report_id`，文件名使用诊断包文件名。
-- 当前第三个 `owner` Token 已通过身份查询、测试上传和回读校验，可直接作为该配置的 `private_token`。后续不要求为此系统更换最小权限 Token；若用户主动轮换，仅替换配置值。
+- 旧 `/1` 配置中的 `owner`/私人 Token 只为已有部署兼容读取。新配置必须显式声明认证类型，客户交付优先使用项目级 Deploy Token 和 `write_package_registry`；若暂时保留高权限 Token，必须记录为有时限的安全例外。
 - 第一阶段仍支持 Local Backend，便于人工导出和上传失败时保留证据；启用极狐 Backend 不依赖系统凭据库或额外安全存储方案。
 - 上传失败写入脱敏结果，不自动无限补传；是否保留本地包由容量策略决定。
 
@@ -509,16 +522,16 @@ Manifest 至少包括：
 
 ```json
 {
-  "schema_version": "ONLINE_TRADER_DIAGNOSTIC_UPLOAD/1",
+  "schema_version": "ONLINE_TRADER_DIAGNOSTIC_UPLOAD/2",
   "enabled": true,
   "backend": "JIHULAB_GENERIC_PACKAGE",
   "host": "jihulab.com",
   "project_id": 390001,
   "project_path": "Yoruto/online-trader-diagnostics",
   "package_name": "online-trader-diagnostics",
-  "private_token": "<第三个 owner Token>",
-  "connect_timeout_seconds": 5,
-  "upload_timeout_seconds": 20
+  "auth_kind": "DEPLOY_TOKEN",
+  "token": "<项目级 write_package_registry Token>",
+  "request_timeout_seconds": 20
 }
 ```
 
@@ -647,8 +660,8 @@ src/online_trader/diagnostics/
 | --- | --- | --- |
 | 事件合同与 Sink | 已实现 schema、有界队列、2 MiB segment、健康与丢弃计数、安装级 HMAC 账号匿名 | 队列/磁盘/权限故障测试 `NOT_RUN` |
 | 产品诊断点 | 已接入 Runtime 生命周期、Owner、订单、行情、命令、历史缓存和 Workbench | 实际 Runtime/Workbench/柜台事件覆盖 `NOT_RUN` |
-| 截点与 Reporter | 已实现正常退出 Journal 截点、request 认领、闭合 segment 收集、Manifest、ZIP、SHA-256 和 500 MiB 本地保留 | crash/cutoff 及冻结 EXE 独立存活 `NOT_RUN` |
-| 远程上报 | 已实现固定极狐 Project 390001 Generic Package 单次尽力上报，严格校验 `private/diagnostics-upload.json` | 产品路径上报和封装配置验收 `NOT_RUN` |
+| 截点与 Reporter | 已实现进程内收盘一次触发、退出触发、request 认领、目标 boot 逐事件筛选、活跃前缀安全读取、诚实完整性、活动目录保护、Manifest、ZIP 与 SHA-256 | 功能、crash/cutoff 及冻结 EXE 独立存活 `NOT_RUN` |
+| 远程上报 | 已实现固定极狐 Project 390001 Generic Package 单次尽力上报；新 `/2` 配置支持 Deploy/Project/Personal Token，旧 `/1` 私人 Token 兼容读取 | Deploy Token 实际上传、产品路径和封装配置验收 `NOT_RUN` |
 | 开发端工具 | 已实现包校验、通用时间线和行情规则检查 | `compare`、订单/命令专项 trace 仍待后续实现；现有 Analyzer 不对未实现规则给出 `OBSERVED_OK` |
 
 ### PR1：证据合同与首个行情纵向切片
@@ -682,7 +695,7 @@ src/online_trader/diagnostics/
 
 ### PR5：经授权的 GitLab/JiHuLab 上报与版本比较
 
-- 按已定稿的 `private/diagnostics-upload.json` 接入极狐 Generic Package Backend；构建时把用户指定的第三个 Token 写入客户私有交付配置。
+- 按 `private/diagnostics-upload.json` 接入极狐 Generic Package Backend；新交付显式选择认证类型并优先写入项目级 `write_package_registry` Deploy Token。
 - 加入上传超时、去重身份和失败记录；不做可靠补传。
 - 完成 `analyze`、`compare`、incident/order/command timeline 和 AI 使用说明。
 
@@ -752,7 +765,7 @@ src/online_trader/diagnostics/
 - 正常退出由单一协调器创建 Reporter request；
 - 保留 Local Backend，同时使用极狐 Generic Package Registry 作为远端 Backend；
 - 极狐目标固定为 `Yoruto/online-trader-diagnostics` / Project ID `390001`；
-- 第三个 `owner` Token 直接写入并随包交付于 `private/diagnostics-upload.json`，不再等待最小权限或系统安全存储方案；
+- 旧 `/1` owner/private Token 配置仅兼容读取；新 `/2` 配置显式声明认证类型，优先使用项目级最小权限 Deploy Token；
 - 不用一次实机轨迹替代完整功能测试。
 
 当前已实现但仍需在后续验收中确认：

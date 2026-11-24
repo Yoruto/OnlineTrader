@@ -16,6 +16,7 @@ from online_trader.diagnostics.contract import diagnostic_event, utc_now
 
 _DEFAULT_QUEUE = 2048
 _DEFAULT_SEGMENT_BYTES = 2 * 1024 * 1024
+_DEFAULT_STREAM_BYTES = 64 * 1024 * 1024
 
 
 class NullDiagnosticSink:
@@ -33,6 +34,8 @@ class NullDiagnosticSink:
             "dropped_by_priority": {},
             "write_failures": 1,
             "last_persisted_seq": None,
+            "retention_dropped_segments": 0,
+            "retention_dropped_events": 0,
             "segments": [],
         }
 
@@ -54,11 +57,15 @@ class DiagnosticSink:
         configuration_revision: str | None = None,
         max_queue: int = _DEFAULT_QUEUE,
         segment_bytes: int = _DEFAULT_SEGMENT_BYTES,
+        max_stream_bytes: int = _DEFAULT_STREAM_BYTES,
     ):
         if type(max_queue) is not int or not 16 <= max_queue <= 65536:
             raise ValueError("invalid diagnostic queue bound")
         if type(segment_bytes) is not int or not 64 * 1024 <= segment_bytes <= 32 * 1024 * 1024:
             raise ValueError("invalid diagnostic segment bound")
+        if (type(max_stream_bytes) is not int
+                or not segment_bytes <= max_stream_bytes <= 512 * 1024 * 1024):
+            raise ValueError("invalid diagnostic stream bound")
         if stream_group not in {"runtime", "workbench", "runtime-view"}:
             raise ValueError("invalid diagnostic stream group")
         self.root = Path(diagnostics_root).resolve()
@@ -74,6 +81,7 @@ class DiagnosticSink:
         self._lock = Lock()
         self._sequence = 0
         self._segment_bytes = segment_bytes
+        self._max_stream_bytes = max_stream_bytes
         self._segment_number = 0
         self._stream = None
         self._stream_path = None
@@ -88,6 +96,8 @@ class DiagnosticSink:
             "dropped_by_priority": {},
             "write_failures": 0,
             "last_persisted_seq": None,
+            "retention_dropped_segments": 0,
+            "retention_dropped_events": 0,
         }
         self.directory.mkdir(parents=True, exist_ok=True)
         publish_replace_bytes(canonical_bytes({
@@ -190,6 +200,8 @@ class DiagnosticSink:
             }
             publish_replace_bytes(canonical_bytes(metadata), path.with_suffix(".segment.json"))
             self._segments.append(metadata)
+            self._prune_closed_segments()
+            self._publish_health(active=True)
         except Exception:
             self._health["write_failures"] += 1
             try:
@@ -200,6 +212,53 @@ class DiagnosticSink:
             self._stream = None
             self._stream_path = None
             self._stream_hash = None
+
+    def _prune_closed_segments(self):
+        """Prune only this writer's oldest closed segments; never touch another process."""
+        total = sum(int(row.get("bytes") or 0) for row in self._segments)
+        while total > self._max_stream_bytes and len(self._segments) > 1:
+            oldest = self._segments[0]
+            path = self.directory / oldest["file"]
+            metadata = path.with_suffix(".segment.json")
+            try:
+                path.unlink(missing_ok=True)
+                metadata.unlink(missing_ok=True)
+            except OSError:
+                self._health["write_failures"] += 1
+                break
+            self._segments.pop(0)
+            total = max(0, total - int(oldest.get("bytes") or 0))
+            first = oldest.get("first_event_seq")
+            last = oldest.get("last_event_seq")
+            count = 0
+            try:
+                if first is not None and last is not None:
+                    count = max(0, int(last) - int(first) + 1)
+            except (TypeError, ValueError):
+                count = 0
+            self._health["retention_dropped_segments"] += 1
+            self._health["retention_dropped_events"] += count
+
+    def _publish_health(
+        self,
+        *,
+        active,
+        clean_shutdown=False,
+        snapshot_available=False,
+        writer_timeout=False,
+    ):
+        status = dict(self._health) | {
+            "schema_version": "ONLINE_TRADER_DIAGNOSTIC_HEALTH/1",
+            "stream_id": self.stream_id,
+            "active": bool(active),
+            "clean_shutdown": bool(clean_shutdown),
+            "snapshot_available": bool(snapshot_available),
+            "writer_timeout": bool(writer_timeout),
+            "finalized_at_utc": None if active else utc_now(),
+            "segments": list(self._segments),
+        }
+        publish_replace_bytes(canonical_bytes(status), self.directory / "health.json")
+        return status
 
     def _write_loop(self):
         while not self._closing.is_set() or not self._queue.empty():
@@ -240,18 +299,15 @@ class DiagnosticSink:
             if self._writer.is_alive():
                 self._health["write_failures"] += 1
         writer_timeout = self._writer.is_alive()
-        status = dict(self._health) | {
-            "schema_version": "ONLINE_TRADER_DIAGNOSTIC_HEALTH/1",
-            "stream_id": self.stream_id,
-            "clean_shutdown": bool(clean_shutdown),
-            "snapshot_available": bool(snapshot_available),
-            "writer_timeout": writer_timeout,
-            "finalized_at_utc": utc_now(),
-            "segments": list(self._segments),
-        }
         try:
-            publish_replace_bytes(canonical_bytes(status), self.directory / "health.json")
+            status = self._publish_health(
+                active=writer_timeout,
+                clean_shutdown=clean_shutdown,
+                snapshot_available=snapshot_available,
+                writer_timeout=writer_timeout,
+            )
         except Exception:
+            status = dict(self._health)
             status["write_failures"] += 1
         return status
 

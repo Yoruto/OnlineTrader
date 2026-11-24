@@ -2,6 +2,8 @@
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import os
+import sys
 import time
 import uuid
 from PySide6.QtCore import QEvent,QEventLoop,QItemSelectionModel,QSettings,QStandardPaths,Qt,QThread,QTimer,Signal
@@ -189,9 +191,14 @@ class WorkbenchWindow(StatusWindow):
         self._diagnostic_sink = None
         self._diagnostic_sink_holder = {'sink': None}
         self._diagnostic_account_pseudonym = None
+        self._diagnostic_snapshot_signature = None
+        self._diagnostic_snapshot_summary_ns = 0
+        self._diagnostic_connection_signature = None
+        self._diagnostic_previous_excepthook = None
+        self._diagnostic_excepthook = None
         if self._runtime_root is not None:
             from online_trader.diagnostics import open_sink
-            process_id = 'workbench-' + uuid.uuid4().hex
+            process_id = f'workbench-{os.getpid()}-' + uuid.uuid4().hex
             self._diagnostic_sink = open_sink(
                 self._runtime_root / 'diagnostics',
                 process_role='WORKBENCH',
@@ -208,6 +215,21 @@ class WorkbenchWindow(StatusWindow):
                 'WORKBENCH_STARTED', component='LIFECYCLE', priority='HIGH',
                 payload={'runtime_mode': bool(runtime_view)},
             )
+            previous_excepthook = sys.excepthook
+            self._diagnostic_previous_excepthook = previous_excepthook
+            holder = self._diagnostic_sink_holder
+            def diagnostic_excepthook(exception_type, exception, traceback):
+                sink = holder.get('sink')
+                if sink is not None:
+                    sink.record(
+                        'QT_UNHANDLED_EXCEPTION', component='LIFECYCLE',
+                        severity='ERROR', priority='CRITICAL',
+                        error_code='E_QT_UNHANDLED',
+                        payload={'exception_type': exception_type.__name__},
+                    )
+                previous_excepthook(exception_type, exception, traceback)
+            self._diagnostic_excepthook = diagnostic_excepthook
+            sys.excepthook = diagnostic_excepthook
         self._runtime_shutdown_verified = False
         self._runtime_shutdown_in_progress = False
         self._runtime_bootstrap = None
@@ -566,25 +588,40 @@ class WorkbenchWindow(StatusWindow):
                     except Exception:
                         pass
             configuration = view.get('configuration') or {}
-            self._diagnostic_sink.record(
-                'WORKBENCH_SNAPSHOT_RECEIVED', component='PROJECTION', priority='LOW',
-                runtime_boot_id=boot_id,
-                account_pseudonym=self._diagnostic_account_pseudonym,
-                configuration_revision=str(configuration.get('config_revision') or '0'),
-                correlation={
-                    'snapshot_id': str(view.get('snapshot_id') or view.get('checkpoint_event_seq') or '0'),
-                },
-                payload={
-                    'entry_authority': view.get('entry_authority'),
-                    'truncated': bool(view.get('truncated')),
-                    'cycle_count': len(view.get('cycles') or ()),
-                    'order_count': len(view.get('orders') or ()),
-                },
+            signature = (
+                boot_id,
+                str(configuration.get('config_revision') or '0'),
+                view.get('entry_authority'),
+                bool(view.get('truncated')),
+                len(view.get('cycles') or ()),
+                len(view.get('orders') or ()),
             )
+            now_ns = time.monotonic_ns()
+            changed = signature != self._diagnostic_snapshot_signature
+            if changed or now_ns - self._diagnostic_snapshot_summary_ns >= 30_000_000_000:
+                self._diagnostic_sink.record(
+                    'WORKBENCH_SNAPSHOT_CHANGED' if changed else 'WORKBENCH_SNAPSHOT_SUMMARY',
+                    component='PROJECTION', priority='HIGH' if changed else 'LOW',
+                    runtime_boot_id=boot_id,
+                    account_pseudonym=self._diagnostic_account_pseudonym,
+                    configuration_revision=signature[1],
+                    correlation={
+                        'snapshot_id': str(view.get('snapshot_id') or view.get('checkpoint_event_seq') or '0'),
+                    },
+                    payload={
+                        'entry_authority': signature[2],
+                        'truncated': signature[3],
+                        'cycle_count': signature[4],
+                        'order_count': signature[5],
+                    },
+                )
+                self._diagnostic_snapshot_signature = signature
+                self._diagnostic_snapshot_summary_ns = now_ns
         self._runtime_updated({'action': 'refresh', 'value': value})
 
     def _runtime_client_connection_changed(self, state, reason):
-        if self._diagnostic_sink is not None:
+        signature = (str(state), str(reason or ''))
+        if self._diagnostic_sink is not None and signature != self._diagnostic_connection_signature:
             self._diagnostic_sink.record(
                 'WORKBENCH_CONNECTION_CHANGED', component='IPC',
                 severity='INFO' if state == 'READY' else 'WARNING', priority='HIGH',
@@ -592,6 +629,7 @@ class WorkbenchWindow(StatusWindow):
                 account_pseudonym=self._diagnostic_account_pseudonym,
                 payload={'connection_state': str(state), 'reason': str(reason or '')},
             )
+            self._diagnostic_connection_signature = signature
         if self._closing or state == 'READY':
             return
         self._runtime_unavailable(reason or state)
@@ -691,6 +729,12 @@ class WorkbenchWindow(StatusWindow):
         self.snapshot_published_ns = stamp
         if self._stale and not self.published_snapshot_expired():
             self._stale = False
+            if self._diagnostic_sink is not None:
+                self._diagnostic_sink.record(
+                    'WORKBENCH_SNAPSHOT_RECOVERED', component='PROJECTION', priority='HIGH',
+                    runtime_boot_id=self._boot,
+                    account_pseudonym=self._diagnostic_account_pseudonym,
+                )
             self.render_view()
             self._enable_commands(not self.view['truncated'])
 
@@ -703,7 +747,16 @@ class WorkbenchWindow(StatusWindow):
         # the existing fail-closed path below.
         if self.view is not None and not self.published_snapshot_expired():
             return
+        became_stale = not self._stale
         self._stale = True
+        if became_stale and self._diagnostic_sink is not None:
+            self._diagnostic_sink.record(
+                'WORKBENCH_SNAPSHOT_EXPIRED', component='PROJECTION',
+                severity='WARNING', priority='HIGH', reason_code='SNAPSHOT_EXPIRED',
+                runtime_boot_id=self._boot,
+                account_pseudonym=self._diagnostic_account_pseudonym,
+                payload={'snapshot_age_seconds': self.published_snapshot_age()},
+            )
         self._enable_commands(False)
         self.show_home_feedback(f'工作台未收到最新投影，正在等待 Runtime 同步 · {code}')
         # A stale client projection is a Workbench/view condition, not a market
@@ -726,12 +779,26 @@ class WorkbenchWindow(StatusWindow):
             if hot_add_profile is not None:
                 self._pending_focus_contracts = ()
             self.show_home_feedback('请先取得当前完整 Runtime 状态，再提交命令。')
+            if self._diagnostic_sink is not None:
+                self._diagnostic_sink.record(
+                    'WORKBENCH_COMMAND_BLOCKED', component='COMMAND', priority='HIGH',
+                    reason_code='SNAPSHOT_UNAVAILABLE', runtime_boot_id=self._boot,
+                    account_pseudonym=self._diagnostic_account_pseudonym,
+                    payload={'operation': operation},
+                )
             return
         bus = self._runtime_command_bus
         if bus is None:
             if hot_add_profile is not None:
                 self._pending_focus_contracts = ()
             self.show_home_feedback('Runtime CommandBus 尚未就绪；命令未发送。')
+            if self._diagnostic_sink is not None:
+                self._diagnostic_sink.record(
+                    'WORKBENCH_COMMAND_BLOCKED', component='COMMAND', priority='HIGH',
+                    reason_code='COMMAND_BUS_UNAVAILABLE', runtime_boot_id=self._boot,
+                    account_pseudonym=self._diagnostic_account_pseudonym,
+                    payload={'operation': operation},
+                )
             return
         try:
             command_id = bus.submit(operation, scope, parameters)
@@ -741,6 +808,15 @@ class WorkbenchWindow(StatusWindow):
             self.show_home_feedback(f'Runtime 命令未提交 · {error.code} · {error}')
             if operation == 'SAVE_DSV_PARAMETERS':
                 self.dashboard.set_parameter_feedback(f'参数未提交 · {error.code} · {error}', error=True)
+            if self._diagnostic_sink is not None:
+                self._diagnostic_sink.record(
+                    'WORKBENCH_COMMAND_SUBMIT_FAILED', component='COMMAND',
+                    severity='WARNING', priority='HIGH',
+                    error_code=error.code if error.code.startswith('E_') else 'E_COMMAND_SUBMIT',
+                    runtime_boot_id=self._boot,
+                    account_pseudonym=self._diagnostic_account_pseudonym,
+                    payload={'operation': operation},
+                )
             return
         if self._diagnostic_sink is not None:
             self._diagnostic_sink.record(
@@ -2281,6 +2357,11 @@ class WorkbenchWindow(StatusWindow):
         holder = getattr(self, '_diagnostic_sink_holder', None)
         if holder is not None:
             holder['sink'] = None
+        hook = getattr(self, '_diagnostic_excepthook', None)
+        previous = getattr(self, '_diagnostic_previous_excepthook', None)
+        if hook is not None and sys.excepthook is hook and previous is not None:
+            sys.excepthook = previous
+        self._diagnostic_excepthook = None
         sink = getattr(self, '_diagnostic_sink', None)
         if sink is None:
             return

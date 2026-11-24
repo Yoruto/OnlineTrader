@@ -12,11 +12,21 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from online_trader.contracts.codec import strict_loads
 
 
-UPLOAD_SCHEMA = "ONLINE_TRADER_DIAGNOSTIC_UPLOAD/1"
+UPLOAD_SCHEMA = "ONLINE_TRADER_DIAGNOSTIC_UPLOAD/2"
+LEGACY_UPLOAD_SCHEMA = "ONLINE_TRADER_DIAGNOSTIC_UPLOAD/1"
 UPLOAD_BACKEND = "JIHULAB_GENERIC_PACKAGE"
-_CONFIG_KEYS = {
+_CONFIG_KEYS_V1 = {
     "schema_version", "enabled", "backend", "host", "project_id", "project_path",
     "package_name", "private_token", "connect_timeout_seconds", "upload_timeout_seconds",
+}
+_CONFIG_KEYS_V2 = {
+    "schema_version", "enabled", "backend", "host", "project_id", "project_path",
+    "package_name", "auth_kind", "token", "request_timeout_seconds",
+}
+_AUTH_HEADERS = {
+    "DEPLOY_TOKEN": "DEPLOY-TOKEN",
+    "PROJECT_ACCESS_TOKEN": "PRIVATE-TOKEN",
+    "PERSONAL_ACCESS_TOKEN": "PRIVATE-TOKEN",
 }
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
 _MAX_CONFIG_BYTES = 64 * 1024
@@ -30,9 +40,9 @@ class UploadConfig:
     project_id: int
     project_path: str
     package_name: str
-    private_token: str
-    connect_timeout_seconds: int
-    upload_timeout_seconds: int
+    auth_kind: str
+    token: str
+    request_timeout_seconds: int
 
 
 @dataclass(frozen=True)
@@ -69,9 +79,13 @@ def load_upload_config(runtime_root) -> UploadConfig | None:
     if len(raw) > _MAX_CONFIG_BYTES:
         raise ValueError("diagnostic upload configuration is too large")
     value = strict_loads(raw)
-    if type(value) is not dict or set(value) != _CONFIG_KEYS:
+    if type(value) is not dict:
         raise ValueError("invalid diagnostic upload configuration fields")
-    if value["schema_version"] != UPLOAD_SCHEMA or type(value["enabled"]) is not bool:
+    schema = value.get("schema_version")
+    expected_keys = _CONFIG_KEYS_V2 if schema == UPLOAD_SCHEMA else _CONFIG_KEYS_V1
+    if set(value) != expected_keys:
+        raise ValueError("invalid diagnostic upload configuration fields")
+    if schema not in {UPLOAD_SCHEMA, LEGACY_UPLOAD_SCHEMA} or type(value["enabled"]) is not bool:
         raise ValueError("invalid diagnostic upload configuration schema")
     if not value["enabled"]:
         return None
@@ -84,10 +98,17 @@ def load_upload_config(runtime_root) -> UploadConfig | None:
     package_name = value["package_name"]
     if not isinstance(package_name, str) or _SAFE_NAME.fullmatch(package_name) is None:
         raise ValueError("invalid diagnostic package name")
-    connect_timeout = value["connect_timeout_seconds"]
-    upload_timeout = value["upload_timeout_seconds"]
-    if (type(connect_timeout) is not int or not 1 <= connect_timeout <= 30
-            or type(upload_timeout) is not int or not 1 <= upload_timeout <= 30):
+    if schema == LEGACY_UPLOAD_SCHEMA:
+        auth_kind = "PERSONAL_ACCESS_TOKEN"
+        token = value["private_token"]
+        request_timeout = value["upload_timeout_seconds"]
+    else:
+        auth_kind = value["auth_kind"]
+        token = value["token"]
+        request_timeout = value["request_timeout_seconds"]
+    if auth_kind not in _AUTH_HEADERS:
+        raise ValueError("unsupported diagnostic upload authentication")
+    if type(request_timeout) is not int or not 1 <= request_timeout <= 30:
         raise ValueError("invalid diagnostic upload timeout")
     return UploadConfig(
         enabled=True,
@@ -95,9 +116,9 @@ def load_upload_config(runtime_root) -> UploadConfig | None:
         project_id=value["project_id"],
         project_path=value["project_path"],
         package_name=package_name,
-        private_token=_token(value["private_token"]),
-        connect_timeout_seconds=connect_timeout,
-        upload_timeout_seconds=upload_timeout,
+        auth_kind=auth_kind,
+        token=_token(token),
+        request_timeout_seconds=request_timeout,
     )
 
 
@@ -122,17 +143,18 @@ class JiHuLabBackend:
             f"https://{self.config.host}/api/v4/projects/{self.config.project_id}/packages/generic/"
             f"{quote(self.config.package_name, safe='')}/{quote(report_id, safe='')}/{quote(path.name, safe='')}"
         )
+        auth_header = _AUTH_HEADERS[self.config.auth_kind]
         request = Request(
             url,
             data=path.read_bytes(),
             method="PUT",
             headers={
-                "PRIVATE-TOKEN": self.config.private_token,
+                auth_header: self.config.token,
                 "Content-Type": "application/zip",
                 "User-Agent": "OnlineTrader-Diagnostics/1",
             },
         )
-        with self._open(request, timeout=self.config.upload_timeout_seconds) as response:
+        with self._open(request, timeout=self.config.request_timeout_seconds) as response:
             status = int(response.status)
             response.read(4097)
         if status != 201:

@@ -47,6 +47,9 @@ class FrameAssembler:
         broker_order_snapshot_complete: bool | None = None,
         absent_orders: list[str] | None = None,
         health_reason: str | None = None,
+        sdk_pump_gap_ns: int | None = None,
+        sdk_updated: bool | None = None,
+        connection_complete: bool | None = None,
     ) -> dict[str, object]:
         self._sequence += 1
         seq = self._sequence
@@ -60,12 +63,15 @@ class FrameAssembler:
             broker_order_snapshot_complete=broker_order_snapshot_complete,
             absent_orders=absent_orders,
         )
-        pos = broker_snap["positions"]
-        market_rows = self.market.snapshot()
+        positions_by_contract = broker_snap.get("positions_by_contract") or {
+            self.broker.contract: broker_snap["positions"]
+        }
+        market_rows = self.market.snapshot(wall_time=str(clock_fields["wall_time"]))
         merged_market: list[dict[str, object]] = []
         for row in market_rows:
             merged = deepcopy(row)
-            if merged["contract_id"] == self.broker.contract:
+            pos = positions_by_contract.get(merged["contract_id"])
+            if pos is not None:
                 merged.update({
                     "long_qty": pos["long_qty"],
                     "short_qty": pos["short_qty"],
@@ -98,6 +104,12 @@ class FrameAssembler:
             "native": broker_snap["native"],
             **clock_fields,
         }
+        if sdk_pump_gap_ns is not None or sdk_updated is not None or connection_complete is not None:
+            frame["qa_market_health_inputs"] = {
+                "sdk_pump_gap_ns": sdk_pump_gap_ns,
+                "sdk_updated": sdk_updated,
+                "connection_complete": connection_complete,
+            }
         if "broker_order_snapshot_complete" in broker_snap:
             frame["broker_order_snapshot_complete"] = broker_snap["broker_order_snapshot_complete"]
         if "absent_orders" in broker_snap:

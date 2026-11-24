@@ -1,17 +1,18 @@
-"""Freeze diagnostic evidence, build a bounded ZIP, and perform one best-effort upload."""
+"""Build one bounded, attributable diagnostic bundle and attempt one upload."""
 
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
 import hashlib
-import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+from threading import Lock, Thread
 import time
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -28,11 +29,26 @@ from online_trader.diagnostics.backend import (
 from online_trader.diagnostics.contract import utc_now
 
 
-REQUEST_SCHEMA = "ONLINE_TRADER_DIAGNOSTIC_REPORT_REQUEST/1"
+REQUEST_SCHEMA = "ONLINE_TRADER_DIAGNOSTIC_REPORT_REQUEST/2"
+LEGACY_REQUEST_SCHEMA = "ONLINE_TRADER_DIAGNOSTIC_REPORT_REQUEST/1"
 MANIFEST_SCHEMA = "ONLINE_TRADER_DIAGNOSTIC_MANIFEST/1"
 _MAX_SOURCE_FILE = 8 * 1024 * 1024
 _MAX_BUNDLE_INPUT = 32 * 1024 * 1024
 _MAX_LOCAL_BYTES = 500 * 1024 * 1024
+_CONTEXT_EVENTS = frozenset({
+    "WORKBENCH_STARTED", "WORKBENCH_STOPPED", "WORKBENCH_CONNECTION_CHANGED",
+    "QT_UNHANDLED_EXCEPTION",
+})
+_VIEW_LINE = re.compile(
+    r"^(\S+) (?:SUPERVISOR )?("
+    r"START pid=\d+|EXIT code=-?\d+ uptime_ms=\d+|START_FAILED error=[A-Za-z0-9_]+|"
+    r"VIEW_CLIENT pid=\d+ boot=[A-Za-z0-9._-]+|"
+    r"COMMAND source=(?:WORKBENCH|OPERATOR) .* boot=[A-Za-z0-9._-]+ .*"
+    r"result=(?:ACCEPTED|REJECTED) code=[A-Za-z0-9._-]+)$"
+)
+_BOOT_TOKEN = re.compile(r"(?:^| )boot=([A-Za-z0-9._-]+)(?: |$)")
+_async_lock = Lock()
+_async_keys = set()
 
 
 def _sha256(path: Path) -> str:
@@ -41,7 +57,10 @@ def _sha256(path: Path) -> str:
 
 
 def _build_manifest_hash(runtime_root: Path) -> str | None:
-    for candidate in (runtime_root / "base-build-manifest.json", runtime_root.parent / "base-build-manifest.json"):
+    for candidate in (
+        runtime_root / "base-build-manifest.json",
+        runtime_root.parent / "base-build-manifest.json",
+    ):
         try:
             if candidate.is_file() and candidate.stat().st_size <= 2 * 1024 * 1024:
                 return _sha256(candidate)
@@ -57,6 +76,9 @@ def create_report_request(
     runtime_boot_id: str | None,
     clean_shutdown: bool,
     runtime_process_instance_id: str | None,
+    trigger_key: str | None = None,
+    runtime_view_expected: bool = True,
+    workbench_expected: bool = False,
 ) -> Path:
     diagnostics = Path(runtime_root).resolve() / "diagnostics"
     report_id = "report-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid4().hex[:16]
@@ -68,6 +90,12 @@ def create_report_request(
         "runtime_boot_id": runtime_boot_id,
         "runtime_process_instance_id": runtime_process_instance_id,
         "clean_shutdown": bool(clean_shutdown),
+        "trigger_key": trigger_key,
+        "expected_sources": {
+            "runtime": bool(runtime_process_instance_id),
+            "runtime_view": bool(runtime_view_expected),
+            "workbench": bool(workbench_expected),
+        },
         "diagnostic_protocol": "1",
     }
     return publish_new_bytes(
@@ -75,49 +103,108 @@ def create_report_request(
     )
 
 
+def _append_line(path: Path, record: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = canonical_bytes(record) + b"\n"
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        view = memoryview(line)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("diagnostic append made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _record_failure(diagnostics: Path, *, report_id, stage, error):
+    try:
+        _append_line(diagnostics / "report-failures.ndjson", {
+            "schema_version": "ONLINE_TRADER_DIAGNOSTIC_REPORT_FAILURE/1",
+            "report_id": report_id,
+            "stage": stage,
+            "error_code": "E_DIAGNOSTIC_REPORTER",
+            "error_type": type(error).__name__,
+            "observed_at_utc": utc_now(),
+        })
+    except OSError:
+        pass
+
+
 def launch_reporter(runtime_root, request_path) -> bool:
-    """Start a detached, bounded Reporter without delaying Runtime shutdown."""
+    """Start a detached Reporter without delaying Runtime work."""
     root = str(Path(runtime_root).resolve())
     request = str(Path(request_path).resolve())
     if getattr(sys, "frozen", False):
         command = [sys.executable, "--diagnostic-reporter", request, "--diagnostic-runtime-root", root]
     else:
-        command = [
-            sys.executable,
-            "-m",
-            "online_trader.diagnostics.reporter",
-            "--request",
-            request,
-            "--runtime-root",
-            root,
-        ]
+        command = [sys.executable, "-m", "online_trader.diagnostics.reporter",
+                   "--request", request, "--runtime-root", root]
     flags = 0
     if os.name == "nt":
-        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        flags = 0x00000008 | 0x00000200
     try:
         subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            creationflags=flags,
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags,
         )
         return True
-    except OSError:
+    except OSError as error:
+        _record_failure(Path(root) / "diagnostics", report_id=Path(request).stem,
+                        stage="LAUNCH", error=error)
         return False
+
+
+def request_report_async(runtime_root, **request):
+    """Create one process-local close report request off the Owner thread."""
+    key = request.get("trigger_key")
+    identity = (str(Path(runtime_root).resolve()), key or uuid4().hex)
+    with _async_lock:
+        if key is not None and identity in _async_keys:
+            return False
+        _async_keys.add(identity)
+
+    def create_and_launch():
+        diagnostics = Path(runtime_root).resolve() / "diagnostics"
+        try:
+            path = create_report_request(runtime_root, **request)
+            launch_reporter(runtime_root, path)
+        except Exception as error:
+            _record_failure(diagnostics, report_id="uncreated-" + uuid4().hex[:12],
+                            stage="REQUEST", error=error)
+
+    Thread(target=create_and_launch, name="OnlineTrader-diagnostic-close-report", daemon=True).start()
+    return True
 
 
 def _read_request(path: Path) -> dict:
     value = strict_loads(path.read_bytes())
-    expected = {
+    if type(value) is not dict:
+        raise ValueError("invalid diagnostic report request")
+    schema = value.get("schema_version")
+    legacy = {
         "schema_version", "report_id", "report_reason", "requested_at_utc", "runtime_boot_id",
         "runtime_process_instance_id", "clean_shutdown", "diagnostic_protocol",
     }
-    if type(value) is not dict or set(value) != expected or value["schema_version"] != REQUEST_SCHEMA:
+    current = legacy | {"trigger_key", "expected_sources"}
+    if schema == LEGACY_REQUEST_SCHEMA and set(value) == legacy:
+        value = value | {
+            "trigger_key": None,
+            "expected_sources": {"runtime": bool(value.get("runtime_process_instance_id")),
+                                 "runtime_view": True,
+                                 "workbench": False},
+        }
+    elif schema != REQUEST_SCHEMA or set(value) != current:
         raise ValueError("invalid diagnostic report request")
     if not isinstance(value["report_id"], str) or not value["report_id"].startswith("report-"):
         raise ValueError("invalid diagnostic report identity")
+    expected = value.get("expected_sources")
+    if (type(expected) is not dict or set(expected) != {"runtime", "runtime_view", "workbench"}
+            or type(expected["runtime"]) is not bool or type(expected["runtime_view"]) is not bool
+            or type(expected["workbench"]) is not bool):
+        raise ValueError("invalid diagnostic expected source contract")
     return value
 
 
@@ -127,138 +214,347 @@ def _claim(path: Path) -> Path:
     return claimed
 
 
-def _segment_sources(diagnostics: Path, request: dict):
-    roots = []
+def _json_snapshot(path: Path):
+    try:
+        raw = path.read_bytes()
+        if len(raw) > 2 * 1024 * 1024:
+            return None
+        value = strict_loads(raw)
+        return value if type(value) is dict else None
+    except Exception:
+        return None
+
+
+def _line_snapshot(path: Path, *, limit: int):
+    with path.open("rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        take = min(size, limit)
+        raw = stream.read(take)
+    limited = size > take
+    tail_discarded = False
+    if raw and not raw.endswith(b"\n"):
+        end = raw.rfind(b"\n")
+        raw = b"" if end < 0 else raw[:end + 1]
+        tail_discarded = True
+    return raw, size, limited, tail_discarded
+
+
+def _stage(staging: Path, target: str, raw: bytes, files: list):
+    destination = staging / Path(target)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(raw)
+    files.append((destination, target, len(raw), hashlib.sha256(raw).hexdigest()))
+
+
+def _collect_event_stream(staging, group, root, target_boot, budget, files, omissions):
+    metadata = _json_snapshot(root / "metadata.json")
+    health = _json_snapshot(root / "health.json")
+    rows = []
+    source_first = None
+    source_last = None
+    source_sequence_complete = True
+    source_open = False
+    tail_discarded = False
+    invalid_events = 0
+    raw_bytes = 0
+    for source in sorted(root.glob("events-*.ndjson")):
+        remaining = max(0, min(_MAX_SOURCE_FILE, budget - raw_bytes))
+        if remaining <= 0:
+            omissions.append(f"{group}/{root.name}/{source.name}:BUNDLE_LIMIT")
+            break
+        try:
+            raw, _, limited, tail = _line_snapshot(source, limit=remaining)
+        except OSError:
+            omissions.append(f"{group}/{root.name}/{source.name}:UNREADABLE")
+            continue
+        raw_bytes += len(raw)
+        sidecar = source.with_suffix(".segment.json")
+        closed = sidecar.is_file()
+        source_open = source_open or not closed
+        tail_discarded = tail_discarded or tail
+        if limited:
+            omissions.append(f"{group}/{root.name}/{source.name}:SIZE_LIMIT")
+        if closed and not limited:
+            segment = _json_snapshot(sidecar)
+            try:
+                integrity_ok = (
+                    segment is not None and segment.get("file") == source.name
+                    and int(segment.get("bytes")) == len(raw)
+                    and segment.get("sha256") == hashlib.sha256(raw).hexdigest()
+                )
+            except (TypeError, ValueError):
+                integrity_ok = False
+            if not integrity_ok:
+                omissions.append(f"{group}/{root.name}/{source.name}:SEGMENT_INTEGRITY")
+                source_sequence_complete = False
+        for line in raw.splitlines():
+            try:
+                row = strict_loads(line)
+                sequence = int(row["event_seq"])
+                if type(row) is not dict or row.get("stream_id") != (metadata or {}).get("stream_id"):
+                    raise ValueError
+            except Exception:
+                invalid_events += 1
+                continue
+            if source_last is not None and sequence != source_last + 1:
+                source_sequence_complete = False
+            source_first = sequence if source_first is None else source_first
+            source_last = sequence
+            rows.append(row)
+    exact = [row for row in rows if row.get("runtime_boot_id") == target_boot]
+    context = []
+    if group == "workbench" and exact:
+        context = [row for row in rows if row.get("runtime_boot_id") is None
+                   and row.get("event_type") in _CONTEXT_EVENTS]
+    selected = exact if group == "runtime" else sorted(
+        [*exact, *context], key=lambda row: int(row["event_seq"])
+    )
+    if group == "workbench" and not exact:
+        return None, raw_bytes
+    if group == "runtime" and not exact:
+        omissions.append(f"runtime/{root.name}:NO_TARGET_BOOT_EVENTS")
+    if selected:
+        _stage(staging, f"{group}/{root.name}/events-selected.ndjson",
+               b"".join(canonical_bytes(row) + b"\n" for row in selected), files)
+    if metadata is not None:
+        _stage(staging, f"{group}/{root.name}/metadata.json", canonical_bytes(metadata), files)
+    else:
+        omissions.append(f"{group}/{root.name}/metadata.json:INVALID_OR_MISSING")
+    if health is not None:
+        _stage(staging, f"{group}/{root.name}/health.json", canonical_bytes(health), files)
+    else:
+        omissions.append(f"{group}/{root.name}/health.json:INVALID_OR_MISSING")
+    finalized = bool(health and not health.get("active") and health.get("finalized_at_utc"))
+    dropped = sum(int(count) for count in (health or {}).get("dropped_by_priority", {}).values())
+    write_failures = int((health or {}).get("write_failures") or 0)
+    retention_dropped = int((health or {}).get("retention_dropped_events") or 0)
+    if source_open:
+        omissions.append(f"{group}/{root.name}:OPEN_PREFIX")
+    if tail_discarded:
+        omissions.append(f"{group}/{root.name}:TAIL_DISCARDED")
+    if invalid_events:
+        omissions.append(f"{group}/{root.name}:INVALID_EVENTS:{invalid_events}")
+    if not source_sequence_complete:
+        omissions.append(f"{group}/{root.name}:SOURCE_SEQUENCE_GAP")
+    if not finalized:
+        omissions.append(f"{group}/{root.name}:NOT_FINALIZED")
+    if dropped or write_failures or retention_dropped:
+        omissions.append(f"{group}/{root.name}:SINK_GAPS")
+    return {
+        "stream_id": (metadata or {}).get("stream_id"),
+        "process_role": (metadata or {}).get("process_role"),
+        "process_instance_id": (metadata or {}).get("process_instance_id", root.name),
+        "runtime_boot_id": target_boot,
+        "created_at_utc": (metadata or {}).get("created_at_utc"),
+        "source_first_event_seq": None if source_first is None else str(source_first),
+        "source_last_event_seq": None if source_last is None else str(source_last),
+        "source_sequence_complete": source_sequence_complete,
+        "selected_event_count": len(exact),
+        "unattributed_context_count": len(context),
+        "excluded_event_count": max(0, len(rows) - len(selected)),
+        "source_was_open": source_open,
+        "tail_discarded": tail_discarded,
+        "finalized": finalized,
+        "dropped_events": dropped + retention_dropped,
+        "write_failures": write_failures,
+        "snapshot_available": bool((health or {}).get("snapshot_available")),
+    }, raw_bytes
+
+
+def _collect_view_log(staging, runtime_root, request, coverage_start, files, omissions):
+    rows = []
+    unparsed = 0
+    target_boot = request.get("runtime_boot_id")
+    logs = runtime_root / "logs"
+    found = False
+    for path in (logs / "runtime-view.log.1", logs / "runtime-view.log"):
+        if not path.is_file():
+            continue
+        found = True
+        try:
+            raw, _, limited, tail = _line_snapshot(path, limit=_MAX_SOURCE_FILE)
+        except OSError:
+            omissions.append(f"runtime-view/{path.name}:UNREADABLE")
+            continue
+        if limited:
+            omissions.append(f"runtime-view/{path.name}:SIZE_LIMIT")
+        if tail:
+            omissions.append(f"runtime-view/{path.name}:TAIL_DISCARDED")
+        for raw_line in raw.decode("utf-8", errors="replace").splitlines():
+            match = _VIEW_LINE.fullmatch(raw_line)
+            if match is None:
+                if raw_line[:1].isdigit():
+                    unparsed += 1
+                continue
+            occurred, message = match.groups()
+            if not coverage_start <= occurred <= request["requested_at_utc"]:
+                continue
+            boot_match = _BOOT_TOKEN.search(message)
+            boot = boot_match.group(1) if boot_match else None
+            if boot is not None and boot != target_boot:
+                continue
+            rows.append({
+                "schema_version": "ONLINE_TRADER_RUNTIME_VIEW_LOG/1",
+                "occurred_at_utc": occurred,
+                "runtime_boot_id": boot,
+                "attribution": "EXACT_BOOT" if boot is not None else "UNATTRIBUTED_PROCESS_CONTEXT",
+                "message": message,
+            })
+    if request["expected_sources"]["runtime_view"] and not found:
+        omissions.append("runtime-view:MISSING_EXPECTED_SOURCE")
+    if unparsed:
+        omissions.append(f"runtime-view:UNPARSED_LINES:{unparsed}")
+    if rows:
+        _stage(staging, "runtime-view/runtime-view-selected.jsonl",
+               b"".join(canonical_bytes(row) + b"\n" for row in rows), files)
+    workbench_expected = any(
+        row["runtime_boot_id"] == target_boot and row["message"].startswith("VIEW_CLIENT ")
+        for row in rows
+    )
+    return rows, workbench_expected
+
+
+def _collect_sources(staging: Path, runtime_root: Path, request: dict):
+    diagnostics = runtime_root / "diagnostics"
+    files = []
+    streams = []
+    omissions = []
+    total = 0
     runtime_id = request.get("runtime_process_instance_id")
-    if runtime_id:
-        candidate = diagnostics / "runtime" / runtime_id
-        if candidate.is_dir():
-            roots.append(("runtime", candidate))
+    runtime_directory = diagnostics / "runtime" / str(runtime_id)
+    if runtime_id and runtime_directory.is_dir():
+        row, used = _collect_event_stream(
+            staging, "runtime", runtime_directory, request.get("runtime_boot_id"),
+            _MAX_BUNDLE_INPUT - total, files, omissions,
+        )
+        total += used
+        if row is not None:
+            streams.append(row)
+    elif request["expected_sources"]["runtime"]:
+        omissions.append(f"runtime/{runtime_id}:MISSING_EXPECTED_SOURCE")
+    coverage_start = min(
+        (row.get("created_at_utc") for row in streams if row.get("created_at_utc")),
+        default=request["requested_at_utc"],
+    )
+    view_rows, workbench_expected = _collect_view_log(
+        staging, runtime_root, request, coverage_start, files, omissions,
+    )
+    workbench_count = 0
     workbench_root = diagnostics / "workbench"
     if workbench_root.is_dir():
+        def modified(path):
+            try:
+                return path.stat().st_mtime_ns
+            except OSError:
+                return -1
         candidates = sorted(
             (path for path in workbench_root.iterdir() if path.is_dir()),
-            key=lambda path: path.stat().st_mtime_ns,
+            key=modified,
             reverse=True,
-        )
-        roots.extend(("workbench", path) for path in candidates[:3])
-    files = []
-    total = 0
-    omitted = []
-    streams = []
-    for group, root in roots:
-        metadata_path = root / "metadata.json"
-        health_path = root / "health.json"
-        stream = None
-        if metadata_path.is_file():
-            try:
-                stream = strict_loads(metadata_path.read_bytes())
-            except Exception:
-                omitted.append(f"{group}/{root.name}/metadata.json:INVALID")
-        if isinstance(stream, dict):
-            streams.append({
-                "stream_id": stream.get("stream_id"),
-                "process_role": stream.get("process_role"),
-                "process_instance_id": stream.get("process_instance_id"),
-                "runtime_boot_id": stream.get("runtime_boot_id"),
-                "created_at_utc": stream.get("created_at_utc"),
-            })
-        allowed = [metadata_path, health_path]
-        allowed.extend(sorted(root.glob("events-*.segment.json")))
-        allowed.extend(sorted(root.glob("events-*.ndjson")))
-        for source in allowed:
-            if not source.is_file():
-                continue
-            size = source.stat().st_size
-            if size > _MAX_SOURCE_FILE or total + size > _MAX_BUNDLE_INPUT:
-                omitted.append(f"{group}/{root.name}/{source.name}:SIZE_LIMIT")
-                continue
-            if source.suffix == ".ndjson" and not source.with_suffix(".segment.json").is_file():
-                omitted.append(f"{group}/{root.name}/{source.name}:OPEN_SEGMENT")
-                continue
-            target = f"{group}/{root.name}/{source.name}"
-            files.append((source, target, size, _sha256(source)))
-            total += size
-    return files, streams, omitted
+        )[:64]
+        for directory in candidates:
+            if total >= _MAX_BUNDLE_INPUT:
+                omissions.append("workbench:BUNDLE_LIMIT")
+                break
+            row, used = _collect_event_stream(
+                staging, "workbench", directory, request.get("runtime_boot_id"),
+                _MAX_BUNDLE_INPUT - total, files, omissions,
+            )
+            if row is not None:
+                total += used
+                streams.append(row)
+                workbench_count += 1
+    workbench_expected = bool(request["expected_sources"]["workbench"] or workbench_expected)
+    if workbench_expected and not workbench_count:
+        omissions.append("workbench:MISSING_EXPECTED_SOURCE")
+    return files, streams, omissions, view_rows, workbench_expected
 
 
 def _write_bundle(runtime_root: Path, request: dict):
     diagnostics = runtime_root / "diagnostics"
-    files, streams, omitted = _segment_sources(diagnostics, request)
-    member_hashes = {target: digest for _, target, _, digest in files}
-    known_gaps = bool(omitted)
-    health_rows = []
-    for source, target, _, _ in files:
-        if target.endswith("/health.json"):
-            try:
-                health_rows.append(strict_loads(source.read_bytes()))
-            except Exception:
-                known_gaps = True
-    dropped = sum(
-        sum(int(count) for count in (row.get("dropped_by_priority") or {}).values())
-        for row in health_rows if isinstance(row, dict)
-    )
-    write_failures = sum(
-        int(row.get("write_failures") or 0) for row in health_rows if isinstance(row, dict)
-    )
-    known_gaps = known_gaps or dropped > 0 or write_failures > 0
-    capture_status = "PARTIAL" if known_gaps or not files else "COMPLETE_WITHIN_SCOPE"
-    if not files:
-        capture_status = "FAILED"
-    content_sha = hashlib.sha256(canonical_bytes(member_hashes)).hexdigest()
-    manifest = {
-        "schema_version": MANIFEST_SCHEMA,
-        "diagnostic_protocol": "1",
-        "report_id": request["report_id"],
-        "report_reason": request["report_reason"],
-        "application_version": __version__,
-        "build_manifest_hash": _build_manifest_hash(runtime_root),
-        "coverage_start": min(
-            (row.get("created_at_utc") for row in streams if row.get("created_at_utc")),
-            default=request["requested_at_utc"],
-        ),
-        "coverage_end": request["requested_at_utc"],
-        "streams": streams,
-        "dropped_events": dropped,
-        "write_failures": write_failures,
-        "missing_sources": omitted,
-        "snapshot_available": any(bool(row.get("snapshot_available")) for row in health_rows if isinstance(row, dict)),
-        "clean_shutdown": bool(request["clean_shutdown"]),
-        "capture_status": capture_status,
-        "redaction_version": "1",
-        # A ZIP cannot contain its own byte hash. This is the deterministic hash
-        # of every evidence member; the actual ZIP hash is recorded beside and
-        # with the upload result.
-        "bundle_sha256": content_sha,
-        "bundle_hash_scope": "EVIDENCE_MEMBERS_EXCLUDING_MANIFEST",
-        "members": member_hashes,
-    }
-    summary = {
-        "schema_version": "ONLINE_TRADER_DIAGNOSTIC_SUMMARY/1",
-        "report_id": request["report_id"],
-        "capture_status": capture_status,
-        "stream_count": len(streams),
-        "evidence_file_count": len(files),
-        "known_omissions": omitted,
-    }
-    environment = {
-        "schema_version": "ONLINE_TRADER_DIAGNOSTIC_ENVIRONMENT/1",
-        "application_version": __version__,
-        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        "platform": sys.platform,
-    }
-    bundles = diagnostics / "bundles"
-    bundles.mkdir(parents=True, exist_ok=True)
-    final = bundles / f"diagnostic-{request['report_id']}.zip"
-    temporary = final.with_suffix(".tmp")
-    with ZipFile(temporary, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
-        archive.writestr("manifest.json", canonical_bytes(manifest))
-        archive.writestr("summary.json", canonical_bytes(summary))
-        archive.writestr("environment.json", canonical_bytes(environment))
-        for source, target, _, _ in files:
-            archive.write(source, target)
-    os.replace(temporary, final)
-    return final, _sha256(final), manifest
+    with TemporaryDirectory(prefix="online-trader-diagnostic-") as temporary_directory:
+        staging = Path(temporary_directory)
+        files, streams, omitted, view_rows, workbench_expected = _collect_sources(
+            staging, runtime_root, request
+        )
+        member_hashes = {target: digest for _, target, _, digest in files}
+        dropped = sum(int(row.get("dropped_events") or 0) for row in streams)
+        write_failures = sum(int(row.get("write_failures") or 0) for row in streams)
+        valid_events = sum(int(row.get("selected_event_count") or 0) for row in streams)
+        valid_evidence = valid_events + len(view_rows)
+        capture_status = "COMPLETE_WITHIN_SCOPE"
+        if valid_evidence <= 0:
+            capture_status = "FAILED"
+        elif omitted or dropped or write_failures or any(not row.get("finalized") for row in streams):
+            capture_status = "PARTIAL"
+        if not request["clean_shutdown"]:
+            capture_status = "PARTIAL" if valid_evidence else "FAILED"
+        content_sha = hashlib.sha256(canonical_bytes(member_hashes)).hexdigest()
+        manifest = {
+            "schema_version": MANIFEST_SCHEMA,
+            "diagnostic_protocol": "1",
+            "report_id": request["report_id"],
+            "report_reason": request["report_reason"],
+            "trigger_key": request.get("trigger_key"),
+            "application_version": __version__,
+            "build_manifest_hash": _build_manifest_hash(runtime_root),
+            "coverage_start": min(
+                (row.get("created_at_utc") for row in streams if row.get("created_at_utc")),
+                default=request["requested_at_utc"],
+            ),
+            "coverage_end": request["requested_at_utc"],
+            "target_runtime_boot_id": request.get("runtime_boot_id"),
+            "expected_sources": request["expected_sources"] | {
+                "workbench_observed_by_runtime_view": workbench_expected,
+            },
+            "streams": streams,
+            "valid_event_count": valid_events,
+            "runtime_view_record_count": len(view_rows),
+            "dropped_events": dropped,
+            "write_failures": write_failures,
+            "missing_sources": omitted,
+            "snapshot_available": any(bool(row.get("snapshot_available")) for row in streams),
+            "clean_shutdown": bool(request["clean_shutdown"]),
+            "capture_status": capture_status,
+            "redaction_version": "1",
+            "bundle_sha256": content_sha,
+            "bundle_hash_scope": "EVIDENCE_MEMBERS_EXCLUDING_MANIFEST",
+            "members": member_hashes,
+        }
+        summary = {
+            "schema_version": "ONLINE_TRADER_DIAGNOSTIC_SUMMARY/1",
+            "report_id": request["report_id"],
+            "capture_status": capture_status,
+            "stream_count": len(streams),
+            "valid_event_count": valid_events,
+            "runtime_view_record_count": len(view_rows),
+            "known_omissions": omitted,
+        }
+        environment = {
+            "schema_version": "ONLINE_TRADER_DIAGNOSTIC_ENVIRONMENT/1",
+            "application_version": __version__,
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "platform": sys.platform,
+        }
+        bundles = diagnostics / "bundles"
+        bundles.mkdir(parents=True, exist_ok=True)
+        final = bundles / f"diagnostic-{request['report_id']}.zip"
+        temporary = final.with_suffix(".tmp")
+        with ZipFile(temporary, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
+            archive.writestr("manifest.json", canonical_bytes(manifest))
+            archive.writestr("summary.json", canonical_bytes(summary))
+            archive.writestr("environment.json", canonical_bytes(environment))
+            for source, target, _, _ in files:
+                archive.write(source, target)
+        os.replace(temporary, final)
+    archive_sha = _sha256(final)
+    publish_replace_bytes((archive_sha + "\n").encode("ascii"), final.with_suffix(".zip.sha256"))
+    return final, archive_sha, manifest
+
+
+def _finalized_directory(path: Path) -> bool:
+    health = _json_snapshot(path / "health.json")
+    return bool(health and not health.get("active") and health.get("finalized_at_utc"))
 
 
 def _retention_units(diagnostics: Path, keep: Path):
@@ -269,7 +565,8 @@ def _retention_units(diagnostics: Path, keep: Path):
     for group in ("runtime", "runtime-view", "workbench"):
         root = diagnostics / group
         if root.is_dir():
-            units.extend(path for path in root.iterdir() if path.is_dir())
+            units.extend(path for path in root.iterdir()
+                         if path.is_dir() and _finalized_directory(path))
     return sorted(units, key=lambda path: path.stat().st_mtime_ns)
 
 
@@ -279,31 +576,21 @@ def enforce_retention(diagnostics: Path, *, keep: Path):
         for unit in _retention_units(diagnostics, keep):
             if total <= _MAX_LOCAL_BYTES:
                 break
-            size = sum(path.stat().st_size for path in unit.rglob("*") if path.is_file()) if unit.is_dir() else unit.stat().st_size
+            size = (sum(path.stat().st_size for path in unit.rglob("*") if path.is_file())
+                    if unit.is_dir() else unit.stat().st_size)
             if unit.is_dir():
                 shutil.rmtree(unit)
             else:
                 unit.unlink()
+                unit.with_suffix(".zip.sha256").unlink(missing_ok=True)
             total = max(0, total - size)
     except OSError:
         pass
 
 
 def _append_result(diagnostics: Path, result: UploadResult):
-    path = diagnostics / "upload-results.ndjson"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    line = canonical_bytes(result.to_record() | {"observed_at_utc": utc_now()}) + b"\n"
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    try:
-        view = memoryview(line)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("diagnostic upload result write made no progress")
-            view = view[written:]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _append_line(diagnostics / "upload-results.ndjson",
+                 result.to_record() | {"observed_at_utc": utc_now()})
 
 
 def report(runtime_root, request_path) -> int:
@@ -313,51 +600,59 @@ def report(runtime_root, request_path) -> int:
     if not request_path.is_relative_to((diagnostics / "report-requests").resolve()):
         raise ValueError("diagnostic report request is outside the Runtime root")
     claimed = _claim(request_path)
-    request = _read_request(claimed)
-    # Let a concurrently closing Workbench finish its final segment without
-    # keeping the Runtime process alive.
-    time.sleep(0.75)
-    bundle, archive_sha, manifest = _write_bundle(root, request)
     try:
-        config = load_upload_config(root)
-        if config is None:
-            result = UploadResult(
-                status="LOCAL_ONLY",
-                backend="LOCAL",
-                host=None,
-                project_id=None,
-                report_id=request["report_id"],
-                bundle_file=bundle.name,
-                bundle_bytes=bundle.stat().st_size,
-                bundle_sha256=archive_sha,
-            )
-        else:
-            result = JiHuLabBackend(config).upload(
-                bundle, report_id=request["report_id"], bundle_sha256=archive_sha
-            )
+        request = _read_request(claimed)
+        time.sleep(0.75)
+        bundle, archive_sha, manifest = _write_bundle(root, request)
     except Exception as error:
-        result = failed_upload_result(
-            bundle=bundle,
-            report_id=request["report_id"],
-            bundle_sha256=archive_sha,
-            error=error,
-        )
+        _record_failure(diagnostics, report_id=claimed.stem, stage="BUNDLE", error=error)
+        try:
+            publish_replace_bytes(canonical_bytes({
+                "schema_version": "ONLINE_TRADER_DIAGNOSTIC_REPORT_FAILED/1",
+                "report_id": claimed.stem,
+                "stage": "BUNDLE",
+                "error_code": "E_DIAGNOSTIC_REPORTER",
+                "error_type": type(error).__name__,
+                "observed_at_utc": utc_now(),
+            }), claimed.with_suffix(".failed.json"))
+            claimed.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return 2
     try:
-        _append_result(diagnostics, result)
-    except OSError:
-        pass
-    completed = claimed.with_suffix(".done.json")
-    publish_replace_bytes(canonical_bytes({
-        **request,
-        "completed_at_utc": utc_now(),
-        "capture_status": manifest["capture_status"],
-        "bundle_file": bundle.name,
-        "bundle_sha256": archive_sha,
-        "upload": result.to_record(),
-    }), completed)
-    claimed.unlink(missing_ok=True)
-    enforce_retention(diagnostics, keep=bundle)
-    return 0 if result.status in {"UPLOADED", "LOCAL_ONLY"} else 2
+        try:
+            config = load_upload_config(root)
+            if config is None:
+                result = UploadResult(
+                    status="LOCAL_ONLY", backend="LOCAL", host=None, project_id=None,
+                    report_id=request["report_id"], bundle_file=bundle.name,
+                    bundle_bytes=bundle.stat().st_size, bundle_sha256=archive_sha,
+                )
+            else:
+                result = JiHuLabBackend(config).upload(
+                    bundle, report_id=request["report_id"], bundle_sha256=archive_sha
+                )
+        except Exception as error:
+            result = failed_upload_result(bundle=bundle, report_id=request["report_id"],
+                                          bundle_sha256=archive_sha, error=error)
+        try:
+            _append_result(diagnostics, result)
+        except OSError:
+            pass
+        publish_replace_bytes(canonical_bytes({
+            **request,
+            "completed_at_utc": utc_now(),
+            "capture_status": manifest["capture_status"],
+            "bundle_file": bundle.name,
+            "bundle_sha256": archive_sha,
+            "upload": result.to_record(),
+        }), claimed.with_suffix(".done.json"))
+        claimed.unlink(missing_ok=True)
+        enforce_retention(diagnostics, keep=bundle)
+        return 0 if result.status in {"UPLOADED", "LOCAL_ONLY"} else 2
+    except Exception as error:
+        _record_failure(diagnostics, report_id=request["report_id"], stage="COMPLETE", error=error)
+        return 2
 
 
 def main(argv=None):
@@ -367,7 +662,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         return report(args.runtime_root, args.request)
-    except Exception:
+    except Exception as error:
+        _record_failure(args.runtime_root.resolve() / "diagnostics",
+                        report_id=args.request.stem, stage="ENTRY", error=error)
         return 2
 
 

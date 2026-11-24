@@ -9,6 +9,8 @@ from pathlib import Path
 import time
 from uuid import uuid4
 
+from online_trader.configuration.baseline import load_confirmed_baseline
+from online_trader.configuration.dsv import DsvProfile
 from online_trader.transport.status_client import StatusClient
 from qa.e2e import assert_offline_qa_environment
 from qa.e2e.assembler import FrameAssembler
@@ -118,6 +120,36 @@ class BrokerFacade:
         return fact
 
 
+def build_multi_contract_profile_record(
+    contracts: list[str] | tuple[str, ...],
+    *,
+    max_quote_age_seconds: int | float = 0,
+    order_volume: int = 5,
+) -> dict[str, object]:
+    """Build a valid multi-contract DsvProfile record for QA E2E scenarios."""
+    settings = load_confirmed_baseline()[0].to_settings()
+    template = settings["symbols"][0]
+    settings["symbols"] = [
+        template | {
+            "code": code,
+            "open_offset": 40,
+            "stop_offset": 8,
+            "profit_offset": 20,
+            "order_volume": order_volume,
+        }
+        for code in contracts
+    ]
+    settings["trade"].update(
+        continuation_entry=False,
+        no_chase_after_act=False,
+        passive_entry_first=False,
+        protect_80_enabled=False,
+        trailing_activate_ratio=0,
+        max_quote_age_seconds=max_quote_age_seconds,
+    )
+    return DsvProfile.from_settings(settings).to_record()
+
+
 class TradingScenario:
     """Drives an isolated QA Owner process round-by-round against FakeMarket + FakeBroker."""
 
@@ -127,6 +159,7 @@ class TradingScenario:
         *,
         scenario_name: str,
         contract: str = CONTRACT,
+        contracts: list[str] | tuple[str, ...] | None = None,
         trading_day: str = DAY,
         initial_utc: str = f"{DAY}T01:09:50Z",
         session_open: str = f"{DAY}T01:00:00Z",
@@ -136,27 +169,38 @@ class TradingScenario:
         startup_timeout: float = 10.0,
         shutdown_timeout: float = 10.0,
         profile_record: dict[str, object] | None = None,
+        max_quote_age_seconds: int | float = 0,
         use_production_tick_wrapper: bool = False,
+        enable_market_diagnostics: bool = False,
     ) -> None:
         assert_offline_qa_environment(block_tqsdk=True)
         self.root = Path(root).resolve()
         self.scenario_name = scenario_name
         self.contract = contract
+        self.contracts = tuple(dict.fromkeys([contract, *(contracts or ())]))
         self.trading_day = trading_day
         self.run_id = f"e2e-{uuid4().hex[:12]}"
         self.process_dir = self.root / "owner-process"
         self.evidence_dir = self.root / "evidence"
+        effective_profile = profile_record
+        if effective_profile is None and (len(self.contracts) > 1 or max_quote_age_seconds):
+            effective_profile = build_multi_contract_profile_record(
+                self.contracts,
+                max_quote_age_seconds=max_quote_age_seconds,
+            )
         self.process = OfflineTargetOwnerProcess(
             self.process_dir,
             startup_timeout=startup_timeout,
             shutdown_timeout=shutdown_timeout,
-            profile_record=profile_record,
+            profile_record=effective_profile,
             trading_day=trading_day,
             use_production_tick_wrapper=use_production_tick_wrapper,
+            enable_market_diagnostics=enable_market_diagnostics,
         )
         self.clock = VirtualClock(initial_utc)
         self.market = FakeMarket(
             contract_id=contract,
+            contracts=self.contracts,
             trading_day=trading_day,
             session_open=session_open,
             session_close=session_close,
@@ -185,6 +229,7 @@ class TradingScenario:
         self._raw_broker = FakeBroker(
             account_key=self.process.account_key,
             contract=self.contract,
+            contracts=self.contracts,
             trading_day=self.trading_day,
             trace_path=self.evidence_dir / "broker-events.jsonl",
             run_id=self.run_id,
@@ -266,7 +311,7 @@ class TradingScenario:
         receipt = self.client.command(
             "PAUSE_NEW_ENTRIES",
             {"scope_type": "ACCOUNT", "scope_ids": []},
-            {"config_revision": config_rev},
+            {"cancel_owned_entry_remainders": False},
             command_id=cmd_id,
             expected_config_revision=config_rev,
         )
@@ -276,9 +321,9 @@ class TradingScenario:
         self.trace.record("COMMAND", operation="PAUSE_NEW_ENTRIES", command_id=cmd_id, receipt_status=receipt.get("status"))
         return receipt
 
-    def set_adapter_fault(self, *, fail_send: bool = False) -> dict[str, object]:
-        """Inject or clear ambiguous send failure in the QA adapter."""
-        return self.process.set_adapter_fault(fail_send=fail_send)
+    def set_adapter_fault(self, *, fail_send: bool = False, step_delay_ms: int | None = None) -> dict[str, object]:
+        """Inject or clear ambiguous send failure or step delay in the QA adapter."""
+        return self.process.set_adapter_fault(fail_send=fail_send, step_delay_ms=step_delay_ms)
 
     def inject_step_error(self, error_code: str, *, timeout: float = 5.0) -> dict[str, object]:
         """Inject one TraderError(error_code) into the next owner_tick via production execute_owner_tick."""
@@ -309,11 +354,15 @@ class TradingScenario:
         self,
         tick_spec: dict[str, object] | None = None,
         *,
+        ticks_by_contract: dict[str, dict[str, object]] | None = None,
         complete: bool = True,
         synchronized: bool | None = None,
         broker_order_snapshot_complete: bool | None = None,
         absent_orders: list[str] | None = None,
         health_reason: str | None = None,
+        sdk_pump_gap_ns: int | None = None,
+        sdk_updated: bool | None = None,
+        connection_complete: bool | None = None,
         on_round: Callable[[StepOutcome], None] | None = None,
     ) -> StepOutcome:
         """Execute one deterministic V3.1 round: clock -> market -> broker -> owner -> oracle."""
@@ -327,7 +376,7 @@ class TradingScenario:
             advance_seconds = int(spec.get("advance_seconds", 1))
             self.clock.advance(seconds=advance_seconds)
 
-        # 2. Update FakeMarket
+        # 2. Update FakeMarket (single-contract tick_spec and/or multi-contract ticks_by_contract)
         if "last" in spec or spec.get("drop_tick"):
             self.market.apply_tick(
                 wall_time=self.clock.now_utc,
@@ -342,6 +391,22 @@ class TradingScenario:
                 market_session_active=spec.get("market_session_active"),  # type: ignore[arg-type]
                 drop_tick=bool(spec.get("drop_tick", False)),
             )
+        if ticks_by_contract:
+            for code, item in ticks_by_contract.items():
+                self.market.apply_tick(
+                    wall_time=self.clock.now_utc,
+                    last=item.get("last"),
+                    contract_id=code,
+                    bid1=item.get("bid1"),
+                    ask1=item.get("ask1"),
+                    day_low=item.get("day_low"),
+                    day_high=item.get("day_high"),
+                    candle_id=item.get("candle_id"),  # type: ignore[arg-type]
+                    opening_session=item.get("opening_session"),  # type: ignore[arg-type]
+                    market_session_active=item.get("market_session_active"),  # type: ignore[arg-type]
+                    native_time=item.get("native_time"),  # type: ignore[arg-type]
+                    drop_tick=bool(item.get("drop_tick", False)),
+                )
 
         # 3 & 4. Snapshot pending FakeBroker facts and assemble FACT_FRAME
         frame = self.assembler.build(
@@ -350,6 +415,9 @@ class TradingScenario:
             broker_order_snapshot_complete=broker_order_snapshot_complete,
             absent_orders=absent_orders,
             health_reason=health_reason,
+            sdk_pump_gap_ns=sdk_pump_gap_ns,
+            sdk_updated=sdk_updated,
+            connection_complete=connection_complete,
         )
         frame_id = str(frame["id"])
         round_seq = int(frame["sequence"])
@@ -395,6 +463,7 @@ class TradingScenario:
                 workbench_view=wb,
                 round_seq=round_seq,
                 frame_id=frame_id,
+                outbound_events=outbound,
             )
         except OracleViolation as error:
             self._failure_record = {

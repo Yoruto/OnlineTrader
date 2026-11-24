@@ -69,7 +69,11 @@ def run_cli(args):
     if getattr(args, 'mode', 'strategy') != 'strategy':
         raise TraderError('E_ONLINE_SCOPE', 'Standalone target execution requires a strategy runtime scope')
     request = build_start_request(store, selected['account_id'], profile, arm=False, manual=False)
-    return run_session(store, selected, request, use_profile_file=args.use_profile_file)
+    return run_session(
+        store, selected, request,
+        use_profile_file=args.use_profile_file,
+        workbench_expected=bool(getattr(args, 'desktop_bootstrap', False)),
+    )
 
 
 def _history(args, ledger, account_key):
@@ -84,7 +88,7 @@ def _history(args, ledger, account_key):
                              limit=50 if args.limit is None else args.limit)
 
 
-def run_session(store, selected, request, *, use_profile_file=False):
+def run_session(store, selected, request, *, use_profile_file=False, workbench_expected=False):
     pipe = store.pipe_name(selected)
     directory = store.directory / 'desktop-starts' / request['request_id']
     request_path = publish_new_bytes(canonical_bytes(request), directory / 'request.json')
@@ -120,6 +124,18 @@ def run_session(store, selected, request, *, use_profile_file=False):
             'RUNTIME_STARTED', component='LIFECYCLE', priority='HIGH',
             payload={'entry_authority': 'DISARMED', 'execution_core': 'DSV_TARGET_EXECUTION'},
         )
+        def request_market_close_report(*, report_reason, trigger_key):
+            from online_trader.diagnostics.reporter import request_report_async
+            return request_report_async(
+                store.directory,
+                report_reason=report_reason,
+                runtime_boot_id=runtime_boot_id,
+                clean_shutdown=False,
+                runtime_process_instance_id=runtime_process_instance_id,
+                trigger_key=trigger_key,
+                runtime_view_expected=True,
+                workbench_expected=workbench_expected,
+            )
         process = None
         try:
             process = ViewProcess(pipe, selected['account_key'], store.directory, session.ledger,
@@ -133,7 +149,8 @@ def run_session(store, selected, request, *, use_profile_file=False):
                                              runtime_lock=runtime_lock,
                                              runtime_boot_id=session.boot_id,
                                              session_storage=session,
-                                             diagnostic_sink=diagnostics)
+                                             diagnostic_sink=diagnostics,
+                                             diagnostic_report_request=request_market_close_report)
         finally:
             if process is not None:
                 process.close()
@@ -159,6 +176,7 @@ def run_session(store, selected, request, *, use_profile_file=False):
                 runtime_boot_id=runtime_boot_id,
                 clean_shutdown=result == 0,
                 runtime_process_instance_id=runtime_process_instance_id,
+                workbench_expected=workbench_expected,
             )
             launch_reporter(store.directory, report_request)
         except Exception:

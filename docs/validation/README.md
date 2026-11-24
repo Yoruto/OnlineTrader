@@ -42,4 +42,16 @@
 
 C01来源为 `aa8bd35` 精简事件 `{id,result}`，不是仅缺发生时间。至少分别检查：精简SEND/CANCEL UNKNOWN有/无原请求、身份冲突、PR #1后有child但无at、当前完整字段、坏辅助事件后的有效决定/逐笔、读锁恢复和重开。展示修复不能改写 UNKNOWN、成交价量或订单责任。
 
+## PR4/PR5 离线仿真与统一证据入口（2026-11-24）
+
+通过 `scripts/test.ps1 -Profile <Profile>` 或 `.venv\Scripts\python.exe -X utf8 qa\test_runner.py --profile <Profile>` 可按风险选择离线验证集（每次运行均在 `output/tests/<run_id>/evidence-index.json` 产出 `ONLINE_TRADER_EVIDENCE_BUNDLE/1` 统一索引）：
+
+- `Unit`：全部 `T1` 纯逻辑/合同单元测试（不启工作台、不起子进程、零 PySide6 依赖，快速运行）。
+- `SimAll`：一键跑遍全部无头 Fake 行情/持仓仿真测试（含 `TradingE2E`、`FaultE2E` 断流/重连/泵阻塞、`timeline_001` 35 分钟加速多 K 线行情、`recovery` 强杀跨日、`StatefulE2E`）。
+- `SmokeE2E` / `TradingE2E` / `TradingExtended` / `DesktopE2E`：基于独立 QA Owner 子进程、`FakeBroker`、`FakeMarket`、`VirtualClock` 与 `ReferenceOracle` 的离线端到端仿真场景；其中 `DesktopE2E` 启动真实 Qt 工作台面板并校验面板操作与 Runtime/FakeBroker 一致性。
+- `FaultE2E`：多合约静默（`QUIET`）与全盘断流（`FEED_SUSPECTED_STALLED`）、断连重连同步恢复（`RECONNECTING` / `RESYNCHRONIZING`）、SDK 泵阻塞与 `TargetMarketDiagnostics` JSONL 核验、休市与后台投影隔离、命令幂等/冲突（`INV-011`）与客户端断线安全（`INV-012`）。
+- `StatefulE2E`：标准库确定性种子状态机探索、脚本轨迹回放与 `ReferenceOracle` 负向控制校验。
+- `ReleaseGate`：离线组合全量门禁（`FullOffline` 单测 + `SimAll` + `DesktopE2E`，不执行打包且不连接真实账户）。
+- `LivePreflight`：默认 fail-closed 返回 `NOT_RUN`（`NOT_RUN_REQUIRES_AUTHORIZATION`）；仅在显式传 `--authorize-live` 时执行真实预检脚本静态就绪核对，仍不直接发起交易连接。
+
 本次文档 PR 不关闭 C01。代码修复、合并状态及 Windows 复测见 [PR #2](https://github.com/Yoruto/OnlineTrader/pull/2)。部署时按实际 SHA重新核对，不能只见PR存在就标为已交付。

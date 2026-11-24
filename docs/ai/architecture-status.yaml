@@ -27,10 +27,10 @@ documents:
     verified_at_sha: WORKTREE
     evidence:
       design: REVIEWED_REVISED_AFTER_TARGET_OWNER_COLD_CUTOVER
-      source: PR1_RUNNER_MANIFEST_AND_PR2_HARNESS_IMPLEMENTED
-      tests: FULL_OFFLINE_1931_OF_1931_PASS
-      product_acceptance: NOT_APPLICABLE
-    notes: Affected fails closed to FullOffline until dependency mapping is independently justified; online and release profiles are not exposed by PR1. OFFLINE is manifest-only and no OS network sandbox is installed.
+      source: PR1_TO_PR5_OFFLINE_HARNESS_FAULT_AND_EVIDENCE_IMPLEMENTED
+      tests: SIM_ALL_16_OF_16_AND_DESKTOP_E2E_3_OF_3_PASS
+      product_acceptance: LIVE_AND_PACKAGED_NOT_RUN
+    notes: PR4 adds stdlib deterministic seeded StatefulFuzzRunner, trace replay, Oracle negative controls, disconnect/reconnect recovery, 35-min accelerated timeline, and multi-contract fault injection without third-party dependencies. PR5 adds ONLINE_TRADER_EVIDENCE_BUNDLE/1 (evidence-index.json), Unit (T1), SimAll, ReleaseGate, authorization-gated LivePreflight, synced qa/test_manifest.json (1974 cases in 134 modules), and removes hardcoded historical output path from qa/build_audit.py.
 
   - path: docs/refactor/testing-system-pr2-harness-20261121.md
     scope: testing/qa-only-standalone-owner-process-harness
@@ -38,10 +38,10 @@ documents:
     verified_at_sha: WORKTREE
     evidence:
       design: REVIEWED_PROCESS_AND_FACT_CHANNEL_CONTRACT
-      source: QA_OWNER_PROCESS_AND_FAKE_BROKER_IMPLEMENTED
-      tests: PROCESS_LIFECYCLE_AND_PUBLIC_PIPE_TESTS_PASS
+      source: QA_OWNER_PROCESS_AND_MULTI_CONTRACT_FAKE_BROKER_IMPLEMENTED
+      tests: TRADING_E2E_5_OF_5_AND_FAULT_E2E_4_OF_4_PASS
       product_acceptance: NOT_APPLICABLE
-    notes: Separate QA fact channel and product Named Pipe; parent Fake Broker is single-contract and flat-start only. OfflineTargetOwnerProcess lifecycle and public pipe control pass offline; multi-round trading scenarios and Windows package acceptance remain separate.
+    notes: Separate QA fact channel and product Named Pipe; FakeBroker supports multi-contract positions/facts (flat-start) and OfflineAdapter evaluates market_health per round. Active SimNow session and Windows package acceptance remain separate.
 
   - path: docs/refactor/runtime-workbench-current-20261120.md
     scope: standalone/workbench-current-overview
@@ -63,7 +63,7 @@ documents:
       source: STAGE0_PR1_PR2_PR3A_PR3B_IMPLEMENTED_ON_TQSDK_3_10_5
       tests: OFFLINE_1974_OF_1974_PASS_MIDDAY_SIMNOW_READONLY_RECONNECT_PASS
       product_acceptance: ACTIVE_SESSION_AND_PACKAGED_NOT_RUN
-    notes: Implements Stage 0 stale-recheck CommandBus/UI passthrough, PR1 non-blocking TargetMarketDiagnostics JSONL summary/anomaly black-box, PR2 off-thread workbench projection/bar formatting and 0.1s idle-round skipping, PR3-A centralized tqsdk 3.10.5 upgrade with bytecode/timeout hook tests, and PR3-B separate feed_health/symbol_health classification with max_quote_age_seconds=0 feed gate. PR4 multi-contract fake_broker injection, active trading-session tick telemetry, and packaged acceptance remain NOT_RUN.
+    notes: Implements Stage 0 stale-recheck CommandBus/UI passthrough, PR1 non-blocking TargetMarketDiagnostics JSONL summary/anomaly black-box, PR2 off-thread workbench projection/bar formatting and 0.1s idle-round skipping, PR3-A centralized tqsdk 3.10.5 upgrade with bytecode/timeout hook tests, PR3-B separate feed_health/symbol_health classification with max_quote_age_seconds=0 feed gate, and PR4 offline multi-contract fake_broker fault injection (FaultE2E 4/4 PASS). Active trading-session SimNow tick telemetry and packaged acceptance remain NOT_RUN.
 
   - path: docs/refactor/runtime-business-state-restart-continuity-adr-20261124.md
     scope: standalone/business-state-restart-continuity-adr
@@ -81,16 +81,16 @@ documents:
     status: CANDIDATE
     verified_at_sha: WORKTREE
     evidence:
-      design: USER_REQUESTED_IMPLEMENTATION_PLAN
-      source: IMPLEMENTED_CANDIDATE
-      tests: COMPILE_ONLY_FUNCTIONAL_NOT_RUN
+      design: USER_REVIEWED_SIMPLIFIED
+      source: IMPLEMENTED_REVISED_CANDIDATE
+      tests: SOURCE_COMPILE_PASS_FUNCTIONAL_NOT_RUN
       product_acceptance: NOT_RUN
-    notes: Implements a non-authoritative, best-effort Runtime and Workbench evidence system,
-      bounded per-process sinks, cutoff and detached Reporter lifecycle, diagnostic bundle
-      coverage semantics, developer Analyzer rules and vertical delivery phases. The user-authorized
-      single-recipient upload target is JiHuLab project 390001, with the third owner token delivered
-      directly in private/diagnostics-upload.json rather than extending strict runtime.json. Product,
-      connected upload and artifact acceptance remain NOT_RUN.
+    notes: Implements a non-authoritative, best-effort Runtime and Workbench evidence system with
+      process-local market-close triggering, event-level boot selection, safe active-file prefixes,
+      honest PARTIAL/FAILED coverage, finalized-directory retention, bounded per-stream pruning,
+      parsed runtime-view logs and explicit upload auth kinds. Legacy /1 private-token configuration
+      remains readable; new /2 delivery prefers a project deploy token. Product, connected upload,
+      functional tests and artifact acceptance remain NOT_RUN.
 
   - path: docs/refactor/desktop-lifecycle-user-flow-20261120.md
     scope: standalone/desktop-exit-and-tray-lifecycle

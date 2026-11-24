@@ -144,7 +144,8 @@ def _startup_record(run_directory):
 
 
 def _launch_owner(runtime_root, mode, account=None):
-    command = [*_cli_command(), 'runtime', 'run', '--root', str(runtime_root), '--mode', mode]
+    command = [*_cli_command(), 'runtime', 'run', '--root', str(runtime_root), '--mode', mode,
+               '--desktop-bootstrap']
     if account is not None:
         command.extend(('--account', account))
     logs = runtime_root / 'logs' / 'desktop-bootstrap'

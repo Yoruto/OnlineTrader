@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.dsv import DsvProfile
+from online_trader.dsv_runtime.market_health import evaluate_market_health
 from online_trader.dsv_runtime.owner_binding import StandaloneOwnerBinding
 from online_trader.dsv_runtime.runner import DsvSession
 from online_trader.dsv_runtime.standalone_owner import StandaloneDsvOwner
@@ -88,29 +89,103 @@ class OfflineConnection:
 class OfflineAdapter(RecordingPort):
     """Controller port plus the minimum owner-facing adapter contract."""
 
-    def __init__(self, frames):
+    def __init__(self, frames, *, profile: DsvProfile | None = None):
         super().__init__()
         self.frames = frames
+        self._profile = profile
+        self.contracts = (
+            [row["code"] for row in profile.to_record()["settings"]["symbols"]]
+            if profile is not None
+            else []
+        )
         self.connection = OfflineConnection()
         self.synchronized = False
         self.dispatch_market = {}
+        self._health = {}
+        self.market_health = None
+        self.metrics = {}
+        self._incomplete_count = 0
         self.grant = SimpleNamespace(value={'calendar_hash': 'qa-calendar'})
 
     def command(self, session, command):
         return session.command(command)
+
+    def _max_quote_age_seconds(self):
+        if self._profile is None:
+            return 0
+        return self._profile.to_record()["settings"]["trade"]["max_quote_age_seconds"]
 
     def step(self, session, *, trading_day, complete):
         try:
             current = self.frames.get_nowait()
         except Empty:
             return None
+        qa_inputs = current.pop("qa_market_health_inputs", None) or {}
+        clock_health = current.get("clock_health") or {}
+        self._health = dict(clock_health) if isinstance(clock_health, dict) else {}
+        gap_ns = qa_inputs.get("sdk_pump_gap_ns")
+        sdk_updated = qa_inputs.get("sdk_updated")
+        conn_complete = True if qa_inputs.get("connection_complete") is None else bool(qa_inputs["connection_complete"])
+        if gap_ns is not None:
+            self.metrics["sdk_pump_gap_ns"] = str(int(gap_ns))
+        if sdk_updated is not None:
+            self.metrics["sdk_updated"] = bool(sdk_updated)
+
         if not current.pop('complete'):
+            self._incomplete_count += 1
             self.synchronized = False
             session.disconnect('QA_INCOMPLETE_BROKER_BASELINE')
+            contracts = self.contracts or list(self.dispatch_market.keys())
+            if contracts:
+                self.market_health = evaluate_market_health(
+                    contracts,
+                    self.dispatch_market,
+                    clock_health=self._health,
+                    synchronized=False,
+                    connection_complete=False,
+                    sdk_pump_gap_ns=gap_ns,
+                    sdk_updated=sdk_updated,
+                    max_quote_age_seconds=self._max_quote_age_seconds(),
+                )
             return {'type': 'DISCONNECTED', 'synchronized': False}
+
+        expected_seq = session.snapshot()['sequence'] + 1
+        if self._incomplete_count and current.get('sequence') == expected_seq + self._incomplete_count:
+            current['sequence'] = expected_seq
+
         self.dispatch_market = {row['contract_id']: row for row in current.get('market', ())}
+        contracts = self.contracts or list(self.dispatch_market.keys())
+        max_age = self._max_quote_age_seconds()
+        if contracts:
+            pre_health = evaluate_market_health(
+                contracts,
+                self.dispatch_market,
+                clock_health=self._health,
+                synchronized=bool(current.get("synchronized")),
+                connection_complete=conn_complete,
+                sdk_pump_gap_ns=gap_ns,
+                sdk_updated=sdk_updated,
+                max_quote_age_seconds=max_age,
+                allow_single_contract_stall=True,
+            )
+            current["feed_health_status"] = pre_health["status"]
+            current["feed_entry_blocked"] = bool(pre_health["feed_entry_blocked"])
+
         result = session.apply_round(current)
-        self.synchronized = session.snapshot()['synchronized']
+        state = session.snapshot()
+        self.synchronized = state['synchronized']
+        if contracts:
+            self.market_health = evaluate_market_health(
+                contracts,
+                self.dispatch_market,
+                clock_health=self._health,
+                synchronized=bool(self.synchronized),
+                connection_complete=conn_complete,
+                sdk_pump_gap_ns=gap_ns,
+                sdk_updated=sdk_updated,
+                max_quote_age_seconds=max_age,
+                allow_single_contract_stall=True,
+            )
         return result
 
 

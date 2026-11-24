@@ -23,6 +23,7 @@ def _json(archive: ZipFile, name: str):
 def validate(path):
     errors = []
     gaps = []
+    selection_gaps = []
     streams = {}
     with ZipFile(path) as archive:
         names = archive.namelist()
@@ -36,6 +37,10 @@ def validate(path):
         if manifest.get("schema_version") != "ONLINE_TRADER_DIAGNOSTIC_MANIFEST/1":
             errors.append("UNSUPPORTED_MANIFEST")
         expected = manifest.get("members") or {}
+        stream_contracts = {
+            row.get("stream_id"): row for row in (manifest.get("streams") or [])
+            if isinstance(row, dict) and row.get("stream_id")
+        }
         for name, digest in expected.items():
             if name not in names:
                 errors.append(f"MISSING_MEMBER:{name}")
@@ -62,7 +67,13 @@ def validate(path):
                     errors.append(f"STREAM_CHANGED:{name}:{line_number}")
                 previous = last_by_stream.get(current_stream, 0)
                 if previous and sequence != previous + 1:
-                    gaps.append({"member": name, "after": previous, "next": sequence})
+                    gap = {"member": name, "after": previous, "next": sequence}
+                    contract = stream_contracts.get(current_stream) or {}
+                    if (contract.get("source_sequence_complete")
+                            and int(contract.get("excluded_event_count") or 0) > 0):
+                        selection_gaps.append(gap)
+                    else:
+                        gaps.append(gap)
                 last_by_stream[current_stream] = sequence
             if stream_id is not None:
                 streams[stream_id] = last_by_stream[stream_id]
@@ -75,6 +86,7 @@ def validate(path):
             "report_id": manifest.get("report_id"),
             "errors": errors,
             "sequence_gaps": gaps,
+            "selection_gaps": selection_gaps,
             "streams": streams,
         }
 
@@ -92,6 +104,7 @@ def main(argv=None):
             "coverage": "FAILED",
             "errors": [type(error).__name__],
             "sequence_gaps": [],
+            "selection_gaps": [],
             "streams": {},
         }
     print(json.dumps(result, ensure_ascii=False, indent=2))

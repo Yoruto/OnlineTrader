@@ -72,7 +72,7 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                      session_storage, runtime_lock, account_lock, clock,
                      trusted_control_pid, history_cache, arm=False,
                      configuration_revision='1', entry_point=None, configured_store=None,
-                     diagnostic_sink=None):
+                     diagnostic_sink=None, diagnostic_report_request=None):
     """Run the single target owner on the calling Runtime thread."""
     if grant.replacement or grant.manual_workbench:
         raise TraderError('E_ONLINE_SCOPE', 'Standalone target execution requires a strategy desktop scope')
@@ -198,9 +198,23 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             'last_history_capture': 0.0,
             'initial_start_pending': bool(arm),
             'initial_arm_generation': getattr(owner, 'authority_generation', 0),
+            'diagnostic_seen_active_day': None,
+            'diagnostic_reported_close_keys': set(),
+            'diagnostic_close_check_monotonic': 0.0,
+            'diagnostic_close_failure_recorded': False,
         }
 
         contracts = tuple(grant.value.get('contracts', ()))
+        close_schedule = {}
+        for row in calendar.to_record().get('contracts', ()):
+            code = row.get('contract_id')
+            if code not in contracts:
+                continue
+            for session in row.get('sessions', ()):
+                if session.get('force_close_at_end'):
+                    day = session.get('trading_day')
+                    close_schedule.setdefault(day, {})[code] = max(
+                        close_schedule.get(day, {}).get(code, ''), session.get('close_utc') or '')
 
         def current_trading_day(current_day=None, now=None):
             base_day = current_day or owner.snapshot().get('trading_day') or grant.value['trading_day']
@@ -223,6 +237,54 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                 loop_state=loop_state, market_diagnostics=market_diagnostics,
                 diagnostic_sink=diagnostic_sink,
             )
+            if diagnostic_report_request is None:
+                return
+            try:
+                check_at = time.monotonic()
+                if check_at - loop_state['diagnostic_close_check_monotonic'] < 1.0:
+                    return
+                loop_state['diagnostic_close_check_monotonic'] = check_at
+                now = clock.now()
+                now_utc = utc_text(now)
+                windows = [calendar.query(code, now_utc) for code in contracts]
+                if not windows or any(not window.get('complete') for window in windows):
+                    return
+                active_days = {
+                    (window.get('session') or {}).get('trading_day')
+                    for window in windows if window.get('is_trading')
+                }
+                active_days.discard(None)
+                if len(active_days) == 1:
+                    loop_state['diagnostic_seen_active_day'] = next(iter(active_days))
+                    return
+                if active_days:
+                    return
+                day = loop_state.get('diagnostic_seen_active_day')
+                closes = close_schedule.get(day) or {}
+                if (not day or set(closes) != set(contracts)
+                        or any(not close for close in closes.values())
+                        or now_utc < max(closes.values())):
+                    return
+                close_key = f'{binding.boot_id}:{day}:{calendar.content_hash}'
+                reported = loop_state['diagnostic_reported_close_keys']
+                if close_key in reported:
+                    return
+                reported.add(close_key)
+                if diagnostic_sink is not None:
+                    diagnostic_sink.record(
+                        'REPORT_CUT_REQUEST', component='LIFECYCLE', priority='HIGH',
+                        correlation={'trading_day': day},
+                        payload={'trigger': 'MARKET_CLOSE', 'calendar_hash': calendar.content_hash},
+                    )
+                diagnostic_report_request(report_reason='MARKET_CLOSE', trigger_key=close_key)
+            except Exception as error:
+                if diagnostic_sink is not None and not loop_state['diagnostic_close_failure_recorded']:
+                    loop_state['diagnostic_close_failure_recorded'] = True
+                    diagnostic_sink.record(
+                        'REPORT_CUT_FAILED', component='LIFECYCLE', severity='WARNING',
+                        priority='HIGH', error_code='E_DIAGNOSTIC_REPORTER',
+                        payload={'exception_type': type(error).__name__},
+                    )
 
         with attach_order_blocking_log(output), market_diagnostics:
             server.serve(stop_event=owner.stop_event, owner_tick=tick, publish_workbench=True)

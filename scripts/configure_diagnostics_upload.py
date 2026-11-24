@@ -28,22 +28,28 @@ def main(argv=None):
     parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--token-file", type=Path, required=True)
     parser.add_argument("--token-entry", type=int, default=3)
+    parser.add_argument(
+        "--auth-kind",
+        required=True,
+        choices=("deploy-token", "project-access-token", "personal-access-token"),
+        help="Token 类型；客户交付优先使用仅含 write_package_registry 的 deploy-token",
+    )
     args = parser.parse_args(argv)
     try:
         root = args.runtime_root.resolve()
         if not (root / "runtime.json").is_file():
             raise ValueError("runtime root is missing runtime.json")
         document = {
-            "schema_version": "ONLINE_TRADER_DIAGNOSTIC_UPLOAD/1",
+            "schema_version": "ONLINE_TRADER_DIAGNOSTIC_UPLOAD/2",
             "enabled": True,
             "backend": "JIHULAB_GENERIC_PACKAGE",
             "host": "jihulab.com",
             "project_id": 390001,
             "project_path": "Yoruto/online-trader-diagnostics",
             "package_name": "online-trader-diagnostics",
-            "private_token": _token(args.token_file, args.token_entry),
-            "connect_timeout_seconds": 5,
-            "upload_timeout_seconds": 20,
+            "auth_kind": args.auth_kind.replace("-", "_").upper(),
+            "token": _token(args.token_file, args.token_entry),
+            "request_timeout_seconds": 20,
         }
         path = root / "private" / "diagnostics-upload.json"
         path.parent.mkdir(parents=True, exist_ok=True)

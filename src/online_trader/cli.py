@@ -82,6 +82,7 @@ def main(argv=None):
         if name == 'run':
             command.add_argument('--mode', choices=('strategy',), default='strategy')
             command.add_argument('--use-profile-file', action='store_true', help='本次以明确选定的参数文件建立新范围')
+            command.add_argument('--desktop-bootstrap', action='store_true', help=argparse.SUPPRESS)
         if name == 'history':
             from online_trader.runtime.account_cache import SECTIONS
             command.add_argument('--before', help='上页输出的历史游标')

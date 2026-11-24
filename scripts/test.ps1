@@ -1,10 +1,11 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Quick', 'Affected', 'Trading', 'Runtime', 'FullOffline', 'SmokeE2E', 'TradingE2E', 'TradingExtended', 'DesktopE2E')]
+    [ValidateSet('Unit', 'Quick', 'Affected', 'Trading', 'Runtime', 'FullOffline', 'SmokeE2E', 'TradingE2E', 'TradingExtended', 'DesktopE2E', 'FaultE2E', 'StatefulE2E', 'SimAll', 'ReleaseGate', 'LivePreflight')]
     [string]$Profile,
     [switch]$ListOnly,
     [switch]$ShowIds,
-    [string]$BaseRef
+    [string]$BaseRef,
+    [switch]$AuthorizeLive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,6 +19,7 @@ $arguments = @('-X', 'utf8', (Join-Path $projectRoot 'qa\test_runner.py'), '--pr
 if ($ListOnly) { $arguments += '--list-only' }
 if ($ShowIds) { $arguments += '--show-ids' }
 if ($BaseRef) { $arguments += @('--base-ref', $BaseRef) }
+if ($AuthorizeLive) { $arguments += '--authorize-live' }
 
 Push-Location -LiteralPath $projectRoot
 try {

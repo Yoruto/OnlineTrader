@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
@@ -17,6 +18,13 @@ from online_trader.domain.values import decimal_text, decimal_value
 
 class FakeMarketError(ValueError):
     """Raised when market tick or contract state is invalid."""
+
+
+def _utc_dt(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.utcoffset() is None:
+        raise FakeMarketError(f"Market timestamp must carry UTC offset: {value!r}")
+    return parsed.astimezone(timezone.utc)
 
 
 def _canon_price(value: str | int | Decimal) -> str:
@@ -48,11 +56,14 @@ class ContractMarketState:
     ask1: str | None = None
     candle_id: str | None = "qa-bar-001"
     native_time: str | None = None
+    last_quote_wall_time: str | None = None
     available: str = "100000"
     margin_per_lot: str = "1000"
     multiplier: str = "10"
     drop_tick: bool = False
     external_orders: bool = False
+    age_quality_override: str | None = None
+    quote_reason_override: str | None = None
 
 
 class FakeMarket:
@@ -62,6 +73,7 @@ class FakeMarket:
         self,
         *,
         contract_id: str,
+        contracts: list[str] | tuple[str, ...] | None = None,
         trading_day: str,
         session_open: str,
         session_close: str,
@@ -74,9 +86,10 @@ class FakeMarket:
         margin_per_lot: str | int | Decimal = "1000",
         multiplier: str | int | Decimal = "10",
     ) -> None:
+        ordered = tuple(dict.fromkeys([contract_id, *(contracts or ())]))
         self._contracts: dict[str, ContractMarketState] = {
-            contract_id: ContractMarketState(
-                contract_id=contract_id,
+            code: ContractMarketState(
+                contract_id=code,
                 trading_day=trading_day,
                 session_open=session_open,
                 session_close=session_close,
@@ -89,9 +102,44 @@ class FakeMarket:
                 margin_per_lot=_canon_price(margin_per_lot),
                 multiplier=_canon_price(multiplier),
             )
+            for code in ordered
         }
         self._default_contract = contract_id
         self._history: list[dict[str, object]] = []
+
+    @property
+    def contracts(self) -> tuple[str, ...]:
+        return tuple(self._contracts.keys())
+
+    def set_session_state(
+        self,
+        contract_id: str | None = None,
+        *,
+        opening_session: bool | None = None,
+        market_session_active: bool | None = None,
+    ) -> None:
+        targets = [self._contracts[contract_id]] if contract_id else list(self._contracts.values())
+        for state in targets:
+            if opening_session is not None:
+                state.opening_session = bool(opening_session)
+            if market_session_active is not None:
+                state.market_session_active = bool(market_session_active)
+
+    def inject_quote_fault(
+        self,
+        contract_id: str,
+        *,
+        age_quality: str | None = None,
+        reason: str | None = None,
+        drop_tick: bool | None = None,
+    ) -> None:
+        state = self._contracts.get(contract_id)
+        if state is None:
+            raise FakeMarketError(f"Unknown market contract: {contract_id}")
+        state.age_quality_override = age_quality
+        state.quote_reason_override = reason
+        if drop_tick is not None:
+            state.drop_tick = bool(drop_tick)
 
     def apply_tick(
         self,
@@ -125,7 +173,8 @@ class FakeMarket:
         if candle_id is not None:
             state.candle_id = candle_id
         if drop_tick or last is None:
-            state.native_time = native_time or wall_time
+            if native_time is not None:
+                state.native_time = native_time
             self._history.append({
                 "contract_id": code,
                 "wall_time": wall_time,
@@ -140,6 +189,9 @@ class FakeMarket:
         state.bid1 = bid_text
         state.ask1 = ask_text
         state.native_time = native_time or wall_time
+        state.last_quote_wall_time = wall_time
+        state.age_quality_override = None
+        state.quote_reason_override = None
         self._history.append({
             "contract_id": code,
             "wall_time": wall_time,
@@ -152,8 +204,9 @@ class FakeMarket:
             "candle_id": state.candle_id,
         })
 
-    def snapshot(self) -> list[dict[str, object]]:
+    def snapshot(self, *, wall_time: str | None = None) -> list[dict[str, object]]:
         """Return market rows ready to be merged with FakeBroker position buckets."""
+        now_dt = _utc_dt(wall_time) if wall_time is not None else None
         rows: list[dict[str, object]] = []
         for state in self._contracts.values():
             ticks: list[dict[str, object]] = []
@@ -170,22 +223,41 @@ class FakeMarket:
                     "lower_limit": state.lower_limit,
                     "upper_limit": state.upper_limit,
                 })
-            rows.append({
+            source_age_ns: int | None = None
+            silence_ns: int | None = None
+            if now_dt is not None and state.last_quote_wall_time is not None and state.native_time is not None:
+                native_dt = _utc_dt(state.native_time)
+                quote_wall_dt = _utc_dt(state.last_quote_wall_time)
+                source_age_ns = max(0, int((now_dt - native_dt).total_seconds() * 1_000_000_000))
+                silence_ns = max(0, int((now_dt - quote_wall_dt).total_seconds() * 1_000_000_000))
+            elif ticks:
+                source_age_ns = 0
+                silence_ns = 0
+
+            obs: dict[str, object] = {
+                "age_quality": state.age_quality_override or "VALID",
+                "reason": state.quote_reason_override if state.quote_reason_override is not None else (None if ticks else "NO_TICK"),
+                "source_time_raw": state.native_time,
+            }
+            if source_age_ns is not None:
+                obs["source_age_raw_ns"] = str(source_age_ns)
+            if silence_ns is not None:
+                obs["silence_ns"] = str(silence_ns)
+
+            row: dict[str, object] = {
                 "contract_id": state.contract_id,
                 "ticks": ticks,
                 "opening_session": state.opening_session,
                 "session_open": state.session_open,
                 "session_close": state.session_close,
                 "market_session_active": state.market_session_active,
-                "quote_observation": {
-                    "age_quality": "VALID",
-                    "reason": None if ticks else "NO_TICK",
-                },
+                "quote_observation": obs,
                 "available": state.available,
                 "margin_per_lot": state.margin_per_lot,
                 "multiplier": state.multiplier,
                 "external_orders": state.external_orders,
-            })
+            }
+            rows.append(row)
         return rows
 
     @property

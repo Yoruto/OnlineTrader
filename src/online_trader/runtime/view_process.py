@@ -165,6 +165,7 @@ def _runtime_log_page(root, *, before=None, limit=100):
     pattern = re.compile(
         r'^(\S+) (?:SUPERVISOR )?('
         r'START pid=\d+|EXIT code=-?\d+ uptime_ms=\d+|START_FAILED error=[A-Za-z0-9_]+|'
+        r'VIEW_CLIENT pid=\d+ boot=[A-Za-z0-9._-]+|'
         r'COMMAND source=(?:WORKBENCH|OPERATOR) '
         r'(?:peer_pid=\d+ peer_sid=[A-Za-z0-9._-]+ actor_kind=[A-Z_]+ '
         r'actor=[A-Za-z0-9._-]+ account=[a-f0-9]{16} boot=[A-Za-z0-9._-]+ )?'
@@ -192,7 +193,7 @@ def _account_display(root, account_key):
         return None
 
 
-def _serve_peer(connection, history, history_page, day_history, runtime_log, stopped, slots):
+def _serve_peer(connection, history, history_page, day_history, runtime_log, root, stopped, slots):
     try:
         with connection:
             request = connection.recv(timeout=1)
@@ -215,6 +216,16 @@ def _serve_peer(connection, history, history_page, day_history, runtime_log, sto
                 return
             cursor = request['cursor']
             response = history.response(cursor)
+            boot = None
+            try:
+                boot = response['body']['view']['kernel_boot_id']
+            except (KeyError, TypeError):
+                pass
+            _supervisor_log(
+                root,
+                f'VIEW_CLIENT pid={max(0, connection.peer_pid or 0)} '
+                f'boot={_safe_log_token(boot)}',
+            )
             connection.send(response, timeout=.5)
             if request['kind'] == 'subscribe':
                 while not stopped.is_set():
@@ -371,7 +382,7 @@ def serve(pipe, account_key, root, ledger, history_cache):
                 Thread(target=read_account_owner, daemon=True).start()
                 Thread(target=_accept, args=(accounts, _serve_account, (current_account,), BoundedSemaphore(4), stopped),
                        daemon=True).start()
-            _accept(views, _serve_peer, (history, history_page, day_history, runtime_log, stopped),
+            _accept(views, _serve_peer, (history, history_page, day_history, runtime_log, root, stopped),
                     BoundedSemaphore(12), stopped)
     finally:
         stopped.set()

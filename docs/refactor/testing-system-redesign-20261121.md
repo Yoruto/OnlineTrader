@@ -1,7 +1,7 @@
 # OnlineTrader 测试体系重构设计 V2.0
 
-> 日期：2026-11-21  
-> 状态：**DESIGN / NOT IMPLEMENTED**  
+> 日期：2026-11-21（PR4/PR5 更新于 2026-11-24）  
+> 状态：**PR1–PR5 OFFLINE HARNESS / FAULT MATRIX / UNIFIED EVIDENCE IMPLEMENTED (LIVE & PACKAGED NOT_RUN)**  
 > 适用：Standalone Trading Runtime、DSV、Workbench、SimNow、Windows 发行  
 > 范围：重构测试组织、测试执行器、交易场景与证据；**本文不批准连接账户、真实发单、自动启用 CI、修改交易行为或发行制品**。  
 > 关联：[测试入口迁移](standalone-trading-runtime-test-migration-20261119.md) · [流水线与便携交付优化](testing-and-portable-delivery-pipeline-optimization-20261120.md) · [行情竞态 P0](runtime-market-race-entry-exit-remediation-20261120.md) · [验证证据规则](../validation/README.md)
@@ -382,4 +382,8 @@ PR1 报告记录完整 `candidate_commit`、含 tracked/modified/untracked 的 `
 - [ ] 将有风险的在线测试独立授权，默认所有非 Live Profile 禁止真实 SDK 连接和报单；
 - [ ] 最后才删除/归档不再使用的 Legacy 脚本，并保留必要历史证据索引。
 
-**设计状态：PR1 清单一致性校验与 Profile 仅列出检查已通过；PR2 独立 Owner 子进程与单合约 Fake Broker 状态模型已进入候选工作树。5 手/3+2/撤单/退出场景驱动、Oracle、强杀后恢复场景及独立行为验收仍未完成。48 项新场景、stateful/fault 与 Live/Release Profile 尚未实现。本次未执行功能用例。详见 [PR2 Harness 设计](testing-system-pr2-harness-20261121.md)。**
+**实施状态（2026-11-24 更新）：PR1–PR5 核心离线体系已落地候选工作树：**
+- **PR1–PR3**：`qa/test_runner.py`、`qa/test_registry.py`、`qa/target_owner/process_runtime.py`、`qa/e2e/`（`FakeMarket`、`VirtualClock`、`FrameAssembler`、`ReferenceOracle`、`TradingScenario`、`QADesktopHost`）及 `SmokeE2E` / `TradingE2E` / `TradingExtended` / `DesktopE2E`。
+- **PR4**：`FakeBroker` 与 `FakeMarket` / `FrameAssembler` / `ReferenceOracle` 已扩展支持多合约；新增标准库确定性种子状态机与轨迹重放（`qa/e2e/stateful.py`，零新增第三方包）、`FaultE2E`（4 个多合约静默/断流/泵间隙/`TargetMarketDiagnostics`/休市与投影减负/命令幂等与断线场景）与 `StatefulE2E`（确定性种子状态机回放 + Oracle 负向控制）。
+- **PR5**：新增 `qa/evidence_schema.py` 统一输出 `ONLINE_TRADER_EVIDENCE_BUNDLE/1`（`evidence-index.json`），`qa/test_runner.py` 与 `scripts/test.ps1` 增加 `Unit`、`FaultE2E`、`StatefulE2E`、`SimAll`、`ReleaseGate` 与 `--authorize-live` 门控的 `LivePreflight`，已同步 `qa/test_manifest.json`（134 模块 / 1,974 条用例），并消除 `qa/build_audit.py` 对历史 `output/artifacts/...` 的硬编码依赖。
+- **未宣称事项**：原设计提及的 48 项全量场景尚未逐条补齐，仅落地核心代表场景；`DesktopE2E`（3/3）与 `SimAll`（16/16，含 35 分钟加速与断连重连）已离线通过；全量 `Unit`/`FullOffline`/`ReleaseGate` 完整执行及真实 SimNow 活跃盘段、Windows 打包制品验收仍为 `NOT_RUN`。**

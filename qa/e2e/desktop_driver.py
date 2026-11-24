@@ -10,7 +10,7 @@ from typing import Any
 def _qt_workbench_main(pipe_name: str, control) -> None:
     """Subprocess hosting a real QApplication + WorkbenchWindow(runtime_view=True)."""
     from PySide6.QtCore import Qt, QTimer
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMessageBox, QSpinBox
     from online_trader.desktop.workbench import WorkbenchWindow
 
     app = QApplication.instance() or QApplication([])
@@ -22,42 +22,82 @@ def _qt_workbench_main(pipe_name: str, control) -> None:
     window.show()
     window.refresh()
 
+    def _table_rows(table) -> list[list[str]]:
+        if table is None:
+            return []
+        rows: list[list[str]] = []
+        for r in range(table.rowCount()):
+            if table.isRowHidden(r):
+                continue
+            rows.append([
+                table.item(r, c).text() if table.item(r, c) else ""
+                for c in range(table.columnCount())
+            ])
+        return rows
+
     def _read_ui_state() -> dict[str, Any]:
         tables = getattr(window.dashboard, "tables", {}) or {}
-        orders_rows: list[list[str]] = []
-        orders_table = tables.get("orders")
-        if orders_table is not None:
-            for r in range(orders_table.rowCount()):
-                orders_rows.append([
-                    orders_table.item(r, c).text() if orders_table.item(r, c) else ""
-                    for c in range(orders_table.columnCount())
-                ])
-        protection_rows: list[list[str]] = []
-        prot_table = tables.get("protection")
-        if prot_table is not None:
-            for r in range(prot_table.rowCount()):
-                protection_rows.append([
-                    prot_table.item(r, c).text() if prot_table.item(r, c) else ""
-                    for c in range(prot_table.columnCount())
-                ])
-        trades_rows: list[list[str]] = []
-        trades_table = tables.get("trades")
-        if trades_table is not None:
-            for r in range(trades_table.rowCount()):
-                trades_rows.append([
-                    trades_table.item(r, c).text() if trades_table.item(r, c) else ""
-                    for c in range(trades_table.columnCount())
-                ])
+        toolbar_texts = [
+            label.text() for _dot, label in getattr(window.dashboard, "toolbar_status", ())
+        ]
+        buttons = {"pause": window.pause_button.isEnabled()}
+        for name, btn in window.command_buttons.items():
+            buttons[name] = btn.isEnabled()
+        view = window.view or {}
         return {
             "visible": window.isVisible(),
             "title": window.windowTitle(),
             "status_text": window.status.text() if hasattr(window, "status") else "",
-            "orders_rows": orders_rows,
-            "protection_rows": protection_rows,
-            "trades_rows": trades_rows,
-            "view_boot_id": None if window.view is None else window.view.get("kernel_boot_id"),
-            "view_entry_authority": None if window.view is None else window.view.get("entry_authority"),
+            "notice_text": window.notice_label.text() if hasattr(window, "notice_label") else "",
+            "home_state": window.dashboard.home_state.text() if hasattr(window.dashboard, "home_state") else "",
+            "home_connection": window.dashboard.home_connection.text() if hasattr(window.dashboard, "home_connection") else "",
+            "toolbar_status": toolbar_texts,
+            "button_enabled": buttons,
+            "cycles_rows": _table_rows(getattr(window, "cycles", None)),
+            "markets_rows": _table_rows(tables.get("markets")),
+            "orders_rows": _table_rows(tables.get("orders")),
+            "protection_rows": _table_rows(tables.get("protection")),
+            "trades_rows": _table_rows(tables.get("trades")),
+            "blocks_rows": _table_rows(tables.get("blocks")),
+            "view_boot_id": view.get("kernel_boot_id"),
+            "view_entry_authority": view.get("entry_authority"),
+            "view_synchronized": (view.get("connection") or {}).get("synchronized"),
+            "view_owned_quantity": (view.get("current_responsibility") or {}).get("owned_quantity"),
         }
+
+    def _resolve_table(name: str):
+        if name == "cycles":
+            return window.cycles
+        return (getattr(window.dashboard, "tables", {}) or {}).get(name)
+
+    def _handle_modal(dialog_int: int | None, dialog_text: str | None, accept_msg: bool, attempts: list[int]) -> None:
+        modal = app.activeModalWidget()
+        if modal is None:
+            attempts[0] += 1
+            if attempts[0] < 40:
+                QTimer.singleShot(25, lambda: _handle_modal(dialog_int, dialog_text, accept_msg, attempts))
+            return
+        if isinstance(modal, QInputDialog):
+            if dialog_int is not None:
+                spin = modal.findChild(QSpinBox)
+                if spin is not None:
+                    spin.setValue(int(dialog_int))
+                else:
+                    modal.setIntValue(int(dialog_int))
+            if dialog_text is not None:
+                edit = modal.findChild(QLineEdit)
+                if edit is not None:
+                    edit.setText(str(dialog_text))
+                else:
+                    modal.setTextValue(str(dialog_text))
+            modal.accept()
+            return
+        if isinstance(modal, QMessageBox):
+            btn = modal.button(QMessageBox.Yes if accept_msg else QMessageBox.No)
+            if btn is not None:
+                btn.click()
+            else:
+                modal.accept()
 
     def _poll_commands() -> None:
         while control.poll(0):
@@ -74,16 +114,27 @@ def _qt_workbench_main(pipe_name: str, control) -> None:
                 elif action == "REFRESH":
                     window.refresh()
                     control.send({"id": req_id, "ok": True})
+                elif action == "SELECT_ROW":
+                    table_name = str(cmd["table"])
+                    row_idx = int(cmd.get("row", 0))
+                    table = _resolve_table(table_name)
+                    if table is None or row_idx < 0 or row_idx >= table.rowCount():
+                        control.send({"id": req_id, "ok": False, "error": f"Invalid row {row_idx} for table {table_name}"})
+                    else:
+                        table.selectRow(row_idx)
+                        control.send({"id": req_id, "ok": True})
                 elif action == "CLICK_BUTTON":
                     name = str(cmd["button"])
-                    if name == "pause":
-                        btn = window.pause_button
-                    else:
-                        btn = window.command_buttons[name]
+                    btn = window.pause_button if name == "pause" else window.command_buttons[name]
                     if not btn.isEnabled():
                         control.send({"id": req_id, "ok": False, "error": f"Button {name!r} is disabled"})
                     else:
-                        btn.click()
+                        if cmd.get("dialog_int") is not None or cmd.get("dialog_text") is not None or cmd.get("expect_modal"):
+                            d_int = cmd.get("dialog_int")
+                            d_txt = cmd.get("dialog_text")
+                            d_acc = bool(cmd.get("message_box_accept", True))
+                            QTimer.singleShot(25, lambda: _handle_modal(d_int, d_txt, d_acc, [0]))
+                        QTimer.singleShot(0, btn.click)
                         control.send({"id": req_id, "ok": True})
                 elif action == "CLOSE_TO_TRAY":
                     window._tray.set_enabled(True)
@@ -179,8 +230,26 @@ class DesktopWorkbenchDriver:
     def refresh(self) -> None:
         self._call("REFRESH")
 
-    def click_button(self, button: str) -> None:
-        self._call("CLICK_BUTTON", button=button)
+    def select_row(self, table: str, row: int = 0) -> None:
+        self._call("SELECT_ROW", table=table, row=int(row))
+
+    def click_button(
+        self,
+        button: str,
+        *,
+        dialog_int: int | None = None,
+        dialog_text: str | None = None,
+        expect_modal: bool = False,
+        message_box_accept: bool = True,
+    ) -> None:
+        self._call(
+            "CLICK_BUTTON",
+            button=button,
+            dialog_int=dialog_int,
+            dialog_text=dialog_text,
+            expect_modal=expect_modal,
+            message_box_accept=message_box_accept,
+        )
 
     def close_to_tray(self) -> tuple[bool, bool]:
         reply = self._call("CLOSE_TO_TRAY")

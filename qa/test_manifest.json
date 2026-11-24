@@ -4757,6 +4757,8 @@
         "TargetOwnerRuntimeTests.test_flatten_then_stop_waits_for_original_child_terminal_fact",
         "TargetOwnerRuntimeTests.test_history_cache_failure_does_not_change_target_authority",
         "TargetOwnerRuntimeTests.test_incomplete_baseline_stays_disarmed_then_complete_frame_enables_controls",
+        "TargetOwnerRuntimeTests.test_live_save_dsv_parameters_persist_failure_leaves_runtime_unchanged",
+        "TargetOwnerRuntimeTests.test_live_save_dsv_parameters_rejects_open_position",
         "TargetOwnerRuntimeTests.test_live_save_dsv_parameters_updates_revision_triggers_and_preserves_scope",
         "TargetOwnerRuntimeTests.test_manual_close_all_requires_and_verifies_per_cycle_target_revisions",
         "TargetOwnerRuntimeTests.test_manual_close_requires_and_verifies_expected_target_revision",
@@ -4798,6 +4800,16 @@
           ]
         },
         "TargetOwnerRuntimeTests.test_incomplete_baseline_stays_disarmed_then_complete_frame_enables_controls": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "TargetOwnerRuntimeTests.test_live_save_dsv_parameters_persist_failure_leaves_runtime_unchanged": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "TargetOwnerRuntimeTests.test_live_save_dsv_parameters_rejects_open_position": {
           "platform": [
             "Windows"
           ]
@@ -4971,6 +4983,7 @@
         "UpdateInstallTests.test_jihulab_source_client_and_redirect_token_isolation",
         "UpdateInstallTests.test_payload_guard_blocks_standalone_execution_and_allows_offline_smoke",
         "UpdateInstallTests.test_process_or_account_lock_defers_update",
+        "UpdateInstallTests.test_publish_gitlab_update_uses_publish_token_when_read_token_absent",
         "UpdateInstallTests.test_verified_update_preserves_portable_program_and_preferences"
       ],
       "case_overrides": {}

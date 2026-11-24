@@ -38,6 +38,7 @@ class ExpectedAccountState:
     long_historical: int = 0
     short_today: int = 0
     short_historical: int = 0
+    positions_by_contract: dict[str, dict[str, int]] = field(default_factory=dict)
     orders: dict[str, dict[str, object]] = field(default_factory=dict)
     trades: dict[str, dict[str, object]] = field(default_factory=dict)
     effective_targets: dict[str, dict[str, object]] = field(default_factory=dict)
@@ -96,6 +97,9 @@ class ReferenceOracle:
 
     def derive_state(self, broker_snapshot: dict[str, object]) -> ExpectedAccountState:
         positions = broker_snapshot["positions"]
+        positions_by_contract = broker_snapshot.get("positions_by_contract") or {
+            str(broker_snapshot["contract_id"]): positions
+        }
         orders = broker_snapshot["orders"]
         trades = broker_snapshot["trades"]
         pending_open: dict[str, int] = {}
@@ -118,12 +122,14 @@ class ReferenceOracle:
             long_historical=int(positions["long_historical"]),
             short_today=int(positions["short_today"]),
             short_historical=int(positions["short_historical"]),
+            positions_by_contract=deepcopy(positions_by_contract),
             orders=deepcopy(orders),
             trades=deepcopy(trades),
             effective_targets=deepcopy(self.expected_targets),
             pending_open_quantity=pending_open,
             pending_close_quantity=pending_close,
             exit_responsibilities=deepcopy(self.exit_active),
+            unowned_positions=deepcopy(self.expected_unowned_positions),
             entry_authority=self.expected_entry_authority or "DISARMED",
             configuration_revision=self.expected_config_revision or "1",
             runtime_boot_id=self.expected_boot_id,
@@ -136,16 +142,14 @@ class ReferenceOracle:
         workbench_view: dict[str, object],
         round_seq: int,
         frame_id: str | None,
+        outbound_events: list[dict[str, object]] | None = None,
     ) -> ExpectedAccountState:
         """Verify INV-001..INV-015 invariants on the current round."""
         state = self.derive_state(broker_snapshot)
-        contract = str(broker_snapshot["contract_id"])
-        broker_pos = broker_snapshot["positions"]
-        broker_long = int(broker_pos["long_qty"])
-        broker_short = int(broker_pos["short_qty"])
-        broker_net = broker_long + broker_short
+        contracts = tuple(broker_snapshot.get("contracts") or (str(broker_snapshot["contract_id"]),))
+        positions_by_contract = state.positions_by_contract
 
-        # 1. Boot & configuration identity checks
+        # 1. Boot & configuration identity checks (INV-009)
         if self.expected_boot_id is not None and workbench_view.get("kernel_boot_id") != self.expected_boot_id:
             raise OracleViolation(
                 "INV-009",
@@ -155,41 +159,71 @@ class ReferenceOracle:
                 frame_id=frame_id,
             )
 
-        # 2. Capacity & duplicate/UNKNOWN/cancel-in-flight checks (INV-001, INV-002, INV-003, INV-005)
-        open_orders = [
-            o for o in state.orders.values()
-            if o["request"]["native_offset"] == "OPEN" and o["status"] in {"SEND_REQUESTED", "ALIVE"}
-        ]
-        unknown_open = [o for o in open_orders if o["status"] == "SEND_REQUESTED"]
-        cancelling_open = [o for o in open_orders if o["cancel_effect_ids"] and o["status"] == "ALIVE"]
+        # 1b. INV-010: No new OPEN order permitted under clock fault or blocked feed health
+        if outbound_events:
+            conn = workbench_view.get("connection") or {}
+            market_health = ((workbench_view.get("configuration") or {}).get("market_health") or {})
+            if conn.get("clock_fault") or market_health.get("feed_entry_blocked"):
+                open_sends = [
+                    ev for ev in outbound_events
+                    if ev.get("event_type") == "OUTBOUND_SEND"
+                    and (ev.get("request") or {}).get("native_offset") == "OPEN"
+                ]
+                if open_sends:
+                    raise OracleViolation(
+                        "INV-010",
+                        "New OPEN order emitted while clock_fault or feed_entry_blocked was active",
+                        round_seq=round_seq,
+                        frame_id=frame_id,
+                        details={
+                            "clock_fault": conn.get("clock_fault"),
+                            "feed_status": market_health.get("status"),
+                            "open_sends": [ev.get("request") for ev in open_sends],
+                        },
+                    )
 
-        target_spec = self.expected_targets.get(contract)
-        if target_spec is not None:
-            direction = target_spec["direction"]
-            target_qty = int(target_spec["quantity"])
-            broker_owned = broker_long if direction == "LONG" else broker_short
-            pending_open_qty = state.pending_open_quantity.get(contract, 0)
-            potential_total = broker_owned + pending_open_qty
-            if potential_total > target_qty:
-                inv_id = (
-                    "INV-002" if unknown_open else
-                    "INV-003" if cancelling_open else
-                    "INV-001" if len(open_orders) > 1 else
-                    "INV-005"
-                )
-                raise OracleViolation(
-                    inv_id,
-                    f"Potential open exposure {potential_total} (owned={broker_owned} + "
-                    f"pending_open={pending_open_qty}) exceeds target {target_qty}",
-                    round_seq=round_seq,
-                    frame_id=frame_id,
-                    details={
-                        "broker_owned": broker_owned,
-                        "pending_open": pending_open_qty,
-                        "target_qty": target_qty,
-                        "open_orders": [o["request"]["child_order_id"] for o in open_orders],
-                    },
-                )
+        # 2. Capacity & duplicate/UNKNOWN/cancel-in-flight checks per contract (INV-001, INV-002, INV-003, INV-005)
+        for contract in contracts:
+            broker_pos = positions_by_contract.get(contract) or broker_snapshot["positions"]
+            broker_long = int(broker_pos["long_qty"])
+            broker_short = int(broker_pos["short_qty"])
+            open_orders = [
+                o for o in state.orders.values()
+                if o["request"]["contract_id"] == contract
+                and o["request"]["native_offset"] == "OPEN"
+                and o["status"] in {"SEND_REQUESTED", "ALIVE"}
+            ]
+            unknown_open = [o for o in open_orders if o["status"] == "SEND_REQUESTED"]
+            cancelling_open = [o for o in open_orders if o["cancel_effect_ids"] and o["status"] == "ALIVE"]
+
+            target_spec = self.expected_targets.get(contract)
+            if target_spec is not None:
+                direction = target_spec["direction"]
+                target_qty = int(target_spec["quantity"])
+                broker_owned = broker_long if direction == "LONG" else broker_short
+                pending_open_qty = state.pending_open_quantity.get(contract, 0)
+                potential_total = broker_owned + pending_open_qty
+                if potential_total > target_qty:
+                    inv_id = (
+                        "INV-002" if unknown_open else
+                        "INV-003" if cancelling_open else
+                        "INV-001" if len(open_orders) > 1 else
+                        "INV-005"
+                    )
+                    raise OracleViolation(
+                        inv_id,
+                        f"[{contract}] Potential open exposure {potential_total} (owned={broker_owned} + "
+                        f"pending_open={pending_open_qty}) exceeds target {target_qty}",
+                        round_seq=round_seq,
+                        frame_id=frame_id,
+                        details={
+                            "contract_id": contract,
+                            "broker_owned": broker_owned,
+                            "pending_open": pending_open_qty,
+                            "target_qty": target_qty,
+                            "open_orders": [o["request"]["child_order_id"] for o in open_orders],
+                        },
+                    )
 
         # 3. INV-004: Trade deduplication in Runtime projection
         runtime_trades = workbench_view.get("trades") or []
@@ -209,18 +243,21 @@ class ReferenceOracle:
         # 4. INV-015: Only enforce strict Broker <-> Runtime convergence when no facts are pending
         pending_fact_count = int(broker_snapshot.get("pending_fact_count", 0))
         if pending_fact_count == 0:
-            unowned = self.expected_unowned_positions.get(contract) or {}
-            expected_unowned_net = int(unowned.get("long_qty", 0)) + int(unowned.get("short_qty", 0))
-            expected_owned_net = max(0, broker_net - expected_unowned_net)
+            expected_total_owned = 0
+            for contract in contracts:
+                broker_pos = positions_by_contract.get(contract) or broker_snapshot["positions"]
+                broker_net = int(broker_pos["long_qty"]) + int(broker_pos["short_qty"])
+                unowned = self.expected_unowned_positions.get(contract) or {}
+                expected_unowned_net = int(unowned.get("long_qty", 0)) + int(unowned.get("short_qty", 0))
+                expected_total_owned += max(0, broker_net - expected_unowned_net)
             runtime_owned = int((workbench_view.get("current_responsibility") or {}).get("owned_quantity", 0))
-            if runtime_owned != expected_owned_net:
+            if runtime_owned != expected_total_owned:
                 raise OracleViolation(
                     "INV-015",
-                    f"Runtime owned_quantity={runtime_owned} disagrees with expected owned={expected_owned_net} "
-                    f"(broker_net={broker_net}, unowned={expected_unowned_net})",
+                    f"Runtime owned_quantity={runtime_owned} disagrees with expected owned={expected_total_owned}",
                     round_seq=round_seq,
                     frame_id=frame_id,
-                    details={"runtime_owned": runtime_owned, "broker_positions": broker_pos},
+                    details={"runtime_owned": runtime_owned, "positions_by_contract": positions_by_contract},
                 )
 
             broker_active_ids = set(broker_snapshot["active_children"])
@@ -257,27 +294,30 @@ class ReferenceOracle:
                 )
 
             # INV-006 / INV-007: Exit responsibility cannot disappear while Broker still holds position
-            exit_spec = self.exit_active.get(contract)
-            if exit_spec is not None and broker_net > int(exit_spec["exit_target"]):
-                cycles = [
-                    c for c in (workbench_view.get("cycles") or [])
-                    if c.get("contract_id") == contract
-                ]
-                if not cycles:
-                    raise OracleViolation(
-                        "INV-006",
-                        f"Exit responsibility disappeared while Broker still holds {broker_net} lots",
-                        round_seq=round_seq,
-                        frame_id=frame_id,
-                    )
-                target_rem = cycles[0].get("target_remaining_quantity")
-                if target_rem is None or int(target_rem) > int(exit_spec["exit_target"]):
-                    raise OracleViolation(
-                        "INV-007",
-                        f"Cycle target_remaining_quantity={target_rem} failed to preserve "
-                        f"exit target {exit_spec['exit_target']}",
-                        round_seq=round_seq,
-                        frame_id=frame_id,
-                    )
+            for contract in contracts:
+                broker_pos = positions_by_contract.get(contract) or broker_snapshot["positions"]
+                broker_net = int(broker_pos["long_qty"]) + int(broker_pos["short_qty"])
+                exit_spec = self.exit_active.get(contract)
+                if exit_spec is not None and broker_net > int(exit_spec["exit_target"]):
+                    cycles = [
+                        c for c in (workbench_view.get("cycles") or [])
+                        if c.get("contract_id") == contract
+                    ]
+                    if not cycles:
+                        raise OracleViolation(
+                            "INV-006",
+                            f"[{contract}] Exit responsibility disappeared while Broker still holds {broker_net} lots",
+                            round_seq=round_seq,
+                            frame_id=frame_id,
+                        )
+                    target_rem = cycles[0].get("target_remaining_quantity")
+                    if target_rem is None or int(target_rem) > int(exit_spec["exit_target"]):
+                        raise OracleViolation(
+                            "INV-007",
+                            f"[{contract}] Cycle target_remaining_quantity={target_rem} failed to preserve "
+                            f"exit target {exit_spec['exit_target']}",
+                            round_seq=round_seq,
+                            frame_id=frame_id,
+                        )
 
         return state

@@ -26,6 +26,7 @@ from online_trader.configuration.dsv import DsvProfile
 from online_trader.dsv_runtime.owner_binding import StandaloneOwnerBinding
 from online_trader.dsv_runtime.runner import DsvSession
 from online_trader.dsv_runtime.standalone_owner import StandaloneDsvOwner
+from online_trader.dsv_runtime.target_diagnostics import TargetMarketDiagnostics
 from online_trader.errors import TraderError
 from online_trader.kernel.server import ControlServer
 from online_trader.runtime.owner_tick import execute_owner_tick
@@ -78,12 +79,17 @@ class _ObservedFrames(Queue):
 
 
 class _ObservedAdapter(OfflineAdapter):
-    def __init__(self, frames: _ObservedFrames, emit: Callable[..., None]):
-        super().__init__(frames)
+    def __init__(self, frames: _ObservedFrames, emit: Callable[..., None], *, profile: DsvProfile | None = None):
+        super().__init__(frames, profile=profile)
         self._emit = emit
         self.next_step_error_code: str | None = None
+        self.next_step_delay_ms: int = 0
 
     def step(self, session, *, trading_day, complete):
+        if self.next_step_delay_ms > 0:
+            delay_ms = self.next_step_delay_ms
+            self.next_step_delay_ms = 0
+            time.sleep(delay_ms / 1000.0)
         if self.next_step_error_code is not None:
             code = self.next_step_error_code
             self.next_step_error_code = None
@@ -121,6 +127,7 @@ def _owner_process_main(
     profile_record: dict[str, object] | None = None,
     trading_day: str = DAY,
     use_production_tick_wrapper: bool = False,
+    enable_market_diagnostics: bool = False,
 ) -> None:
     """Spawn target. All owner construction and calls stay on this process thread."""
     event_seq = 0
@@ -161,8 +168,13 @@ def _owner_process_main(
         with RuntimeSessionStorage() as storage:
             boot_id, ledger = storage.boot_id, storage.ledger
             binding = StandaloneOwnerBinding(boot_id, account, "OFFLINE", object(), object())
-            adapter = _ObservedAdapter(frames, emit)
+            adapter = _ObservedAdapter(frames, emit, profile=settings)
             connection = adapter.connection
+            market_diagnostics = (
+                TargetMarketDiagnostics(runtime_root, boot_id=boot_id, sdk_version="QA-OFFLINE")
+                if enable_market_diagnostics
+                else None
+            )
             session = DsvSession(
                 storage.ledger, account_key=account, provider="OFFLINE",
                 trading_day=trading_day, profile=settings, port=adapter,
@@ -223,10 +235,13 @@ def _owner_process_main(
                         adapter.fail_send = bool(message.get("fail_send", False))
                         if "next_step_error_code" in message:
                             adapter.next_step_error_code = message.get("next_step_error_code")
+                        if "step_delay_ms" in message:
+                            adapter.next_step_delay_ms = max(0, int(message.get("step_delay_ms") or 0))
                         emit(
                             "ADAPTER_FAULT_UPDATED",
                             fail_send=adapter.fail_send,
                             next_step_error_code=adapter.next_step_error_code,
+                            step_delay_ms=adapter.next_step_delay_ms,
                         )
                         continue
                     if kind != "FACT_FRAME":
@@ -274,6 +289,7 @@ def _owner_process_main(
                         status_path=status_path,
                         diagnostics_path=diagnostics_path,
                         loop_state=loop_state,
+                        market_diagnostics=market_diagnostics,
                         sleep_fn=lambda _s: None,
                     )
                     if diagnostics_path.is_file():
@@ -296,6 +312,8 @@ def _owner_process_main(
                              publish_workbench=False)
                 shutdown = owner.session.prepare_shutdown()
             finally:
+                if market_diagnostics is not None:
+                    market_diagnostics.close()
                 owner.close()
                 owner = None
 
@@ -331,7 +349,8 @@ class OfflineTargetOwnerProcess:
                  shutdown_timeout: float = 10.0,
                  profile_record: dict[str, object] | None = None,
                  trading_day: str = DAY,
-                 use_production_tick_wrapper: bool = False):
+                 use_production_tick_wrapper: bool = False,
+                 enable_market_diagnostics: bool = False):
         self.root = Path(root).resolve()
         self.runtime_root = self.root / "runtime-temp"
         self.pipe = "online-trader-target-process-qa-" + uuid4().hex
@@ -341,6 +360,7 @@ class OfflineTargetOwnerProcess:
         self.profile_record = deepcopy(profile_record) if profile_record is not None else None
         self.trading_day = trading_day
         self.use_production_tick_wrapper = bool(use_production_tick_wrapper)
+        self.enable_market_diagnostics = bool(enable_market_diagnostics)
         self.boot_id = None
         self.account_key = None
         self.owner_pid = None
@@ -401,6 +421,7 @@ class OfflineTargetOwnerProcess:
                 self.profile_record,
                 self.trading_day,
                 self.use_production_tick_wrapper,
+                self.enable_market_diagnostics,
             ),
             daemon=True,
         )
@@ -522,6 +543,7 @@ class OfflineTargetOwnerProcess:
         *,
         fail_send: bool = False,
         next_step_error_code: str | None = None,
+        step_delay_ms: int | None = None,
         timeout: float = 5.0,
     ) -> dict[str, object]:
         if not self.is_alive or self._control is None:
@@ -530,6 +552,8 @@ class OfflineTargetOwnerProcess:
         payload: dict[str, object] = {"type": "SET_ADAPTER_FAULT", "fail_send": bool(fail_send)}
         if next_step_error_code is not None:
             payload["next_step_error_code"] = next_step_error_code
+        if step_delay_ms is not None:
+            payload["step_delay_ms"] = int(step_delay_ms)
         with self._input_lock:
             with self._send_lock:
                 self._control.send(payload)
