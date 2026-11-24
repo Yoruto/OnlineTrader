@@ -12,8 +12,9 @@ from online_trader import __version__
 
 def console_main(argv):
     if argv[:1] == ['--verify-runtime']:
+        from online_trader.runtime.startup_metadata import SDK_VERSION
         try:
-            return 0 if argv[1:] == [__version__] and version('tqsdk') == '3.10.4' else 2
+            return 0 if argv[1:] == [__version__] and version('tqsdk') == SDK_VERSION else 2
         except PackageNotFoundError:
             return 2
     if argv[:1] == ['--strategy-worker']:

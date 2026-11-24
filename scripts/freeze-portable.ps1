@@ -12,7 +12,7 @@ $interpreter = (Resolve-Path -LiteralPath $Python).Path
 $destination = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
 if (Test-Path -LiteralPath $destination) { throw 'Choose a new base-bundle output directory.' }
 
-& $interpreter -I -c "import importlib.metadata as m,struct,sys; assert sys.platform=='win32' and sys.version_info[:2]==(3,13) and struct.calcsize('P')==8; assert all(m.version(name)==value for name,value in {'pyinstaller':'6.22.3','PySide6':'6.8.2.1','tqsdk':'3.10.4','jsonschema':'4.26.0','referencing':'0.37.0'}.items())"
+& $interpreter -I -c "import importlib.metadata as m,struct,sys; assert sys.platform=='win32' and sys.version_info[:2]==(3,13) and struct.calcsize('P')==8; assert all(m.version(name)==value for name,value in {'pyinstaller':'6.22.3','PySide6':'6.8.2.1','tqsdk':'3.10.5','jsonschema':'4.26.0','referencing':'0.37.0'}.items())"
 if ($LASTEXITCODE -ne 0) { throw 'The portable build needs the documented Windows x64 build environment.' }
 
 $cacheRoot = Join-Path $project 'output/build-cache/pyinstaller'

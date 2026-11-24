@@ -40,7 +40,7 @@ SILVER = re.compile(r"(?<![A-Za-z0-9])SHFE\.ag[0-9]*(?![A-Za-z0-9])", re.IGNOREC
 REQUIRED_TOOLCHAIN = {
     "pyinstaller": "6.22.3",
     "PySide6": "6.8.2.1",
-    "tqsdk": "3.10.4",
+    "tqsdk": "3.10.5",
     "jsonschema": "4.26.0",
     "referencing": "0.37.0",
 }
@@ -83,16 +83,26 @@ print(json.dumps({
 """.strip()
 
 
-def source_version(root: Path) -> str:
-    module = root / "src" / "online_trader" / "__init__.py"
+def _literal_assignment(module: Path, name: str) -> str:
     parsed = ast.parse(module.read_text(encoding="utf-8"), filename=str(module))
     for statement in parsed.body:
         if isinstance(statement, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "__version__" for target in statement.targets
+            isinstance(target, ast.Name) and target.id == name for target in statement.targets
         ):
             if isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str):
                 return statement.value.value
-    raise ValueError("src/online_trader/__init__.py has no literal __version__ assignment")
+    raise ValueError(f"{module} has no literal {name} assignment")
+
+
+def source_version(root: Path) -> str:
+    return _literal_assignment(root / "src" / "online_trader" / "__init__.py", "__version__")
+
+
+def source_sdk_version(root: Path) -> str:
+    return _literal_assignment(
+        root / "src" / "online_trader" / "runtime" / "startup_metadata.py",
+        "SDK_VERSION",
+    )
 
 
 def _validate_config_with_product_parser(directory: Path, source_root: Path) -> dict[str, object]:
@@ -192,6 +202,13 @@ def main() -> int:
         actual = source_version(root)
         if declared != actual:
             raise ValueError(f"Version mismatch: pyproject={declared}, source={actual}")
+        sdk_declared = source_sdk_version(root)
+        expected_sdk = REQUIRED_TOOLCHAIN["tqsdk"]
+        simulation_deps = project.get("project", {}).get("optional-dependencies", {}).get("simulation", [])
+        if sdk_declared != expected_sdk or f"tqsdk=={expected_sdk}" not in simulation_deps:
+            raise ValueError(
+                f"SDK pin mismatch: preflight={expected_sdk}, source={sdk_declared}, simulation={simulation_deps}"
+            )
         if sys.platform != "win32" or sys.version_info[:2] != (3, 13) or struct.calcsize("P") != 8:
             raise ValueError("Release tools require Windows x64 and Python 3.13.")
         installed = {name: importlib.metadata.version(name) for name in REQUIRED_TOOLCHAIN}
