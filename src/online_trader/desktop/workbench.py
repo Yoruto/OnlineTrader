@@ -14,6 +14,7 @@ from online_trader.desktop.app import StatusWindow
 from online_trader.desktop.dingtalk import WorkbenchDingTalk
 from online_trader.desktop.notifications import WorkbenchSounds
 from online_trader.desktop.preferences import workbench_preferences
+from online_trader.desktop.runtime_client.state import OWNER_RECHECK_OPERATIONS
 from online_trader.desktop.tray import WorkbenchTray
 from online_trader.desktop.workbench_layout import ACTIVATION_MESSAGES,WorkbenchLayout
 from online_trader.errors import TraderError
@@ -24,12 +25,6 @@ from online_trader.transport.workbench_snapshot import MAX_AGE_NS, read_workbenc
 
 RECONNECT_TIMEOUT_NS = 30_000_000_000
 CONNECTION_ERRORS = frozenset({'E_TIMEOUT', 'E_PIPE', 'E_PIPE_CLOSED'})
-
-
-OWNER_RECHECK_OPERATIONS = frozenset({
-    'STOP_DSV_STRATEGY', 'PAUSE_NEW_ENTRIES', 'CANCEL_SELECTED', 'CANCEL_OWNED',
-    'MANUAL_CLOSE', 'MANUAL_CLOSE_ALL', 'FLATTEN_THEN_STOP', 'REQUEST_RECONCILIATION',
-})
 
 
 class _RuntimeShutdownWorker(QThread):
@@ -420,8 +415,15 @@ class WorkbenchWindow(StatusWindow):
 
     def _enable_commands(self,enabled):
         for button in self.command_buttons.values():button.setEnabled(enabled)
-        owner_controls = (not self._closing and self._worker is None and self.view is not None
-                          and (self._runtime_command_bus is None or enabled))
+        runtime_store = self._runtime_client_store
+        runtime_recheck_ok = (
+            runtime_store is None
+            or runtime_store.connection_state.value in {'READY', 'STALE', 'SYNCHRONIZING'}
+        )
+        owner_controls = (
+            not self._closing and self._worker is None and self.view is not None
+            and (self._runtime_command_bus is None or enabled or runtime_recheck_ok)
+        )
         for name in ('close', 'flatten', 'cancel', 'cancel_entries', 'reconcile'):
             self.command_buttons[name].setEnabled(owner_controls)
         self.command_buttons['arm'].setEnabled(not self._startup_in_progress and ((enabled and self.view['entry_authority']!='ARMED'
@@ -645,7 +647,10 @@ class WorkbenchWindow(StatusWindow):
         )
         if operation == 'SAVE_DSV_PARAMETERS':
             self._pending_hot_add_profile = None
-        if self.view is None or self._stale or self.published_snapshot_expired() or self.view['truncated']:
+        stale_or_truncated = (
+            self.view is None or self._stale or self.published_snapshot_expired() or self.view['truncated']
+        )
+        if self.view is None or (stale_or_truncated and operation not in OWNER_RECHECK_OPERATIONS):
             if hot_add_profile is not None:
                 self._pending_focus_contracts = ()
             self.show_home_feedback('请先取得当前完整 Runtime 状态，再提交命令。')
@@ -776,6 +781,19 @@ class WorkbenchWindow(StatusWindow):
     def published_snapshot_age(self):
         if self.snapshot_published_ns is not None:
             return (time.monotonic_ns() - self.snapshot_published_ns) // 1_000_000_000
+
+    def snapshot_age_tier(self):
+        if self.snapshot_published_ns is None:
+            return 'UNKNOWN_BACKEND', None
+        age_ns = max(0, time.monotonic_ns() - self.snapshot_published_ns)
+        age_sec = age_ns // 1_000_000_000
+        if age_ns < 2_000_000_000:
+            return 'NORMAL', age_sec
+        if age_ns < 5_000_000_000:
+            return 'SLOW', age_sec
+        if age_ns < 15_000_000_000:
+            return 'STALE', age_sec
+        return 'UNKNOWN_BACKEND', age_sec
 
     def refresh_monitor(self):
         view = self.view
@@ -1129,6 +1147,16 @@ class WorkbenchWindow(StatusWindow):
             diagnostic_notice += ' · ' + operation_log_message(operation_log)
         if any(diagnostics.get(key) for key in ('status', 'run_identity')) or isinstance(operation_log, str):
             diagnostic_notice += ' · 诊断日志写入失败'
+        market_health = v['configuration'].get('market_health') or {}
+        feed_status = market_health.get('status')
+        if feed_status == 'FEED_SUSPECTED_STALLED':
+            diagnostic_notice += ' · 多合约行情疑似断流（暂停新开仓）'
+        elif feed_status == 'OWNER_STALLED':
+            diagnostic_notice += ' · 后台主循环调度偏慢'
+        elif feed_status == 'RECONNECTING':
+            diagnostic_notice += ' · 行情/柜台连接恢复中'
+        if v['configuration'].get('age_filter_disabled'):
+            diagnostic_notice += ' · 开仓报价年龄检查已关闭(0秒)'
         self.connection_detail.setText(f"账户连接：{'已连接' if c['broker_connected'] else '未连接'} · 事实同步：{'完整' if c['synchronized'] else '不完整'} · 通道：{'故障' if c['fault'] else '无已知故障'} · 持仓核对：{'待处理' if c['recovery_required'] else '无未决屏障'} · 时钟：{'故障' if c['clock_fault'] else '无已知故障'} · {authority_label}：{v['entry_authority']}" + diagnostic_notice)
         for name,table in self.tables.items():
             if name in {'orders', 'trades'}:
@@ -1172,8 +1200,18 @@ class WorkbenchWindow(StatusWindow):
         source_notice = ('状态来自目标执行 Owner' if
                          v['configuration'].get('execution_core') == 'DSV_TARGET_EXECUTION'
                          else '状态来自原内核')
+        age_tier, age_sec = self.snapshot_age_tier()
+        stale_notice = (
+            f'无法确认后台最新状态（已超过 {age_sec} 秒未收到刷新），请核查运行进程/日志；仍可向 Owner 提交停策略、撤单或平仓请求。'
+            if self._stale and age_tier == 'UNKNOWN_BACKEND' and age_sec is not None else
+            f'工作台快照已滞后 {age_sec} 秒（显示上次确认数据；后台策略由 Owner 独立维持，可提交降风险请求）。'
+            if self._stale and age_sec is not None else
+            f'界面更新偏慢（快照已滞后 {age_sec} 秒）。'
+            if age_tier == 'SLOW' and age_sec is not None else ''
+        )
         self.notice_label.setText(capacity_notice if v.get('detail_unavailable') else
             '当前摘要不完整，请通过执行器核对控制请求。' if v['truncated'] else
+            stale_notice or
             history_notice or
             self._control_notice or source_notice + '；行情来源时间与新鲜度单独显示。关闭工作台保留原持仓保护。')
 

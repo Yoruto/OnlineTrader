@@ -202,6 +202,12 @@ class WorkbenchSounds:
                 error_text[code] = '委托结果待核对' if code == 'E_UNKNOWN_SEND' else '平仓重试次数已达上限'
             elif code=='EXIT_REDUCTION_TERMINAL_UNFILLED':
                 error_text[code,block['position_cycle_id']] = f"{block['contract_id']} 平仓委托已终态，剩余目标未完成，请人工核对"
+            elif code == 'MARKET_FEED_FEED_SUSPECTED_STALLED':
+                error_text[code] = '多个活跃合约行情疑似断流，已暂停新开仓（持仓保护维持）'
+            elif code == 'MARKET_FEED_OWNER_STALLED':
+                error_text[code] = '后台交易主循环调度延迟异常，请核查运行状态'
+            elif code == 'MARKET_FEED_RECONNECTING':
+                error_text[code] = '行情或柜台连接正在重连恢复中'
         new_errors = error_text.keys() - self.error_events
         if not initial and not self.request_failed and new_errors:
             self._emit('error', message='、'.join(sorted({error_text[key] for key in new_errors})))

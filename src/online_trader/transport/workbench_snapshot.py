@@ -31,7 +31,12 @@ class WorkbenchPublication:
         self._frame = None
         self._next_publication = 0
         self._interval_ns = interval_ns
-        self.status = {'error_code': None, 'last_success_monotonic_ns': None}
+        self.status = {
+            'error_code': None,
+            'last_success_monotonic_ns': None,
+            'last_prepare_ns': None,
+            'last_encode_ns': None,
+        }
         self._encoder = None
         if deferred:
             self._pending = None
@@ -53,9 +58,13 @@ class WorkbenchPublication:
                     return False
         stamp = datetime.now(timezone.utc).isoformat()
         try:
+            prepare_started = time.monotonic_ns()
             value = project()
+            prepare_ns = str(time.monotonic_ns() - prepare_started)
+            self.status = self.status | {'last_prepare_ns': prepare_ns}
             if self._encoder is None:
-                self._encode(*value, now, stamp)
+                encode_started = time.monotonic_ns()
+                self._encode(*value, now, stamp, encode_started=encode_started)
             else:
                 with self._pending_lock:
                     if self._pending is not None:
@@ -86,19 +95,25 @@ class WorkbenchPublication:
             if value is not None:
                 complete, now, stamp = value
                 try:
-                    self._encode(*complete(), now, stamp)
+                    encode_started = time.monotonic_ns()
+                    self._encode(*complete(), now, stamp, encode_started=encode_started)
                 except Exception as error:
                     self._failure(error)
 
-    def _encode(self, base, view, now, stamp):
+    def _encode(self, base, view, now, stamp, *, encode_started=None):
         self._frame = encode_frame({
             'protocol': 'ONLINE_TRADER_WORKBENCH_SNAPSHOT/1',
             'published_ns': str(now), 'published_utc': stamp, 'base': base, 'view': view,
         })
+        encode_ns = None if encode_started is None else str(time.monotonic_ns() - encode_started)
         code = 'PUBLICATION_OVERSIZE' if view.get('detail_unavailable') == 'CURRENT_STATE_OVERSIZE' else None
         if code and self.status['error_code'] != code:
             logging.getLogger(__name__).warning('%s', code)
-        self.status = {'error_code': code, 'last_success_monotonic_ns': str(now)}
+        self.status = self.status | {
+            'error_code': code,
+            'last_success_monotonic_ns': str(now),
+            'last_encode_ns': encode_ns,
+        }
 
     def _serve(self):
         while not self._stop.is_set():

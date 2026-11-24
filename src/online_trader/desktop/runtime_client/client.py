@@ -222,7 +222,7 @@ class CommandBus(QObject):
     def submit(self, operation, scope, parameters):
         self._require_pending_storage()
         view = self.store.view
-        if view is None or self.store.connection_state.value != 'READY':
+        if view is None or not self.store.allows_owner_recheck_submission(operation):
             raise TraderError('E_NOT_READY', '请先取得当前完整 Runtime 状态')
         allowed, reason = self.store.capability(operation)
         if not allowed:

@@ -50,6 +50,8 @@ ENTRY_MESSAGES = {
     'CONTROL_BARRIER': '开仓权限受限',
     'OBSERVATION_ONLY_BACKLOG': '正在补齐行情',
     'DSV_QUOTE_AGE_EXCEEDED': '行情已滞后，暂停开新仓',
+    'QUOTE_AGE': '报价年龄超过配置上限，暂停开新仓',
+    'FEED_HEALTH_BLOCK': '全局行情或连接异常，暂停开新仓（持仓保护维持）',
     'TAKE_PROFIT_OUTSIDE_PRICE_LIMIT': '理论止盈超过涨跌停',
     'LAST_NEAR_PRICE_LIMIT': '最新价接近涨跌停',
     'SAME_DIRECTION_WITHIN_ONE_SECOND': '同方向报单间隔不足 1 秒',
@@ -436,14 +438,32 @@ def market_age_summary(quotes):
 def market_quote_states(markets, codes, monitor):
     legacy_resting = (monitor.get('quote_status') == '休市' and not any(
         quote.get('market_session_active') is True or quote.get('fresh') for quote in markets.values()))
+    symbol_health_labels = {
+        'FRESH': '新鲜',
+        'STALE': '行情已滞后',
+        'QUIET': '盘口静默',
+        'MARKET_CLOSED': '休市',
+        'WAITING_FIRST_QUOTE': '等待首笔报价',
+        'INVALID_QUOTE': '报价异常',
+        'SESSION_MISMATCH': '跨盘段报价',
+    }
     states = {}
     for code in codes:
         quote = markets.get(code, {})
         reason = quote.get('quote_time_reason')
-        if reason == 'QUOTE_OUTSIDE_CURRENT_SESSION':
-            states[code] = '休市'
-        elif quote.get('local_market_wait_ns') is not None:
+        symbol_health = quote.get('symbol_health')
+        if quote.get('local_market_wait_ns') is not None:
             states[code] = '本机处理积压'
+        elif reason in {'CLOCK_PROTECTION_WINDOW_EXPIRED', 'QUOTE_LEADS_LOCAL_UTC', 'QUOTE_REFERENCE_CONFLICT'}:
+            states[code] = '时钟异常'
+        elif symbol_health in symbol_health_labels:
+            states[code] = symbol_health_labels[symbol_health]
+        elif reason == 'QUOTE_OUTSIDE_CURRENT_SESSION':
+            states[code] = '休市'
+        elif reason == 'QUOTE_SESSION_MISMATCH':
+            states[code] = '跨盘段报价'
+        elif reason in {'QUOTE_TIMESTAMP_INVALID', 'QUOTE_TIME_REGRESSION', 'QUOTE_SESSION_UNKNOWN'}:
+            states[code] = '报价异常'
         elif quote.get('fresh'):
             states[code] = '新鲜'
         elif legacy_resting and reason is None and quote.get('market_session_active') is not True:
@@ -1304,8 +1324,16 @@ class WorkbenchLayout:
             quote_current = self.market_view_current(view) and quote_state == '新鲜'
             lines = (quote.get('trigger_prices') or {}) if quote_current else {}
             decision = quote.get('decision_time_utc')
+            tier_reader = getattr(self.window, 'snapshot_age_tier', None)
+            age_tier = tier_reader()[0] if callable(tier_reader) else None
             if not self.market_view_current(view):
-                status = '上次快照已过期' if previous_snapshot else '状态待同步'
+                status = (
+                    '无法确认后台状态'
+                    if previous_snapshot and age_tier == 'UNKNOWN_BACKEND'
+                    else '上次快照已过期'
+                    if previous_snapshot
+                    else '状态待同步'
+                )
             elif any(cycle.get('exit_pending') for cycle in owned) or report.get('state') == 'PENDING':
                 status = '平仓待确认'
             elif quote.get('enabled') is False:

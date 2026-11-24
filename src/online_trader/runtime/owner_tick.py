@@ -51,9 +51,11 @@ def execute_owner_tick(
     status_path,
     diagnostics_path,
     loop_state,
+    market_diagnostics=None,
     sleep_fn=time.sleep,
 ):
     """Execute one Target Owner step, preserving pending auto-arm across transient errors."""
+    loop_started_ns = time.monotonic_ns()
     try:
         receipt = owner.step(trading_day=current_trading_day, complete=is_complete)
         state = owner.snapshot()
@@ -87,6 +89,16 @@ def execute_owner_tick(
             fault_code=code if disarm else None,
         )
         state = owner.snapshot()
+        if market_diagnostics is not None:
+            now_ns = time.monotonic_ns()
+            market_diagnostics.observe_tick(
+                owner=owner,
+                owner_loop_ns=now_ns - loop_started_ns,
+                synchronized=bool(state.get("synchronized")),
+                disconnected=True,
+                error_code=code,
+                now_ns=now_ns,
+            )
         authority_effect = (
             "DISARMED_RECOVERY_REQUIRED"
             if disarm
@@ -126,6 +138,18 @@ def execute_owner_tick(
             loop_state["last_status"] = current
         sleep_fn(0.1)
         return
+    if market_diagnostics is not None:
+        now_ns = time.monotonic_ns()
+        disconnected = bool(
+            receipt is not None and receipt.get("type") == "DISCONNECTED"
+        )
+        market_diagnostics.observe_tick(
+            owner=owner,
+            owner_loop_ns=now_ns - loop_started_ns,
+            synchronized=bool(state.get("synchronized")),
+            disconnected=disconnected,
+            now_ns=now_ns,
+        )
     if receipt is not None:
         current = {
             "phase": (

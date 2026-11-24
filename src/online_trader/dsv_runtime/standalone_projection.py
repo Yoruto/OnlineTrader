@@ -10,6 +10,8 @@ from online_trader.domain.values import decimal_text
 from online_trader.dsv_runtime.controller import terminal
 from online_trader.dsv_core.entry_rules import trigger_prices
 from online_trader.errors import TraderError
+from online_trader.gateway.dsv_facts import native_integer
+from online_trader.gateway.tqkq import number
 
 
 def _utc_now():
@@ -222,19 +224,75 @@ def workbench_positions(snapshot, after=None):
             'positions': rows[:64], 'has_more': len(rows) > 64}
 
 
-def workbench_view(snapshot, *, profile, adapter, configuration_revision):
+def format_minute_chart_bars(raw_bars_by_code):
+    """Validate and format raw (datetime, open, high, low, close) bar tuples off-thread."""
+    result = {}
+    for code, rows in (raw_bars_by_code or {}).items():
+        bars = {}
+        for stamp_raw, open_raw, high_raw, low_raw, close_raw in rows:
+            try:
+                stamp = native_integer(stamp_raw, minimum=60_000_000_000)
+                values = tuple(number(val) for val in (open_raw, high_raw, low_raw, close_raw))
+                if any(value is None or len(value) > 32 for value in values):
+                    continue
+                opening, high, low, closing = map(Decimal, values)
+                if 0 < low <= min(opening, closing) <= max(opening, closing) <= high:
+                    bars[stamp // 60_000_000_000] = list(values)
+            except (TraderError, TypeError, ValueError, ArithmeticError):
+                continue
+        if bars:
+            result[code] = [[minute, *bars[minute]] for minute in sorted(bars)]
+    return result
+
+
+def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, projection_inputs=None):
     scope = snapshot['scope']
     boot = scope['runtime_boot_id']
     revision = str(max(1, int(snapshot.get('projection_seq') or snapshot.get('sequence') or 0)))
-    settings = profile.to_record()['settings']
+    profile_record = profile if isinstance(profile, dict) else profile.to_record()
+    profile_hash = (
+        projection_inputs.get('profile_hash')
+        if projection_inputs is not None and projection_inputs.get('profile_hash') is not None
+        else (profile_record.get('content_hash') if isinstance(profile, dict) else profile.content_hash)
+    )
+    if profile_hash is None:
+        from online_trader.configuration.dsv import DsvProfile
+        profile_hash = DsvProfile.from_record(profile_record).content_hash
+    settings = profile_record['settings']
     symbols = {item['code']: item for item in settings['symbols']}
     latest_decisions = snapshot.get('latest_decisions') or {}
-    detail_reader = getattr(adapter, 'display_market_details', None)
+    if projection_inputs is not None:
+        dispatch_markets = projection_inputs.get('dispatch_market') or {}
+        market_details_map = projection_inputs.get('market_details') or {}
+        connected = bool(projection_inputs.get('broker_connected'))
+        adapter_synchronized = bool(projection_inputs.get('adapter_synchronized'))
+        clock_health = projection_inputs.get('clock_health')
+        market_health = projection_inputs.get('market_health')
+        schedule_display = projection_inputs.get('schedule_display')
+        calendar_hash = projection_inputs.get('calendar_hash')
+        if 'minute_bars' in projection_inputs:
+            minute_bars = projection_inputs['minute_bars']
+        else:
+            minute_bars = format_minute_chart_bars(projection_inputs.get('minute_raw'))
+    else:
+        dispatch_markets = getattr(adapter, 'dispatch_market', {}) or {}
+        market_details_map = None
+        detail_reader = getattr(adapter, 'display_market_details', None)
+        connected = bool(adapter.connection and adapter.connection.broker_connected)
+        adapter_synchronized = bool(adapter.synchronized)
+        clock_health = getattr(adapter, '_health', None)
+        market_health = getattr(adapter, 'market_health', None)
+        schedule_display = _schedule_display(adapter, snapshot.get('trading_day'), list(symbols))
+        calendar_hash = adapter.grant.value['calendar_hash']
+        bar_reader = getattr(adapter, 'minute_chart_bars', None)
+        minute_bars = bar_reader() if callable(bar_reader) else {}
+    symbol_health_map = (market_health or {}).get('symbols') or {}
+    feed_health_status = (market_health or {}).get('status')
     markets, cycles, orders, trades, external_positions = [], [], [], [], []
     seen_trade_positions = set()
     for contract, row in snapshot['symbols'].items():
         tick = row.get('tick') or {}
-        market = adapter.dispatch_market.get(contract, {})
+        market = dispatch_markets.get(contract, {})
         quote = row.get('quote_observation') or {}
         decision = latest_decisions.get(contract) or {}
         decision_reasons = list(dict.fromkeys(
@@ -283,10 +341,16 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
             'decision_time_utc': decision.get('decision_time_utc'),
             'price_tick': tick.get('tick_size'),
             'market_session_active': market.get('market_session_active'),
+            'symbol_health': symbol_health_map.get(contract),
+            'feed_health_status': feed_health_status,
             'position_quantity': 0 if position is None else position['owned'],
             'net_loss_points': row.get('net_loss'), 'opening_orders': row.get('target_count', 0),
         }
-        if callable(detail_reader):
+        if market_details_map is not None:
+            details = market_details_map.get(contract)
+            if details:
+                market_row.update(details)
+        elif callable(detail_reader):
             market_row.update(detail_reader(contract, snapshot.get('trading_day'), fresh=fresh))
         markets.append(market_row)
         if position is None:
@@ -369,8 +433,7 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
                'source_time_ns': order.get('native_order_time_ns'),
                'native_message': order.get('native_message'),
                'potential_remaining': remaining, 'order_source': 'STRATEGY'})
-    connected = bool(adapter.connection and adapter.connection.broker_connected)
-    synchronized = connected and snapshot['synchronized'] and adapter.synchronized
+    synchronized = connected and snapshot['synchronized'] and adapter_synchronized
     storage_failed = bool(snapshot.get('storage_failed', False))
     clock_fault = snapshot.get('clock_recovery_required')
     owner_fault = snapshot.get('owner_fault_code')
@@ -415,25 +478,27 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
             reason = None if allowed else 'RUNTIME_NOT_READY'
         operations.append({'operation': operation, 'scope_type': scope_type,
                            'allowed': allowed, 'reason': reason})
-    clock_health = getattr(adapter, '_health', None)
-    schedule_display = _schedule_display(adapter, snapshot.get('trading_day'), list(symbols))
     strategy_diagnostics = _strategy_diagnostics(clock_health, clock_fault, cycles)
     config = {
         'config_revision': str(configuration_revision),
         'rule_set_id': 'DSV_TARGET_EXECUTION',
         'execution_core': 'DSV_TARGET_EXECUTION',
-        'strategy_profile_hash': profile.content_hash,
-        'strategy_profile': profile.to_record(),
+        'strategy_profile_hash': profile_hash,
+        'strategy_profile': profile_record,
         'scoped_contracts': list(symbols), 'strategy_symbols': list(symbols.values()),
         'cancel_on_stop': settings['trade']['cancel_on_stop'],
         'manual_close_price_mode': settings['trade']['close_price_mode'],
         'manual_workbench': False, 'live_parameter_save': True,
-        'calendar_hash': adapter.grant.value['calendar_hash'],
+        'calendar_hash': calendar_hash,
         'runtime_identity': snapshot.get('runtime_identity'),
         'run_directory': snapshot.get('run_directory'),
     }
     if isinstance(clock_health, dict):
         config['clock_health'] = copy.deepcopy(clock_health)
+    if isinstance(market_health, dict):
+        config['market_health'] = copy.deepcopy(market_health)
+        if market_health.get('age_filter_disabled'):
+            config['age_filter_disabled'] = True
     if schedule_display is not None:
         config['schedule_display'] = schedule_display
     if strategy_diagnostics:
@@ -441,10 +506,10 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
     config_snapshot = {
         'schema_version': 'ONLINE_TRADER_CONFIG_SNAPSHOT/1',
         'account_key': scope['account_key'], 'kernel_boot_id': boot,
-        'config_revision': str(configuration_revision), 'payload_hash': profile.content_hash,
-        'rule_set_id': 'DSV_TARGET_EXECUTION', 'profile_hash': profile.content_hash,
+        'config_revision': str(configuration_revision), 'payload_hash': profile_hash,
+        'rule_set_id': 'DSV_TARGET_EXECUTION', 'profile_hash': profile_hash,
         'effective_boundary': 'CURRENT_BOOT', 'created_event_seq': '0',
-        'effective_at_utc': None, 'decision_inputs': {'calendar_hash': adapter.grant.value['calendar_hash']},
+        'effective_at_utc': None, 'decision_inputs': {'calendar_hash': calendar_hash},
         'integrity': 'VERIFIED', 'errors': [],
     }
     config['config_snapshot_hash'] = content_hash(config_snapshot)
@@ -455,10 +520,10 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
         blocks.append({'reason_code': 'CLOCK_FAULT', 'active': True})
     if owner_fault:
         blocks.append({'reason_code': owner_fault, 'active': True})
+    if isinstance(market_health, dict) and market_health.get('feed_entry_blocked') and synchronized and not clock_fault and not owner_fault:
+        blocks.append({'reason_code': 'MARKET_FEED_' + str(market_health.get('status') or 'DEGRADED'), 'active': True})
     if any(row.get('external_order_block') for row in snapshot['symbols'].values()):
         blocks.append({'reason_code': 'E_FOREIGN_ACTIVE_ORDER', 'active': True})
-    bar_reader = getattr(adapter, 'minute_chart_bars', None)
-    minute_bars = bar_reader() if callable(bar_reader) else {}
     observed_at_utc = _utc_now()
     result = {
         'view_schema': 'workbench/1', 'account_key': scope['account_key'],

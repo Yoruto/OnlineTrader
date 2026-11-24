@@ -13,12 +13,14 @@ from online_trader.contracts.codec import canonical_bytes
 from online_trader.configuration.files import publish_new_bytes, publish_replace_bytes
 from online_trader.dsv_runtime.order_diagnostics import attach_order_blocking_log
 from online_trader.dsv_runtime.standalone_owner import create_standalone_owner
+from online_trader.dsv_runtime.target_diagnostics import TargetMarketDiagnostics
 from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.simnow import strategy_port
 from online_trader.kernel.server import ControlServer
 from online_trader.runtime.account_cache import BrokerHistoryWriter
 from online_trader.runtime.identity import runtime_identity
 from online_trader.runtime.owner_tick import classify_owner_tick_error, execute_owner_tick
+from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.scheduling.clock import utc_text
 
 
@@ -173,15 +175,19 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
         def is_complete():
             return bool(connection.broker_connected and connection.complete())
 
+        market_diagnostics = TargetMarketDiagnostics(
+            output, boot_id=binding.boot_id, sdk_version=SDK_VERSION,
+        )
+
         def tick():
             execute_owner_tick(
                 owner, binding=binding, current_trading_day=current_trading_day,
                 is_complete=is_complete, history_writer=history_writer,
                 status_path=status, diagnostics_path=diagnostics,
-                loop_state=loop_state,
+                loop_state=loop_state, market_diagnostics=market_diagnostics,
             )
 
-        with attach_order_blocking_log(output):
+        with attach_order_blocking_log(output), market_diagnostics:
             server.serve(stop_event=owner.stop_event, owner_tick=tick, publish_workbench=True)
         shutdown = owner.session.prepare_shutdown()
         publish_replace_bytes(canonical_bytes({

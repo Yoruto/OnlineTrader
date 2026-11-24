@@ -53,9 +53,16 @@ class StandaloneDsvOwner:
         self.run_directory = None
         self._projection_seq = 1
         self._authority_generation = 0
+        self._track_commit_views = True
         self._commit_views = [self.snapshot()]
+        self.publication_status = None
         self.stop_event = Event()
         self._shutdown_after_flatten = False
+
+    def set_stream_tracking(self, enabled):
+        self._track_commit_views = bool(enabled)
+        if not self._track_commit_views:
+            self._commit_views.clear()
 
     @property
     def authority_generation(self):
@@ -101,13 +108,61 @@ class StandaloneDsvOwner:
         return workbench_view(self.snapshot(), profile=self.profile, adapter=self.adapter,
                               configuration_revision=self.configuration_revision)
 
+    def _capture_projection_inputs(self, snapshot, profile_record):
+        adapter = self.adapter
+        capture = getattr(adapter, 'projection_market_snapshot', None)
+        if callable(capture):
+            contracts = [item['code'] for item in profile_record['settings']['symbols']]
+            return capture(contracts, snapshot.get('trading_day'), snapshot.get('symbols'))
+        from online_trader.dsv_runtime.standalone_projection import _schedule_display
+        contracts = [item['code'] for item in profile_record['settings']['symbols']]
+        dispatch_copy = {}
+        details_copy = {}
+        detail_reader = getattr(adapter, 'display_market_details', None)
+        for contract in contracts:
+            market = getattr(adapter, 'dispatch_market', {}).get(contract) or {}
+            dispatch_copy[contract] = {
+                key: market.get(key)
+                for key in ('long_qty', 'short_qty', 'margin_per_lot', 'multiplier', 'market_session_active')
+            }
+            if callable(detail_reader):
+                sym = (snapshot.get('symbols') or {}).get(contract) or {}
+                tick = sym.get('tick') or {}
+                quote_obs = sym.get('quote_observation') or {}
+                fresh = bool(tick and quote_obs.get('age_quality') == 'VALID'
+                             and sym.get('market_session_active') is not False)
+                details = detail_reader(contract, snapshot.get('trading_day'), fresh=fresh)
+                if details:
+                    details_copy[contract] = details
+        bar_reader = getattr(adapter, 'minute_chart_bars', None)
+        minute_bars = bar_reader() if callable(bar_reader) else {}
+        return {
+            'profile_hash': self.profile.content_hash,
+            'calendar_hash': adapter.grant.value['calendar_hash'],
+            'broker_connected': bool(adapter.connection and adapter.connection.broker_connected),
+            'adapter_synchronized': bool(adapter.synchronized),
+            'clock_health': copy.deepcopy(getattr(adapter, '_health', None)),
+            'market_health': copy.deepcopy(getattr(adapter, 'market_health', None)),
+            'schedule_display': _schedule_display(adapter, snapshot.get('trading_day'), contracts),
+            'dispatch_market': dispatch_copy,
+            'market_details': details_copy,
+            'minute_bars': minute_bars,
+        }
+
     def prepare_workbench_publication(self):
         snapshot = self.snapshot()
-        base = projection_batch(snapshot)
-        view = workbench_view(snapshot, profile=self.profile, adapter=self.adapter,
-                              configuration_revision=self.configuration_revision)
+        profile_record = copy.deepcopy(self.profile.to_record())
+        configuration_revision = self.configuration_revision
+        projection_inputs = self._capture_projection_inputs(snapshot, profile_record)
 
         def complete():
+            base = projection_batch(snapshot)
+            view = workbench_view(
+                snapshot,
+                profile=profile_record,
+                configuration_revision=configuration_revision,
+                projection_inputs=projection_inputs,
+            )
             return base, view
         return complete
 
@@ -151,7 +206,8 @@ class StandaloneDsvOwner:
             self.profile = DsvProfile.from_record(command['profile'])
             self.configuration_revision = str(int(self.configuration_revision) + 1)
         self._projection_seq += 1
-        self._commit_views.append(self.snapshot())
+        if self._track_commit_views:
+            self._commit_views.append(self.snapshot())
         self._update_stop_ready()
         return receipt
 
@@ -236,7 +292,8 @@ class StandaloneDsvOwner:
                     'decisions': decisions,
                 }
             self._projection_seq += 1
-            self._commit_views.append(self.snapshot())
+            if self._track_commit_views:
+                self._commit_views.append(self.snapshot())
         self._update_stop_ready()
         return receipt
 
@@ -245,7 +302,8 @@ class StandaloneDsvOwner:
         if disarm:
             self._authority_generation += 1
         self._projection_seq += 1
-        self._commit_views.append(self.snapshot())
+        if self._track_commit_views:
+            self._commit_views.append(self.snapshot())
         self._update_stop_ready()
         return receipt
 

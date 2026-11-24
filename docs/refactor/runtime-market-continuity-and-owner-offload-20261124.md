@@ -6,6 +6,7 @@
 > 基线提交：`12b4e6e`  
 > 对照依据：[DSV 原版与 OnlineTrader Standalone Runtime 做法差异及参考建议](dsv-vs-standalone-runtime-implementation-comparison-20261124.md)  
 > 状态：`CANDIDATE / DESIGN_ONLY`（本文档仅作设计评审与排期依据，不授予账号连接、下单、测试或打包权限）
+> 总体合同：本文是 [Runtime & Workbench Diagnostics 诊断上报与运行证据系统](runtime-workbench-diagnostics-reporting-20261124.md) 的行情链路专项子设计；统一事件、覆盖、Reporter 与 Analyzer 合同以总体设计为准，不另建平行 Recorder。
 
 ---
 

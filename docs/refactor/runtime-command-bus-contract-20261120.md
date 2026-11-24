@@ -12,16 +12,19 @@
 ## 提交时序
 
 ```text
-UI -> CommandBus: validate current view + Capability + duplicate intent
+UI -> CommandBus: validate view + tiered Capability (stale/syncing allows OWNER_RECHECK_OPERATIONS) + duplicate intent
 CommandBus -> process-local registry: reserve command ID
 CommandBus -> bounded worker queue: enqueue original request
 worker -> Runtime endpoint: submit
-Runtime endpoint -> Owner: command with account/boot/config binding
+Runtime endpoint -> Owner: command with account/boot/config binding + live Owner recheck
 Owner --> worker: receipt
 worker --> CommandBus: request_id + receipt
 CommandBus -> process-local registry: update/remove matching ID
 CommandBus --> UI: state + feedback
 ```
+
+当快照过期或处于重新同步（`STALE` / `SYNCHRONIZING`）且仍持有有效 `view` 时，开仓、启动策略、改参与外部仓认领仍由前端拦截；降风险操作（`STOP_DSV_STRATEGY`、`PAUSE_NEW_ENTRIES`、`CANCEL_SELECTED`、`CANCEL_OWNED`、`MANUAL_CLOSE`、`MANUAL_CLOSE_ALL`、`FLATTEN_THEN_STOP`、`REQUEST_RECONCILIATION`）允许沿用已有 `view` 的账号/boot/配置绑定入队提交，由当前 Owner 按实时状态与 `target_revision` 裁决。
+
 
 如果 bounded queue 在同步 `enqueue` 时拒绝，请求确定没有到达 worker：内存状态先标为 `LOCAL_NOT_ENQUEUED`，再删除同一 command ID 的进程内记录。不存在本地持久化清理或交接步骤。
 

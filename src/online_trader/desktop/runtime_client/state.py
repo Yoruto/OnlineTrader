@@ -7,6 +7,13 @@ from types import MappingProxyType
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, Signal
 
 
+OWNER_RECHECK_OPERATIONS = frozenset({
+    'STOP_DSV_STRATEGY', 'PAUSE_NEW_ENTRIES', 'CANCEL_SELECTED', 'CANCEL_OWNED',
+    'MANUAL_CLOSE', 'MANUAL_CLOSE_ALL', 'FLATTEN_THEN_STOP', 'REQUEST_RECONCILIATION',
+})
+
+
+
 class ClientConnectionState(StrEnum):
     DISCONNECTED = 'DISCONNECTED'
     CONNECTING = 'CONNECTING'
@@ -137,13 +144,33 @@ class ClientStateStore(QObject):
     def view(self):
         return None if self.runtime is None else self.runtime['view']
 
+    def allows_owner_recheck_submission(self, operation):
+        if self.view is None:
+            return False
+        if self.connection_state == ClientConnectionState.READY:
+            return True
+        return (
+            operation in OWNER_RECHECK_OPERATIONS
+            and self.connection_state in {ClientConnectionState.STALE, ClientConnectionState.SYNCHRONIZING}
+        )
+
     def capability(self, operation):
         view = self.view
-        if self.connection_state != ClientConnectionState.READY or view is None:
+        if view is None:
+            return False, self.connection_reason or 'RUNTIME_NOT_READY'
+        recheck_when_stale = (
+            self.connection_state in {ClientConnectionState.STALE, ClientConnectionState.SYNCHRONIZING}
+            and operation in OWNER_RECHECK_OPERATIONS
+        )
+        if self.connection_state != ClientConnectionState.READY and not recheck_when_stale:
             return False, self.connection_reason or 'RUNTIME_NOT_READY'
         for row in view.get('capabilities', {}).get('operations', ()):
             if row.get('operation') == operation:
-                return bool(row.get('allowed')), row.get('reason')
+                allowed = bool(row.get('allowed'))
+                reason = row.get('reason')
+                if not allowed and recheck_when_stale and reason != 'E_STORAGE':
+                    return True, None
+                return allowed, reason
         return False, 'CAPABILITY_UNAVAILABLE'
 
 

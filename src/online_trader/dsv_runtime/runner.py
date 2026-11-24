@@ -996,7 +996,7 @@ class DsvSession:
         position_id = None if position is None else position.get('id')
         blocking_reasons = {
             'LATE_FILL_OWNERSHIP_REVIEW', 'UNRESOLVED_PRIOR_CHILD', 'USER_STOPPED',
-            'OUTSIDE_SESSION', 'QUOTE_UNAVAILABLE', 'QUOTE_AGE',
+            'FEED_HEALTH_BLOCK', 'OUTSIDE_SESSION', 'QUOTE_UNAVAILABLE', 'QUOTE_AGE',
             'E_FOREIGN_ACTIVE_ORDER', 'EXTERNAL_POSITION_PRESENT', 'UNOWNED_POSITION',
             'MINUTE_BAR_UNAVAILABLE', 'POSITION_WAITING_FOR_MARKET', 'DATA_GAP_EXIT_PENDING',
             'DATA_GAP_EXIT', 'GEOMETRY_BLOCK',
@@ -1099,6 +1099,8 @@ class DsvSession:
             return [{'reason': 'UNRESOLVED_PRIOR_CHILD', 'rule_ids': ['I02']}]
         if not state['running']:
             return [{'reason': 'USER_STOPPED', 'rule_ids': ['D14']}]
+        if frame.get('feed_entry_blocked'):
+            return [{'reason': 'FEED_HEALTH_BLOCK', 'rule_ids': ['D01', 'I02']}]
         if tick is None:
             return [{'reason': 'QUOTE_UNAVAILABLE', 'rule_ids': ['D01']}]
         if timing:

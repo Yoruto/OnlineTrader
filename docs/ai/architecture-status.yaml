@@ -1,6 +1,6 @@
 schema_version: ONLINE_TRADER_ARCHITECTURE_STATUS/1
 reviewed_at_sha: WORKTREE
-reviewed_on: "2026-11-23"
+reviewed_on: "2026-11-24"
 rules:
   identity: path_and_scope
   conflict_result: CONFLICT_NEEDS_REVIEW
@@ -53,6 +53,19 @@ documents:
       tests: TARGETED_LIFECYCLE_AND_PROJECTION_PASS
       product_acceptance: NOT_RUN
     notes: Current user entry, state ownership, lifecycle (tray hide on X; controlled safe full-process shutdown on explicit exit), live SAVE_DSV_PARAMETERS, command, failure, diagnostic and acceptance routing for Runtime Workbench work.
+
+  - path: docs/refactor/runtime-workbench-diagnostics-reporting-20261124.md
+    scope: standalone/runtime-workbench-diagnostics-reporting
+    status: CANDIDATE
+    verified_at_sha: WORKTREE
+    evidence:
+      design: USER_REQUESTED_IMPLEMENTATION_PLAN
+      source: EXISTING_DIAGNOSTIC_FRAGMENTS_NOT_UNIFIED
+      tests: NOT_RUN
+      product_acceptance: NOT_RUN
+    notes: Defines a non-authoritative, best-effort Runtime and Workbench evidence system,
+      bounded per-process sinks, cutoff and detached Reporter lifecycle, diagnostic bundle
+      coverage semantics, developer Analyzer rules, privacy boundaries and vertical delivery phases.
 
   - path: docs/refactor/desktop-lifecycle-user-flow-20261120.md
     scope: standalone/desktop-exit-and-tray-lifecycle

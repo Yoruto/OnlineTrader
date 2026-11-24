@@ -66,6 +66,8 @@ class ControlServer:
         boundary = self._boundary(snap)
         self.streams.update(self._projection(snap),boundary,boundary)
         kernel.take_committed_views()
+        if self._target_owner and hasattr(kernel, 'set_stream_tracking'):
+            kernel.set_stream_tracking(False)
         self._stream_peers={}
         self._last_progress_utc=_utc()
         self._last_progress_seq=int(boundary)
@@ -93,6 +95,7 @@ class ControlServer:
     def _publish_workbench(self, publication, *, standalone=False, native_snapshot=None):
         if self._target_owner:
             publication.publish(self.kernel.prepare_workbench_publication)
+            self.kernel.publication_status = dict(publication.status)
             return
         from online_trader.kernel.workbench import prepare_workbench_publication, workbench_publication
 
@@ -198,7 +201,9 @@ class ControlServer:
             raise TraderError("E_AUTH","Shadow has no control or order capability")
         peer.last_seen=time.monotonic()
         if kind=="SnapshotRequest":
-            self._sync_streams()
+            if self._target_owner and hasattr(self.kernel, 'set_stream_tracking'):
+                self.kernel.set_stream_tracking(True)
+            self._sync_streams(force=True)
             key,messages=self.streams.request(peer.instance_id or peer.peer_id,body)
             if peer.stream_key is not None and peer.stream_key!=key:self._detach(peer)
             previous=self._stream_peers.get(key)
@@ -264,6 +269,8 @@ class ControlServer:
                 self._stream_peers.pop(key,None);self.streams.detach(key)
             peer.stream_key=None
             peer.stream_ready=False
+        if self._target_owner and not self._stream_peers and not self.streams._streams and hasattr(self.kernel, 'set_stream_tracking'):
+            self.kernel.set_stream_tracking(False)
 
     def _heartbeat(self,peer):
         if peer.stream_key is None or not peer.stream_ready or peer.closed.is_set():return
@@ -278,8 +285,15 @@ class ControlServer:
             "last_progress_utc":self._last_progress_utc}))
         peer.last_heartbeat=time.monotonic()
 
-    def _sync_streams(self):
+    def _sync_streams(self, *, force=False):
+        if self._target_owner and not force and not self._stream_peers and not self.streams._streams:
+            self.kernel.take_committed_views()
+            return
         overflow,views=self.kernel.take_committed_views()
+        if self._target_owner and force and not views:
+            current_boundary = int(self._boundary())
+            if current_boundary > self.streams.durable_seq:
+                views = [self.kernel.snapshot()]
         if overflow:
             for key,peer in tuple(self._stream_peers.items()):
                 kind,body=self.streams.invalidate(key,"QUEUE_OVERFLOW")
