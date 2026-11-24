@@ -10,7 +10,7 @@ from online_trader.accounts import AccountStore
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.errors import TraderError
-from online_trader.runtime.startup_metadata import _sdk_factory, build_metadata, read_contract_catalog, read_metadata, read_offset_inputs
+from online_trader.runtime.startup_metadata import SDK_VERSION, _sdk_factory, build_metadata, read_contract_catalog, read_metadata, read_offset_inputs
 from online_trader.scheduling.calendar import TradingCalendar
 from tests.test_accounts import MemoryVault
 
@@ -221,7 +221,7 @@ class StartupMetadataTests(unittest.TestCase):
             def close(self): pass
         class LocalAccount: pass
         sdk = SimpleNamespace(TqApi=BaseApi, TqSim=LocalAccount, TqAuth=lambda user, password: (user, password))
-        with patch.dict('sys.modules', {'tqsdk': sdk}), patch('online_trader.runtime.startup_metadata.version', return_value='3.10.4'):
+        with patch.dict('sys.modules', {'tqsdk': sdk}), patch('online_trader.runtime.startup_metadata.version', return_value=SDK_VERSION):
             api = _sdk_factory({'username': 'market-user', 'password': 'market-password'}, deadline=time.monotonic() + 10)
         self.assertIsInstance(api.arguments['account'], LocalAccount)
         self.assertEqual(api.arguments['auth'], ('market-user', 'market-password'))

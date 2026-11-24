@@ -9,6 +9,7 @@ from online_trader.configuration.files import publish_new_bytes
 from online_trader.errors import TraderError
 from online_trader.runtime.dsv_simulation import load_inputs
 from online_trader.runtime.executable import bundled_cli
+from online_trader.runtime.startup_metadata import SDK_VERSION
 
 
 def scheduled_minute(schedule, local):
@@ -146,7 +147,7 @@ class SessionLauncher:
         use_bundled=packaged is not None and executable==packaged.resolve()
         prefix=[str(executable)]
         probe_args=prefix+(['--verify-runtime',__version__] if use_bundled else ['-I','-c',
-            "import online_trader,importlib.metadata;assert online_trader.__version__=="+repr(__version__)+";assert importlib.metadata.version('tqsdk')=='3.10.4'"])
+            "import online_trader,importlib.metadata;assert online_trader.__version__=="+repr(__version__)+f";assert importlib.metadata.version('tqsdk')=={SDK_VERSION!r}"])
         # Probe only installed identities; no network, credentials or ledger.
         try:
             probe=subprocess.run(probe_args,

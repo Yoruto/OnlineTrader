@@ -18,6 +18,7 @@ from online_trader.gateway.tqkq_dsv import TqKqDsvPort
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.comparison import parse_dsv_line,DsvLogTail,build_report,read_records,verify_dsv_profile
 from online_trader.runtime.dsv_simulation import prepare
+from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.scheduling.reference import ReferenceClock,clock_observation
 from qa.dsv_native_facts import FactClock,NativeFactApi
 from tests import test_online_dsv as fixture
@@ -383,7 +384,7 @@ class SimNowComparisonTests(unittest.TestCase):
         value=x.grant.value;value['account_fingerprint']=account_fingerprint(raw['simnow_username'])
         grant=DsvSimulationGrant.parse(canonical_bytes(value))
         with (patch.dict(sys.modules,{'tqsdk':stub}),patch('online_trader.gateway.simnow.credentials',return_value=raw),
-              patch('online_trader.gateway.simnow.version',return_value='3.10.4')):
+              patch('online_trader.gateway.simnow.version',return_value=SDK_VERSION)):
             port=SimNowDsvPort.connect('not-read',grant,x.clock,read_only=True)
         self.assertEqual(calls[0]['account'].args,('simnow','FACT_ACCOUNT','FACT_PASSWORD'))
         self.assertEqual(calls[0]['account'].kwargs,{})

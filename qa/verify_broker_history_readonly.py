@@ -17,6 +17,7 @@ sys.path.insert(0,str(ROOT/'src'))
 from online_trader.accounts import account_identity
 from online_trader.gateway.simnow import account_fingerprint, credentials
 from online_trader.runtime.instance import AccountLock
+from online_trader.runtime.startup_metadata import SDK_VERSION
 
 
 BEIJING=timezone(timedelta(hours=8))
@@ -203,7 +204,7 @@ def main():
     parser.add_argument('--prior-kq-evidence',type=Path)
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
-    if version('tqsdk')!='3.10.4':raise RuntimeError('PINNED_SDK_REQUIRED')
+    if version('tqsdk')!=SDK_VERSION:raise RuntimeError('PINNED_SDK_REQUIRED')
     auth=credentials(args.credentials)
     prior=json.loads(args.prior_kq_evidence.read_bytes())['native_snapshot'] if args.provider=='TqKq' and args.prior_kq_evidence else None
     result={'provider':args.provider}

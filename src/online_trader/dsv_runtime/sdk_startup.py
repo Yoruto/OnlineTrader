@@ -36,9 +36,9 @@ def sdk_version():
     try:
         installed = version('tqsdk')
     except PackageNotFoundError:
-        raise TraderError('E_DEPENDENCY', 'The pinned TqSdk 3.10.4 is required') from None
+        raise TraderError('E_DEPENDENCY', f'The pinned TqSdk {SDK_VERSION} is required') from None
     if installed != SDK_VERSION:
-        raise TraderError('E_DEPENDENCY', 'The replacement requires the pinned TqSdk 3.10.4')
+        raise TraderError('E_DEPENDENCY', f'The replacement requires the pinned TqSdk {SDK_VERSION}')
     return installed
 
 

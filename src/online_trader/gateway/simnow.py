@@ -12,6 +12,7 @@ from online_trader.contracts.codec import strict_loads
 from online_trader.errors import TraderError
 from online_trader.gateway.tqkq import number
 from online_trader.gateway.tqkq_dsv import TqKqDsvPort
+from online_trader.runtime.startup_metadata import SDK_VERSION
 
 
 def account_fingerprint(username):
@@ -80,7 +81,7 @@ class SimNowDsvPort(TqKqDsvPort):
         if account_fingerprint(auth['simnow_username'])!=grant.value['account_fingerprint']:
             raise TraderError('E_SCOPE','SimNow identity differs from its reviewed scope')
         try:
-            if version('tqsdk')!='3.10.4':raise TraderError('E_DEPENDENCY','SimNow requires the reviewed TqSdk 3.10.4')
+            if version('tqsdk')!=SDK_VERSION:raise TraderError('E_DEPENDENCY',f'SimNow requires the reviewed TqSdk {SDK_VERSION}')
         except PackageNotFoundError:
             raise TraderError('E_DEPENDENCY','The optional pinned simulation SDK is required') from None
         try:

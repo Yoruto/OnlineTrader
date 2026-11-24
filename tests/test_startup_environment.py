@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 from online_trader.errors import TraderError
 from online_trader.runtime.startup_environment import DesktopRuntime, launch_bootstrap, process_running, resolve_environment
+from online_trader.runtime.startup_metadata import SDK_VERSION
 
 
 class StartupEnvironmentTests(unittest.TestCase):
@@ -66,7 +67,7 @@ class StartupEnvironmentTests(unittest.TestCase):
         self.assertIn(repr(str(runner)), script)
         self.assertIn(repr(str(package)), script)
         self.assertIn("run_name='online_trader_desktop_probe'", script)
-        self.assertIn("metadata.version('tqsdk') == '3.10.4'", script)
+        self.assertIn(f"metadata.version('tqsdk') == {SDK_VERSION!r}", script)
         self.assertNotIn('TqApi', script)
 
     def test_failed_or_timed_out_probe_exposes_no_subprocess_details_and_never_launches(self):

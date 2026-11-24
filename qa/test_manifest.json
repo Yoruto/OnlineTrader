@@ -3780,7 +3780,9 @@
         "StaleSnapshotRecheckTests.test_recheck_operations_remain_allowed_when_stale_or_synchronizing",
         "StaleSnapshotRecheckTests.test_snapshot_age_tiers_and_symbol_quote_labels",
         "TargetMarketDiagnosticsTests.test_diagnostics_drops_when_queue_full_without_raising",
-        "TargetMarketDiagnosticsTests.test_diagnostics_emits_summary_and_anomaly_jsonl"
+        "TargetMarketDiagnosticsTests.test_diagnostics_emits_summary_and_anomaly_jsonl",
+        "TqSdkUpgradeHookRegressionTests.test_pinned_sdk_version_and_wait_timeout_hook_match_installed_tqsdk",
+        "TqSdkUpgradeHookRegressionTests.test_pre_queue_send_and_cancel_refusal_hooks_match_real_tqsdk_frames"
       ],
       "case_overrides": {}
     },

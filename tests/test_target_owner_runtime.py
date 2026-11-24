@@ -1695,7 +1695,7 @@ class TargetOwnerWorkbenchProjectionTests(unittest.TestCase):
         calendar = TradingCalendar.from_record({
             'schema_version': 'TRADING_CALENDAR/1',
             'calendar_id': 'cal-hotadd',
-            'calendar_version': 'tqsdk-3.10.4',
+            'calendar_version': f'tqsdk-{SDK_VERSION}',
             'complete': True,
             'coverage_from_utc': '2026-11-12T12:00:00Z',
             'coverage_to_utc': '2026-11-13T08:00:00Z',

@@ -7,8 +7,9 @@ from online_trader.scheduling.clock import sdk_deadline
 
 @cache
 def _pinned_sdk_available():
+    from online_trader.runtime.startup_metadata import SDK_VERSION
     try:
-        return version('tqsdk') == '3.10.4'
+        return version('tqsdk') == SDK_VERSION
     except PackageNotFoundError:
         return False
 
@@ -35,7 +36,7 @@ def wait_update_slice(api, seconds):
             return loop.call_at(deadline, callback, *args, context=context)
         return schedule(delay, callback, *args, context=context)
 
-    # TqSdk 3.10.4 schedules this callback inside _run_until_task_done.
+    # TqSdk schedules this callback inside _run_until_task_done.
     # Preserve its wait, I/O, diff merge and task cancellation behavior.
     loop.call_later = call_later
     try:

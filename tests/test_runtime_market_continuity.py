@@ -1,5 +1,7 @@
 """Offline unit tests for Runtime market continuity, owner offload, and stale-recheck flows."""
 
+import asyncio
+from importlib.metadata import version
 import json
 import os
 from pathlib import Path
@@ -23,7 +25,9 @@ from online_trader.dsv_runtime.runner import DsvSession
 from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
 from online_trader.dsv_runtime.standalone_projection import format_minute_chart_bars
 from online_trader.dsv_runtime.target_diagnostics import TargetMarketDiagnostics
+from online_trader.gateway.tq_wait import _pinned_sdk_available, wait_update_slice
 from online_trader.kernel.server import ControlServer
+from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.scheduling.clock import NS_PER_SECOND
 from qa.target_owner.offline_runtime import OfflineTargetRuntime, profile as single_contract_profile
 
@@ -160,7 +164,7 @@ class StaleSnapshotRecheckTests(unittest.TestCase):
 class TargetMarketDiagnosticsTests(unittest.TestCase):
     def test_diagnostics_emits_summary_and_anomaly_jsonl(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            diag = TargetMarketDiagnostics(temp_dir, boot_id='boot-diag-1', sdk_version='3.10.4')
+            diag = TargetMarketDiagnostics(temp_dir, boot_id='boot-diag-1', sdk_version=SDK_VERSION)
             owner = SimpleNamespace(
                 adapter=SimpleNamespace(
                     metrics={
@@ -217,7 +221,7 @@ class TargetMarketDiagnosticsTests(unittest.TestCase):
 
     def test_diagnostics_drops_when_queue_full_without_raising(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            diag = TargetMarketDiagnostics(temp_dir, boot_id='boot-diag-2', sdk_version='3.10.4')
+            diag = TargetMarketDiagnostics(temp_dir, boot_id='boot-diag-2', sdk_version=SDK_VERSION)
             diag._closing.set()
             if diag._writer is not None:
                 diag._writer.join(timeout=1.5)
@@ -390,6 +394,106 @@ class MarketHealthClassificationTests(unittest.TestCase):
         result = session._evaluate_symbol(state, row, observed, frame, spec)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]['reason'], 'FEED_HEALTH_BLOCK')
+
+
+class TqSdkUpgradeHookRegressionTests(unittest.TestCase):
+    def test_pinned_sdk_version_and_wait_timeout_hook_match_installed_tqsdk(self):
+        self.assertEqual(SDK_VERSION, '3.10.5')
+        self.assertEqual(version('tqsdk'), SDK_VERSION)
+        _pinned_sdk_available.cache_clear()
+        self.assertTrue(_pinned_sdk_available())
+
+        from tqsdk.api import TqApi
+
+        self.assertIn('call_later', TqApi._run_until_task_done.__code__.co_names)
+        self.assertIn('_set_wait_timeout', TqApi._run_until_task_done.__code__.co_names)
+        self.assertTrue(callable(TqApi._set_wait_timeout))
+
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        api = TqApi.__new__(TqApi)
+        api._loop = loop
+        api._set_wait_timeout = lambda *_: None
+        api.wait_update = lambda deadline=None: (loop.call_later(0.05, api._set_wait_timeout), False)[1]
+        updated, wait_mode = wait_update_slice(api, 0.1)
+        self.assertFalse(updated)
+        self.assertEqual(wait_mode, 'SDK_MONOTONIC_TIMEOUT')
+
+    def test_pre_queue_send_and_cancel_refusal_hooks_match_real_tqsdk_frames(self):
+        from tqsdk import TqSim
+        from tqsdk.api import TqApi
+        from tqsdk.auth import TqAuth
+        from tqsdk.multiaccount import TqMultiAccount
+        from tqsdk.objs import Order, Quote
+        from tqsdk.risk_manager import TqRiskManager
+        from tqsdk.risk_rule import TqRiskRule
+
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        api = TqApi.__new__(TqApi)
+        api._loop = loop
+        acct = TqSim()
+        api._account = TqMultiAccount([acct])
+        quote = Quote(api)
+        quote.ins_class = 'FUTURE'
+        quote.price_tick = 2.0
+        quote.volume_multiple = 10
+        quote.exchange_id = 'DCE'
+        quote.instrument_id = 'p2701'
+        api._data = {'quotes': {'DCE.p2701': quote}}
+        api._auth = TqAuth('u', 'p')
+        api._ensure_symbol = lambda symbol: None
+        api._generate_uuid = lambda: 'oid-1'
+        adapter = DsvSdkAdapter.__new__(DsvSdkAdapter)
+        adapter.api = api
+
+        try:
+            api.insert_order('DCE.p2701', 'BUY', 'OPEN', 1, advanced='BAD', account=acct)
+            self.fail('expected validation refusal')
+        except Exception as exc_arg:
+            self.assertEqual(
+                adapter._sdk_send_refused_before_queue(exc_arg),
+                ('E_DSV_SDK_SEND_VALIDATION', 'SDK_PRE_SEND_REFUSED'),
+            )
+
+        try:
+            api.insert_order('DCE.p2701', 'BUY', 'OPEN', 1, limit_price=1000, account=acct)
+            self.fail('expected permission refusal')
+        except Exception as exc_auth:
+            self.assertEqual(
+                adapter._sdk_send_refused_before_queue(exc_auth),
+                ('E_DSV_SDK_SEND_VALIDATION', 'SDK_PERMISSION_REFUSED'),
+            )
+
+        api._auth._has_td_grants = lambda symbol: True
+
+        class _BlockRule(TqRiskRule):
+            def _could_insert_order(self, pack):
+                return False, 'risk_open'
+
+            def _could_cancel_order(self, pack):
+                return False, 'risk_cancel'
+
+        rm = TqRiskManager()
+        rm.append(_BlockRule(api))
+        api._risk_manager = rm
+        try:
+            api.insert_order('DCE.p2701', 'BUY', 'OPEN', 1, limit_price=1000, account=acct)
+            self.fail('expected risk insert refusal')
+        except Exception as exc_risk:
+            self.assertEqual(
+                adapter._sdk_send_refused_before_queue(exc_risk),
+                ('E_DSV_SDK_SEND_RISK', 'SDK_RISK_RULE_REFUSED'),
+            )
+
+        order = Order(api)
+        order.order_id = 'o1'
+        api._data['trade'] = {acct._get_account_key(): {'orders': {'o1': order}}}
+        try:
+            api.cancel_order('o1', account=acct)
+            self.fail('expected risk cancel refusal')
+        except Exception as exc_cancel:
+            self.assertTrue(adapter._sdk_cancel_refused_before_queue(exc_cancel))
 
 
 if __name__ == '__main__':

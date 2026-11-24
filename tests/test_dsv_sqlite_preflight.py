@@ -17,6 +17,7 @@ from online_trader.contracts.codec import canonical_bytes, strict_loads
 from online_trader.dsv_runtime import sdk_startup
 from online_trader.dsv_storage import journal
 from online_trader.errors import TraderError
+from online_trader.runtime.startup_metadata import SDK_VERSION
 
 
 class SqliteRuntimePolicyTests(unittest.TestCase):
@@ -74,7 +75,7 @@ class SqliteStartupPreflightTests(unittest.TestCase):
         self.port.return_value.connect.side_effect = TraderError('E_TEST_CONNECT_BOUNDARY', 'No real connection')
         self.claim = self.enterContext(patch.object(sdk_startup, '_claim_run_output'))
         self.status = self.enterContext(patch.object(sdk_startup, '_status'))
-        self.enterContext(patch.object(sdk_startup, 'sdk_version', return_value='3.10.4'))
+        self.enterContext(patch.object(sdk_startup, 'sdk_version', return_value=SDK_VERSION))
         self.enterContext(patch.object(sdk_startup, '_date_resolver', return_value=lambda *args: '2026-11-16'))
         wall = self.enterContext(patch.object(sdk_startup, 'CalibratedClock'))
         wall.return_value.now.return_value = datetime(2026, 11, 16, 1, tzinfo=timezone.utc)

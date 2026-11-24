@@ -17,6 +17,7 @@ import online_trader
 from online_trader import __version__
 from online_trader.errors import TraderError
 from online_trader.runtime.executable import bundled_cli
+from online_trader.runtime.startup_metadata import SDK_VERSION
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,7 @@ class DesktopRuntime:
                 'import online_trader',
                 "assert sys.version_info[:2] == (3, 13) and struct.calcsize('P') == 8",
                 f'assert online_trader.__version__ == {__version__!r}',
-                "assert metadata.version('tqsdk') == '3.10.4'",
+                f"assert metadata.version('tqsdk') == {SDK_VERSION!r}",
             ])
             if self.package_file is not None:
                 statements.append(f'assert pathlib.Path(online_trader.__file__).resolve() == pathlib.Path({str(self.package_file)!r}).resolve()')

@@ -21,7 +21,7 @@ from online_trader.scheduling.clock import NS_PER_SECOND, quote_age_quality, quo
 
 
 BEIJING = timezone(timedelta(hours=8))
-SDK_VERSION = '3.10.4'
+SDK_VERSION = '3.10.5'
 OFFSET_MAX_QUOTE_AGE_NS = 15 * NS_PER_SECOND
 OFFSET_MAX_QUOTE_LEAD_NS = 15 * NS_PER_SECOND
 _CLOCK = re.compile(r'(\d{2}):([0-5]\d):([0-5]\d)\Z')
@@ -190,13 +190,13 @@ def build_metadata(calendar_dates, quote_records, contracts, *, now, provider):
                 opened.append(begin); closed.append(finish)
         rows.append({'contract_id': code, 'sessions': sessions})
     calendar = {'schema_version': 'TRADING_CALENDAR/1', 'calendar_id': 'desktop-sdk-' + target.isoformat(),
-                'calendar_version': 'tqsdk-3.10.4', 'complete': True,
+                'calendar_version': f'tqsdk-{SDK_VERSION}', 'complete': True,
                 'coverage_from_utc': _utc(min([local, *opened])),
                 'coverage_to_utc': _utc(max(closed) + timedelta(seconds=1)), 'contracts': rows}
     TradingCalendar.from_record(calendar)
     return {'provider': provider, 'trading_day': target.isoformat(), 'last_completed_day': prior.isoformat(),
             'calendar': calendar, 'instruments': instruments, 'observed_at_utc': _utc(now),
-            'source': 'TqSdk 3.10.4 get_trading_calendar + quote.trading_time; market metadata, not cabinet reconciliation'}
+            'source': f'TqSdk {SDK_VERSION} get_trading_calendar + quote.trading_time; market metadata, not cabinet reconciliation'}
 
 
 def read_metadata(credential_reference, contracts, *, now=None, timeout_seconds=60, sdk_factory=None, quote_preview=False):

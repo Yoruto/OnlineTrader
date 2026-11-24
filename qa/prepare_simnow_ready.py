@@ -17,6 +17,7 @@ from online_trader.gateway.simnow import credentials,account_fingerprint
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.comparison import read_dsv_profile
 from online_trader.runtime.dsv_simulation import prepare
+from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.scheduling.calendar import TradingCalendar
 
 
@@ -46,7 +47,7 @@ def main():
     if Decimal(budget)<=0:raise RuntimeError('No configured positive stop exposure is ready')
     sdk_site=ROOT/'output/online/sdk-venv/Lib/site-packages'
     sdk_versions={d.metadata['Name'].lower():d.version for d in importlib.metadata.distributions(path=[str(sdk_site)])}
-    if sdk_versions.get('tqsdk')!='3.10.4':raise RuntimeError('The reviewed SDK is not available')
+    if sdk_versions.get('tqsdk')!=SDK_VERSION:raise RuntimeError('The reviewed SDK is not available')
     args.output.mkdir(parents=True,exist_ok=False)
     scope={'schema_version':'SIMNOW_DSV_AUTO/1','grant_id':'simnow-night-'+uuid.uuid4().hex,'account_fingerprint':fingerprint,
         'ledger_path':str((args.output/'ledger.db').resolve()),'contracts':codes,'trading_day':'2026-11-11',
@@ -64,7 +65,7 @@ def main():
                    dsv_config=args.dsv_config,dsv_log_dir=args.dsv_config.parent/'logs')
     metadata={'status':'LOCAL_PREPARATION_COMPLETE_NOT_CONNECTED','account_key':grant.account_key,
         'scope_hash':grant.content_hash,'credential_reference':str(args.credential_reference.resolve()),
-        'profile_hash':profile.content_hash,'calendar_hash':calendar.content_hash,'sdk_version':'3.10.4',
+        'profile_hash':profile.content_hash,'calendar_hash':calendar.content_hash,'sdk_version':SDK_VERSION,
         'max_order_quantity_source':'DSV max_volume','opening_attempts_source':'DSV max_daily_orders per contract times contract count',
         'nominal_risk_ceiling_source':'Sum of DSV calculated fixed stop distance * contract multiplier * saved max_volume',
         'nominal_risk_ceiling':budget,'nominal_risk_components':components,'automatic_sizing_preserved':True,
