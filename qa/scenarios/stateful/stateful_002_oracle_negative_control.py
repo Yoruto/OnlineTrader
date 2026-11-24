@@ -35,15 +35,20 @@ def _base_broker(*, orders=None, trades=None, long_qty=0, active_children=None, 
     }
 
 
-def _base_workbench(*, boot_id="boot-1", owned=0, orders=None, trades=None, cycles=None, clock_fault=None, feed_blocked=False):
+def _base_workbench(*, boot_id="boot-1", owned=0, orders=None, trades=None, cycles=None,
+                    clock_fault=None, feed_blocked=False, entry_authority="DISARMED", config_revision="1"):
     return {
         "kernel_boot_id": boot_id,
+        "entry_authority": entry_authority,
         "current_responsibility": {"owned_quantity": owned},
         "orders": orders or [],
         "trades": trades or [],
         "cycles": cycles or [],
         "connection": {"clock_fault": clock_fault},
-        "configuration": {"market_health": {"status": "FEED_SUSPECTED_STALLED" if feed_blocked else "HEALTHY", "feed_entry_blocked": feed_blocked}},
+        "configuration": {
+            "config_revision": config_revision,
+            "market_health": {"status": "FEED_SUSPECTED_STALLED" if feed_blocked else "HEALTHY", "feed_entry_blocked": feed_blocked},
+        },
     }
 
 
@@ -116,5 +121,68 @@ def run(work_dir: Path) -> dict[str, object]:
         frame_id="f8",
     ))
 
-    trace.record("COMMAND", operation="NEGATIVE_CONTROL_9_INVARIANTS", receipt_status="PASS")
+    # INV-009: Authority & config_revision mismatch
+    o = ReferenceOracle()
+    o.set_boot_expectation("boot-1", config_revision="2")
+    o.set_authority_expectation("ARMED")
+    _expect_violation("INV-009", lambda: o.verify(
+        broker_snapshot=_base_broker(),
+        workbench_view=_base_workbench(entry_authority="DISARMED", config_revision="2"),
+        round_seq=1, frame_id="f9",
+    ))
+    _expect_violation("INV-009", lambda: o.verify(
+        broker_snapshot=_base_broker(),
+        workbench_view=_base_workbench(entry_authority="ARMED", config_revision="1"),
+        round_seq=1, frame_id="f10",
+    ))
+
+    # INV-005: Close order exceeds closable position
+    o = ReferenceOracle()
+    close_order = {
+        "request": {"contract_id": CONTRACT, "direction": "SELL", "native_offset": "CLOSETODAY", "quantity": 6, "child_order_id": "c-close"},
+        "status": "ALIVE", "traded_qty": 0, "cancel_effect_ids": [],
+    }
+    _expect_violation("INV-005", lambda: o.verify(
+        broker_snapshot=_base_broker(long_qty=5, orders={"c-close": close_order}, active_children=["c-close"]),
+        workbench_view=_base_workbench(owned=5, cycles=[{"contract_id": CONTRACT, "direction": "LONG", "remaining_quantity": 5}]),
+        round_seq=1, frame_id="f11",
+    ))
+
+    # INV-015: Per-contract attribution swap (same total 5 lots, wrong contract)
+    other = "SHFE.ag2612"
+    multi_broker = _base_broker(long_qty=5)
+    multi_broker["contracts"] = [CONTRACT, other]
+    multi_broker["positions_by_contract"][other] = {
+        "long_today": 0, "long_historical": 0, "short_today": 0, "short_historical": 0, "long_qty": 0, "short_qty": 0,
+    }
+    o = ReferenceOracle()
+    _expect_violation("INV-015", lambda: o.verify(
+        broker_snapshot=multi_broker,
+        workbench_view=_base_workbench(owned=5, cycles=[{"contract_id": other, "direction": "LONG", "remaining_quantity": 5}]),
+        round_seq=1, frame_id="f12",
+    ))
+
+    # INV-015: Direction flip (LONG vs SHORT, same total 5 lots)
+    _expect_violation("INV-015", lambda: o.verify(
+        broker_snapshot=_base_broker(long_qty=5),
+        workbench_view=_base_workbench(owned=5, cycles=[{"contract_id": CONTRACT, "direction": "SHORT", "remaining_quantity": 5}]),
+        round_seq=1, frame_id="f13",
+    ))
+
+    # INV-015: Trade price mismatch (same trade ID, wrong price)
+    broker_trade = {
+        "native_trade_id": "t-1", "contract_id": CONTRACT, "direction": "BUY",
+        "native_offset": "OPEN", "quantity": 5, "price": "1060",
+    }
+    _expect_violation("INV-015", lambda: o.verify(
+        broker_snapshot=_base_broker(long_qty=5, trades={"t-1": broker_trade}),
+        workbench_view=_base_workbench(
+            owned=5,
+            cycles=[{"contract_id": CONTRACT, "direction": "LONG", "remaining_quantity": 5}],
+            trades=[{"native_trade_id": "t-1", "contract_id": CONTRACT, "direction": "LONG", "quantity": 5, "price": "1065", "effect": "OPEN"}],
+        ),
+        round_seq=1, frame_id="f14",
+    ))
+
+    trace.record("COMMAND", operation="NEGATIVE_CONTROL_14_INVARIANTS", receipt_status="PASS")
     return trace.finalize(passed=True)

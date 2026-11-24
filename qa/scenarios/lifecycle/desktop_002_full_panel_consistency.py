@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 import time
 
@@ -20,35 +21,91 @@ from qa.target_owner.offline_runtime import CONTRACT, DAY
 
 
 def _assert_panel_matches_runtime(ui: dict[str, object], runtime_wb: dict[str, object], broker_snap: dict[str, object]) -> None:
-    """Assert Qt Workbench UI panel widgets agree with Runtime projection and FakeBroker truth."""
+    """Assert Qt Workbench UI panel widget contents agree with Runtime projection and FakeBroker truth."""
     runtime_auth = runtime_wb.get("entry_authority")
     if ui.get("view_entry_authority") != runtime_auth:
         raise AssertionError(f"UI authority {ui.get('view_entry_authority')!r} != Runtime {runtime_auth!r}")
 
+    positions_by_contract = broker_snap.get("positions_by_contract") or {
+        str(broker_snap["contract_id"]): broker_snap["positions"],
+    }
+    broker_owned = sum(int(p["long_qty"]) + int(p["short_qty"]) for p in positions_by_contract.values())
     runtime_owned = int((runtime_wb.get("current_responsibility") or {}).get("owned_quantity", 0))
-    broker_owned = int(broker_snap["positions"]["long_qty"]) + int(broker_snap["positions"]["short_qty"])
     if int(ui.get("view_owned_quantity") or 0) != runtime_owned or runtime_owned != broker_owned:
         raise AssertionError(
             f"Owned mismatch: UI={ui.get('view_owned_quantity')} Runtime={runtime_owned} Broker={broker_owned}"
         )
 
+    # 1. Cycles table: verify contract, direction ('多'/'空'), and quantity per row
     cycles_rows = ui.get("cycles_rows") or []
-    expected_cycles = len([
-        c for c in (runtime_wb.get("cycles") or [])
-        if int(c.get("remaining_quantity", 0)) > 0
-    ])
-    if len(cycles_rows) != expected_cycles:
-        raise AssertionError(f"UI visible cycles rows={len(cycles_rows)} != Runtime active cycles {expected_cycles}: {cycles_rows}")
+    expected_positions: dict[tuple[str, str], int] = {}
+    for code, pos in positions_by_contract.items():
+        if int(pos["long_qty"]) > 0:
+            expected_positions[(code, "多")] = int(pos["long_qty"])
+        if int(pos["short_qty"]) > 0:
+            expected_positions[(code, "空")] = int(pos["short_qty"])
+    ui_positions: dict[tuple[str, str], int] = {}
+    for row in cycles_rows:
+        if len(row) < 3:
+            raise AssertionError(f"Unexpected cycles row shape: {row}")
+        key = (str(row[0]), str(row[1]))
+        ui_positions[key] = ui_positions.get(key, 0) + int(row[2])
+    if ui_positions != expected_positions:
+        raise AssertionError(
+            f"UI cycles table content mismatch: UI={ui_positions} != Broker={expected_positions} (rows={cycles_rows})"
+        )
 
+    # 2. Active orders table: verify native_order_id, contract, side, offset, qty, remaining, price, status
+    offset_labels = {"OPEN": "开仓", "CLOSE": "平仓", "CLOSETODAY": "平今", "CLOSEYESTERDAY": "平昨"}
+    side_labels = {"BUY": "买", "SELL": "卖"}
     orders_rows = ui.get("orders_rows") or []
-    expected_orders = len(broker_snap.get("active_children") or [])
-    if len(orders_rows) != expected_orders:
-        raise AssertionError(f"UI active orders rows={len(orders_rows)} != Broker active orders {expected_orders}: {orders_rows}")
+    active_ids = list(broker_snap.get("active_children") or [])
+    if len(orders_rows) != len(active_ids):
+        raise AssertionError(f"UI active orders rows={len(orders_rows)} != Broker active orders {len(active_ids)}: {orders_rows}")
+    orders_by_native = {str(row[0]): row for row in orders_rows if len(row) >= 8}
+    broker_orders = broker_snap.get("orders") or {}
+    for cid in active_ids:
+        order = broker_orders[cid]
+        req = order["request"]
+        native_id = str(order["native_order_id"])
+        row = orders_by_native.get(native_id)
+        if row is None:
+            raise AssertionError(f"Active order {native_id} missing from UI orders table: {orders_rows}")
+        expected_rem = int(req["quantity"]) - int(order["traded_qty"])
+        if (
+            row[1] != str(req["contract_id"])
+            or row[2] != side_labels[str(req["direction"])]
+            or row[3] != offset_labels[str(req["native_offset"])]
+            or int(row[4]) != int(req["quantity"])
+            or int(row[5]) != expected_rem
+            or Decimal(row[6]) != Decimal(str(req["limit_price"]))
+            or row[7] != "挂单"
+        ):
+            raise AssertionError(
+                f"UI order row {row} disagrees with Broker order {order}"
+            )
 
+    # 3. Trades table: verify native_trade_id, contract, side, effect, quantity, price
     trades_rows = ui.get("trades_rows") or []
-    expected_trades = len(broker_snap.get("trades") or {})
-    if len(trades_rows) != expected_trades:
-        raise AssertionError(f"UI trades table rows={len(trades_rows)} != Broker trades {expected_trades}: {trades_rows}")
+    broker_trades = broker_snap.get("trades") or {}
+    if len(trades_rows) != len(broker_trades):
+        raise AssertionError(f"UI trades table rows={len(trades_rows)} != Broker trades {len(broker_trades)}: {trades_rows}")
+    trades_by_id = {str(row[0]): row for row in trades_rows if len(row) >= 6}
+    for tid, trade in broker_trades.items():
+        row = trades_by_id.get(str(tid))
+        if row is None:
+            raise AssertionError(f"Trade {tid} missing from UI trades table: {trades_rows}")
+        expected_effect = "开仓" if trade["native_offset"] == "OPEN" else "平仓"
+        if (
+            row[1] != str(trade["contract_id"])
+            or row[2] != side_labels[str(trade["direction"])]
+            or row[3] != expected_effect
+            or int(row[4]) != int(trade["quantity"])
+            or Decimal(row[5]) != Decimal(str(trade["price"]))
+        ):
+            raise AssertionError(
+                f"UI trade row {row} disagrees with Broker trade {trade}"
+            )
 
     btn = ui.get("button_enabled") or {}
     if runtime_auth == "ARMED" and btn.get("arm"):

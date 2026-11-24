@@ -34,6 +34,15 @@ LEGACY_REQUEST_SCHEMA = "ONLINE_TRADER_DIAGNOSTIC_REPORT_REQUEST/1"
 MANIFEST_SCHEMA = "ONLINE_TRADER_DIAGNOSTIC_MANIFEST/1"
 _MAX_SOURCE_FILE = 8 * 1024 * 1024
 _MAX_BUNDLE_INPUT = 32 * 1024 * 1024
+# Group reservations; whatever one group does not need is shared with the other.
+_RUNTIME_RESERVE = 20 * 1024 * 1024
+_WORKBENCH_RESERVE = _MAX_BUNDLE_INPUT - _RUNTIME_RESERVE
+# Per-stream evidence kept even when recent segments consume the budget.
+_HEAD_RESERVE = 1 * 1024 * 1024
+_KEY_EVENT_RESERVE = 1 * 1024 * 1024
+_MAX_KEY_SCAN = 64 * 1024 * 1024
+_KEY_COMPONENTS = frozenset({"LIFECYCLE"})
+_KEY_SEVERITIES = frozenset({"ERROR", "CRITICAL"})
 _MAX_LOCAL_BYTES = 500 * 1024 * 1024
 _CONTEXT_EVENTS = frozenset({
     "WORKBENCH_STARTED", "WORKBENCH_STOPPED", "WORKBENCH_CONNECTION_CHANGED",
@@ -49,6 +58,14 @@ _VIEW_LINE = re.compile(
 _BOOT_TOKEN = re.compile(r"(?:^| )boot=([A-Za-z0-9._-]+)(?: |$)")
 _async_lock = Lock()
 _async_keys = set()
+
+
+def _utc_key(value):
+    """Order UTC text by instant; strings with/without fractions do not sort correctly."""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _sha256(path: Path) -> str:
@@ -225,13 +242,23 @@ def _json_snapshot(path: Path):
         return None
 
 
-def _line_snapshot(path: Path, *, limit: int):
+def _line_snapshot(path: Path, *, limit: int, from_end: bool = False):
+    """Read complete lines from a fixed-size snapshot.
+
+    ``from_end`` keeps the newest bytes of a larger file and drops the leading
+    partial line, so recent evidence wins when the file exceeds ``limit``.
+    """
     with path.open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
         take = min(size, limit)
+        if from_end and take < size:
+            stream.seek(size - take)
         raw = stream.read(take)
     limited = size > take
     tail_discarded = False
+    if from_end and limited and raw:
+        start = raw.find(b"\n")
+        raw = b"" if start < 0 else raw[start + 1:]
     if raw and not raw.endswith(b"\n"):
         end = raw.rfind(b"\n")
         raw = b"" if end < 0 else raw[:end + 1]
@@ -246,6 +273,70 @@ def _stage(staging: Path, target: str, raw: bytes, files: list):
     files.append((destination, target, len(raw), hashlib.sha256(raw).hexdigest()))
 
 
+def _is_key_event(row) -> bool:
+    return (row.get("component") in _KEY_COMPONENTS
+            or row.get("severity") in _KEY_SEVERITIES)
+
+
+def _scan_key_events(path: Path, budget: int):
+    """Stream one skipped segment and keep only bounded lifecycle/error lines."""
+    kept = []
+    used = 0
+    scanned = 0
+    with path.open("rb") as stream:
+        for line in stream:
+            scanned += len(line)
+            if scanned > _MAX_SOURCE_FILE or not line.endswith(b"\n"):
+                break
+            if b'"LIFECYCLE"' not in line and b'"ERROR"' not in line and b'"CRITICAL"' not in line:
+                continue
+            if used + len(line) > budget:
+                break
+            kept.append(line)
+            used += len(line)
+    return kept, used, scanned
+
+
+def _plan_sources(sources, budget):
+    """Choose which segments to read: newest first, plus the oldest head.
+
+    Returns ``(plan, key_budget)`` where ``plan`` maps a segment to
+    ``("FULL"|"TAIL"|"HEAD", byte_limit)``; unplanned segments are skipped and
+    only scanned for key lifecycle/error events within ``key_budget``.
+    """
+    plan = {}
+    if not sources or budget <= 0:
+        return plan, 0
+    sizes = {}
+    for source in sources:
+        try:
+            sizes[source] = source.stat().st_size
+        except OSError:
+            sizes[source] = 0
+    total_size = sum(min(size, _MAX_SOURCE_FILE) for size in sizes.values())
+    if total_size <= budget:
+        return {source: ("FULL", _MAX_SOURCE_FILE) for source in sources}, 0
+    multiple = len(sources) > 1
+    head_reserve = min(_HEAD_RESERVE, budget // 8) if multiple else 0
+    key_reserve = min(_KEY_EVENT_RESERVE, budget // 8) if len(sources) > 2 else 0
+    recent_budget = budget - head_reserve - key_reserve
+    oldest = sources[0]
+    for source in reversed(sources):
+        if recent_budget <= 0:
+            break
+        size = sizes[source]
+        take = min(size, _MAX_SOURCE_FILE, recent_budget)
+        if take <= 0:
+            continue
+        plan[source] = ("FULL" if take >= size else "TAIL", take)
+        recent_budget -= take
+    if oldest not in plan:
+        head_budget = head_reserve + max(0, recent_budget)
+        if head_budget > 0:
+            plan[oldest] = ("HEAD", min(head_budget, _MAX_SOURCE_FILE))
+    return plan, key_reserve
+
+
 def _collect_event_stream(staging, group, root, target_boot, budget, files, omissions):
     metadata = _json_snapshot(root / "metadata.json")
     health = _json_snapshot(root / "health.json")
@@ -257,15 +348,52 @@ def _collect_event_stream(staging, group, root, target_boot, budget, files, omis
     tail_discarded = False
     invalid_events = 0
     raw_bytes = 0
-    for source in sorted(root.glob("events-*.ndjson")):
-        remaining = max(0, min(_MAX_SOURCE_FILE, budget - raw_bytes))
-        if remaining <= 0:
-            omissions.append(f"{group}/{root.name}/{source.name}:BUNDLE_LIMIT")
-            break
+    budget_trimmed = False
+    key_event_count = 0
+    sources = sorted(root.glob("events-*.ndjson"))
+    plan, key_budget = _plan_sources(sources, budget)
+    key_scanned = 0
+    boundary_break = False
+
+    def accept(line):
+        nonlocal invalid_events
         try:
-            raw, _, limited, tail = _line_snapshot(source, limit=remaining)
+            row = strict_loads(line)
+            sequence = int(row["event_seq"])
+            if type(row) is not dict or row.get("stream_id") != (metadata or {}).get("stream_id"):
+                raise ValueError
+        except Exception:
+            invalid_events += 1
+            return None, None
+        return row, sequence
+
+    for source in sources:
+        step = plan.get(source)
+        if step is None:
+            budget_trimmed = True
+            boundary_break = True
+            omissions.append(f"{group}/{root.name}/{source.name}:BUNDLE_LIMIT")
+            if key_budget > 0 and key_scanned < _MAX_KEY_SCAN:
+                try:
+                    lines, used, scanned = _scan_key_events(source, key_budget)
+                except OSError:
+                    omissions.append(f"{group}/{root.name}/{source.name}:UNREADABLE")
+                    continue
+                key_budget -= used
+                key_scanned += scanned
+                raw_bytes += used
+                for line in lines:
+                    row, _ = accept(line)
+                    if row is not None and _is_key_event(row):
+                        rows.append(row)
+                        key_event_count += 1
+            continue
+        mode, limit = step
+        try:
+            raw, _, limited, tail = _line_snapshot(source, limit=limit, from_end=(mode == "TAIL"))
         except OSError:
             omissions.append(f"{group}/{root.name}/{source.name}:UNREADABLE")
+            boundary_break = True
             continue
         raw_bytes += len(raw)
         sidecar = source.with_suffix(".segment.json")
@@ -273,7 +401,8 @@ def _collect_event_stream(staging, group, root, target_boot, budget, files, omis
         source_open = source_open or not closed
         tail_discarded = tail_discarded or tail
         if limited:
-            omissions.append(f"{group}/{root.name}/{source.name}:SIZE_LIMIT")
+            budget_trimmed = True
+            omissions.append(f"{group}/{root.name}/{source.name}:SIZE_LIMIT_{mode}")
         if closed and not limited:
             segment = _json_snapshot(sidecar)
             try:
@@ -287,20 +416,23 @@ def _collect_event_stream(staging, group, root, target_boot, budget, files, omis
             if not integrity_ok:
                 omissions.append(f"{group}/{root.name}/{source.name}:SEGMENT_INTEGRITY")
                 source_sequence_complete = False
+        if mode == "TAIL":
+            boundary_break = True
         for line in raw.splitlines():
-            try:
-                row = strict_loads(line)
-                sequence = int(row["event_seq"])
-                if type(row) is not dict or row.get("stream_id") != (metadata or {}).get("stream_id"):
-                    raise ValueError
-            except Exception:
-                invalid_events += 1
+            row, sequence = accept(line)
+            if row is None:
                 continue
-            if source_last is not None and sequence != source_last + 1:
+            # Deliberate budget trimming is reported as BUNDLE_LIMIT/SIZE_LIMIT,
+            # not as a source sequence defect.
+            if source_last is not None and not boundary_break and sequence != source_last + 1:
                 source_sequence_complete = False
+            boundary_break = False
             source_first = sequence if source_first is None else source_first
             source_last = sequence
             rows.append(row)
+        if mode == "HEAD" and limited:
+            boundary_break = True
+    rows.sort(key=lambda row: int(row["event_seq"]))
     exact = [row for row in rows if row.get("runtime_boot_id") == target_boot]
     context = []
     if group == "workbench" and exact:
@@ -340,12 +472,17 @@ def _collect_event_stream(staging, group, root, target_boot, budget, files, omis
         omissions.append(f"{group}/{root.name}:NOT_FINALIZED")
     if dropped or write_failures or retention_dropped:
         omissions.append(f"{group}/{root.name}:SINK_GAPS")
+    observed = [row.get("observed_at_utc") for row in selected if row.get("observed_at_utc")]
     return {
         "stream_id": (metadata or {}).get("stream_id"),
         "process_role": (metadata or {}).get("process_role"),
         "process_instance_id": (metadata or {}).get("process_instance_id", root.name),
         "runtime_boot_id": target_boot,
         "created_at_utc": (metadata or {}).get("created_at_utc"),
+        "first_event_at_utc": min(observed, key=_utc_key, default=None),
+        "last_event_at_utc": max(observed, key=_utc_key, default=None),
+        "budget_trimmed": budget_trimmed,
+        "key_event_count": key_event_count,
         "source_first_event_seq": None if source_first is None else str(source_first),
         "source_last_event_seq": None if source_last is None else str(source_last),
         "source_sequence_complete": source_sequence_complete,
@@ -387,7 +524,7 @@ def _collect_view_log(staging, runtime_root, request, coverage_start, files, omi
                     unparsed += 1
                 continue
             occurred, message = match.groups()
-            if not coverage_start <= occurred <= request["requested_at_utc"]:
+            if not _utc_key(coverage_start) <= _utc_key(occurred) <= _utc_key(request["requested_at_utc"]):
                 continue
             boot_match = _BOOT_TOKEN.search(message)
             boot = boot_match.group(1) if boot_match else None
@@ -422,10 +559,37 @@ def _collect_sources(staging: Path, runtime_root: Path, request: dict):
     total = 0
     runtime_id = request.get("runtime_process_instance_id")
     runtime_directory = diagnostics / "runtime" / str(runtime_id)
+    workbench_root = diagnostics / "workbench"
+    workbench_candidates = []
+    if workbench_root.is_dir():
+        def modified(path):
+            try:
+                return path.stat().st_mtime_ns
+            except OSError:
+                return -1
+        workbench_candidates = sorted(
+            (path for path in workbench_root.iterdir() if path.is_dir()),
+            key=modified,
+            reverse=True,
+        )[:64]
+
+    def stream_bytes(directory):
+        total_bytes = 0
+        for path in directory.glob("events-*.ndjson"):
+            try:
+                total_bytes += min(path.stat().st_size, _MAX_SOURCE_FILE)
+            except OSError:
+                continue
+        return total_bytes
+
+    # Workbench keeps its reservation only up to what it could use; the rest is
+    # shared with Runtime.  Runtime's unused bytes flow to Workbench below.
+    workbench_need = sum(stream_bytes(directory) for directory in workbench_candidates)
+    runtime_budget = _MAX_BUNDLE_INPUT - min(_WORKBENCH_RESERVE, workbench_need)
     if runtime_id and runtime_directory.is_dir():
         row, used = _collect_event_stream(
             staging, "runtime", runtime_directory, request.get("runtime_boot_id"),
-            _MAX_BUNDLE_INPUT - total, files, omissions,
+            runtime_budget, files, omissions,
         )
         total += used
         if row is not None:
@@ -434,36 +598,25 @@ def _collect_sources(staging: Path, runtime_root: Path, request: dict):
         omissions.append(f"runtime/{runtime_id}:MISSING_EXPECTED_SOURCE")
     coverage_start = min(
         (row.get("created_at_utc") for row in streams if row.get("created_at_utc")),
+        key=_utc_key,
         default=request["requested_at_utc"],
     )
     view_rows, workbench_expected = _collect_view_log(
         staging, runtime_root, request, coverage_start, files, omissions,
     )
     workbench_count = 0
-    workbench_root = diagnostics / "workbench"
-    if workbench_root.is_dir():
-        def modified(path):
-            try:
-                return path.stat().st_mtime_ns
-            except OSError:
-                return -1
-        candidates = sorted(
-            (path for path in workbench_root.iterdir() if path.is_dir()),
-            key=modified,
-            reverse=True,
-        )[:64]
-        for directory in candidates:
-            if total >= _MAX_BUNDLE_INPUT:
-                omissions.append("workbench:BUNDLE_LIMIT")
-                break
-            row, used = _collect_event_stream(
-                staging, "workbench", directory, request.get("runtime_boot_id"),
-                _MAX_BUNDLE_INPUT - total, files, omissions,
-            )
-            if row is not None:
-                total += used
-                streams.append(row)
-                workbench_count += 1
+    for directory in workbench_candidates:
+        if total >= _MAX_BUNDLE_INPUT:
+            omissions.append("workbench:BUNDLE_LIMIT")
+            break
+        row, used = _collect_event_stream(
+            staging, "workbench", directory, request.get("runtime_boot_id"),
+            _MAX_BUNDLE_INPUT - total, files, omissions,
+        )
+        if row is not None:
+            total += used
+            streams.append(row)
+            workbench_count += 1
     workbench_expected = bool(request["expected_sources"]["workbench"] or workbench_expected)
     if workbench_expected and not workbench_count:
         omissions.append("workbench:MISSING_EXPECTED_SOURCE")
@@ -474,9 +627,20 @@ def _write_bundle(runtime_root: Path, request: dict):
     diagnostics = runtime_root / "diagnostics"
     with TemporaryDirectory(prefix="online-trader-diagnostic-") as temporary_directory:
         staging = Path(temporary_directory)
+        capture_started = utc_now()
         files, streams, omitted, view_rows, workbench_expected = _collect_sources(
             staging, runtime_root, request
         )
+        # Coverage describes evidence actually in the bundle, not process lifetime
+        # or the trigger instant; events may legitimately follow requested_at_utc.
+        event_times = [
+            value for row in streams
+            for value in (row.get("first_event_at_utc"), row.get("last_event_at_utc")) if value
+        ] + [row["occurred_at_utc"] for row in view_rows if row.get("occurred_at_utc")]
+        first_event = min(event_times, key=_utc_key, default=None)
+        last_event = max(event_times, key=_utc_key, default=None)
+        coverage_start = first_event or request["requested_at_utc"]
+        coverage_end = last_event or request["requested_at_utc"]
         member_hashes = {target: digest for _, target, _, digest in files}
         dropped = sum(int(row.get("dropped_events") or 0) for row in streams)
         write_failures = sum(int(row.get("write_failures") or 0) for row in streams)
@@ -498,11 +662,13 @@ def _write_bundle(runtime_root: Path, request: dict):
             "trigger_key": request.get("trigger_key"),
             "application_version": __version__,
             "build_manifest_hash": _build_manifest_hash(runtime_root),
-            "coverage_start": min(
-                (row.get("created_at_utc") for row in streams if row.get("created_at_utc")),
-                default=request["requested_at_utc"],
-            ),
-            "coverage_end": request["requested_at_utc"],
+            "coverage_start": coverage_start,
+            "coverage_end": coverage_end,
+            "coverage_semantics": "OBSERVED_EVENTS",
+            "requested_at_utc": request["requested_at_utc"],
+            "capture_started_at_utc": capture_started,
+            "first_event_at_utc": first_event,
+            "last_event_at_utc": last_event,
             "target_runtime_boot_id": request.get("runtime_boot_id"),
             "expected_sources": request["expected_sources"] | {
                 "workbench_observed_by_runtime_view": workbench_expected,

@@ -119,6 +119,7 @@ def run(work_dir: Path) -> dict[str, object]:
             wb_after = read_workbench_view()
         if str(wb_after["configuration"]["config_revision"]) != "2":
             raise AssertionError(f"Expected config_revision=2, got {wb_after['configuration']['config_revision']}")
+        oracle.set_config_revision_expectation("2")
         saved_disk_before = param_file.read_bytes()
 
         # 2. Arm and open 5 lots -> while holding position, parameter save MUST be rejected (INV-013 & INV-014)
