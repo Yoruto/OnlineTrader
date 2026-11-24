@@ -6,6 +6,8 @@
 > 范围：OnlineTrader 默认 Standalone Trading Runtime + DSV Target Owner；人工监督的 Windows 桌面自动交易终端。  
 > 本文是后续开发设计和分批验收合同，不代表新增功能已经实现或通过测试；不授权连接账户、下单、运行测试、打包或发布。
 
+> **实施入口（2026-11-24）：** [最小实现规格 V1.0](configuration-persistence-runtime-implementation-20261124.md) 将本文转化为分批编码规格，明确冷切换、派生状态、最小配置/存储接口及反过度设计约束。其源码基线为 `7a9df4d`，纳入后续 CURRENT 的[全账户目标持仓收敛与启动推算](runtime-account-target-convergence-20261124.md)；本文关于外部仓归属的旧描述不得覆盖该现行合同。两份文档均仍为 CANDIDATE，跨 boot 新持久化等变更需先批准。
+
 ## 0. 摘要与核心决策
 
 **V1.1 核心修订：Runtime 进程、行情、账户连接与交易会话具有不同生命周期。软件运行不等于策略运行，账户连接不等于交易授权，策略停止不等于交易责任结束。** 普通打开软件进入监控模式；仅在有效授权后进入交易模式。策略停止且交易责任已证明清空时，不应再要求用户先退出 Runtime 才能发起账号切换或更新。首版允许 Supervisor 自动受控重启 Runtime 实现切换，不要求新增独立行情进程或两套 SDK。
