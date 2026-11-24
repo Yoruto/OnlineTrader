@@ -1194,9 +1194,22 @@ class WorkbenchLayout:
                           detail_target='blocks', detail_text='查看阻挡详情',
                           items=['先修复 Windows 时间或交易日证据，再点击“重新核对”；不会重发订单'])
         elif owner_faults:
+            detail_map = {
+                str(block.get('reason_code')): str(block.get('detail'))
+                for block in (view.get('blocks') or ())
+                if isinstance(block, dict) and block.get('reason_code') and block.get('detail')
+            }
+            if connection.get('owner_fault_code') and connection.get('owner_fault_detail'):
+                detail_map.setdefault(str(connection['owner_fault_code']), str(connection['owner_fault_detail']))
+            items = []
+            for code in owner_faults:
+                msg = f'{OWNER_RECOVERY_MESSAGES[code]}（{code}）'
+                if detail_map.get(code):
+                    msg += f'：{detail_map[code]}'
+                items.append(msg)
             result.update(title='需要人工核对', reconcile=True,
                           detail_target='blocks', detail_text='查看阻挡详情',
-                          items=[f'{OWNER_RECOVERY_MESSAGES[code]}（{code}）' for code in owner_faults])
+                          items=items)
         elif connection.get('recovery_required') and (fallback_faults or (connected and synchronized)):
             if fallback_faults:
                 suffix = '、'.join(str(code) for code in fallback_faults)
@@ -1238,7 +1251,7 @@ class WorkbenchLayout:
         else:
             return None
 
-        if result['reconcile'] and not (connected and synchronized):
+        if result['reconcile'] and not (connected and (synchronized or owner_faults)):
             result['items'].append('柜台仍在重新连接或同步；完成后“重新核对”按钮才可用')
 
         if pending and result['title'] not in {'订单处理中', '命令结果待核对'}:
@@ -2141,8 +2154,15 @@ class WorkbenchLayout:
             self.home_pending.setToolTip('\n'.join([attention['title'], *items]))
             self.home_pending.show()
             self.home_reconcile_button.setVisible(attention['reconcile'])
+            owner_fault_present = bool(
+                (view or {}).get('connection', {}).get('owner_fault_code')
+                or any(
+                    isinstance(b, dict) and b.get('active', True) and b.get('reason_code') in OWNER_RECOVERY_MESSAGES
+                    for b in ((view or {}).get('blocks') or ())
+                )
+            )
             self.home_reconcile_button.setEnabled(
-                attention['reconcile'] and connected and synced
+                attention['reconcile'] and connected and (synced or owner_fault_present)
                 and self.buttons['reconcile'].isEnabled())
             self._home_detail_target = attention['detail_target']
             self.home_detail_button.setText(attention['detail_text'])

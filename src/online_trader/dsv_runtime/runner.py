@@ -128,6 +128,7 @@ class DsvSession:
             self._state.setdefault('trading_day', trading_day)
             self._state.setdefault('synchronized', True)
             self._state.setdefault('owner_fault_code', None)
+            self._state.setdefault('owner_fault_detail', None)
             self._state.setdefault('retired_positions', {})
             if self._standalone_convergence:
                 self._state.setdefault('startup_inferred', False)
@@ -273,7 +274,7 @@ class DsvSession:
         if expected is not None and expected != self._state['trading_day']:
             raise TraderError('E_DSV_SCOPE', 'The observed cabinet trading day changed')
 
-    def disconnect(self, reason='FEED_DISCONNECTED', *, disarm=False, fault_code=None):
+    def disconnect(self, reason='FEED_DISCONNECTED', *, disarm=False, fault_code=None, fault_detail=None):
         """Keep the last committed owner state; require a fresh complete round before effects."""
         self._check_owner()
         if self._busy:
@@ -287,6 +288,8 @@ class DsvSession:
                     position.update(entry_stopped=True, preserve_open_on_stop=False)
         if fault_code is not None:
             state['owner_fault_code'] = fault_code
+            if fault_detail is not None:
+                state['owner_fault_detail'] = str(fault_detail)[:240]
         try:
             with self._journal.transaction():
                 event_payload = {'reason': reason}
@@ -294,6 +297,8 @@ class DsvSession:
                     event_payload['entry_authority'] = 'DISARMED'
                 if fault_code is not None:
                     event_payload['fault_code'] = fault_code
+                if fault_detail is not None:
+                    event_payload['fault_detail'] = str(fault_detail)[:240]
                 self._journal.event('DISCONNECTED', event_payload)
                 self._journal.save(state)
         except sqlite3.Error as error:
@@ -301,7 +306,23 @@ class DsvSession:
             raise TraderError('E_DSV_STORE', 'Connection loss could not be recorded; owner requires restart') from error
         self._state = state
         return {'synchronized': False, 'running': state['running'],
-                'owner_fault_code': state.get('owner_fault_code')}
+                'owner_fault_code': state.get('owner_fault_code'),
+                'owner_fault_detail': state.get('owner_fault_detail')}
+
+    def set_owner_fault_detail(self, fault_detail):
+        """Record human-readable persistent fault detail without resetting sync barrier."""
+        self._check_owner()
+        text = None if fault_detail is None else str(fault_detail)[:240]
+        if self._state.get('owner_fault_detail') == text:
+            return
+        state = copy.deepcopy(self._state)
+        state['owner_fault_detail'] = text
+        try:
+            with self._journal.transaction():
+                self._journal.save(state)
+        except sqlite3.Error:
+            return
+        self._state = state
 
     def disable_entries_on_restart(self):
         self._check_owner()
@@ -1991,6 +2012,7 @@ class DsvSession:
                    for row in state['symbols'].values()):
                 raise TraderError('E_DSV_OWNERSHIP', 'Resolve native position or late-fill conflicts before clearing fault')
             state['owner_fault_code'] = None
+            state['owner_fault_detail'] = None
             return [{'reason': 'BROKER_FACTS_RECONCILED', 'sequence': state['sequence'],
                      'rule_ids': ['I01', 'I02']}], []
         if action == 'SAVE_PARAMETERS':

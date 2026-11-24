@@ -440,6 +440,22 @@ class DsvSdkAdapter:
         state = self._bind(session)
         if command.get('action') in {'START', 'STOP', 'CLOCK_RECOVER'}:
             self._clock_resume_day = None
+        if command.get('action') == 'RECONCILE' and not state.get('synchronized'):
+            for cache_attr in ('_verified_order_facts', '_verified_trade_facts'):
+                cache = getattr(self, cache_attr, None)
+                if isinstance(cache, dict):
+                    cache.clear()
+            self._native_fact_cache.clear()
+            complete_fn = (
+                (lambda: bool(self.connection.broker_connected and self.connection.complete()))
+                if self.connection is not None else True
+            )
+            try:
+                self.step(session, trading_day=state['trading_day'], complete=complete_fn)
+                state = session.snapshot()
+            except TraderError as error:
+                session.set_owner_fault_detail(str(error))
+                raise TraderError(error.code, f'重新核对失败（{error.code}）：{error}') from error
         added = tuple(command.get('added_contracts') or ()) if command.get('action') == 'SAVE_PARAMETERS' else ()
         if added and prepared_contracts is None:
             candidate = DsvProfile.from_record(command['profile'])
@@ -609,13 +625,17 @@ class DsvSdkAdapter:
             )
             self._try_resume_clock_entries(session, state, market)
             return receipt
-        except BaseException:
+        except BaseException as error:
             self.metrics = dict(getattr(self, 'metrics', None) or {}, sdk_updated='ERROR')
             self._clock_resume_day = None
             self.synchronized = False
             self.flat_confirmed = False
-            self.dispatch_market = {}
-            self.quote_observations = {}
+            self._last_step_error = f"{getattr(error, 'code', type(error).__name__)}: {error}"[:400]
+            if not isinstance(error, TraderError) or error.code not in {
+                'E_DSV_NATIVE_FACT', 'E_DSV_SDK_FACT', 'E_DSV_OWNERSHIP',
+            }:
+                self.dispatch_market = {}
+                self.quote_observations = {}
             self._minute_chart_sample_at = None
             self._minute_chart_cache = {}
             if hasattr(self, '_minute_chart_raw_cache'):
@@ -637,11 +657,55 @@ class DsvSdkAdapter:
             self._last_idle_signature = None
             self._local_returns.clear()
             self.epoch = uuid4().hex
-            if not session._failed:
+            if not session._failed and session.snapshot().get('synchronized', True):
                 session.disconnect('SDK_ROUND_FAILED')
             raise
         finally:
             self.enabled = False
+
+    def poll_fault_hold(self, session, *, trading_day, complete):
+        """Keep quotes and positions refreshed read-only during persistent DISARMED fault hold."""
+        del trading_day, complete
+        self._bind(session)
+        self.enabled = False
+        if self.connection is not None:
+            try:
+                self.connection.poll_updates(0.05)
+            except Exception:
+                return
+        else:
+            try:
+                self.api.wait_update(deadline=sdk_deadline(0.05))
+            except Exception:
+                return
+        sample = self._clock_sample()
+        for code in self.contracts:
+            try:
+                quote = self.api.get_quote(code)
+            except Exception:
+                quote = None
+            if quote is not None:
+                self.quotes[code] = quote
+            if getattr(self, 'owner_mode', None) == 'STANDALONE':
+                try:
+                    pos = self.api.get_position(code, account=self.account)
+                except Exception:
+                    pos = None
+                cur = dict(self.dispatch_market.get(code) or {})
+                if pos is not None:
+                    cur['long_qty'] = native_integer(getattr(pos, 'pos_long', 0))
+                    cur['short_qty'] = native_integer(getattr(pos, 'pos_short', 0))
+                if quote is not None:
+                    last_px = number(getattr(quote, 'last_price', None))
+                    if last_px is not None:
+                        ticks = list(cur.get('ticks') or [])
+                        if ticks:
+                            ticks[-1] = dict(ticks[-1], last=last_px)
+                        else:
+                            ticks = [{'native_time': sample.now_utc, 'last': last_px}]
+                        cur['ticks'] = ticks
+                if cur:
+                    self.dispatch_market[code] = cur
 
     def _try_resume_clock_entries(self, session, state, market):
         day = self._clock_resume_day
@@ -1426,11 +1490,20 @@ class DsvSdkAdapter:
                 continue
             if (trade.trade_id != native_trade or self._contract(trade) != binding['contract_id'] or
                     trade.direction != binding['direction'] or trade.offset != binding['native_offset']):
-                raise TraderError('E_DSV_SDK_FACT', 'SDK trade does not match the durable original child')
-            if type(stamp) is not int:
-                raise TraderError('E_DSV_SDK_FACT', 'SDK trade needs an exact nanosecond timestamp')
+                raise TraderError(
+                    'E_DSV_SDK_FACT',
+                    f'SDK trade does not match the durable original child ({binding["contract_id"]} {native_trade})',
+                )
+            if type(stamp) is not int or stamp <= 0:
+                raise TraderError(
+                    'E_DSV_SDK_FACT',
+                    f'SDK trade needs an exact positive nanosecond timestamp ({binding["contract_id"]} {native_trade}: {stamp})',
+                )
             if stamp + 5_000_000_000 < int(ordered):
-                raise TraderError('E_DSV_SDK_FACT', 'Native trade precedes its original order timestamp')
+                raise TraderError(
+                    'E_DSV_SDK_FACT',
+                    f'Native trade precedes its original order timestamp ({binding["contract_id"]} {native_trade}: {stamp} < {ordered})',
+                )
             cal_for_contract = self._calendar_for(binding['contract_id']) or self.calendar
             try:
                 proof = native_day(cal_for_contract, binding['contract_id'], str(stamp))
@@ -1764,10 +1837,13 @@ class DsvSdkAdapter:
         details_copy = {}
         for contract in contracts:
             market = self.dispatch_market.get(contract) or {}
+            mtick = (market.get('ticks') or [None])[-1]
             dispatch_copy[contract] = {
                 key: market.get(key)
-                for key in ('long_qty', 'short_qty', 'margin_per_lot', 'multiplier', 'market_session_active')
+                for key in ('long_qty', 'short_qty', 'margin_per_lot', 'multiplier', 'market_session_active', 'market_permission')
             }
+            if mtick is not None and mtick.get('last') is not None:
+                dispatch_copy[contract]['last_price'] = mtick.get('last')
             sym = (symbols_state or {}).get(contract) or {}
             tick = sym.get('tick') or {}
             quote_obs = sym.get('quote_observation') or {}

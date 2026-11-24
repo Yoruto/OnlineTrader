@@ -2603,6 +2603,8 @@
         "FakeBrokerAuctionScenarioTests.test_fake_broker_auction_wait_and_recovery_flow",
         "MarketPermissionsUnitTests.test_calendar_phase_query_preserves_schema_and_identifies_auction_phases",
         "MarketPermissionsUnitTests.test_layered_permissions_handle_tqsdk_spelling_halt_fallback_and_broker_override",
+        "NativeFactDeadlockAndToleranceTests.test_controller_tolerates_bounded_ctp_order_timestamp_skew_and_cancelled_to_rejected_transition",
+        "NativeFactDeadlockAndToleranceTests.test_persistent_fact_hold_avoids_crash_loop_refreshes_quotes_and_reconciles",
         "SdkAdapterAuctionAndPermissionsTests.test_first_minute_2100_allows_convergence_close_while_blocking_ordinary_open_and_unsupported_status_degrades",
         "SdkAdapterAuctionAndPermissionsTests.test_presend_and_precancel_market_phase_guard_never_consumes_cancel_budget"
       ],

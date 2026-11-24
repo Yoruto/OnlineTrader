@@ -347,10 +347,14 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         entry_reasons = decision_reasons
         day_stop_reason = ((row.get('day_stop_reason') or '当日已停止开仓')
                            if row.get('day_stop') else None)
+        live_last = tick.get('last') if tick.get('last') is not None else market.get('last_price')
+        if live_last is None and market.get('ticks'):
+            live_last = (market['ticks'][-1] or {}).get('last')
         market_row = {
             'contract_id': contract, 'name': symbols[contract]['name'],
             'trading_day': snapshot['trading_day'], 'session_id': snapshot.get('session_id'),
-            'last': tick.get('last'), 'bid1': tick.get('bid1'), 'ask1': tick.get('ask1'),
+            'last': live_last,
+            'bid1': tick.get('bid1'), 'ask1': tick.get('ask1'),
             'day_high': tick.get('day_high'), 'day_low': tick.get('day_low'),
             'upper_limit': tick.get('upper_limit'), 'lower_limit': tick.get('lower_limit'),
             'margin': market.get('margin_per_lot'), 'volume_multiple': market.get('multiplier'),
@@ -586,13 +590,17 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         'integrity': 'VERIFIED', 'errors': [],
     }
     config['config_snapshot_hash'] = content_hash(config_snapshot)
+    owner_fault_detail = snapshot.get('owner_fault_detail')
     blocks = []
     if not synchronized:
         blocks.append({'reason_code': 'BROKER_FACTS_INCOMPLETE', 'active': True})
     if clock_fault:
         blocks.append({'reason_code': 'CLOCK_FAULT', 'active': True})
     if owner_fault:
-        blocks.append({'reason_code': owner_fault, 'active': True})
+        block = {'reason_code': owner_fault, 'active': True}
+        if owner_fault_detail:
+            block['detail'] = owner_fault_detail
+        blocks.append(block)
     if isinstance(market_health, dict) and market_health.get('feed_entry_blocked') and synchronized and not clock_fault and not owner_fault:
         blocks.append({'reason_code': 'MARKET_FEED_' + str(market_health.get('status') or 'DEGRADED'), 'active': True})
     observed_at_utc = _utc_now()
@@ -604,6 +612,8 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         'connection': {'broker_connected': connected, 'synchronized': synchronized,
                        'fault': False,
                        'recovery_required': not synchronized or bool(owner_fault),
+                       'owner_fault_code': owner_fault,
+                       'owner_fault_detail': owner_fault_detail,
                        'storage_failed': storage_failed,
                        'clock_fault': clock_fault,
                        'execution_mode': 'STANDALONE',

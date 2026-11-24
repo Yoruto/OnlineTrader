@@ -57,8 +57,25 @@ def execute_owner_tick(
 ):
     """Execute one Target Owner step, preserving pending auto-arm across transient errors."""
     loop_started_ns = time.monotonic_ns()
+    pumper = getattr(owner, "pump_fault_hold", None)
+    now_mono = time.monotonic()
+    cur_state = owner.snapshot()
+    if (
+        callable(pumper)
+        and cur_state.get("owner_fault_code")
+        and not cur_state.get("synchronized")
+        and loop_state.get("consecutive_persistent_faults", 0) >= 1
+        and now_mono < loop_state.get("fault_retry_at", 0.0)
+    ):
+        try:
+            pumper(trading_day=current_trading_day, complete=is_complete)
+        except Exception:
+            sleep_fn(0.05)
+        return
     try:
         receipt = owner.step(trading_day=current_trading_day, complete=is_complete)
+        loop_state["consecutive_persistent_faults"] = 0
+        loop_state["fault_retry_at"] = 0.0
         state = owner.snapshot()
         if loop_state.get("initial_start_pending"):
             expected_gen = loop_state.get("initial_arm_generation", 0)
@@ -84,11 +101,28 @@ def execute_owner_tick(
         if disarm:
             loop_state["initial_start_pending"] = False
         code = getattr(error, "code", "E_DSV_SDK_RUNTIME")
-        owner.disconnect_for_error(
-            "PERSISTENT_OWNER_FACT_CONFLICT" if disarm else "TRANSIENT_OWNER_TICK_ERROR",
-            disarm=disarm,
-            fault_code=code if disarm else None,
+        detail = str(error)[:240]
+        prior_state = owner.snapshot()
+        already_disarmed = bool(
+            disarm
+            and not prior_state.get("synchronized")
+            and not prior_state.get("running")
+            and prior_state.get("owner_fault_code") == code
         )
+        if not already_disarmed:
+            owner.disconnect_for_error(
+                "PERSISTENT_OWNER_FACT_CONFLICT" if disarm else "TRANSIENT_OWNER_TICK_ERROR",
+                disarm=disarm,
+                fault_code=code if disarm else None,
+            )
+        if disarm:
+            setter = getattr(owner, "set_owner_fault_detail", None)
+            if callable(setter):
+                setter(detail)
+            loop_state["consecutive_persistent_faults"] = loop_state.get("consecutive_persistent_faults", 0) + 1
+            loop_state["fault_retry_at"] = time.monotonic() + 2.0
+        else:
+            loop_state["consecutive_persistent_faults"] = 0
         state = owner.snapshot()
         if market_diagnostics is not None:
             now_ns = time.monotonic_ns()
@@ -107,31 +141,39 @@ def execute_owner_tick(
             if state["running"]
             else "SYNCHRONIZATION_LOST_DISARMED"
         )
-        publish_replace_bytes(
-            canonical_bytes({
-                "runtime_boot_id": binding.boot_id,
-                "account_key": binding.account_key,
-                "execution_core": "DSV_TARGET_EXECUTION",
-                "authority_effect": authority_effect,
-                "error_category": category,
-                "entry_authority": "RUNNING" if state["running"] else "DISARMED",
-                "diagnostic": code,
-                "observed_at_utc": _utc_now(),
-                "exception": exception_record(error),
-            }),
-            diagnostics_path,
+        should_emit_diag = (
+            not already_disarmed
+            or time.monotonic() >= loop_state.get("last_fault_diag_at", 0.0) + 30.0
         )
-        if diagnostic_sink is not None:
-            diagnostic_sink.record(
-                'OWNER_TICK_FAILED', component='OWNER', severity='ERROR', priority='CRITICAL',
-                error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_DSV_SDK_RUNTIME',
-                reason_code=category,
-                payload={
-                    'authority_effect': authority_effect,
-                    'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
-                    'exception_type': type(error).__name__,
-                },
+        if should_emit_diag:
+            loop_state["last_fault_diag_at"] = time.monotonic()
+            publish_replace_bytes(
+                canonical_bytes({
+                    "runtime_boot_id": binding.boot_id,
+                    "account_key": binding.account_key,
+                    "execution_core": "DSV_TARGET_EXECUTION",
+                    "authority_effect": authority_effect,
+                    "error_category": category,
+                    "entry_authority": "RUNNING" if state["running"] else "DISARMED",
+                    "diagnostic": code,
+                    "detail": detail,
+                    "observed_at_utc": _utc_now(),
+                    "exception": exception_record(error),
+                }),
+                diagnostics_path,
             )
+            if diagnostic_sink is not None:
+                diagnostic_sink.record(
+                    'OWNER_TICK_FAILED', component='OWNER', severity='ERROR', priority='CRITICAL',
+                    error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_DSV_SDK_RUNTIME',
+                    reason_code=category,
+                    payload={
+                        'authority_effect': authority_effect,
+                        'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
+                        'exception_type': type(error).__name__,
+                        'detail': detail,
+                    },
+                )
         current = {
             "phase": "NEEDS_REVIEW" if disarm else "WAITING_FOR_NATIVE_SYNC",
             "entry_authority": "RUNNING" if state["running"] else "DISARMED",
@@ -148,7 +190,7 @@ def execute_owner_tick(
                 status_path,
             )
             loop_state["last_status"] = current
-        sleep_fn(0.1)
+        sleep_fn(0.1 if not disarm else 0.05)
         return
     if market_diagnostics is not None:
         now_ns = time.monotonic_ns()

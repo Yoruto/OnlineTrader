@@ -858,3 +858,196 @@ class FakeBrokerAuctionScenarioTests(unittest.TestCase):
         self.assertTrue(f2['market'][0]['market_session_active'])
         self.assertEqual(len(f2['market'][0]['ticks']), 1)
         broker.acknowledge_frame(f2['id'])
+
+
+class NativeFactDeadlockAndToleranceTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def test_controller_tolerates_bounded_ctp_order_timestamp_skew_and_cancelled_to_rejected_transition(self):
+        from online_trader.dsv_runtime.runner import initial_state
+        from online_trader.dsv_runtime.controller import ExplicitOrderController
+        from online_trader.dsv_storage.journal import Journal
+        from online_trader.errors import TraderError
+        from qa.recording_port import RecordingPort
+
+        scope = {'account_key': 'DEV:skew-1', 'provider': 'OFFLINE', 'trading_day': DAY, 'configuration_id': 'cfg-1'}
+        journal = Journal(self.root / 'journal.sqlite', scope, initial_state(DAY, [CONTRACT]))
+        self.addCleanup(journal.close)
+        controller = ExplicitOrderController(scope, journal, RecordingPort())
+        state = journal.load()
+        order = {
+            'child_order_id': 'c-skew-1', 'intent_id': 'conv-DCE.p2701-long',
+            'attempt_id': 'c-skew-1', 'position_id': 'conv-DCE.p2701-long',
+            'contract_id': CONTRACT, 'direction': 'SELL', 'native_offset': 'CLOSE',
+            'effect': 'REDUCE', 'original_qty': 1, 'filled_qty': 0, 'limit_price': '1050',
+            'send_state': 'CALL_RETURNED', 'broker_state': 'ALIVE', 'cancel_status': None,
+            'terminal_confirmed': False, 'reported_fill_qty': 0, 'native_id': None,
+            'native_trading_day': DAY, 'convergence_order': True, 'convergence_side': 'LONG',
+        }
+        state['orders']['c-skew-1'] = order
+        t1 = 1_794_488_400_000_000_000
+        with journal.transaction():
+            # 1) Initial alive ack binds native timestamp t1
+            controller.accept_native(state, [{
+                'kind': 'ORDER', 'child_order_id': 'c-skew-1', 'native_order_id': 'nat-skew-1',
+                'contract_id': CONTRACT, 'direction': 'SELL', 'native_offset': 'CLOSE',
+                'status': 'ALIVE', 'filled_qty': 0, 'source_time_ns': str(t1), 'trading_day': DAY,
+            }])
+            # 2) CTP front/exchange timestamp shifts +3s and prematurely emits CANCELLED
+            controller.accept_native(state, [{
+                'kind': 'ORDER', 'child_order_id': 'c-skew-1', 'native_order_id': 'nat-skew-1',
+                'contract_id': CONTRACT, 'direction': 'SELL', 'native_offset': 'CLOSE',
+                'status': 'CANCELLED', 'filled_qty': 0, 'source_time_ns': str(t1 + 3_000_000_000), 'trading_day': DAY,
+            }])
+            # 3) Delayed is_error=True REJECTED arrives with 0 fills -> converges cleanly without crashing!
+            controller.accept_native(state, [{
+                'kind': 'ORDER', 'child_order_id': 'c-skew-1', 'native_order_id': 'nat-skew-1',
+                'contract_id': CONTRACT, 'direction': 'SELL', 'native_offset': 'CLOSE',
+                'status': 'REJECTED', 'filled_qty': 0, 'native_message': '平仓量不足',
+                'rejection_category': 'STRUCTURAL', 'rejection_detail': 'INSUFFICIENT_CLOSE_POSITION',
+                'source_time_ns': str(t1 + 3_000_000_000), 'trading_day': DAY,
+            }])
+        self.assertEqual(order['broker_state'], 'REJECTED')
+        self.assertEqual(order['native_order_time_ns'], str(t1))
+
+        # Large anomalous jump > 60s still raises E_DSV_NATIVE_FACT with contract/order context!
+        with self.assertRaises(TraderError) as exc_info:
+            with journal.transaction():
+                controller.accept_native(state, [{
+                    'kind': 'ORDER', 'child_order_id': 'c-skew-1', 'native_order_id': 'nat-skew-1',
+                    'contract_id': CONTRACT, 'direction': 'SELL', 'native_offset': 'CLOSE',
+                    'status': 'REJECTED', 'filled_qty': 0, 'source_time_ns': str(t1 + 120_000_000_000),
+                    'trading_day': DAY,
+                }])
+        self.assertEqual(exc_info.exception.code, 'E_DSV_NATIVE_FACT')
+        self.assertIn(CONTRACT, str(exc_info.exception))
+
+    def test_persistent_fact_hold_avoids_crash_loop_refreshes_quotes_and_reconciles(self):
+        from online_trader.runtime.owner_tick import execute_owner_tick
+        from online_trader.dsv_runtime.standalone_projection import workbench_view
+
+        t_2101 = datetime(2026, 11, 12, 13, 1, 5, tzinfo=timezone.utc)
+        bar_ns = int(t_2101.timestamp()) * 1_000_000_000
+        quotes = {
+            CONTRACT: SimpleNamespace(
+                instrument_id=CONTRACT, expired=False, ins_class='FUTURE', volume_multiple=10,
+                trading_time={'day': [['09:00:00', '10:15:00']], 'night': [['21:00:00', '23:00:00']]},
+                datetime='2026-11-12 21:01:05.000000', last_price=1060.0, highest=1065.0, lowest=1020.0,
+                bid_price1=1060.0, ask_price1=1060.0, price_tick=1.0, lower_limit=950.0, upper_limit=1150.0, margin=4000.0,
+            ),
+        }
+        positions = {
+            CONTRACT: SimpleNamespace(pos_long=1, pos_short=0, pos_long_today=0, pos_long_his=1, pos_short_today=0, pos_short_his=0, margin=4000.0),
+        }
+        orders, trades = {}, {}
+        helper = SdkAdapterAuctionAndPermissionsTests()
+        helper.root = self.root
+        clock_state = [t_2101, 1000]
+        adapter, session, _ins, _can, _cal_hash = helper._harness(
+            quotes=quotes, positions=positions, orders=orders, trades=trades,
+            serials={CONTRACT: _make_serial([{'datetime': bar_ns, 'open': 1050.0, 'high': 1065.0, 'low': 1020.0, 'close': 1060.0}])},
+            clock_times=[t_2101], clock_fn=lambda: (clock_state[0], clock_state[1]),
+        )
+        self.addCleanup(session.close)
+        # First clean step commits baseline & populates dispatch_market
+        adapter.step(session, trading_day=DAY, complete=True)
+        # Seed a conflicting order state (>60s jump) to force a genuine E_DSV_NATIVE_FACT inside step()
+        from online_trader.errors import TraderError
+        conflict_msg = f'Original native order timestamp changed ({CONTRACT} bad-1)'
+
+        class _FaultOwner:
+            def __init__(self):
+                self.session = session
+                self.adapter = adapter
+                self.authority_generation = 0
+                self.step_calls = 0
+                self.disconnect_calls = 0
+                self.pump_calls = 0
+
+            def snapshot(self):
+                return self.session.snapshot()
+
+            def step(self, *, trading_day, complete):
+                self.step_calls += 1
+                if self.step_calls <= 1:
+                    adapter._last_step_error = conflict_msg
+                    session.disconnect('SDK_ROUND_FAILED')
+                    raise TraderError('E_DSV_NATIVE_FACT', conflict_msg)
+                return adapter.step(session, trading_day=trading_day, complete=complete)
+
+            def disconnect_for_error(self, reason, *, disarm=False, fault_code=None):
+                self.disconnect_calls += 1
+                return self.session.disconnect(reason, disarm=disarm, fault_code=fault_code)
+
+            def set_owner_fault_detail(self, detail):
+                self.session.set_owner_fault_detail(detail)
+
+            def pump_fault_hold(self, *, trading_day, complete):
+                self.pump_calls += 1
+                adapter.poll_fault_hold(self.session, trading_day=trading_day, complete=complete)
+
+            def native_account_snapshot(self):
+                return None
+
+        fault_owner = _FaultOwner()
+        loop_state = {'last_status': None, 'last_history_capture': 0.0, 'initial_start_pending': False}
+        binding = SimpleNamespace(boot_id='boot-auc-1', account_key='SIM:KQ:' + '1' * 16)
+        # Tick 1 triggers PERSISTENT_DISARM
+        execute_owner_tick(
+            fault_owner, binding=binding, current_trading_day=DAY, is_complete=lambda: True,
+            history_writer=None, status_path=self.root / 'status.json',
+            diagnostics_path=self.root / 'diag.json', loop_state=loop_state, sleep_fn=lambda _s: None,
+        )
+        self.assertEqual(fault_owner.disconnect_calls, 1)
+        self.assertEqual(fault_owner.step_calls, 1)
+        # Tick 2 & Tick 3 within backoff do NOT crash-loop step() or commit SQLite disconnects; they pump live quotes!
+        quotes[CONTRACT].last_price = 1072.0
+        execute_owner_tick(
+            fault_owner, binding=binding, current_trading_day=DAY, is_complete=lambda: True,
+            history_writer=None, status_path=self.root / 'status.json',
+            diagnostics_path=self.root / 'diag.json', loop_state=loop_state, sleep_fn=lambda _s: None,
+        )
+        execute_owner_tick(
+            fault_owner, binding=binding, current_trading_day=DAY, is_complete=lambda: True,
+            history_writer=None, status_path=self.root / 'status.json',
+            diagnostics_path=self.root / 'diag.json', loop_state=loop_state, sleep_fn=lambda _s: None,
+        )
+        self.assertEqual(fault_owner.step_calls, 1)
+        self.assertEqual(fault_owner.disconnect_calls, 1)
+        self.assertEqual(fault_owner.pump_calls, 2)
+        self.assertEqual(adapter.dispatch_market[CONTRACT]['ticks'][-1]['last'], '1072')
+
+        # Workbench view exposes owner_fault_detail and keeps home_reconcile_button ENABLED!
+        view = workbench_view(session.snapshot(), profile=adapter.profile, adapter=adapter, configuration_revision='1')
+        self.assertEqual(view['connection']['owner_fault_code'], 'E_DSV_NATIVE_FACT')
+        self.assertIn(CONTRACT, view['connection']['owner_fault_detail'])
+        self.assertEqual(view['markets'][0]['last'], '1072')
+
+        app = QApplication.instance() or QApplication([])
+        from online_trader.desktop.workbench import WorkbenchWindow
+        win = WorkbenchWindow(SimpleNamespace())
+        self.addCleanup(win.close)
+        win._boot = view['kernel_boot_id']
+        win._stale = False
+        win.view = view
+        win._enable_commands(False)
+        win.dashboard.render_home()
+        app.processEvents()
+        self.assertFalse(win.dashboard.home_reconcile_button.isHidden())
+        self.assertTrue(win.dashboard.home_reconcile_button.isEnabled())
+        self.assertIn(CONTRACT, win.dashboard.home_pending.text())
+
+        # Clicking RECONCILE when unsynced triggers fresh step() and clears owner_fault_code cleanly!
+        clock_state[0] = clock_state[0] + timedelta(seconds=2)
+        clock_state[1] += 2000
+        receipt = adapter.command(session, {'id': 'cmd-rec-1', 'action': 'RECONCILE'})
+        self.assertEqual(receipt['decisions'][0]['reason'], 'BROKER_FACTS_RECONCILED')
+        snap_after = session.snapshot()
+        self.assertTrue(snap_after['synchronized'])
+        self.assertIsNone(snap_after['owner_fault_code'])
+        self.assertIsNone(snap_after['owner_fault_detail'])
+        self.assertFalse(snap_after['running'])

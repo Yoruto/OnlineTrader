@@ -72,7 +72,10 @@ def _native_id(value):
 def _bind_native(order, value):
     native = _native_id(value)
     if order['send_state'] == 'DEFINITELY_NOT_SENT':
-        raise TraderError('E_DSV_NATIVE_FACT', 'Native evidence contradicts a locally proved unsent child')
+        raise TraderError(
+            'E_DSV_NATIVE_FACT',
+            f'Native evidence contradicts a locally proved unsent child ({order["contract_id"]} {order["child_order_id"]} -> {native})',
+        )
     known = order['native_id'] or order.get('local_order_id')
     if known is not None and known != native:
         raise TraderError('E_DSV_NATIVE_ID', 'A child cannot change its native order identity')
@@ -190,21 +193,41 @@ class ExplicitOrderController:
             if fact.get('trading_day', state['trading_day']) != order_day:
                 raise TraderError('E_DSV_SCOPE', 'Native update must identify its original order day')
             if any(key in fact and fact[key] != order[key] for key in ('contract_id', 'direction', 'native_offset')):
-                raise TraderError('E_DSV_NATIVE_FACT', 'Native contract, side or offset differs from the child')
+                raise TraderError(
+                    'E_DSV_NATIVE_FACT',
+                    f'Native contract, side or offset differs from the child ({order["contract_id"]} {child_id})',
+                )
             if fact['kind'] == 'LOCAL_ORDER':
                 local = _native_id(fact['native_order_id'])
                 if (order['send_state'] != 'CALL_RETURNED' or order['native_id'] is not None
                         or order.get('local_order_id', local) != local):
-                    raise TraderError('E_DSV_NATIVE_FACT', 'Local SDK order must match the original returned send')
+                    raise TraderError(
+                        'E_DSV_NATIVE_FACT',
+                        f'Local SDK order must match the original returned send ({order["contract_id"]} {child_id}: {local})',
+                    )
                 order['local_order_id'] = local
                 continue
             native_id = _bind_native(order, fact['native_order_id'])
             order.pop('local_order_id', None)
             if fact['kind'] == 'ORDER':
                 if stamp := fact.get('source_time_ns'):
-                    if order.get('native_order_time_ns', stamp) != stamp:
-                        raise TraderError('E_DSV_NATIVE_FACT', 'Original native order timestamp changed')
-                    order['native_order_time_ns'] = stamp
+                    prior_stamp = order.get('native_order_time_ns')
+                    if prior_stamp is not None and prior_stamp != stamp:
+                        skew_ns = abs(int(stamp) - int(prior_stamp))
+                        # CTP/SimNow OnRtnOrder packets can adjust InsertTime across front/exchange acks.
+                        if skew_ns > 60_000_000_000:
+                            raise TraderError(
+                                'E_DSV_NATIVE_FACT',
+                                f'Original native order timestamp changed ({order["contract_id"]} {native_id}: {prior_stamp} -> {stamp})',
+                            )
+                        self.journal.event('NATIVE_ORDER_CLOCK_SKEW', {
+                            'child_order_id': child_id,
+                            'native_order_id': native_id,
+                            'prior_time_ns': str(prior_stamp),
+                            'incoming_time_ns': str(stamp),
+                        })
+                    else:
+                        order['native_order_time_ns'] = stamp
                 self._order_update(order, fact)
                 if self.journal.record_order(child_id, native_id, order):
                     self.journal.event('NATIVE_ORDER', fact)
@@ -219,20 +242,40 @@ class ExplicitOrderController:
         if (status not in {'ALIVE', 'FILLED', 'CANCELLED', 'REJECTED'}
                 or filled > order['original_qty'] or status == 'FILLED' and filled != order['original_qty']
                 or status == 'REJECTED' and filled):
-            raise TraderError('E_DSV_NATIVE_FACT', 'Invalid native order status or cumulative fill')
+            raise TraderError(
+                'E_DSV_NATIVE_FACT',
+                f'Invalid native order status or cumulative fill ({order["contract_id"]} {order["child_order_id"]}: {status}/{filled})',
+            )
         if order['terminal_confirmed']:
             if status == 'ALIVE' and filled <= order['reported_fill_qty']:
                 return
-            if status == order['broker_state'] == 'CANCELLED' and filled > order['reported_fill_qty']:
-                order.update(reported_fill_qty=filled, terminal_conflict=True)
+            if order['broker_state'] == 'CANCELLED' and status in {'CANCELLED', 'FILLED'} and filled > order['reported_fill_qty']:
+                order.update(broker_state=status, reported_fill_qty=filled, terminal_conflict=True)
+                return
+            if (order['broker_state'], status) in {('CANCELLED', 'REJECTED'), ('REJECTED', 'CANCELLED')} and filled == order['reported_fill_qty'] == 0:
+                if status == 'REJECTED':
+                    order['broker_state'] = 'REJECTED'
+                    if isinstance(fact.get('native_message'), str) and fact['native_message']:
+                        order['native_message'] = fact['native_message'][:200]
+                    if fact.get('rejection_category') is not None:
+                        order['broker_rejection_category'] = fact['rejection_category']
+                    if fact.get('rejection_detail') is not None:
+                        order['broker_rejection_detail'] = fact['rejection_detail']
                 return
             if (status, filled) != (order['broker_state'], order['reported_fill_qty']):
-                raise TraderError('E_DSV_NATIVE_FACT', 'Conflicting terminal order evidence')
+                raise TraderError(
+                    'E_DSV_NATIVE_FACT',
+                    f'Conflicting terminal order evidence ({order["contract_id"]} {order.get("native_id") or order["child_order_id"]}: '
+                    f'{order["broker_state"]}/{order["reported_fill_qty"]} -> {status}/{filled})',
+                )
             return
         if status == 'ALIVE' and filled < max(order['filled_qty'], order['reported_fill_qty'] or 0):
             return
         if status != 'ALIVE' and filled < max(order['filled_qty'], order['reported_fill_qty'] or 0):
-            raise TraderError('E_DSV_NATIVE_FACT', 'Terminal quantity contradicts accepted fills')
+            raise TraderError(
+                'E_DSV_NATIVE_FACT',
+                f'Terminal quantity contradicts accepted fills ({order["contract_id"]} {order.get("native_id") or order["child_order_id"]}: {filled} < {max(order["filled_qty"], order["reported_fill_qty"] or 0)})',
+            )
         order.update(broker_state=status, terminal_confirmed=status != 'ALIVE', reported_fill_qty=filled)
         if isinstance(fact.get('native_message'), str) and fact['native_message']:
             order['native_message'] = fact['native_message'][:200]

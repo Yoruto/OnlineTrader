@@ -121,10 +121,13 @@ class StandaloneDsvOwner:
         detail_reader = getattr(adapter, 'display_market_details', None)
         for contract in contracts:
             market = getattr(adapter, 'dispatch_market', {}).get(contract) or {}
+            mtick = (market.get('ticks') or [None])[-1]
             dispatch_copy[contract] = {
                 key: market.get(key)
                 for key in ('long_qty', 'short_qty', 'margin_per_lot', 'multiplier', 'market_session_active', 'market_permission')
             }
+            if mtick is not None and mtick.get('last') is not None:
+                dispatch_copy[contract]['last_price'] = mtick.get('last')
             if callable(detail_reader):
                 sym = (snapshot.get('symbols') or {}).get(contract) or {}
                 tick = sym.get('tick') or {}
@@ -325,6 +328,19 @@ class StandaloneDsvOwner:
             self._commit_views.append(self.snapshot())
         self._update_stop_ready()
         return receipt
+
+    def set_owner_fault_detail(self, detail):
+        setter = getattr(self.session, 'set_owner_fault_detail', None)
+        if callable(setter):
+            setter(detail)
+        self._projection_seq += 1
+
+    def pump_fault_hold(self, *, trading_day, complete):
+        pumper = getattr(self.adapter, 'poll_fault_hold', None)
+        if callable(pumper):
+            pumper(self.session, trading_day=trading_day, complete=complete)
+        self._projection_seq += 1
+        self._update_stop_ready()
 
     def poll(self):
         self._update_stop_ready()
