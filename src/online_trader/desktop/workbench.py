@@ -187,6 +187,7 @@ class WorkbenchWindow(StatusWindow):
         self._runtime_root = Path(runtime_root).resolve() if runtime_root is not None else None
         self._runtime_account = runtime_account
         self._diagnostic_sink = None
+        self._diagnostic_sink_holder = {'sink': None}
         self._diagnostic_account_pseudonym = None
         if self._runtime_root is not None:
             from online_trader.diagnostics import open_sink
@@ -197,6 +198,12 @@ class WorkbenchWindow(StatusWindow):
                 process_instance_id=process_id,
                 stream_group='workbench',
             )
+            self._diagnostic_sink_holder['sink'] = self._diagnostic_sink
+            holder = self._diagnostic_sink_holder
+            self.destroyed.connect(lambda *_args, _h=holder: (
+                _h['sink'].finalize(clean_shutdown=False, snapshot_available=False, timeout=1.0)
+                if _h.get('sink') is not None else None
+            ))
             self._diagnostic_sink.record(
                 'WORKBENCH_STARTED', component='LIFECYCLE', priority='HIGH',
                 payload={'runtime_mode': bool(runtime_view)},
@@ -2266,17 +2273,27 @@ class WorkbenchWindow(StatusWindow):
         self.connection_retry_timer.stop()
         self.dashboard.log_timer.stop()
         self.timer.stop()
-        if self._diagnostic_sink is not None:
-            self._diagnostic_sink.record(
+        self._finalize_diagnostic_sink(clean_shutdown=True)
+        super().closeEvent(event)
+
+    def _finalize_diagnostic_sink(self, *, clean_shutdown=False):
+        """Flush and release the optional Workbench evidence sink idempotently."""
+        holder = getattr(self, '_diagnostic_sink_holder', None)
+        if holder is not None:
+            holder['sink'] = None
+        sink = getattr(self, '_diagnostic_sink', None)
+        if sink is None:
+            return
+        self._diagnostic_sink = None
+        if clean_shutdown:
+            sink.record(
                 'WORKBENCH_STOPPED', component='LIFECYCLE', priority='CRITICAL',
                 runtime_boot_id=self._boot,
                 account_pseudonym=self._diagnostic_account_pseudonym,
                 payload={'runtime_shutdown_verified': bool(self._runtime_shutdown_verified)},
             )
-            self._diagnostic_sink.finalize(
-                clean_shutdown=True, snapshot_available=self.view is not None, timeout=1.0)
-            self._diagnostic_sink = None
-        super().closeEvent(event)
+        sink.finalize(
+            clean_shutdown=clean_shutdown, snapshot_available=self.view is not None, timeout=1.0)
 
     def prepare_update_restart(self):
         if (self._startup_in_progress or self._worker is not None

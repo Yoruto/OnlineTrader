@@ -65,6 +65,14 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         self.window.close()
         self.app.processEvents()
 
+    def _cleanup_runtime_window(self, window):
+        window._runtime_shutdown_verified = True
+        window._closing = True
+        window.close()
+        window._finalize_diagnostic_sink(clean_shutdown=True)
+        window.deleteLater()
+        self.app.processEvents()
+
     def test_submit_delegates_the_current_intent_to_command_bus(self):
         scope = {'scope_type': 'CONTRACT', 'scope_ids': ['DCE.p2701']}
         parameters = {'origin': 'STRATEGY', 'enabled': False,
@@ -213,7 +221,7 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         base = single_contract_profile()
         root = self._portable_runtime_root(base)
         window = WorkbenchWindow('Runtime.Sync.Test', runtime_view=True, runtime_root=root)
-        self.addCleanup(lambda: (setattr(window, '_runtime_shutdown_verified', True), window.close(), self.app.processEvents()))
+        self.addCleanup(lambda w=window: self._cleanup_runtime_window(w))
         window._runtime_client_store.apply(self._state_from_profile(base), {'generation': 'g1', 'sequence': '1', 'digest': 'a' * 64}, time.monotonic_ns())
         self.assertEqual([row['code'] for row in window.dashboard.symbols], ['DCE.p2701'])
         self.assertEqual(window.dashboard.symbol_grid.rowCount(), 1)
@@ -240,7 +248,7 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         base = single_contract_profile()
         root = self._portable_runtime_root(base)
         window = WorkbenchWindow(r'\\.\pipe\runtime-hot-add', runtime_view=True, runtime_root=root)
-        self.addCleanup(lambda: (setattr(window, '_runtime_shutdown_verified', True), window.close(), self.app.processEvents()))
+        self.addCleanup(lambda w=window: self._cleanup_runtime_window(w))
         window._runtime_client_store.apply(
             self._state_from_profile(base, authority='ARMED'),
             {'generation': 'g1', 'sequence': '1', 'digest': 'a' * 64},
@@ -306,7 +314,7 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         base = single_contract_profile()
         root = self._portable_runtime_root(base)
         window = WorkbenchWindow(r'\\.\pipe\runtime-hot-reject', runtime_view=True, runtime_root=root)
-        self.addCleanup(lambda: (setattr(window, '_runtime_shutdown_verified', True), window.close(), self.app.processEvents()))
+        self.addCleanup(lambda w=window: self._cleanup_runtime_window(w))
         window._runtime_client_store.apply(
             self._state_from_profile(base, authority='ARMED'),
             {'generation': 'g1', 'sequence': '1', 'digest': 'a' * 64},
@@ -376,7 +384,7 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         base = single_contract_profile()
         root = self._portable_runtime_root(base)
         window = WorkbenchWindow(r'\\.\pipe\runtime-boot-1', runtime_view=True, runtime_root=root)
-        self.addCleanup(lambda: (setattr(window, '_runtime_shutdown_verified', True), window.close(), self.app.processEvents()))
+        self.addCleanup(lambda w=window: self._cleanup_runtime_window(w))
         window._runtime_client_store.apply(self._state_from_profile(base), {'generation': 'g1', 'sequence': '1', 'digest': 'a' * 64}, time.monotonic_ns())
 
         def accept_silver(dialog):
@@ -468,7 +476,7 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         base = single_contract_profile()
         root = self._portable_runtime_root(base)
         window = WorkbenchWindow(r'\\.\pipe\runtime-armed', runtime_view=True, runtime_root=root)
-        self.addCleanup(lambda: (setattr(window, '_runtime_shutdown_verified', True), window.close(), self.app.processEvents()))
+        self.addCleanup(lambda w=window: self._cleanup_runtime_window(w))
         window._runtime_client_store.apply(
             self._state_from_profile(base, authority='ARMED'),
             {'generation': 'g1', 'sequence': '1', 'digest': 'a' * 64},
@@ -527,7 +535,7 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         base = single_contract_profile()
         root = self._portable_runtime_root(base)
         window = WorkbenchWindow(r'\\.\pipe\runtime-catalog', runtime_view=True, runtime_root=root)
-        self.addCleanup(lambda: (setattr(window, '_runtime_shutdown_verified', True), window.close(), self.app.processEvents()))
+        self.addCleanup(lambda w=window: self._cleanup_runtime_window(w))
         window._runtime_client_store.apply(
             self._state_from_profile(base),
             {'generation': 'g1', 'sequence': '1', 'digest': 'a' * 64},
