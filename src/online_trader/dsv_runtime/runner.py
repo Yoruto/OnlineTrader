@@ -1099,8 +1099,6 @@ class DsvSession:
             return [{'reason': 'UNRESOLVED_PRIOR_CHILD', 'rule_ids': ['I02']}]
         if not state['running']:
             return [{'reason': 'USER_STOPPED', 'rule_ids': ['D14']}]
-        if frame.get('feed_entry_blocked'):
-            return [{'reason': 'FEED_HEALTH_BLOCK', 'rule_ids': ['D01', 'I02']}]
         if tick is None:
             return [{'reason': 'QUOTE_UNAVAILABLE', 'rule_ids': ['D01']}]
         if timing:
@@ -1117,6 +1115,8 @@ class DsvSession:
             market.update(entry_throttle_active=throttle is not None and throttle < NS_PER_SECOND,
                           stop_cooldown_active=(stop.get('until') is not None and (
                               cooldown < int(stop_timer['duration_ns']) if cooldown is not None else True)))
+        if frame.get('feed_entry_blocked'):
+            return [{'reason': 'FEED_HEALTH_BLOCK', 'rule_ids': ['D01', 'I02']}]
         if market.get('standalone_external_model'):
             if market.get('external_active_orders'):
                 return [{'reason': 'E_FOREIGN_ACTIVE_ORDER', 'rule_ids': ['I01', 'I02']}]

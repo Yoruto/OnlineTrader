@@ -3750,6 +3750,40 @@
       ],
       "case_overrides": {}
     },
+    "test_runtime_market_continuity": {
+      "tier": "T2",
+      "domains": [
+        "runtime",
+        "trading"
+      ],
+      "risk": "UNTRIAGED",
+      "profiles": [
+        "FullOffline",
+        "Runtime"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": null,
+      "requirements": [
+        "PySide6"
+      ],
+      "timeout_seconds": 120,
+      "cases": [
+        "MarketHealthClassificationTests.test_quiet_symbol_is_isolated_while_all_active_silence_blocks_feed",
+        "MarketHealthClassificationTests.test_zero_max_quote_age_flags_disabled_but_keeps_feed_health_gate",
+        "OwnerProjectionOffloadAndIdleSkipTests.test_control_server_skips_stream_projection_without_subscribers",
+        "OwnerProjectionOffloadAndIdleSkipTests.test_idle_round_skip_respects_open_positions_orders_timers_and_1s_cadence",
+        "OwnerProjectionOffloadAndIdleSkipTests.test_prepare_workbench_publication_defers_projection_and_formats_bars_in_background",
+        "StaleSnapshotRecheckTests.test_recheck_operations_remain_allowed_when_stale_or_synchronizing",
+        "StaleSnapshotRecheckTests.test_snapshot_age_tiers_and_symbol_quote_labels",
+        "TargetMarketDiagnosticsTests.test_diagnostics_drops_when_queue_full_without_raising",
+        "TargetMarketDiagnosticsTests.test_diagnostics_emits_summary_and_anomaly_jsonl"
+      ],
+      "case_overrides": {}
+    },
     "test_runtime_operator": {
       "tier": "T2",
       "domains": [

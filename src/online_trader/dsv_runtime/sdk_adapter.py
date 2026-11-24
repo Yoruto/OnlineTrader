@@ -214,10 +214,14 @@ class DsvSdkAdapter:
         self.quote_observations = {}
         self._minute_chart_sample_at = None
         self._minute_chart_cache = {}
-        self._minute_chart_raw_cache = {}
-        self._minute_chart_signature = {}
-        self._verified_order_facts.clear()
-        self._verified_trade_facts.clear()
+        if hasattr(self, '_minute_chart_raw_cache'):
+            self._minute_chart_raw_cache.clear()
+        if hasattr(self, '_minute_chart_signature'):
+            self._minute_chart_signature.clear()
+        if hasattr(self, '_verified_order_facts'):
+            self._verified_order_facts.clear()
+        if hasattr(self, '_verified_trade_facts'):
+            self._verified_trade_facts.clear()
         self._last_committed_round_mono_ns = None
         self._last_idle_signature = None
         self.market_health = evaluate_market_health(
@@ -435,9 +439,12 @@ class DsvSdkAdapter:
                         self.minutes[code] = self.api.get_kline_serial(code, 60, data_length=500)
                     self._minute_chart_sample_at = None
                     self._minute_chart_cache = {}
-                    self._minute_chart_raw_cache = {}
-                    self._minute_chart_signature = {}
-                    self._schedule_display_cache.clear()
+                    if hasattr(self, '_minute_chart_raw_cache'):
+                        self._minute_chart_raw_cache.clear()
+                    if hasattr(self, '_minute_chart_signature'):
+                        self._minute_chart_signature.clear()
+                    if hasattr(self, '_schedule_display_cache'):
+                        self._schedule_display_cache.clear()
                     self._foreign_trades = None
             return receipt
         finally:
@@ -525,18 +532,21 @@ class DsvSdkAdapter:
             frame, market = self._frame(state, sample, trading_day, day_held=day_held)
             self.metrics['native_facts_ns'] = str(time.monotonic_ns() - facts_started)
             gap_raw = self.metrics.get('sdk_pump_gap_ns')
-            self.market_health = evaluate_market_health(
+            gap_ns = None if gap_raw is None else int(gap_raw)
+            max_age_sec = self.profile.to_record()['settings']['trade']['max_quote_age_seconds']
+            pre_health = evaluate_market_health(
                 self.contracts,
                 market,
                 clock_health=self._health,
-                synchronized=bool(state['synchronized']),
+                synchronized=bool(frame.get('synchronized')),
                 connection_complete=True,
-                sdk_pump_gap_ns=None if gap_raw is None else int(gap_raw),
+                sdk_pump_gap_ns=gap_ns,
                 sdk_updated=updated,
-                max_quote_age_seconds=self.profile.to_record()['settings']['trade']['max_quote_age_seconds'],
+                max_quote_age_seconds=max_age_sec,
+                allow_single_contract_stall=(self.connection is not None),
             )
-            frame['feed_health_status'] = self.market_health['status']
-            frame['feed_entry_blocked'] = bool(self.market_health['feed_entry_blocked'])
+            frame['feed_health_status'] = pre_health['status']
+            frame['feed_entry_blocked'] = bool(pre_health['feed_entry_blocked'])
             self.enabled = True
             self.dispatch_market = market
             receipt = session.apply_round(frame)
@@ -545,6 +555,17 @@ class DsvSdkAdapter:
                 self._native_fact_cache[key] = fact
             self.metrics.update(session.round_timing)
             state = session.snapshot()
+            self.market_health = evaluate_market_health(
+                self.contracts,
+                market,
+                clock_health=self._health,
+                synchronized=bool(state['synchronized']),
+                connection_complete=True,
+                sdk_pump_gap_ns=gap_ns,
+                sdk_updated=updated,
+                max_quote_age_seconds=max_age_sec,
+                allow_single_contract_stall=(self.connection is not None),
+            )
             self._last_committed_round_mono_ns = sample.monotonic
             self._last_committed_ref_status = (self._health or {}).get('reference_status')
             self._last_idle_signature = self._idle_state_signature(state, trading_day)
@@ -563,10 +584,14 @@ class DsvSdkAdapter:
             self.quote_observations = {}
             self._minute_chart_sample_at = None
             self._minute_chart_cache = {}
-            self._minute_chart_raw_cache = {}
-            self._minute_chart_signature = {}
-            self._verified_order_facts.clear()
-            self._verified_trade_facts.clear()
+            if hasattr(self, '_minute_chart_raw_cache'):
+                self._minute_chart_raw_cache.clear()
+            if hasattr(self, '_minute_chart_signature'):
+                self._minute_chart_signature.clear()
+            if hasattr(self, '_verified_order_facts'):
+                self._verified_order_facts.clear()
+            if hasattr(self, '_verified_trade_facts'):
+                self._verified_trade_facts.clear()
             self._last_committed_round_mono_ns = None
             self._last_idle_signature = None
             self._local_returns.clear()
@@ -763,22 +788,25 @@ class DsvSdkAdapter:
         if trading_day != state.get('trading_day'):
             return False
         health = self._health or {}
-        if health.get('reason') or health.get('reference_status') != self._last_committed_ref_status:
+        if health.get('reason') or health.get('reference_status') != getattr(self, '_last_committed_ref_status', None):
             return False
-        last_commit = self._last_committed_round_mono_ns
+        last_commit = getattr(self, '_last_committed_round_mono_ns', None)
         if last_commit is None or sample.monotonic - last_commit >= NS_PER_SECOND:
             return False
         if any(row.get('position') is not None for row in state.get('symbols', {}).values()):
             return False
         if any(not terminal(order) for order in state.get('orders', {}).values()):
             return False
-        if self._idle_state_signature(state, trading_day) != self._last_idle_signature:
+        if self._idle_state_signature(state, trading_day) != getattr(self, '_last_idle_signature', None):
             return False
         return True
 
     def _order_facts(self, orders, bindings):
         result = []
-        cache = self._verified_order_facts
+        cache = getattr(self, '_verified_order_facts', None)
+        if cache is None:
+            cache = {}
+            self._verified_order_facts = cache
         for native_id, binding in bindings.items():
             order = orders.get(native_id)
             if order is None or not order.volume_orign or not order.status:
@@ -793,7 +821,7 @@ class DsvSdkAdapter:
                 getattr(order, 'exchange_order_id', None),
                 binding['send_state'], binding['native_trading_day'],
             )
-            cached = cache.get(native_id)
+            cached = cache.get(native_id) if order.status == 'FINISHED' else None
             if cached is not None and cached[0] == sig:
                 result.append(cached[1])
                 continue
@@ -818,7 +846,6 @@ class DsvSdkAdapter:
                         binding['child_order_id'] in self._local_returns
                         or getattr(self, 'owner_mode', None) == 'STANDALONE'):
                     fact = self._fact('LOCAL_ORDER', binding, native_id)
-                    cache[native_id] = (sig, fact)
                     result.append(fact)
                     continue
                 raise TraderError('E_DSV_SDK_FACT', 'SDK order is missing its native acceptance time')
@@ -840,14 +867,18 @@ class DsvSdkAdapter:
                 if category != 'UNCLASSIFIED':
                     rejection = {'rejection_category': category, 'rejection_detail': detail}
             fact = self._fact('ORDER', binding, native_id) | {'status': status, 'filled_qty': filled} | temporal | rejection
-            cache[native_id] = (sig, fact)
+            if order.status == 'FINISHED':
+                cache[native_id] = (sig, fact)
             result.append(fact)
         return result
 
     def _trade_facts(self, trades, bindings, day, accepted, *, needs_recovery, day_held=False):
         facts, foreign = [], {}
         deferred = set()
-        cache = self._verified_trade_facts
+        cache = getattr(self, '_verified_trade_facts', None)
+        if cache is None:
+            cache = {}
+            self._verified_trade_facts = cache
         for native_trade, trade in trades.items():
             binding = bindings.get(trade.order_id)
             if binding is None:
@@ -1129,8 +1160,19 @@ class DsvSdkAdapter:
     def minute_chart_raw_snapshot(self):
         """Extract raw minute OHLC tuples on the Owner thread with signature + 2s cache."""
         now = time.monotonic()
-        if self._minute_chart_sample_at is not None and now - self._minute_chart_sample_at < 2:
-            return self._minute_chart_raw_cache
+        raw_cache = getattr(self, '_minute_chart_raw_cache', None)
+        if raw_cache is None:
+            raw_cache = {}
+            self._minute_chart_raw_cache = raw_cache
+        sig_cache = getattr(self, '_minute_chart_signature', None)
+        if sig_cache is None:
+            sig_cache = {}
+            self._minute_chart_signature = sig_cache
+        if self._minute_chart_sample_at is None:
+            raw_cache.clear()
+            sig_cache.clear()
+        elif now - self._minute_chart_sample_at < 2:
+            return raw_cache
         ready = getattr(self.api, 'is_serial_ready', None)
         raw_result = {}
         changed = False
@@ -1141,18 +1183,18 @@ class DsvSdkAdapter:
                 tail = serial.tail(48)
                 rows = self._extract_raw_bar_rows(tail)
                 sig = (len(rows), rows[-1] if rows else None)
-                if self._minute_chart_signature.get(code) == sig and code in self._minute_chart_raw_cache:
-                    raw_result[code] = self._minute_chart_raw_cache[code]
+                if sig_cache.get(code) == sig and code in raw_cache:
+                    raw_result[code] = raw_cache[code]
                 else:
                     raw_result[code] = rows
-                    self._minute_chart_signature[code] = sig
+                    sig_cache[code] = sig
                     changed = True
             except (AttributeError, TypeError, ValueError, ArithmeticError):
                 continue
-        if set(raw_result) != set(self._minute_chart_raw_cache):
+        if set(raw_result) != set(raw_cache):
             changed = True
         self._minute_chart_sample_at = now
-        if changed or not self._minute_chart_raw_cache:
+        if changed or not raw_cache:
             self._minute_chart_raw_cache = raw_result
             self._minute_chart_cache = {}
         return self._minute_chart_raw_cache
@@ -1185,10 +1227,14 @@ class DsvSdkAdapter:
             details = self.display_market_details(contract, trading_day, fresh=fresh)
             if details:
                 details_copy[contract] = details
+        sched_cache = getattr(self, '_schedule_display_cache', None)
+        if sched_cache is None:
+            sched_cache = {}
+            self._schedule_display_cache = sched_cache
         sched_key = (trading_day, tuple(contracts))
-        if sched_key not in self._schedule_display_cache:
+        if sched_key not in sched_cache:
             from online_trader.dsv_runtime.standalone_projection import _schedule_display
-            self._schedule_display_cache[sched_key] = _schedule_display(self, trading_day, list(contracts))
+            sched_cache[sched_key] = _schedule_display(self, trading_day, list(contracts))
         return {
             'profile_hash': self.profile.content_hash,
             'calendar_hash': self.grant.value['calendar_hash'] if self.grant is not None else None,
@@ -1196,7 +1242,7 @@ class DsvSdkAdapter:
             'adapter_synchronized': bool(self.synchronized),
             'clock_health': _copy.deepcopy(self._health) if isinstance(self._health, dict) else None,
             'market_health': _copy.deepcopy(getattr(self, 'market_health', None)),
-            'schedule_display': self._schedule_display_cache[sched_key],
+            'schedule_display': sched_cache[sched_key],
             'dispatch_market': dispatch_copy,
             'market_details': details_copy,
             'minute_raw': self.minute_chart_raw_snapshot(),

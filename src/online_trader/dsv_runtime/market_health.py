@@ -80,6 +80,7 @@ def evaluate_market_health(
     sdk_updated=None,
     max_quote_age_seconds=0,
     session_elapsed_ns_by_contract: dict[str, int] | None = None,
+    allow_single_contract_stall: bool = True,
 ) -> dict:
     """Classify global feed health separately from per-symbol quote states.
 
@@ -141,7 +142,7 @@ def evaluate_market_health(
             active_silences[code] is not None and active_silences[code] >= stall_threshold_ns
             for code in active_codes
         )
-    elif len(active_codes) == 1 and sdk_updated is False:
+    elif allow_single_contract_stall and len(active_codes) == 1 and sdk_updated is False:
         only_silence = active_silences[active_codes[0]]
         all_active_silent = only_silence is not None and only_silence >= stall_threshold_ns
 

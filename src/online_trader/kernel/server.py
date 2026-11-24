@@ -68,6 +68,7 @@ class ControlServer:
         kernel.take_committed_views()
         if self._target_owner and hasattr(kernel, 'set_stream_tracking'):
             kernel.set_stream_tracking(False)
+        self._sync_streams_force = False
         self._stream_peers={}
         self._last_progress_utc=_utc()
         self._last_progress_seq=int(boundary)
@@ -201,9 +202,14 @@ class ControlServer:
             raise TraderError("E_AUTH","Shadow has no control or order capability")
         peer.last_seen=time.monotonic()
         if kind=="SnapshotRequest":
-            if self._target_owner and hasattr(self.kernel, 'set_stream_tracking'):
-                self.kernel.set_stream_tracking(True)
-            self._sync_streams(force=True)
+            if self._target_owner:
+                if hasattr(self.kernel, 'set_stream_tracking'):
+                    self.kernel.set_stream_tracking(True)
+                self._sync_streams_force = True
+            try:
+                self._sync_streams()
+            finally:
+                self._sync_streams_force = False
             key,messages=self.streams.request(peer.instance_id or peer.peer_id,body)
             if peer.stream_key is not None and peer.stream_key!=key:self._detach(peer)
             previous=self._stream_peers.get(key)
@@ -285,7 +291,8 @@ class ControlServer:
             "last_progress_utc":self._last_progress_utc}))
         peer.last_heartbeat=time.monotonic()
 
-    def _sync_streams(self, *, force=False):
+    def _sync_streams(self):
+        force = getattr(self, '_sync_streams_force', False)
         if self._target_owner and not force and not self._stream_peers and not self.streams._streams:
             self.kernel.take_committed_views()
             return

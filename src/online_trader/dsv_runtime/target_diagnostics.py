@@ -42,6 +42,10 @@ def _ms_max(current: int | None, candidate_ns: int | None) -> int | None:
     return candidate_ms if current is None else max(current, candidate_ms)
 
 
+def _str_or_none(value) -> str | None:
+    return None if value is None else str(value)
+
+
 def _symbol_diag_row(code: str, market: dict | None, observation: dict | None) -> dict:
     market = market or {}
     observation = observation or {}
@@ -49,8 +53,8 @@ def _symbol_diag_row(code: str, market: dict | None, observation: dict | None) -
         'contract_id': code,
         'active': market.get('market_session_active') is True,
         'source_time_raw': observation.get('source_time_raw'),
-        'source_age_raw_ns': observation.get('source_age_raw_ns'),
-        'silence_ns': observation.get('silence_ns'),
+        'source_age_raw_ns': _str_or_none(observation.get('source_age_raw_ns')),
+        'silence_ns': _str_or_none(observation.get('silence_ns')),
         'age_quality': observation.get('age_quality'),
         'reason': observation.get('reason'),
     }
@@ -217,7 +221,7 @@ class TargetMarketDiagnostics:
             'publication_error': pub_error,
             'clock_state': clock_health.get('reference_status') or 'UNOBSERVED',
             'clock_reason': clock_health.get('reason'),
-            'utc_error_ns': clock_health.get('utc_error_ns'),
+            'utc_error_ns': _str_or_none(clock_health.get('utc_error_ns')),
             'active_symbols': active_count,
             'fresh_symbols': fresh_count,
             'symbols': symbol_rows,
