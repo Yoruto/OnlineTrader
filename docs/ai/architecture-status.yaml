@@ -60,12 +60,15 @@ documents:
     verified_at_sha: WORKTREE
     evidence:
       design: USER_REQUESTED_IMPLEMENTATION_PLAN
-      source: EXISTING_DIAGNOSTIC_FRAGMENTS_NOT_UNIFIED
-      tests: NOT_RUN
+      source: IMPLEMENTED_CANDIDATE
+      tests: COMPILE_ONLY_FUNCTIONAL_NOT_RUN
       product_acceptance: NOT_RUN
-    notes: Defines a non-authoritative, best-effort Runtime and Workbench evidence system,
+    notes: Implements a non-authoritative, best-effort Runtime and Workbench evidence system,
       bounded per-process sinks, cutoff and detached Reporter lifecycle, diagnostic bundle
-      coverage semantics, developer Analyzer rules, privacy boundaries and vertical delivery phases.
+      coverage semantics, developer Analyzer rules and vertical delivery phases. The user-authorized
+      single-recipient upload target is JiHuLab project 390001, with the third owner token delivered
+      directly in private/diagnostics-upload.json rather than extending strict runtime.json. Product,
+      connected upload and artifact acceptance remain NOT_RUN.
 
   - path: docs/refactor/desktop-lifecycle-user-flow-20261120.md
     scope: standalone/desktop-exit-and-tray-lifecycle

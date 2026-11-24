@@ -63,12 +63,13 @@ def _symbol_diag_row(code: str, market: dict | None, observation: dict | None) -
 class TargetMarketDiagnostics:
     """Collect 1s summaries and a 60s anomaly black-box without blocking the Owner."""
 
-    def __init__(self, output_dir, *, boot_id: str, sdk_version: str):
+    def __init__(self, output_dir, *, boot_id: str, sdk_version: str, evidence_sink=None):
         self.output_dir = Path(output_dir)
         self.summary_path = self.output_dir / 'target-market-summary.jsonl'
         self.anomaly_path = self.output_dir / 'target-market-anomaly.jsonl'
         self.boot_id = str(boot_id)
         self.sdk_version = str(sdk_version)
+        self.evidence_sink = evidence_sink
         self._queue: Queue = Queue(maxsize=64)
         self._closing = Event()
         self._queue_drops = 0
@@ -287,6 +288,18 @@ class TargetMarketDiagnostics:
                     'queue_drops': self._queue_drops,
                     'write_failures': self._write_failures,
                 })
+                if self.evidence_sink is not None:
+                    self.evidence_sink.record(
+                        'MARKET_ANOMALY', component='MARKET', severity='WARNING', priority='HIGH',
+                        reason_code=trigger,
+                        payload={
+                            'source_epoch': epoch_text,
+                            'active_symbols': active_count,
+                            'fresh_symbols': fresh_count,
+                            'queue_drops': self._queue_drops,
+                            'write_failures': self._write_failures,
+                        },
+                    )
 
         if now_ns - self._window_started_ns >= _SUMMARY_INTERVAL_NS:
             self._flush_summary(now_ns)
@@ -304,6 +317,15 @@ class TargetMarketDiagnostics:
                 'queue_drops': self._queue_drops,
                 'write_failures': self._write_failures,
             })
+            if self.evidence_sink is not None:
+                self.evidence_sink.record(
+                    'MARKET_SUMMARY', component='MARKET', priority='LOW',
+                    payload={
+                        **w,
+                        'queue_drops': self._queue_drops,
+                        'write_failures': self._write_failures,
+                    },
+                )
         self._window = self._empty_window()
         self._window_started_ns = now_ns
 

@@ -26,6 +26,7 @@ REQUIRED_RUNTIME_FILES = (
     "runtime.json",
     "OnlineTrader-parameters.json",
     "private/OnlineTrader-defaults.json",
+    "private/diagnostics-upload.json",
 )
 OPTIONAL_RUNTIME_FILES = ("OnlineTrader-overrides.json",)
 RETIRED_NAMES = {
@@ -155,6 +156,20 @@ def validate_runtime_config(directory: Path, source_root: Path) -> tuple[dict[st
             raise ValueError(f"Runtime config contains a silver contract: {name}")
     file_hashes = {name: sha256_file(directory / name) for name in sorted(relative)}
     summary = _validate_config_with_product_parser(directory, source_root)
+    sys.path.insert(0, str((source_root / "src").resolve()))
+    try:
+        from online_trader.diagnostics.backend import load_upload_config
+        upload = load_upload_config(directory)
+    finally:
+        sys.path.pop(0)
+    if upload is None:
+        raise ValueError("Runtime diagnostics upload configuration must be enabled.")
+    summary["diagnostics_upload"] = {
+        "host": upload.host,
+        "project_id": upload.project_id,
+        "project_path": upload.project_path,
+        "package_name": upload.package_name,
+    }
     return file_hashes, summary
 
 

@@ -10,6 +10,8 @@
 
 本机日常源码验证可双击桌面的 `OnlineTrader-源码工作台.cmd`。它委托 `scripts/start-dev-runtime-workbench.ps1`，强制使用当前工作区 `src/` 与 `.venv`，并自动选取桌面上开发版本号最高的完整 `OnlineTrader-*-Runtime-Configured/runtime` 作为配置与可重建缓存目录；也可通过 `-RuntimeRoot` 或 `ONLINE_TRADER_DEV_RUNTIME_ROOT` 显式指定。该入口不构建、不打包，也不复制私有配置。若打包版仍在运行，或源码在已有源码进程启动后发生修改，启动器会要求先从托盘安全退出，避免附着旧 Runtime 却误认为正在验证最新源码。诊断日志写入 `%LOCALAPPDATA%\OnlineTrader\dev-launcher`，Runtime 自身仍使用所选配置目录下的启动日志。
 
+Runtime 与 Workbench 的统一诊断事件写入 `<runtime-root>/diagnostics`；Runtime 正常结束后由短生命周期独立 Reporter 固化覆盖范围、生成诊断 ZIP，并在 `private/diagnostics-upload.json` 已启用时尽力上报到固定极狐项目。诊断记录不是交易权威、恢复账本或测试结论；开发端校验与分析入口见 [Runtime & Workbench Diagnostics](docs/refactor/runtime-workbench-diagnostics-reporting-20261124.md)。
+
 便携运行目录使用相对路径配置，不依赖 Windows 凭据库。每次 Runtime 启动创建进程所有的临时执行库，结束后删除，不进行换机交接，也不把旧 `ledger.db` 当成恢复权威。长期保留的是版本默认配置、用户覆盖配置，以及可从期货账户重新下载的交易历史与账户收益缓存。旧 `runtime-control.json`、`private/operators.json` 和 handoff 文件被忽略。公开 CLI/Python 接口只保留状态、账户、行情、历史及诊断读取；交易控制只走同一 Windows 用户的 Workbench 通道。
 
 Trading Workbench 使用只接受启动用户 SID 的本机控制通道，不显示或读取操作员 ID、令牌，也不接受 `LocalSystem` 作为交互用户。命令继续绑定账号、owner boot 和配置版本，14 项封闭操作白名单、Capability 与交易风险由 Runtime 逐次裁决；命令审计保留脱敏账号、actor、boot 及 peer PID/SID。超时只查询原 `command_id`，不自动重发。当前源码候选已把加固后的 CommandBus 接入生产 Workbench，旧直连命令线程、委托操作员管道和旧 Qt 回执兼容均已退役。后续用户级产品测试统一从 Runtime CLI只读/API只读/Qt入口执行；旧 Kernel/ControlServer rehearsal 不可据此宣称当前 Target Owner 的进程级验收。[Target Owner 冷切换合同](docs/refactor/target-execution-and-standalone-cutover-20261121.md) · [测试体系重构](docs/refactor/testing-system-redesign-20261121.md) · [测试入口迁移与固定数据](docs/refactor/standalone-trading-runtime-test-migration-20261119.md)

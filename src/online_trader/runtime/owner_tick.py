@@ -52,6 +52,7 @@ def execute_owner_tick(
     diagnostics_path,
     loop_state,
     market_diagnostics=None,
+    diagnostic_sink=None,
     sleep_fn=time.sleep,
 ):
     """Execute one Target Owner step, preserving pending auto-arm across transient errors."""
@@ -120,6 +121,17 @@ def execute_owner_tick(
             }),
             diagnostics_path,
         )
+        if diagnostic_sink is not None:
+            diagnostic_sink.record(
+                'OWNER_TICK_FAILED', component='OWNER', severity='ERROR', priority='CRITICAL',
+                error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_DSV_SDK_RUNTIME',
+                reason_code=category,
+                payload={
+                    'authority_effect': authority_effect,
+                    'entry_authority': 'RUNNING' if state['running'] else 'DISARMED',
+                    'exception_type': type(error).__name__,
+                },
+            )
         current = {
             "phase": "NEEDS_REVIEW" if disarm else "WAITING_FOR_NATIVE_SYNC",
             "entry_authority": "RUNNING" if state["running"] else "DISARMED",
@@ -174,3 +186,9 @@ def execute_owner_tick(
             status_path,
         )
         loop_state["last_status"] = current
+        if diagnostic_sink is not None:
+            diagnostic_sink.record(
+                'OWNER_STATE_CHANGED', component='OWNER', priority='HIGH',
+                reason_code=current['phase'],
+                payload={'entry_authority': current['entry_authority']},
+            )

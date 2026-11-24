@@ -55,10 +55,15 @@ def _compact_fields(**fields):
 class OrderDiagnosticTracker:
     """Emit deduplicated order-blocking and recovery diagnostics to Python logging."""
 
-    def __init__(self, *, account_key=None, boot_id=None):
+    def __init__(self, *, account_key=None, boot_id=None, evidence_sink=None):
         self.account_key = account_key
         self.boot_id = boot_id
+        self.evidence_sink = evidence_sink
         self._active_blocks = {}
+
+    def bind_evidence_sink(self, sink):
+        self.evidence_sink = sink
+        return self
 
     def emit(self, event_type, *, level=logging.WARNING, **fields):
         payload = _compact_fields(
@@ -69,6 +74,38 @@ class OrderDiagnosticTracker:
             **fields,
         )
         _LOGGER.log(level, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        if self.evidence_sink is not None:
+            try:
+                correlation = {
+                    key: str(fields[key])
+                    for key in ('position_id', 'child_order_id', 'effect_id')
+                    if fields.get(key) is not None
+                }
+                safe = {
+                    key: fields[key]
+                    for key in (
+                        'contract_id', 'effect', 'reason', 'previous_reason',
+                        'stage', 'category', 'broker_state', 'native_offset',
+                        'sequence', 'attempt', 'entry_stopped',
+                    )
+                    if fields.get(key) is not None
+                    and type(fields[key]) in {str, int, bool}
+                }
+                error_code = fields.get('error_code')
+                if not isinstance(error_code, str) or not error_code.startswith('E_'):
+                    error_code = None
+                self.evidence_sink.record(
+                    event_type, component='ORDER', priority='CRITICAL'
+                    if event_type in {'EFFECT_DISPATCH_UNKNOWN', 'SDK_SEND_UNCERTAIN_EXCEPTION'}
+                    else 'HIGH',
+                    severity='ERROR' if level >= logging.ERROR or error_code else
+                    'WARNING' if level >= logging.WARNING else 'INFO',
+                    error_code=error_code,
+                    correlation=correlation,
+                    payload=safe,
+                )
+            except Exception:
+                pass
         return payload
 
     def observe_block(self, key, *, active, contract_id=None, effect=None,

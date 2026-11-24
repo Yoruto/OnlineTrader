@@ -186,6 +186,21 @@ class WorkbenchWindow(StatusWindow):
         self._runtime_mode = runtime_view
         self._runtime_root = Path(runtime_root).resolve() if runtime_root is not None else None
         self._runtime_account = runtime_account
+        self._diagnostic_sink = None
+        self._diagnostic_account_pseudonym = None
+        if self._runtime_root is not None:
+            from online_trader.diagnostics import open_sink
+            process_id = 'workbench-' + uuid.uuid4().hex
+            self._diagnostic_sink = open_sink(
+                self._runtime_root / 'diagnostics',
+                process_role='WORKBENCH',
+                process_instance_id=process_id,
+                stream_group='workbench',
+            )
+            self._diagnostic_sink.record(
+                'WORKBENCH_STARTED', component='LIFECYCLE', priority='HIGH',
+                payload={'runtime_mode': bool(runtime_view)},
+            )
         self._runtime_shutdown_verified = False
         self._runtime_shutdown_in_progress = False
         self._runtime_bootstrap = None
@@ -531,9 +546,45 @@ class WorkbenchWindow(StatusWindow):
                 'received_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
             },
         }
+        if self._diagnostic_sink is not None:
+            view = state['view']
+            boot_id = view.get('kernel_boot_id')
+            if self._diagnostic_account_pseudonym is None and self._runtime_root is not None:
+                account_key = view.get('account_key')
+                if isinstance(account_key, str) and account_key:
+                    try:
+                        from online_trader.diagnostics import account_pseudonym
+                        self._diagnostic_account_pseudonym = account_pseudonym(
+                            self._runtime_root, account_key)
+                    except Exception:
+                        pass
+            configuration = view.get('configuration') or {}
+            self._diagnostic_sink.record(
+                'WORKBENCH_SNAPSHOT_RECEIVED', component='PROJECTION', priority='LOW',
+                runtime_boot_id=boot_id,
+                account_pseudonym=self._diagnostic_account_pseudonym,
+                configuration_revision=str(configuration.get('config_revision') or '0'),
+                correlation={
+                    'snapshot_id': str(view.get('snapshot_id') or view.get('checkpoint_event_seq') or '0'),
+                },
+                payload={
+                    'entry_authority': view.get('entry_authority'),
+                    'truncated': bool(view.get('truncated')),
+                    'cycle_count': len(view.get('cycles') or ()),
+                    'order_count': len(view.get('orders') or ()),
+                },
+            )
         self._runtime_updated({'action': 'refresh', 'value': value})
 
     def _runtime_client_connection_changed(self, state, reason):
+        if self._diagnostic_sink is not None:
+            self._diagnostic_sink.record(
+                'WORKBENCH_CONNECTION_CHANGED', component='IPC',
+                severity='INFO' if state == 'READY' else 'WARNING', priority='HIGH',
+                runtime_boot_id=self._boot,
+                account_pseudonym=self._diagnostic_account_pseudonym,
+                payload={'connection_state': str(state), 'reason': str(reason or '')},
+            )
         if self._closing or state == 'READY':
             return
         self._runtime_unavailable(reason or state)
@@ -541,6 +592,20 @@ class WorkbenchWindow(StatusWindow):
     def _runtime_command_changed(self, pending):
         if self._closing:
             return
+        if self._diagnostic_sink is not None:
+            receipt = dict(pending.receipt) if pending.receipt is not None else {}
+            self._diagnostic_sink.record(
+                'WORKBENCH_COMMAND_CHANGED', component='COMMAND', priority='HIGH',
+                runtime_boot_id=self._boot,
+                account_pseudonym=self._diagnostic_account_pseudonym,
+                correlation={'command_id': pending.command_id},
+                payload={
+                    'operation': pending.operation,
+                    'status': pending.status.value,
+                    'reason': pending.reason,
+                    'receipt_status': receipt.get('status'),
+                },
+            )
         if pending.receipt is not None:
             receipt = dict(pending.receipt)
             self.receipt_identity = {key: receipt[key] for key in ('command_id', 'payload_hash') if key in receipt}
@@ -670,6 +735,14 @@ class WorkbenchWindow(StatusWindow):
             if operation == 'SAVE_DSV_PARAMETERS':
                 self.dashboard.set_parameter_feedback(f'参数未提交 · {error.code} · {error}', error=True)
             return
+        if self._diagnostic_sink is not None:
+            self._diagnostic_sink.record(
+                'WORKBENCH_COMMAND_SUBMITTED', component='COMMAND', priority='HIGH',
+                runtime_boot_id=self._boot,
+                account_pseudonym=self._diagnostic_account_pseudonym,
+                correlation={'command_id': command_id},
+                payload={'operation': operation, 'scope_type': scope.get('scope_type')},
+            )
         if operation == 'SAVE_DSV_PARAMETERS':
             self._pending_parameter_command_ids.add(command_id)
             if hot_add_profile is not None:
@@ -2192,7 +2265,18 @@ class WorkbenchWindow(StatusWindow):
         self.monitor_timer.stop()
         self.connection_retry_timer.stop()
         self.dashboard.log_timer.stop()
-        self.timer.stop();super().closeEvent(event)
+        self.timer.stop()
+        if self._diagnostic_sink is not None:
+            self._diagnostic_sink.record(
+                'WORKBENCH_STOPPED', component='LIFECYCLE', priority='CRITICAL',
+                runtime_boot_id=self._boot,
+                account_pseudonym=self._diagnostic_account_pseudonym,
+                payload={'runtime_shutdown_verified': bool(self._runtime_shutdown_verified)},
+            )
+            self._diagnostic_sink.finalize(
+                clean_shutdown=True, snapshot_available=self.view is not None, timeout=1.0)
+            self._diagnostic_sink = None
+        super().closeEvent(event)
 
     def prepare_update_restart(self):
         if (self._startup_in_progress or self._worker is not None

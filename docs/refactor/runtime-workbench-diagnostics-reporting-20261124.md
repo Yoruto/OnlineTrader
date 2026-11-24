@@ -1,9 +1,9 @@
 # Runtime & Workbench Diagnostics 诊断上报与运行证据系统实施设计
 
-2026-11-24 · `CANDIDATE / DESIGN_ONLY`
+2026-11-24 · `CANDIDATE / IMPLEMENTED_CANDIDATE`
 
 > 适用路径：Standalone Trading Runtime、runtime-view-process、Runtime Workbench 与开发端诊断工具。  
-> 本文定义架构、数据合同、生命周期、迁移、回退、诊断点和验收条件；不代表源码已经实现，不授权账户连接、交易、测试、构建或打包。  
+> 本文定义架构、数据合同、生命周期、迁移、回退、诊断点和验收条件；对应源码候选已实现，但功能、实机、在线上报和制品验收仍为 `NOT_RUN`，本次实现不授权账户连接、交易、测试、构建或打包。
 > 当前权威仍是期货账户、当前 boot 的单一 Owner 与临时执行 Journal。诊断记录不是交易事实、恢复源、第二套状态机或跨设备交接介质。
 
 ## 1. 定位与目标
@@ -487,7 +487,7 @@ Manifest 至少包括：
 | `clean_shutdown` | 是否观察到正常退出完成 |
 | `capture_status` | `COMPLETE_WITHIN_SCOPE` / `PARTIAL` / `FAILED` |
 | `redaction_version` | 脱敏规则版本 |
-| `bundle_sha256` | 包内容校验 |
+| `bundle_sha256` | Manifest 中为除 Manifest 外包内成员的确定性聚合哈希；ZIP 字节级 SHA-256 另写入同名 `.sha256` 和上报结果，避免文件内自指哈希的循环定义 |
 
 不使用单一 `complete=true` 声称整个交易日绝对完整。
 
@@ -497,10 +497,32 @@ Manifest 至少包括：
 - 默认不上传完整配置，只上传 canonical hash、revision 和白名单功能摘要。
 - 异常记录允许异常类型、产品错误码和裁剪后的仓库内文件名/行号；不上传 locals、绝对路径或任意异常文本。
 - 原始柜台拒绝文本先分类，只有明确通过允许列表的安全字段才进入包。
-- 合约代码和数量属于业务敏感数据，内部诊断可保留，但 Backend、访问权限、保留期和用户授权必须明确。
-- GitLab/JiHuLab 上报不得复用包含源码读写权限的 Token，不把上传凭据写进软件包。
-- 第一阶段必须支持 Local Backend。GitLab Backend 只有在获得最小上传权限凭据及安全存储方案后启用。
+- 合约代码和数量可作为单对单诊断所需的业务事实保留；仍不得把账户口令、柜台登录凭据或上传 Token 写入诊断包。
+- 用户已于 2026-11-24 明确授权：该单对单软件的极狐上传 Token 直接写入客户 Runtime 的私有交付配置并随包交付，不再以“凭据不能随包”为启用门槛。
+- 固定配置文件为 `private/diagnostics-upload.json`。它属于 Runtime 配置，不属于诊断目录、诊断包、配置摘要或日志采集范围；更新保留该文件，Reporter 只读取，不回显。
+- 固定 Backend 为极狐 Generic Package Registry：`jihulab.com`、Project ID `390001`、项目 `Yoruto/online-trader-diagnostics`。生产包名使用 `online-trader-diagnostics`，版本使用稳定 `report_id`，文件名使用诊断包文件名。
+- 当前第三个 `owner` Token 已通过身份查询、测试上传和回读校验，可直接作为该配置的 `private_token`。后续不要求为此系统更换最小权限 Token；若用户主动轮换，仅替换配置值。
+- 第一阶段仍支持 Local Backend，便于人工导出和上传失败时保留证据；启用极狐 Backend 不依赖系统凭据库或额外安全存储方案。
 - 上传失败写入脱敏结果，不自动无限补传；是否保留本地包由容量策略决定。
+
+交付配置合同：
+
+```json
+{
+  "schema_version": "ONLINE_TRADER_DIAGNOSTIC_UPLOAD/1",
+  "enabled": true,
+  "backend": "JIHULAB_GENERIC_PACKAGE",
+  "host": "jihulab.com",
+  "project_id": 390001,
+  "project_path": "Yoruto/online-trader-diagnostics",
+  "package_name": "online-trader-diagnostics",
+  "private_token": "<第三个 owner Token>",
+  "connect_timeout_seconds": 5,
+  "upload_timeout_seconds": 20
+}
+```
+
+配置校验失败时仅禁用远端上传并记录安全错误码，不能阻止 Runtime 启动、交易、退出或本地诊断包生成。日志、异常和 `upload-results.ndjson` 只能记录 host、project ID、report ID、HTTP 状态、阶段和裁剪后的错误分类，禁止记录请求头、Token、完整响应正文或带凭据 URL。
 
 Backend 最小协议：
 
@@ -619,6 +641,16 @@ src/online_trader/diagnostics/
 
 ## 18. 分阶段实施
 
+当前源码候选的实现映射如下；这些是源码状态，不是功能验收结论：
+
+| 范围 | 源码状态 | 未验证/未实现 |
+| --- | --- | --- |
+| 事件合同与 Sink | 已实现 schema、有界队列、2 MiB segment、健康与丢弃计数、安装级 HMAC 账号匿名 | 队列/磁盘/权限故障测试 `NOT_RUN` |
+| 产品诊断点 | 已接入 Runtime 生命周期、Owner、订单、行情、命令、历史缓存和 Workbench | 实际 Runtime/Workbench/柜台事件覆盖 `NOT_RUN` |
+| 截点与 Reporter | 已实现正常退出 Journal 截点、request 认领、闭合 segment 收集、Manifest、ZIP、SHA-256 和 500 MiB 本地保留 | crash/cutoff 及冻结 EXE 独立存活 `NOT_RUN` |
+| 远程上报 | 已实现固定极狐 Project 390001 Generic Package 单次尽力上报，严格校验 `private/diagnostics-upload.json` | 产品路径上报和封装配置验收 `NOT_RUN` |
+| 开发端工具 | 已实现包校验、通用时间线和行情规则检查 | `compare`、订单/命令专项 trace 仍待后续实现；现有 Analyzer 不对未实现规则给出 `OBSERVED_OK` |
+
 ### PR1：证据合同与首个行情纵向切片
 
 - 审计并映射现有诊断能力，避免重复 Recorder。
@@ -650,7 +682,7 @@ src/online_trader/diagnostics/
 
 ### PR5：经授权的 GitLab/JiHuLab 上报与版本比较
 
-- 在最小上传权限、安全凭据存储和保留政策明确后接入 Backend。
+- 按已定稿的 `private/diagnostics-upload.json` 接入极狐 Generic Package Backend；构建时把用户指定的第三个 Token 写入客户私有交付配置。
 - 加入上传超时、去重身份和失败记录；不做可靠补传。
 - 完成 `analyze`、`compare`、incident/order/command timeline 和 AI 使用说明。
 
@@ -706,7 +738,7 @@ src/online_trader/diagnostics/
 8. 诊断包经过版本化 schema、脱敏、segment hash、Manifest 和总包 hash 校验。
 9. Analyzer 不把未观察、不可比或缺失证据写成 PASS。
 10. 经授权的独立测试完成相应范围，并如实记录 PASS/FAIL/SKIP/NOT_RUN；未授权部分保持 `NOT_RUN`。
-11. 若要求自动上报，最小权限凭据、用户授权、Backend、保留期和上传失败行为已经确认。
+11. 若要求自动上报，已交付并读取 `private/diagnostics-upload.json`，能够使用已授权 Token 上传到 Project ID `390001`，且诊断包、日志和错误结果中均不包含 Token。
 12. 若要求打包交付，从最终 ZIP/安装器在隔离环境完成独立验收并记录制品 SHA-256。
 
 ## 22. 当前决定与待定项
@@ -718,13 +750,14 @@ src/online_trader/diagnostics/
 - Analyzer 前置并按纵向链路交付；
 - 收盘使用诊断 cutoff，不声称最终结算完整；
 - 正常退出由单一协调器创建 Reporter request；
-- 第一阶段 Local Backend，上传凭据未定前不直连源码仓库；
+- 保留 Local Backend，同时使用极狐 Generic Package Registry 作为远端 Backend；
+- 极狐目标固定为 `Yoruto/online-trader-diagnostics` / Project ID `390001`；
+- 第三个 `owner` Token 直接写入并随包交付于 `private/diagnostics-upload.json`，不再等待最小权限或系统安全存储方案；
 - 不用一次实机轨迹替代完整功能测试。
 
-实施前仍需在对应 PR 设计中确认：
+当前已实现但仍需在后续验收中确认：
 
-- 安装级 HMAC 密钥的安全存储位置和卸载行为；
-- GitLab/JiHuLab 最小上传权限的具体凭据类型与保存方式；
-- 本地保留天数与 500 MiB 上限的淘汰优先级；
-- 各版本诊断协议的最低 Analyzer 支持窗口；
-- Windows 打包环境下 detached Reporter 与更新切换的进程关系。
+- `private/diagnostics-hmac.key` 的 Windows 权限、更新保留和卸载行为；
+- 500 MiB 上限下以诊断包/进程目录为单位的旧优先淘汰是否符合实际使用；
+- 诊断协议升级时 Analyzer 的最低支持窗口；
+- Windows 冻结制品中 detached Reporter 与更新切换的进程关系。

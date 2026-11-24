@@ -1,0 +1,102 @@
+"""Validate an OnlineTrader diagnostic ZIP without trusting its conclusions."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import PurePosixPath
+from zipfile import BadZipFile, ZipFile
+
+
+MAX_MEMBER_BYTES = 16 * 1024 * 1024
+MAX_MEMBERS = 4096
+
+
+def _json(archive: ZipFile, name: str):
+    raw = archive.read(name)
+    if len(raw) > MAX_MEMBER_BYTES:
+        raise ValueError(f"oversized member: {name}")
+    return json.loads(raw.decode("utf-8"))
+
+
+def validate(path):
+    errors = []
+    gaps = []
+    streams = {}
+    with ZipFile(path) as archive:
+        names = archive.namelist()
+        if len(names) > MAX_MEMBERS or len(names) != len(set(names)):
+            raise ValueError("invalid diagnostic member set")
+        for name in names:
+            member = PurePosixPath(name)
+            if member.is_absolute() or ".." in member.parts or archive.getinfo(name).file_size > MAX_MEMBER_BYTES:
+                raise ValueError(f"unsafe diagnostic member: {name}")
+        manifest = _json(archive, "manifest.json")
+        if manifest.get("schema_version") != "ONLINE_TRADER_DIAGNOSTIC_MANIFEST/1":
+            errors.append("UNSUPPORTED_MANIFEST")
+        expected = manifest.get("members") or {}
+        for name, digest in expected.items():
+            if name not in names:
+                errors.append(f"MISSING_MEMBER:{name}")
+                continue
+            actual = hashlib.sha256(archive.read(name)).hexdigest()
+            if actual != digest:
+                errors.append(f"HASH_MISMATCH:{name}")
+        last_by_stream = {}
+        for name in names:
+            if not name.endswith(".ndjson"):
+                continue
+            stream_id = None
+            for line_number, line in enumerate(archive.read(name).splitlines(), 1):
+                try:
+                    row = json.loads(line)
+                    sequence = int(row["event_seq"])
+                    current_stream = row["stream_id"]
+                except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    errors.append(f"INVALID_EVENT:{name}:{line_number}")
+                    continue
+                if stream_id is None:
+                    stream_id = current_stream
+                elif stream_id != current_stream:
+                    errors.append(f"STREAM_CHANGED:{name}:{line_number}")
+                previous = last_by_stream.get(current_stream, 0)
+                if previous and sequence != previous + 1:
+                    gaps.append({"member": name, "after": previous, "next": sequence})
+                last_by_stream[current_stream] = sequence
+            if stream_id is not None:
+                streams[stream_id] = last_by_stream[stream_id]
+        result = "VALID" if not errors else "INVALID"
+        coverage = "PARTIAL" if gaps or manifest.get("capture_status") != "COMPLETE_WITHIN_SCOPE" else "COMPLETE_WITHIN_SCOPE"
+        return {
+            "schema_version": "ONLINE_TRADER_DIAGNOSTIC_VALIDATION/1",
+            "result": result,
+            "coverage": coverage,
+            "report_id": manifest.get("report_id"),
+            "errors": errors,
+            "sequence_gaps": gaps,
+            "streams": streams,
+        }
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("bundle")
+    args = parser.parse_args(argv)
+    try:
+        result = validate(args.bundle)
+    except (OSError, ValueError, BadZipFile, KeyError, json.JSONDecodeError) as error:
+        result = {
+            "schema_version": "ONLINE_TRADER_DIAGNOSTIC_VALIDATION/1",
+            "result": "INVALID",
+            "coverage": "FAILED",
+            "errors": [type(error).__name__],
+            "sequence_gaps": [],
+            "streams": {},
+        }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["result"] == "VALID" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

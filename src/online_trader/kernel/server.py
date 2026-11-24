@@ -54,8 +54,9 @@ class _Peer:
 
 
 class ControlServer:
-    def __init__(self,kernel:Kernel,pipe_name:str, *, trusted_client_pid=None):
+    def __init__(self,kernel:Kernel,pipe_name:str, *, trusted_client_pid=None, diagnostic_sink=None):
         self.kernel=kernel;self.listener=PipeListener(pipe_name)
+        self._diagnostic_sink = diagnostic_sink
         self._target_owner = getattr(kernel, 'runtime_protocol', None) == 'DSV_TARGET/1'
         self._trusted_client_pid = trusted_client_pid
         self._inbound=queue.Queue(256);self._stop=threading.Event();self._peers=set();self._workers=[];self._waiting=[]
@@ -72,6 +73,26 @@ class ControlServer:
         self._stream_peers={}
         self._last_progress_utc=_utc()
         self._last_progress_seq=int(boundary)
+
+    def _diagnose_command(self, event_type, body=None, *, error_code=None, status=None):
+        if self._diagnostic_sink is None:
+            return
+        body = body if isinstance(body, dict) else {}
+        command_id = body.get('command_id')
+        correlation = {'command_id': command_id} if isinstance(command_id, str) else {}
+        payload = {}
+        operation = body.get('operation')
+        if isinstance(operation, str):
+            payload['operation'] = operation
+        if isinstance(status, str):
+            payload['status'] = status
+        self._diagnostic_sink.record(
+            event_type, component='COMMAND', priority='HIGH',
+            severity='ERROR' if error_code else 'INFO',
+            error_code=error_code,
+            correlation=correlation,
+            payload=payload,
+        )
 
     def _projection(self, snapshot):
         if self._target_owner:
@@ -252,6 +273,7 @@ class ControlServer:
             peer.enqueue(self._reply(peer,message,"RequestContext",context))
         elif kind=="OperatorCommand":
             if len(self._waiting)>=256:raise TraderError("E_QUEUE_OVERFLOW","Pending control capacity reached")
+            self._diagnose_command('RUNTIME_COMMAND_RECEIVED', body)
             if self._trusted_client_pid is None:
                 result = self.kernel.execute_command(message, peer.peer_id)
             else:
@@ -389,6 +411,9 @@ class ControlServer:
                 self._handle(peer,message)
             except TraderError as error:
                 fatal=error.code in invariant_codes
+                if message.get('type') == 'OperatorCommand':
+                    code = error.code if isinstance(error.code, str) and error.code.startswith('E_') else 'E_INTERNAL'
+                    self._diagnose_command('RUNTIME_COMMAND_REJECTED', message.get('body'), error_code=code)
                 try:self._error(peer,message,error,action="CLOSE" if fatal else "KEEP")
                 except Exception:peer.close()
                 if fatal:
@@ -396,6 +421,8 @@ class ControlServer:
                     self._fail_closed_owner(error)
                     break
             except Exception as error:
+                if message.get('type') == 'OperatorCommand':
+                    self._diagnose_command('RUNTIME_COMMAND_REJECTED', message.get('body'), error_code='E_INTERNAL')
                 try:self._error(peer,message,error,action="CLOSE")
                 except Exception:pass
                 peer.close()
@@ -406,7 +433,14 @@ class ControlServer:
         for peer,message,result in self._waiting:
             if peer.closed.is_set():continue
             if not result.done():remaining.append((peer,message,result));continue
-            try:peer.enqueue(self._reply(peer,message,'CommandReceipt',result.result()))
+            try:
+                receipt = result.result()
+                peer.enqueue(self._reply(peer,message,'CommandReceipt',receipt))
+                if message.get('type') == 'OperatorCommand':
+                    self._diagnose_command(
+                        'RUNTIME_COMMAND_RECEIPT', message.get('body'),
+                        status=receipt.get('status') if isinstance(receipt, dict) else None,
+                    )
             except TraderError as error:
                 fatal=error.code in invariant_codes
                 try:self._error(peer,message,error,action="CLOSE" if fatal else "KEEP")

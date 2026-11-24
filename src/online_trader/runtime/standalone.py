@@ -1,6 +1,7 @@
 """Headless entry to the current, single-owner simulation execution path."""
 
 import json
+import os
 import sys
 
 from online_trader.configuration.files import publish_new_bytes
@@ -94,10 +95,35 @@ def run_session(store, selected, request, *, use_profile_file=False):
     from online_trader.runtime.instance_registry import RuntimeInstanceRegistration
     from online_trader.runtime.session_storage import RuntimeSessionStorage
     from online_trader.runtime.view_process import ViewProcess
+    result = 2
+    runtime_boot_id = None
+    runtime_process_instance_id = None
+    report_reason = 'STARTUP_FAILED'
     with RuntimeLock() as runtime_lock, RuntimeSessionStorage() as session:
-        process = ViewProcess(pipe, selected['account_key'], store.directory, session.ledger,
-                              store.history_path(selected))
+        from online_trader.diagnostics import account_pseudonym, open_sink
+        runtime_boot_id = session.boot_id
+        runtime_process_instance_id = f'{runtime_boot_id}-{os.getpid()}'
         try:
+            pseudonym = account_pseudonym(store.directory, selected['account_key'])
+        except Exception:
+            pseudonym = None
+        diagnostics = open_sink(
+            store.directory / 'diagnostics',
+            process_role='RUNTIME_OWNER',
+            process_instance_id=runtime_process_instance_id,
+            stream_group='runtime',
+            runtime_boot_id=session.boot_id,
+            account_pseudonym=pseudonym,
+            configuration_revision='1',
+        )
+        diagnostics.record(
+            'RUNTIME_STARTED', component='LIFECYCLE', priority='HIGH',
+            payload={'entry_authority': 'DISARMED', 'execution_core': 'DSV_TARGET_EXECUTION'},
+        )
+        process = None
+        try:
+            process = ViewProcess(pipe, selected['account_key'], store.directory, session.ledger,
+                                  store.history_path(selected))
             with RuntimeInstanceRegistration(store, selected, pipe):
                 result = run_confirmed_start(request_path, output, configured_store=store,
                                              trusted_control_pid=process.trusted_pid,
@@ -106,9 +132,37 @@ def run_session(store, selected, request, *, use_profile_file=False):
                                              history_cache=store.history_path(selected),
                                              runtime_lock=runtime_lock,
                                              runtime_boot_id=session.boot_id,
-                                             session_storage=session)
+                                             session_storage=session,
+                                             diagnostic_sink=diagnostics)
         finally:
-            process.close()
+            if process is not None:
+                process.close()
+            report_reason = 'CONTROLLED_EXIT' if result == 0 else 'STARTUP_OR_RUNTIME_FAILURE'
+            try:
+                result_code = result if type(result) is int and result >= 0 else 2
+                diagnostics.record(
+                    'RUNTIME_STOPPED' if result == 0 else 'RUNTIME_FAILED',
+                    component='LIFECYCLE', severity='INFO' if result == 0 else 'ERROR',
+                    priority='CRITICAL',
+                    error_code=None if result == 0 else 'E_RUNTIME_SESSION',
+                    payload={'result_code': result_code, 'entry_authority': 'DISARMED'},
+                )
+            finally:
+                diagnostics.finalize(
+                    clean_shutdown=result == 0, snapshot_available=result == 0, timeout=1.0)
+    if runtime_process_instance_id is not None:
+        try:
+            from online_trader.diagnostics.reporter import create_report_request, launch_reporter
+            report_request = create_report_request(
+                store.directory,
+                report_reason=report_reason,
+                runtime_boot_id=runtime_boot_id,
+                clean_shutdown=result == 0,
+                runtime_process_instance_id=runtime_process_instance_id,
+            )
+            launch_reporter(store.directory, report_request)
+        except Exception:
+            pass
     failure = output / 'startup-failure.json'
     if result and failure.is_file():
         print(json.dumps({'status': 'STARTUP_FAILED', 'diagnostic': str(failure)}, ensure_ascii=False),

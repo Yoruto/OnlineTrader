@@ -17,6 +17,7 @@ from online_trader.errors import TraderError
 from online_trader.configuration.baseline import APPROVAL_RESOURCE, BASELINE_RESOURCE
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.runtime.portable_config import PortableAccountStore
+from online_trader.diagnostics.backend import load_upload_config
 from online_trader.updates import (
     PAYLOAD_MARKER,
     PAYLOAD_SCHEMA,
@@ -30,6 +31,7 @@ from online_trader.updates import (
 DEFAULTS = 'OnlineTrader-defaults.json'
 PARAMETERS = 'OnlineTrader-parameters.json'
 PARAMETER_OVERRIDES = 'OnlineTrader-overrides.json'
+DIAGNOSTIC_UPLOAD = 'private/diagnostics-upload.json'
 EXECUTABLES = ('OnlineTrader.exe', 'OnlineTraderCLI.exe')
 STARTUP_FILES = ('OnlineTrader.ini', 'update-source.json')
 RUNTIME_STARTUP_FILES = ('start-trading-runtime.cmd', 'open-runtime-workbench.ps1')
@@ -107,11 +109,13 @@ def _runtime_files(directory, kind):
     directory = directory.resolve()
     store = PortableAccountStore(directory)
     store.profile()
-    names = ['runtime.json', PARAMETERS, 'private/' + DEFAULTS]
+    names = ['runtime.json', PARAMETERS, 'private/' + DEFAULTS, DIAGNOSTIC_UPLOAD]
     if (directory / PARAMETER_OVERRIDES).is_file():
         names.append(PARAMETER_OVERRIDES)
     for name in names:
         reject_silver_in_config((directory / name).read_bytes(), name)
+    if load_upload_config(directory) is None:
+        raise ValueError('Runtime delivery requires an enabled private diagnostics upload configuration.')
     if kind != 'fresh':
         raise ValueError('Runtime delivery no longer accepts execution-ledger handoff state.')
     return names

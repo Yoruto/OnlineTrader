@@ -61,7 +61,16 @@ def main(argv=None):
     parser.add_argument('--license', action='store_true', help='写入本机授权状态诊断后退出')
     parser.add_argument('--compare-fills', nargs='?', const='', metavar='CSV',
                         help='打开本地成交对照，或预填指定 CSV')
+    parser.add_argument('--diagnostic-reporter', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--diagnostic-runtime-root', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.diagnostic_reporter is not None:
+        if args.diagnostic_runtime_root is None:
+            parser.error('--diagnostic-reporter requires --diagnostic-runtime-root')
+        from online_trader.diagnostics.reporter import report
+        return report(args.diagnostic_runtime_root, args.diagnostic_reporter)
+    if args.diagnostic_runtime_root is not None:
+        parser.error('--diagnostic-runtime-root requires --diagnostic-reporter')
     if args.license:
         directory = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path.cwd()
         try:

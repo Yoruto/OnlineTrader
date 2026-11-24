@@ -71,7 +71,8 @@ def _resolve_trusted_pid(trusted_control_pid):
 def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                      session_storage, runtime_lock, account_lock, clock,
                      trusted_control_pid, history_cache, arm=False,
-                     configuration_revision='1', entry_point=None, configured_store=None):
+                     configuration_revision='1', entry_point=None, configured_store=None,
+                     diagnostic_sink=None):
     """Run the single target owner on the calling Runtime thread."""
     if grant.replacement or grant.manual_workbench:
         raise TraderError('E_ONLINE_SCOPE', 'Standalone target execution requires a strategy desktop scope')
@@ -86,8 +87,18 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
     status = output / 'target-owner-status.json'
     diagnostics = output / 'target-owner-diagnostics.json'
     try:
+        if diagnostic_sink is not None:
+            diagnostic_sink.record(
+                'OWNER_CONNECTING', component='CONNECTION', priority='HIGH',
+                payload={'provider': grant.provider, 'entry_authority': 'DISARMED'},
+            )
         connection = strategy_port(grant).connect(credentials, grant, clock)
         connection.configure_calendar(calendar)
+        if diagnostic_sink is not None:
+            diagnostic_sink.record(
+                'OWNER_CONNECTED', component='CONNECTION', priority='HIGH',
+                payload={'provider': grant.provider, 'entry_authority': 'DISARMED'},
+            )
         if grant.automatic_offsets:
             from online_trader.runtime.auto_offsets import load_preparation, prepare_connected
             restored = load_preparation(grant, profile)
@@ -106,6 +117,16 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             session_storage.ledger, binding=binding, connection=connection,
             profile=profile, calendar=calendar, clock=clock,
             configuration_revision=configuration_revision)
+        if diagnostic_sink is not None:
+            trackers = (
+                getattr(owner.session, '_diagnostics', None),
+                getattr(getattr(owner.session, '_controller', None), '_diagnostics', None),
+                getattr(owner.adapter, '_diagnostics', None),
+            )
+            for tracker in trackers:
+                bind = getattr(tracker, 'bind_evidence_sink', None)
+                if callable(bind):
+                    bind(diagnostic_sink)
         if configured_store is not None:
             owner.on_parameters_saved = configured_store.replace_profile
             owner.on_parameters_restore = configured_store.restore_overrides
@@ -143,21 +164,35 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             owner.run_directory = None
         else:
             owner.run_directory = str(output)
-        history_writer = BrokerHistoryWriter(
-            history_cache, binding.account_key, binding.provider,
-            on_error=lambda error: publish_replace_bytes(canonical_bytes({
+        def history_error(error):
+            publish_replace_bytes(canonical_bytes({
                 'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
                 'execution_core': 'DSV_TARGET_EXECUTION', 'authority_effect': 'NONE',
                 'diagnostic': getattr(error, 'code', 'E_HISTORY_CACHE_WRITE'),
                 'observed_at_utc': _utc_now(),
-            }), diagnostics))
+            }), diagnostics)
+            if diagnostic_sink is not None:
+                code = getattr(error, 'code', 'E_HISTORY_CACHE_WRITE')
+                diagnostic_sink.record(
+                    'HISTORY_CACHE_WRITE_FAILED', component='HISTORY', severity='WARNING',
+                    priority='HIGH',
+                    error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_HISTORY_CACHE_WRITE',
+                    payload={'authority_effect': 'NONE', 'exception_type': type(error).__name__},
+                )
+
+        history_writer = BrokerHistoryWriter(
+            history_cache, binding.account_key, binding.provider,
+            on_error=history_error)
         publish_replace_bytes(canonical_bytes({
             'phase': 'WAITING_FOR_NATIVE_SYNC', 'runtime_boot_id': binding.boot_id,
             'account_key': binding.account_key, 'entry_authority': 'DISARMED',
             'execution_core': 'DSV_TARGET_EXECUTION',
             'observed_at_utc': _utc_now(),
         }), status)
-        server = ControlServer(owner, pipe, trusted_client_pid=trusted_control_pid)
+        server = ControlServer(
+            owner, pipe, trusted_client_pid=trusted_control_pid,
+            diagnostic_sink=diagnostic_sink,
+        )
         loop_state = {
             'last_status': {'phase': 'WAITING_FOR_NATIVE_SYNC', 'entry_authority': 'DISARMED'},
             'last_history_capture': 0.0,
@@ -177,6 +212,7 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
 
         market_diagnostics = TargetMarketDiagnostics(
             output, boot_id=binding.boot_id, sdk_version=SDK_VERSION,
+            evidence_sink=diagnostic_sink,
         )
 
         def tick():
@@ -185,17 +221,39 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                 is_complete=is_complete, history_writer=history_writer,
                 status_path=status, diagnostics_path=diagnostics,
                 loop_state=loop_state, market_diagnostics=market_diagnostics,
+                diagnostic_sink=diagnostic_sink,
             )
 
         with attach_order_blocking_log(output), market_diagnostics:
             server.serve(stop_event=owner.stop_event, owner_tick=tick, publish_workbench=True)
         shutdown = owner.session.prepare_shutdown()
+        if diagnostic_sink is not None:
+            final_state = owner.snapshot()
+            journal_sequence = final_state.get('sequence')
+            diagnostic_sink.record(
+                'EXECUTION_JOURNAL_CUTOFF', component='STORAGE', priority='CRITICAL',
+                correlation={
+                    'execution_journal_event_seq': (
+                        str(journal_sequence) if journal_sequence is not None else 'UNKNOWN'
+                    ),
+                },
+                payload={
+                    'clean_shutdown': True,
+                    'shutdown_status': shutdown.get('status'),
+                    'entry_authority': 'DISARMED',
+                },
+            )
         publish_replace_bytes(canonical_bytes({
             'phase': 'STOPPED', 'runtime_boot_id': binding.boot_id,
             'account_key': binding.account_key, 'entry_authority': 'DISARMED',
             'execution_core': 'DSV_TARGET_EXECUTION', 'shutdown': shutdown,
             'observed_at_utc': _utc_now(),
         }), status)
+        if diagnostic_sink is not None:
+            diagnostic_sink.record(
+                'OWNER_STOPPED', component='LIFECYCLE', priority='CRITICAL',
+                payload={'entry_authority': 'DISARMED', 'shutdown_status': shutdown.get('status')},
+            )
         return 0
     except Exception as error:
         publish_replace_bytes(canonical_bytes({
@@ -206,6 +264,13 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             'observed_at_utc': _utc_now(),
             'exception': exception_record(error),
         }), status)
+        if diagnostic_sink is not None:
+            code = getattr(error, 'code', 'E_DSV_SDK_RUNTIME')
+            diagnostic_sink.record(
+                'OWNER_FAILED', component='LIFECYCLE', severity='ERROR', priority='CRITICAL',
+                error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_DSV_SDK_RUNTIME',
+                payload={'entry_authority': 'DISARMED', 'exception_type': type(error).__name__},
+            )
         raise
     finally:
         if history_writer is not None:

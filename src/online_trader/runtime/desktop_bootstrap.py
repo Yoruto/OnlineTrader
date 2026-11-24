@@ -326,7 +326,7 @@ def run_desktop_start(request_path, output, *, now=None):
 def run_confirmed_start(request_path, output, *, now=None, configured_store=None, trusted_control_pid=None,
                         use_portable_profile_file=False,
                         execution_ledger=None, history_cache=None, runtime_lock=None, runtime_boot_id=None,
-                        session_storage=None):
+                        session_storage=None, diagnostic_sink=None):
     """Run the original owner using the selected desktop or portable account inputs."""
     directory = Path(output).resolve()
     directory.mkdir(parents=True, exist_ok=False)
@@ -347,6 +347,16 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
                 'observed_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                 **extra,
             }), directory / f'phase-{index:03}-bootstrap.json')
+            if diagnostic_sink is not None:
+                diagnostic_sink.record(
+                    name, component='STARTUP', priority='HIGH',
+                    payload={
+                        'phase_index': index,
+                        'entry_authority': 'DISARMED',
+                        **{key: value for key, value in extra.items()
+                           if key in {'trading_day'} and isinstance(value, str)},
+                    },
+                )
         phase(0, 'STARTUP_CHECKING')
         with ClockActivity(), AccountLock(row['account_key']) as lease:
             runtime_options = {}
@@ -438,7 +448,8 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
                     output=directory, pipe=store.pipe_name(row), session_storage=session_storage,
                     runtime_lock=runtime_lock, account_lock=lease, clock=clock,
                     trusted_control_pid=trusted_control_pid or -1, history_cache=history_cache,
-                    arm=request['arm'], configuration_revision='1', configured_store=configured_store)
+                    arm=request['arm'], configuration_revision='1', configured_store=configured_store,
+                    diagnostic_sink=diagnostic_sink)
             return dsv_simulation.run(directory / 'scope.json', reference, directory / 'profile.json',
                 directory / 'calendar.json', directory, pipe=store.pipe_name(row), arm=request['arm'],
                 _execution_lock=lease, **({'_reference': clock} if clock is not None else {}), **runtime_options)
@@ -451,4 +462,10 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
         path = directory / 'startup-failure.json'
         if not path.exists():
             publish_new_bytes(canonical_bytes(failure), path)
+        if diagnostic_sink is not None:
+            diagnostic_sink.record(
+                'STARTUP_FAILED', component='STARTUP', severity='ERROR', priority='CRITICAL',
+                error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_DESKTOP_START',
+                payload={'entry_authority': 'DISARMED'},
+            )
         return 2
