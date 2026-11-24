@@ -15,6 +15,7 @@ from online_trader.update_install import (
     assert_payload_managed_launch,
     launch_managed,
     managed_root,
+    startup_check_and_download,
 )
 from online_trader.updates import (
     GitLab,
@@ -352,3 +353,117 @@ class UpdateInstallTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(created_clients), 1)
         self.assertEqual(created_clients[0].token, 'publish-rw-token')
+
+    def test_check_on_launch_downloads_and_upgrades_in_same_startup(self):
+        payload = self.root / 'remote-dev35.zip'
+        _write_payload_zip(payload, version='0.1.0.dev35')
+        payload_bytes = payload.read_bytes()
+        payload_sha = hashlib.sha256(payload_bytes).hexdigest()
+
+        from online_trader.updates import Candidate
+        candidate = Candidate('0.1.0.dev35', len(payload_bytes), payload_sha)
+
+        class _FakeGitLab:
+            def __init__(self, project_id, *, host='gitlab.com', token=None):
+                pass
+
+            def latest(self, current, channel):
+                return candidate if current == '0.1.0.dev34' else None
+
+            def download(self, cand, dest, *, on_progress=None):
+                if on_progress is not None:
+                    on_progress('DOWNLOADING', cand.version, len(payload_bytes), len(payload_bytes))
+                dest.write_bytes(payload_bytes)
+
+        progress_events = []
+        with patch('online_trader.updates.GitLab', _FakeGitLab):
+            def run_check(root, current):
+                startup_check_and_download(
+                    root, current, on_progress=lambda *args: progress_events.append(args)
+                )
+
+            def start(arguments, *, cwd, env):
+                self.launched = Path(arguments[0])
+                Path(env['ONLINETRADER_UPDATE_READY']).touch()
+                return process.return_value
+
+            with (patch('online_trader.update_install.subprocess.Popen') as process,
+                  patch('online_trader.update_install.subprocess.call', return_value=0)):
+                process.side_effect = start
+                child = process.return_value.__enter__.return_value
+                child.poll.return_value = 0
+                child.wait.return_value = 0
+                rc = launch_managed(
+                    self.root, [], portable_version='0.1.0.dev34',
+                    check_on_launch=True, startup_check_fn=run_check,
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(active_version(self.root), '0.1.0.dev35')
+        self.assertEqual(self.launched, self.root / 'versions' / '0.1.0.dev35' / 'OnlineTrader.exe')
+        self.assertTrue(any(ev[0] == 'CHECKING' for ev in progress_events))
+        self.assertTrue(any(ev[0] == 'DOWNLOADING' for ev in progress_events))
+        self.assertTrue(any(ev[0] == 'VERIFYING' for ev in progress_events))
+
+    def test_check_on_launch_uses_active_version_when_already_upgraded(self):
+        atomic_json(self.root / 'active.json', {'version': '0.1.0.dev35'})
+        (self.root / 'versions' / '0.1.0.dev35').mkdir(parents=True)
+        payload = self.root / 'remote-dev36.zip'
+        _write_payload_zip(payload, version='0.1.0.dev36')
+        payload_bytes = payload.read_bytes()
+        payload_sha = hashlib.sha256(payload_bytes).hexdigest()
+
+        from online_trader.updates import Candidate
+        candidate = Candidate('0.1.0.dev36', len(payload_bytes), payload_sha)
+        seen_currents = []
+
+        class _FakeGitLab:
+            def __init__(self, project_id, *, host='gitlab.com', token=None):
+                pass
+
+            def latest(self, current, channel):
+                seen_currents.append(current)
+                return candidate if current == '0.1.0.dev35' else None
+
+            def download(self, cand, dest, *, on_progress=None):
+                dest.write_bytes(payload_bytes)
+
+        with patch('online_trader.updates.GitLab', _FakeGitLab):
+            def start(arguments, *, cwd, env):
+                self.launched = Path(arguments[0])
+                Path(env['ONLINETRADER_UPDATE_READY']).touch()
+                return process.return_value
+
+            with (patch('online_trader.update_install.subprocess.Popen') as process,
+                  patch('online_trader.update_install.subprocess.call', return_value=0)):
+                process.side_effect = start
+                child = process.return_value.__enter__.return_value
+                child.poll.return_value = 0
+                child.wait.return_value = 0
+                rc = launch_managed(
+                    self.root, [], portable_version='0.1.0.dev34', check_on_launch=True,
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen_currents, ['0.1.0.dev35'])
+        self.assertEqual(active_version(self.root), '0.1.0.dev36')
+        self.assertEqual(self.launched, self.root / 'versions' / '0.1.0.dev36' / 'OnlineTrader.exe')
+
+    def test_check_on_launch_network_error_falls_back_to_current_version(self):
+        with patch('online_trader.update_install.check_and_download', side_effect=OSError('network unreachable')):
+            def start(arguments, *, cwd, env):
+                self.launched = Path(arguments[0])
+                return process.return_value
+
+            with (patch('online_trader.update_install.subprocess.Popen') as process,
+                  patch('online_trader.update_install.subprocess.call', return_value=0)):
+                process.side_effect = start
+                child = process.return_value.__enter__.return_value
+                child.poll.return_value = 0
+                child.wait.return_value = 0
+                rc = launch_managed(
+                    self.root, [], portable_version='0.1.0.dev34', check_on_launch=True,
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(active_version(self.root), '0.1.0.dev34')
+        self.assertEqual(self.launched, self.original)
+        status = json.loads((self.cache / 'status.json').read_text(encoding='utf-8'))
+        self.assertEqual(status['stage'], 'FAILED')

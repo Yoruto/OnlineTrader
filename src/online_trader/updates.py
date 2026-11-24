@@ -213,16 +213,20 @@ class GitLab:
                 candidates.add(version)
         return self.metadata(max(candidates, key=version_key)) if candidates else None
 
-    def download(self, candidate, path):
+    def download(self, candidate, path, *, on_progress=None):
         url = f'{self.api}/packages/generic/{PACKAGE}/{candidate.version}/{archive_name(candidate.version)}'
         digest = hashlib.sha256()
         count = path.stat().st_size if path.exists() else 0
         if count == candidate.size:
             with path.open('rb') as cached:
                 if hashlib.file_digest(cached, 'sha256').hexdigest() == candidate.sha256:
+                    if on_progress is not None:
+                        on_progress('DOWNLOADING', candidate.version, candidate.size, candidate.size)
                     return
         if count >= candidate.size:
             count = 0
+        if on_progress is not None:
+            on_progress('DOWNLOADING', candidate.version, count, candidate.size)
         extra = {'Range': f'bytes={count}-'} if count else None
         try:
             response = self.open(Request(url, headers=self._auth_headers(extra)), timeout=20)
@@ -252,6 +256,8 @@ class GitLab:
                         break
                     target.write(block)
                     digest.update(block)
+                    if on_progress is not None:
+                        on_progress('DOWNLOADING', candidate.version, min(count, candidate.size), candidate.size)
         if count < candidate.size:
             raise UpdateError('GitLab 更新下载中断，可重试')
         if count != candidate.size or digest.hexdigest() != candidate.sha256:
@@ -327,13 +333,15 @@ def extract_bundle(archive, destination, *, expected_version=None):
     verify_payload_marker(destination, expected_version=expected_version)
 
 
-def check_and_download(root, current=__version__):
+def check_and_download(root, current=__version__, *, on_progress=None):
     from online_trader.update_install import active_version
 
     if active_version(root) != current:
         raise UpdateError('此工作台不是当前安装版本')
     source = load_update_source(root)
     client = GitLab(source['project_id'], host=source['host'], token=source['read_token'])
+    if on_progress is not None:
+        on_progress('CHECKING', None, 0, 0)
     candidate = client.latest(current, source['channel'])
     if candidate is None:
         return None
@@ -342,7 +350,12 @@ def check_and_download(root, current=__version__):
     cache = root / 'updates'
     cache.mkdir(exist_ok=True)
     path = cache / f'{candidate.version}-{candidate.sha256}.zip'
-    client.download(candidate, path)
+    if on_progress is not None:
+        client.download(candidate, path, on_progress=on_progress)
+    else:
+        client.download(candidate, path)
+    if on_progress is not None:
+        on_progress('VERIFYING', candidate.version, candidate.size, candidate.size)
     try:
         with tempfile.TemporaryDirectory(dir=cache, prefix='.verify-') as directory:
             extract_bundle(path, Path(directory), expected_version=candidate.version)

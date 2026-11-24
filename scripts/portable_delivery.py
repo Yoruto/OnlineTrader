@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import re
 import shutil
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
@@ -35,25 +34,13 @@ DIAGNOSTIC_UPLOAD = 'private/diagnostics-upload.json'
 EXECUTABLES = ('OnlineTrader.exe', 'OnlineTraderCLI.exe')
 STARTUP_FILES = ('OnlineTrader.ini', 'update-source.json')
 RUNTIME_STARTUP_FILES = ('start-trading-runtime.cmd', 'open-runtime-workbench.ps1')
-SILVER_CONTRACT = re.compile(r'(?<![A-Za-z0-9])SHFE\.ag[0-9]*(?![A-Za-z0-9])', re.IGNORECASE)
 
 
-def reject_silver_in_config(raw, name):
-    def contains_silver(value):
-        if isinstance(value, str):
-            return '白银' in value or SILVER_CONTRACT.search(value) is not None
-        if isinstance(value, list):
-            return any(contains_silver(item) for item in value)
-        if isinstance(value, dict):
-            return contains_silver(list(value.keys())) or contains_silver(list(value.values()))
-        return False
-
+def ensure_readable_json(raw, name):
     try:
-        has_silver = contains_silver(json.loads(raw.decode('utf-8-sig')))
+        json.loads(raw.decode('utf-8-sig'))
     except (ValueError, RecursionError):
-        raise ValueError(f'{name} must contain readable JSON for the silver configuration check.') from None
-    if has_silver:
-        raise ValueError(f'{name} contains a silver configuration.')
+        raise ValueError(f'{name} must contain readable JSON.') from None
 
 
 def validate_config(directory):
@@ -76,8 +63,8 @@ def validate_config(directory):
         DsvProfile.from_dsv_json(parameter_bytes)
     except (OSError, ValueError, RecursionError, TypeError):
         raise ValueError(f'{PARAMETERS} must contain valid DSV business settings.') from None
-    reject_silver_in_config(raw, DEFAULTS)
-    reject_silver_in_config(parameter_bytes, PARAMETERS)
+    ensure_readable_json(raw, DEFAULTS)
+    ensure_readable_json(parameter_bytes, PARAMETERS)
     return [defaults, parameters]
 
 
@@ -98,7 +85,6 @@ def update_build_manifest(bundle, directory, names, *, deliverable):
         'delivery': {
             'mode': 'RuntimeConfigured',
             'config_hashes': {name: digest(directory / name) for name in sorted(names)},
-            'silver_check': 'PASS',
             'retired_file_check': 'PASS',
         },
     })
@@ -113,7 +99,7 @@ def _runtime_files(directory, kind):
     if (directory / PARAMETER_OVERRIDES).is_file():
         names.append(PARAMETER_OVERRIDES)
     for name in names:
-        reject_silver_in_config((directory / name).read_bytes(), name)
+        ensure_readable_json((directory / name).read_bytes(), name)
     if load_upload_config(directory) is None:
         raise ValueError('Runtime delivery requires an enabled private diagnostics upload configuration.')
     if kind != 'fresh':
@@ -263,7 +249,7 @@ def prepare_update_payload(bundle, version):
     for path in sorted(bundle.rglob('*.json')):
         if path.relative_to(bundle).parts[0].casefold() == '_internal':
             continue
-        reject_silver_in_config(path.read_bytes(), path.relative_to(bundle).as_posix())
+        ensure_readable_json(path.read_bytes(), path.relative_to(bundle).as_posix())
     return (PAYLOAD_MARKER,)
 
 

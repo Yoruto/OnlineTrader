@@ -3,7 +3,9 @@
 from contextlib import contextmanager, ExitStack
 import ctypes
 from ctypes import wintypes
+from datetime import datetime, timezone
 import hashlib
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
@@ -18,7 +20,8 @@ from online_trader.configuration.files import publish_replace_bytes
 from online_trader.errors import TraderError
 from online_trader.runtime.instance import AccountLock, RuntimeLock
 from online_trader.updates import (Candidate, MAX_BUNDLE, PAYLOAD_MARKER, SHA256, UpdateError, atomic_json,
-                                   extract_bundle, verify_payload_marker, version_key)
+                                   check_and_download, extract_bundle, load_update_source,
+                                   verify_payload_marker, version_key)
 
 
 RESTART_FOR_UPDATE = 36
@@ -248,7 +251,53 @@ def launcher_lock(root, *, wait=False):
         yield
 
 
-def launch_managed(root, arguments, *, wait_for_previous=False, portable_version=None):
+def write_update_status(root, stage, message, *, current=None, channel=None, candidate=None, observed_at_utc=None):
+    observed = observed_at_utc or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    payload = {
+        'schema_version': 'ONLINE_TRADER_UPDATE_STATUS/1',
+        'stage': stage,
+        'message': message,
+        'current': current,
+        'channel': channel,
+        'candidate': candidate,
+        'observed_at_utc': observed,
+    }
+    try:
+        cache = Path(root) / 'updates'
+        cache.mkdir(exist_ok=True)
+        atomic_json(cache / 'status.json', payload)
+    except OSError:
+        pass
+    return payload
+
+
+def startup_check_and_download(root, current, *, on_progress=None):
+    root = Path(root)
+    if pending_candidate(root, current) is not None:
+        return None
+    channel = None
+    try:
+        channel = load_update_source(root)['channel']
+        with AccountLock('UPDATE-DOWNLOAD:' + str(root).casefold()):
+            version = check_and_download(root, current=current, on_progress=on_progress)
+        if version:
+            write_update_status(root, 'DOWNLOADED', f'{version} 已下载，等待安全安装',
+                                current=current, channel=channel, candidate=version)
+        else:
+            write_update_status(root, 'CURRENT', '当前已是所选渠道的最新版本',
+                                current=current, channel=channel)
+        return version
+    except UpdateError as error:
+        write_update_status(root, 'FAILED', str(error), current=current, channel=channel)
+        return None
+    except (TraderError, OSError, ValueError, KeyError, TypeError, HTTPException):
+        write_update_status(root, 'FAILED', '启动检查或下载更新失败，已继续使用当前版本',
+                            current=current, channel=channel)
+        return None
+
+
+def launch_managed(root, arguments, *, wait_for_previous=False, portable_version=None,
+                   check_on_launch=False, startup_check_fn=None):
     if arguments not in ([], ['--autostart']):
         return 2
     with launcher_lock(root, wait=wait_for_previous):
@@ -258,6 +307,12 @@ def launch_managed(root, arguments, *, wait_for_previous=False, portable_version
             if not (root / 'active.json').exists():
                 atomic_json(root / 'active.json', {'version': portable_version})
         current = active_version(root)
+        if (check_on_launch and (root / 'update-source.json').is_file()
+                and pending_candidate(root, current) is None):
+            if startup_check_fn is not None:
+                startup_check_fn(root, current)
+            else:
+                startup_check_and_download(root, current)
         deferred = False
         deferred_reason = ''
         try:
@@ -316,7 +371,8 @@ def managed_bootstrap(arguments, *, restarting=False):
                                             or not (root / 'update-source.json').is_file())):
         return 2
     try:
-        return launch_managed(root, arguments, wait_for_previous=restarting)
+        return launch_managed(root, arguments, wait_for_previous=restarting,
+                              check_on_launch=not restarting)
     except TraderError as error:
         if error.code == 'E_INSTANCE_EXISTS':
             return 0

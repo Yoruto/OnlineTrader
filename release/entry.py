@@ -67,10 +67,21 @@ if __name__ == '__main__':
         ready = Path(os.environ.get('ONLINETRADER_UPDATE_READY', '')).resolve()
         is_child = ready.name == 'ready' and ready.parent.parent == root and ready.parent.name.startswith('.launch-')
         if portable_entry and not is_child and arguments in ([], ['--autostart']):
+            from online_trader.desktop.update_ui import run_startup_update_check
+            from online_trader.desktop.workbench_instance import request_existing_workbench
             try:
-                raise SystemExit(launch_managed(root, arguments, portable_version=__version__))
+                raise SystemExit(
+                    launch_managed(
+                        root,
+                        arguments,
+                        portable_version=__version__,
+                        check_on_launch=True,
+                        startup_check_fn=run_startup_update_check,
+                    )
+                )
             except TraderError as error:
                 if error.code == 'E_INSTANCE_EXISTS':
+                    request_existing_workbench()
                     raise SystemExit(0)
                 raise
         with runtime_lease(root) if root else nullcontext():

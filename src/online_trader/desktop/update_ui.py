@@ -6,17 +6,18 @@ import json
 import os
 from pathlib import Path
 from queue import Empty, SimpleQueue
-from threading import Thread
+from threading import Event, Thread
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal
 from PySide6.QtWidgets import (
-    QApplication, QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QVBoxLayout,
+    QApplication, QGroupBox, QHBoxLayout, QLabel, QMessageBox, QProgressDialog, QPushButton, QVBoxLayout,
 )
 
 from online_trader.errors import TraderError
 from online_trader.runtime.instance import AccountLock
-from online_trader.update_install import active_version, pending_candidate, quiescent_installation
-from online_trader.updates import UpdateError, atomic_json, check_and_download, load_update_source
+from online_trader.update_install import (active_version, pending_candidate, quiescent_installation,
+                                          startup_check_and_download, write_update_status)
+from online_trader.updates import UpdateError, check_and_download, load_update_source
 
 
 def offline_smoke():
@@ -28,6 +29,86 @@ def offline_smoke():
     window.winId()
     app.processEvents()
     return 0
+
+
+def run_startup_update_check(root, current):
+    """Check and download updates before launching the Runtime/Workbench."""
+    root = Path(root)
+    if pending_candidate(root, current) is not None or not (root / 'update-source.json').is_file():
+        return None
+    app = QApplication.instance() or QApplication([])
+    dialog = QProgressDialog('正在检查软件更新…', '跳过本次', 0, 0)
+    dialog.setWindowTitle('OnlineTrader 自动更新')
+    dialog.setMinimumDuration(0)
+    dialog.setAutoClose(False)
+    dialog.setAutoReset(False)
+    dialog.setMinimumWidth(420)
+    dialog.show()
+
+    updates = SimpleQueue()
+    finished = SimpleQueue()
+    cancelled = Event()
+    loop = QEventLoop(dialog)
+
+    def on_progress(stage, version, downloaded, total):
+        if cancelled.is_set():
+            raise UpdateError('已跳过本次启动更新')
+        updates.put((stage, version, downloaded, total))
+
+    def worker():
+        try:
+            result = startup_check_and_download(root, current, on_progress=on_progress)
+        except Exception:
+            result = None
+        finished.put(result)
+
+    def poll():
+        while True:
+            try:
+                stage, version, downloaded, total = updates.get_nowait()
+            except Empty:
+                break
+            if stage == 'CHECKING':
+                dialog.setRange(0, 0)
+                dialog.setLabelText('正在检查软件更新…')
+            elif stage == 'DOWNLOADING':
+                if total > 0:
+                    dialog.setRange(0, 1000)
+                    dialog.setValue(min(1000, int(downloaded * 1000 / total)))
+                    mb = 1024 * 1024
+                    dialog.setLabelText(
+                        f'正在下载新版本 {version}（{downloaded / mb:.1f} / {total / mb:.1f} MB）…'
+                    )
+                else:
+                    dialog.setRange(0, 0)
+                    dialog.setLabelText(f'正在下载新版本 {version}…')
+            elif stage == 'VERIFYING':
+                dialog.setRange(0, 0)
+                dialog.setLabelText(f'正在校验并准备自动安装 {version}…')
+        if cancelled.is_set():
+            loop.quit()
+            return
+        try:
+            finished.get_nowait()
+        except Empty:
+            return
+        loop.quit()
+
+    def on_cancel():
+        cancelled.set()
+        loop.quit()
+
+    timer = QTimer(dialog)
+    timer.setInterval(50)
+    timer.timeout.connect(poll)
+    dialog.canceled.connect(on_cancel)
+    Thread(target=worker, name='OnlineTraderStartupUpdate', daemon=True).start()
+    timer.start()
+    loop.exec()
+    timer.stop()
+    dialog.close()
+    app.processEvents()
+    return None
 
 
 class ManagedUpdateController(QObject):
@@ -78,13 +159,11 @@ class ManagedUpdateController(QObject):
         self.window.statusBar().showMessage(message, 10000)
         self.changed.emit(self.state.copy())
         if persist:
-            try:
-                cache = self.root / 'updates'
-                cache.mkdir(exist_ok=True)
-                atomic_json(cache / 'status.json', {'schema_version': 'ONLINE_TRADER_UPDATE_STATUS/1',
-                    **self.state})
-            except OSError:
-                pass
+            status = write_update_status(
+                self.root, stage, message,
+                current=current, channel=channel, candidate=candidate, observed_at_utc=observed,
+            )
+            self.state = {key: value for key, value in status.items() if key != 'schema_version'}
 
     def _has_candidate(self):
         try:

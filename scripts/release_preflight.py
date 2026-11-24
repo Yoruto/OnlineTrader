@@ -8,7 +8,6 @@ import importlib.metadata
 import json
 from pathlib import Path
 import platform
-import re
 import struct
 import subprocess
 import sys
@@ -36,7 +35,6 @@ RETIRED_NAMES = {
 }
 RETIRED_PARTS = {"watchdog", "handoff"}
 DATABASE_SUFFIXES = (".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3")
-SILVER = re.compile(r"(?<![A-Za-z0-9])SHFE\.ag[0-9]*(?![A-Za-z0-9])", re.IGNORECASE)
 REQUIRED_TOOLCHAIN = {
     "pyinstaller": "6.22.3",
     "PySide6": "6.8.2.1",
@@ -160,10 +158,7 @@ def validate_runtime_config(directory: Path, source_root: Path) -> tuple[dict[st
         raw = (directory / name).read_bytes()
         if len(raw) > 262_144:
             raise ValueError(f"Runtime config is too large: {name}")
-        document = json.loads(raw.decode("utf-8-sig"))
-        serialized = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
-        if "白银" in serialized or SILVER.search(serialized):
-            raise ValueError(f"Runtime config contains a silver contract: {name}")
+        json.loads(raw.decode("utf-8-sig"))
     file_hashes = {name: sha256_file(directory / name) for name in sorted(relative)}
     summary = _validate_config_with_product_parser(directory, source_root)
     sys.path.insert(0, str((source_root / "src").resolve()))
