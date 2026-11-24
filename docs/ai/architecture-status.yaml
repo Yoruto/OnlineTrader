@@ -68,16 +68,19 @@ documents:
   - path: docs/refactor/configuration-persistence-runtime-architecture-20261124.md
     scope: standalone/configuration-persistence-runtime-architecture
     status: CANDIDATE
-    verified_at_sha: e43e9d9cbaeb5b929c92877a761e690c55a6de78
+    verified_at_sha: deadb3bb4c8617d96752935ef86cabdffa7935d9
     evidence:
-      design: USER_REQUESTED_DESIGN_NEEDS_REVIEW
+      design: USER_DIRECTED_V1_1_LIFECYCLE_REVISION_NEEDS_REVIEW
       source: DESIGN_ONLY_NOT_IMPLEMENTED
       tests: NOT_RUN
       product_acceptance: NOT_RUN
-    notes: Proposed Configuration/Persistence/Runtime responsibility and data-lifetime boundaries,
-      Desired/Active configuration and crash-consistency protocol, history failure isolation and
-      provider-aware coverage, and separately approved business-state continuity without restoring
-      old boot execution authority. Does not supersede current Standalone or DSV contracts.
+    notes: V1.1 prioritizes Runtime Supervisor / Market Service / Account Session / Trading Session
+      lifecycle separation, MONITORING/TRADING/DRAINING modes and owner-verified maintenance barriers,
+      non-flattening account-switch and update shutdown, account-generation isolation and MONITOR_ONLY
+      maintenance restart. Retains single sender, committed effects and UNKNOWN accounting; integrates
+      Desired/Active config, provider-aware history coverage and conservative business continuity.
+      Does not supersede current Standalone, desktop-exit, update or DSV contracts until implementation
+      and owning-contract review.
 
   - path: docs/refactor/runtime-business-state-restart-continuity-adr-20261124.md
     scope: standalone/business-state-restart-continuity-adr
