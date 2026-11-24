@@ -427,7 +427,10 @@ class FakeBroker:
                          native_order_id=native_id, fact=fact)
             return deepcopy(fact)
 
-    def reject_order(self, child_order_id: str, *, native_order_id: str | None = None) -> dict[str, object]:
+    def reject_order(self, child_order_id: str, *, native_order_id: str | None = None,
+                     native_message: str | None = None,
+                     rejection_category: str | None = None,
+                     rejection_detail: str | None = None) -> dict[str, object]:
         """Explicitly reject an observed send; a send call alone is not acceptance."""
         with self._lock:
             order = self._send_order(child_order_id)
@@ -436,7 +439,12 @@ class FakeBroker:
             native_id = native_order_id or f"fake-native-order-{self._next_order_id:06d}"
             self._next_order_id += 1
             self._bind_native_id(child_order_id, order, native_id)
-            fact = self._queue_order_fact(order, "REJECTED", 0)
+            fact = self._queue_order_fact(
+                order, "REJECTED", 0,
+                native_message=native_message,
+                rejection_category=rejection_category,
+                rejection_detail=rejection_detail,
+            )
             self._record("ORDER_REJECTED", child_order_id=child_order_id,
                          native_order_id=native_id, fact=fact)
             return deepcopy(fact)
@@ -575,7 +583,13 @@ class FakeBroker:
                       bid1: str | int | Decimal | None = None,
                       ask1: str | int | Decimal | None = None,
                       candle_id: str | None = None, complete: bool = True,
-                      synchronized: bool | None = None) -> dict[str, object]:
+                      synchronized: bool | None = None,
+                      session_open: str | None = None,
+                      session_close: str | None = None,
+                      market_session_active: bool | None = None,
+                      market_permissions: dict[str, dict] | None = None,
+                      include_ticks: bool = True,
+                      include_external_orders: bool = False) -> dict[str, object]:
         """Prepare one explicit-time Owner frame; acknowledge it after APPLIED."""
         with self._lock:
             if self._inflight is not None:
@@ -602,25 +616,48 @@ class FakeBroker:
                                if order.status == "ALIVE" and order.native_order_id is not None]
             sequence = self._sequence + 1
             frame_id = f"fake-broker-round-{sequence}"
-            market_rows = [
+            alive_external = [
                 {
+                    "native_order_id": ext["native_order_id"],
+                    "contract_id": ext["contract_id"],
+                    "direction": ext["direction"],
+                    "native_offset": ext["native_offset"],
+                    "volume_left": ext["volume_left"],
+                    "limit_price": ext["limit_price"],
+                }
+                for ext in self._external_orders.values()
+                if ext.get("status") == "ALIVE" and int(ext.get("volume_left") or 0) > 0
+            ] if include_external_orders else []
+            ext_contracts = {item["contract_id"] for item in alive_external}
+            open_ts = session_open or f"{self.trading_day}T01:00:00Z"
+            close_ts = session_close or f"{self.trading_day}T02:15:00Z"
+            tick_list = [{
+                "native_time": stamp, "candle_id": candle_id, "last": last_text,
+                "day_low": "1020", "day_high": "1088", "bid1": bid_text,
+                "ask1": ask_text, "tick_size": "1", "lower_limit": "900",
+                "upper_limit": "1200",
+            }] if include_ticks else []
+            market_rows = []
+            for code in self.contracts:
+                row = {
                     "contract_id": code,
-                    "ticks": [{
-                        "native_time": stamp, "candle_id": candle_id, "last": last_text,
-                        "day_low": "1020", "day_high": "1088", "bid1": bid_text,
-                        "ask1": ask_text, "tick_size": "1", "lower_limit": "900",
-                        "upper_limit": "1200",
-                    }],
+                    "ticks": list(tick_list),
                     "opening_session": True,
-                    "session_open": f"{self.trading_day}T01:00:00Z",
-                    "session_close": f"{self.trading_day}T02:15:00Z",
+                    "session_open": open_ts,
+                    "session_close": close_ts,
                     "long_qty": positions_by_contract[code]["long_qty"],
                     "short_qty": positions_by_contract[code]["short_qty"],
                     "available": "100000", "margin_per_lot": "1000",
-                    "external_orders": False,
+                    "external_orders": code in ext_contracts,
                 }
-                for code in self.contracts
-            ]
+                if market_session_active is not None:
+                    row["market_session_active"] = bool(market_session_active)
+                if market_permissions and code in market_permissions:
+                    row["market_permission"] = deepcopy(market_permissions[code])
+                if include_external_orders:
+                    row["standalone_external_model"] = True
+                    row["external_active_orders"] = code in ext_contracts
+                market_rows.append(row)
             frame = {
                 "id": frame_id,
                 "sequence": sequence,
@@ -633,6 +670,8 @@ class FakeBroker:
                 "market": market_rows,
                 "native": facts,
             }
+            if include_external_orders:
+                frame["non_strategy_orders"] = alive_external
             self._sequence = sequence
             self._last_monotonic_ms = monotonic_ms
             self._inflight = deepcopy(frame)
@@ -711,7 +750,10 @@ class FakeBroker:
         self._native_orders[native_order_id] = child_order_id
 
     def _queue_order_fact(self, order: FakeBrokerOrder, status: str,
-                          filled_qty: int, *, allow_accept: bool = False) -> dict[str, object]:
+                          filled_qty: int, *, allow_accept: bool = False,
+                          native_message: str | None = None,
+                          rejection_category: str | None = None,
+                          rejection_detail: str | None = None) -> dict[str, object]:
         if order.native_order_id is None:
             raise FakeBrokerError("Native order status requires an assigned native id")
         if status not in {"ALIVE", "FILLED", "CANCELLED", "REJECTED"}:
@@ -744,6 +786,12 @@ class FakeBroker:
         order.status = status
         order.reported_filled_qty = filled
         fact = self._base_fact(order) | {"kind": "ORDER", "status": status, "filled_qty": filled}
+        if native_message is not None:
+            fact["native_message"] = native_message
+        if rejection_category is not None:
+            fact["rejection_category"] = rejection_category
+        if rejection_detail is not None:
+            fact["rejection_detail"] = rejection_detail
         self._pending_facts.append(deepcopy(fact))
         return fact
 

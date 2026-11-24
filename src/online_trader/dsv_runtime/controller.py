@@ -12,6 +12,7 @@ from online_trader.domain.orders import OrderState
 from online_trader.domain.values import decimal_text, quantity
 from online_trader.dsv_core.price_rules import strategy_price
 from online_trader.dsv_core.transition import entry_price, price_value
+from online_trader.dsv_runtime.market_permissions import infer_offline_market_permission
 from online_trader.dsv_runtime.order_diagnostics import OrderDiagnosticTracker
 from online_trader.dsv_runtime.target_execution import account_target
 from online_trader.errors import TraderError, exception_record
@@ -479,20 +480,23 @@ class ExplicitOrderController:
         if (not retry_risk_refusal
                 and order.get('local_cancel_rejection', {}).get('error_code') == 'E_DSV_SDK_CANCEL_RISK'):
             return None
+        order['cancel_seq'] = order.get('cancel_seq', order.get('cancel_attempt', 0)) + 1
         order['cancel_attempt'] = order.get('cancel_attempt', 0) + 1
         order.update(cancel_status='SEND_POSSIBLE', cancel_reason=reason)
         return self._prepare(order, 'CANCEL', native_order_id=identity, reason=reason)
 
     def _prepare(self, order, kind, **parameters):
         effect_id = order['child_order_id'] + '-' + kind.lower()
-        if kind == 'CANCEL' and order.get('cancel_attempt', 1) > 1:
-            effect_id += '-' + str(order['cancel_attempt'])
+        cancel_seq = order.get('cancel_seq', order.get('cancel_attempt', 1))
+        if kind == 'CANCEL' and cancel_seq > 1:
+            effect_id += '-' + str(cancel_seq)
         effect = {'id': effect_id, 'kind': kind,
                   'child_order_id': order['child_order_id'], 'contract_id': order['contract_id'],
                   'account_key': self.scope['account_key'], 'provider': self.scope['provider'],
                   'trading_day': order['native_trading_day'], **parameters}
         if kind == 'CANCEL':
             effect['cancel_attempt'] = order['cancel_attempt']
+            effect['cancel_seq'] = cancel_seq
             order['cancel_effect_id'] = effect_id
         self.journal.prepare(effect)
         return effect
@@ -868,6 +872,7 @@ class ExplicitOrderController:
 
     def plan_maintenance(self, state, row, market):
         """Cancel provably owned residual orders using identity and quantity alone."""
+        allow_cancel = market.get('allow_cancel', True)
         position = row['position']
         prior = [
             order for order in state['orders'].values()
@@ -875,10 +880,14 @@ class ExplicitOrderController:
             and not order.get('convergence_order')
             and (position is None or order['position_id'] != position['id'])]
         if prior:
+            if not allow_cancel:
+                return [], False
             current = [] if position is None else self.child_orders(state, position)
             return [request for order in prior + current if order['effect'] == 'OPEN' and not order.get('terminal_conflict')
                     and (request := self.cancel(order, 'TARGET_REDUCED'))], False
         if row.get('detached_positions') or row.get('native_conflicts'):
+            if not allow_cancel:
+                return [], False
             owners = [state['retired_positions'][identity] for identity in row.get('detached_positions', [])]
             if position is not None:
                 owners.append(position)
@@ -892,6 +901,8 @@ class ExplicitOrderController:
         if any(order['native_trading_day'] != state['trading_day'] and not terminal(order) for order in children):
             return [], False
         if any(order.get('terminal_conflict') and not terminal(order) for order in children):
+            if not allow_cancel:
+                return [], False
             return [request for order in children if not order.get('terminal_conflict')
                     and (request := self.cancel(order, 'TARGET_REDUCED'))], False
         effects = []
@@ -899,6 +910,8 @@ class ExplicitOrderController:
             accounting = self.target_accounting(state, position, effect)
             excess = accounting.excess_pending_qty
             if not excess:
+                continue
+            if not allow_cancel:
                 continue
             # A cancellation does not release capacity. Cancel newest children
             # first and let later native facts drive a fresh calculation.
@@ -946,7 +959,13 @@ class ExplicitOrderController:
             needed = accounting.needed_qty
             desired = self._desired(position, market, effect, wall_time)
             repricing = False
-            if proven_position and desired is not None:
+            can_reprice = (
+                proven_position
+                and desired is not None
+                and market.get('allow_cancel', True)
+                and (market.get('market_permission') or {}).get('continuous_matching', True)
+            )
+            if can_reprice:
                 for order in outstanding:
                     pending = order['original_qty'] - order['filled_qty']
                     current = Decimal(order['limit_price'])
@@ -1189,7 +1208,7 @@ class ExplicitOrderController:
             return None, 'DEFERRED_NO_LEGAL_PRICE'
         return price, None
 
-    def new_convergence_order(self, state, contract_id, pos_side, market, qty, price, offset):
+    def new_convergence_order(self, state, contract_id, pos_side, market, qty, price, offset, *, cond_fp=None):
         child_id = 'child-' + uuid4().hex
         side = 'BUY' if pos_side == 'SHORT' else 'SELL'
         chain = [
@@ -1219,6 +1238,8 @@ class ExplicitOrderController:
             convergence_side=pos_side,
             order_source='CONVERGENCE',
         )
+        if cond_fp is not None:
+            order['convergence_cond_fp'] = cond_fp
         ticks = market.get('ticks') or ()
         tick = market.get('tick') or (ticks[-1] if ticks else None)
         if tick is not None and tick.get('native_time') is not None:
@@ -1229,7 +1250,9 @@ class ExplicitOrderController:
             direction=side, order_source='CONVERGENCE',
         )
 
-    def _cancel_non_strategy_order(self, state, ext_order):
+    def _cancel_non_strategy_order(self, state, ext_order, *, perm=None):
+        if perm is not None and not perm.get('can_cancel', False):
+            return None
         native_id = str(ext_order['native_order_id'])
         cancels = state.setdefault('convergence_cancels', {})
         rec = cancels.get(native_id)
@@ -1238,10 +1261,12 @@ class ExplicitOrderController:
                 return None
             if rec.get('local_cancel_rejection', {}).get('error_code') == 'E_DSV_SDK_CANCEL_RISK':
                 return None
-            if rec.get('cancel_attempt', 0) >= 3:
+            fail_count = rec.get('cancel_failure_count', rec.get('cancel_attempt', 0))
+            if fail_count >= 3:
                 return None
-        attempt = (0 if rec is None else rec.get('cancel_attempt', 0)) + 1
-        effect_id = f'conv-cancel-{native_id}-{attempt}'
+        seq = (0 if rec is None else rec.get('cancel_seq', rec.get('cancel_attempt', 0))) + 1
+        fail_count = 0 if rec is None else rec.get('cancel_failure_count', rec.get('cancel_attempt', 0))
+        effect_id = f'conv-cancel-{native_id}-{seq}'
         effect = {
             'id': effect_id,
             'kind': 'CANCEL',
@@ -1253,7 +1278,8 @@ class ExplicitOrderController:
             'native_order_id': native_id,
             'external_order': True,
             'reason': 'CONVERGENCE_CANCEL_NON_STRATEGY',
-            'cancel_attempt': attempt,
+            'cancel_attempt': fail_count + 1,
+            'cancel_seq': seq,
         }
         self.journal.prepare(effect)
         cancels[native_id] = {
@@ -1263,30 +1289,82 @@ class ExplicitOrderController:
             'native_offset': ext_order.get('native_offset'),
             'volume_left': ext_order.get('volume_left'),
             'cancel_status': 'SEND_POSSIBLE',
-            'cancel_attempt': attempt,
+            'cancel_attempt': fail_count + 1,
+            'cancel_seq': seq,
+            'cancel_failure_count': fail_count,
             'cancel_effect_id': effect_id,
         }
         return effect
 
-    def plan_convergence(self, state, configured_markets, unconfigured_markets, non_strategy_orders, wall_time):
+    @staticmethod
+    def _convergence_deferred_status(perm):
+        reason = (perm or {}).get('wait_reason')
+        if reason in {
+            'DEFERRED_AUCTION_ORDERING',
+            'DEFERRED_AUCTION_MATCH',
+            'DEFERRED_HALTED',
+            'DEFERRED_STATUS_UNKNOWN',
+        }:
+            return reason
+        return 'DEFERRED_SESSION_OR_QUOTE'
+
+    @staticmethod
+    def _convergence_cond_fp(offset, desired, free_today, free_hist, excess_qty, has_ext, perm, tick):
+        return '|'.join(str(part) for part in (
+            offset,
+            desired,
+            free_today,
+            free_hist,
+            excess_qty,
+            int(bool(has_ext)),
+            (perm or {}).get('market_phase') or 'UNKNOWN',
+            '' if tick is None else tick.get('lower_limit', ''),
+            '' if tick is None else tick.get('upper_limit', ''),
+            '' if tick is None else tick.get('tick_size', ''),
+        ))
+
+    def plan_convergence(self, state, configured_markets, unconfigured_markets, non_strategy_orders, wall_time,
+                         *, wall_iso=None):
         """Plan non-blocking per-contract convergence orders and external cancellations (ARMED only)."""
         effects = []
         statuses = {}
         events = []
+        if wall_iso is None and wall_time is not None:
+            wall_iso = datetime.fromtimestamp(float(wall_time), tz=timezone.utc).isoformat().replace('+00:00', 'Z')
         active_ext_ids = {str(item['native_order_id']) for item in (non_strategy_orders or ())}
         cancels = state.setdefault('convergence_cancels', {})
         for nid in [k for k in cancels if k not in active_ext_ids]:
             cancels.pop(nid, None)
+
+        all_targets = []
+        market_by_cid = {}
+        for cid in sorted(configured_markets):
+            m = configured_markets[cid]
+            all_targets.append((cid, m, True))
+            market_by_cid[cid] = m
+        unconf_map = {m['contract_id']: m for m in (unconfigured_markets or ())}
+        for cid in sorted(unconf_map):
+            m = unconf_map[cid]
+            all_targets.append((cid, m, False))
+            market_by_cid[cid] = m
+
+        perm_by_cid = {}
+        for cid, market in market_by_cid.items():
+            perm_by_cid[cid] = market.get('market_permission') or infer_offline_market_permission(
+                market, wall_iso, clock_unverified=bool(state.get('clock_recovery_required')))
 
         ext_by_contract = {}
         for item in (non_strategy_orders or ()):
             cid = item['contract_id']
             ext_by_contract.setdefault(cid, []).append(item)
 
-        # Cancel non-strategy active orders on contracts whose session permits it (or immediately).
+        # Cancel non-strategy active orders only when market permission permits cancelling.
         for cid in sorted(ext_by_contract):
+            perm = perm_by_cid.get(cid)
+            if perm is None or not perm.get('can_cancel', False):
+                continue
             for ext_order in ext_by_contract[cid]:
-                req = self._cancel_non_strategy_order(state, ext_order)
+                req = self._cancel_non_strategy_order(state, ext_order, perm=perm)
                 if req is not None:
                     effects.append(req)
                     events.append({
@@ -1298,15 +1376,9 @@ class ExplicitOrderController:
                         'volume_left': ext_order.get('volume_left'),
                     })
 
-        all_targets = []
-        for cid in sorted(configured_markets):
-            all_targets.append((cid, configured_markets[cid], True))
-        unconf_map = {m['contract_id']: m for m in (unconfigured_markets or ())}
-        for cid in sorted(unconf_map):
-            all_targets.append((cid, unconf_map[cid], False))
-
         separated_exchanges = {'SHFE', 'INE'}
         for cid, market, is_configured in all_targets:
+            perm = perm_by_cid[cid]
             pos = state['symbols'][cid]['position'] if (is_configured and cid in state['symbols']) else None
             owned_long = pos['owned'] if (pos is not None and pos['direction'] == 'LONG') else 0
             owned_short = pos['owned'] if (pos is not None and pos['direction'] == 'SHORT') else 0
@@ -1319,54 +1391,98 @@ class ExplicitOrderController:
                 if o.get('convergence_order') and o['contract_id'] == cid and not terminal(o)
             ]
             has_ext = cid in ext_by_contract
+            perm_meta = {
+                'market_phase': perm.get('market_phase'),
+                'evidence_state': perm.get('evidence_state'),
+                'status_source': perm.get('status_source'),
+                'continuous_matching': bool(perm.get('continuous_matching')),
+                'can_open': bool(perm.get('can_open')),
+                'can_close': bool(perm.get('can_close')),
+                'can_cancel': bool(perm.get('can_cancel')),
+            }
             if excess_long == 0 and excess_short == 0 and not has_ext:
                 statuses[cid] = {
                     'configured': is_configured,
                     'status': 'CONVERGING_FILL_PENDING' if conv_orders else 'ALIGNED',
+                    'wait_reason': None,
+                    'failure_count': 0,
                     'actual_long': actual_long,
                     'actual_short': actual_short,
                     'target_long': owned_long,
                     'target_short': owned_short,
                     'excess_long': 0,
                     'excess_short': 0,
+                    **perm_meta,
                 }
                 continue
             if has_ext:
-                statuses[cid] = {
-                    'configured': is_configured,
-                    'status': 'CANCELLING_NON_STRATEGY_ORDERS',
-                    'actual_long': actual_long,
-                    'actual_short': actual_short,
-                    'target_long': owned_long,
-                    'target_short': owned_short,
-                    'excess_long': excess_long,
-                    'excess_short': excess_short,
-                }
-                events.append({
-                    'event': 'CONVERGENCE_DEFERRED',
-                    'contract_id': cid,
-                    'reason': 'WAITING_NON_STRATEGY_CANCEL',
-                    'pending_orders': len(ext_by_contract[cid]),
-                })
+                if not perm.get('can_cancel', False):
+                    defer_status = self._convergence_deferred_status(perm)
+                    defer_reason = perm.get('wait_reason') or 'DEFERRED_CANCEL_DISALLOWED'
+                    statuses[cid] = {
+                        'configured': is_configured,
+                        'status': defer_status,
+                        'wait_reason': defer_reason,
+                        'failure_count': 0,
+                        'actual_long': actual_long,
+                        'actual_short': actual_short,
+                        'target_long': owned_long,
+                        'target_short': owned_short,
+                        'excess_long': excess_long,
+                        'excess_short': excess_short,
+                        **perm_meta,
+                    }
+                    events.append({
+                        'event': 'CONVERGENCE_DEFERRED',
+                        'contract_id': cid,
+                        'reason': defer_reason,
+                        'market_phase': perm.get('market_phase'),
+                        'pending_orders': len(ext_by_contract[cid]),
+                    })
+                else:
+                    statuses[cid] = {
+                        'configured': is_configured,
+                        'status': 'CANCELLING_NON_STRATEGY_ORDERS',
+                        'wait_reason': 'WAITING_NON_STRATEGY_CANCEL',
+                        'failure_count': 0,
+                        'actual_long': actual_long,
+                        'actual_short': actual_short,
+                        'target_long': owned_long,
+                        'target_short': owned_short,
+                        'excess_long': excess_long,
+                        'excess_short': excess_short,
+                        **perm_meta,
+                    }
+                    events.append({
+                        'event': 'CONVERGENCE_DEFERRED',
+                        'contract_id': cid,
+                        'reason': 'WAITING_NON_STRATEGY_CANCEL',
+                        'pending_orders': len(ext_by_contract[cid]),
+                    })
                 continue
 
             ticks = market.get('ticks') or ()
-            in_session = bool(market.get('market_session_active', True) and ticks)
-            if not in_session:
+            if not perm.get('can_close', False) or not ticks:
+                defer_status = self._convergence_deferred_status(perm)
+                defer_reason = perm.get('wait_reason') or 'OUTSIDE_SESSION_OR_NO_QUOTE'
                 statuses[cid] = {
                     'configured': is_configured,
-                    'status': 'DEFERRED_SESSION_OR_QUOTE',
+                    'status': defer_status,
+                    'wait_reason': defer_reason,
+                    'failure_count': 0,
                     'actual_long': actual_long,
                     'actual_short': actual_short,
                     'target_long': owned_long,
                     'target_short': owned_short,
                     'excess_long': excess_long,
                     'excess_short': excess_short,
+                    **perm_meta,
                 }
                 events.append({
                     'event': 'CONVERGENCE_DEFERRED',
                     'contract_id': cid,
-                    'reason': 'OUTSIDE_SESSION_OR_NO_QUOTE',
+                    'reason': defer_reason,
+                    'market_phase': perm.get('market_phase'),
                     'excess_long': excess_long,
                     'excess_short': excess_short,
                 })
@@ -1383,6 +1499,9 @@ class ExplicitOrderController:
                     owned_hist_bucket = 0
 
             contract_status = 'CONVERGING'
+            contract_wait_reason = None
+            contract_failures = 0
+            tick = market.get('tick') or ticks[-1]
             for pos_side, excess_qty in (('LONG', excess_long), ('SHORT', excess_short)):
                 if excess_qty <= 0:
                     continue
@@ -1390,6 +1509,7 @@ class ExplicitOrderController:
                 desired, price_reason = self._convergence_close_price(market, pos_side)
                 if desired is None:
                     contract_status = price_reason
+                    contract_wait_reason = price_reason
                     events.append({
                         'event': 'CONVERGENCE_DEFERRED',
                         'contract_id': cid,
@@ -1405,18 +1525,22 @@ class ExplicitOrderController:
                 ]
                 pending_qty = sum(max(0, o['original_qty'] - o['filled_qty']) for o in side_orders)
                 if pending_qty > excess_qty and not uncertain:
-                    over = pending_qty - excess_qty
-                    for order in reversed(side_orders):
-                        if req := self.cancel(order, 'TARGET_REDUCED'):
-                            effects.append(req)
-                        over -= max(0, order['original_qty'] - order['filled_qty'])
-                        if over <= 0:
-                            break
-                    contract_status = 'CANCELLING_EXCESS_CLOSE'
+                    if perm.get('can_cancel', False):
+                        over = pending_qty - excess_qty
+                        for order in reversed(side_orders):
+                            if req := self.cancel(order, 'TARGET_REDUCED'):
+                                effects.append(req)
+                            over -= max(0, order['original_qty'] - order['filled_qty'])
+                            if over <= 0:
+                                break
+                        contract_status = 'CANCELLING_EXCESS_CLOSE'
+                    else:
+                        contract_status = self._convergence_deferred_status(perm)
+                        contract_wait_reason = perm.get('wait_reason')
                     continue
 
                 repricing = False
-                if not uncertain:
+                if not uncertain and perm.get('can_cancel', False) and perm.get('continuous_matching', False):
                     for order in side_orders:
                         if order.get('native_id') is None or order['broker_state'] != 'ALIVE':
                             continue
@@ -1433,26 +1557,6 @@ class ExplicitOrderController:
                 needed = max(0, excess_qty - pending_qty)
                 if needed <= 0:
                     contract_status = 'CONVERGING_FILL_PENDING'
-                    continue
-
-                # Avoid tight-looping on repeated structural rejections for the same contract side.
-                recent_struct_rejects = sum(
-                    1 for o in state['orders'].values()
-                    if o.get('convergence_order') and o['contract_id'] == cid and o.get('convergence_side') == pos_side
-                    and terminal(o) and o['filled_qty'] == 0 and (
-                        o.get('broker_rejection_category') == 'STRUCTURAL'
-                        or o.get('local_send_rejection', {}).get('error_code') in {'E_DSV_SDK_SEND_VALIDATION'}
-                    )
-                )
-                if recent_struct_rejects >= 2:
-                    contract_status = 'DEFERRED_STRUCTURAL_REJECTION'
-                    events.append({
-                        'event': 'CONVERGENCE_DEFERRED',
-                        'contract_id': cid,
-                        'side': pos_side,
-                        'reason': 'STRUCTURAL_REJECTION_CAP',
-                        'excess_qty': needed,
-                    })
                     continue
 
                 side_key = pos_side.lower()
@@ -1494,6 +1598,7 @@ class ExplicitOrderController:
                     send_qty = min(needed, max_qty)
                 if send_qty < min_qty:
                     contract_status = 'DEFERRED_BELOW_MIN_QTY'
+                    contract_wait_reason = 'BELOW_MIN_ORDER_QTY'
                     events.append({
                         'event': 'CONVERGENCE_DEFERRED',
                         'contract_id': cid,
@@ -1504,7 +1609,122 @@ class ExplicitOrderController:
                     })
                     continue
 
-                req = self.new_convergence_order(state, cid, pos_side, market, send_qty, desired, offset)
+                cond_fp = self._convergence_cond_fp(
+                    offset, desired, free_today, free_hist, excess_qty, has_ext, perm, tick,
+                )
+
+                # Classify prior unfilled convergence failures on this side (since last fill, current day).
+                side_history = [
+                    o for o in state['orders'].values()
+                    if o.get('convergence_order') and o['contract_id'] == cid
+                    and o.get('convergence_side') == pos_side
+                    and o.get('native_trading_day') == state['trading_day']
+                    and terminal(o)
+                ]
+                recent_failures = []
+                for prev in side_history:
+                    if prev['filled_qty'] > 0:
+                        recent_failures.clear()
+                        continue
+                    local_rej = prev.get('local_send_rejection') or {}
+                    local_code = local_rej.get('error_code')
+                    local_reason = local_rej.get('rejection_reason')
+                    # Market phase pre-send guards and quote-race unsent proofs never count as failures.
+                    if prev['send_state'] == 'DEFINITELY_NOT_SENT' and (
+                        local_code == 'E_DSV_MARKET_PHASE'
+                        or local_reason in {'QUOTE_REVISION_CHANGED', 'NATIVE_QUOTE_NOT_CURRENT'}
+                    ):
+                        continue
+                    if prev.get('convergence_failure_at') is None:
+                        prev['convergence_failure_at'] = str(wall_time)
+                    recent_failures.append(prev)
+
+                if recent_failures:
+                    last_fail = recent_failures[-1]
+                    last_local = last_fail.get('local_send_rejection') or {}
+                    last_cat = last_fail.get('broker_rejection_category')
+                    last_detail = last_fail.get('broker_rejection_detail') or last_local.get('rejection_reason')
+                    last_code = last_local.get('error_code')
+                    if last_detail in {'NO_TRADING_PERMISSION', 'SDK_PERMISSION_REFUSED'}:
+                        contract_failures += 1
+                        contract_status = 'DEFERRED_NO_TRADING_PERMISSION'
+                        contract_wait_reason = 'NO_TRADING_PERMISSION'
+                        events.append({
+                            'event': 'CONVERGENCE_DEFERRED',
+                            'contract_id': cid,
+                            'side': pos_side,
+                            'reason': 'NO_TRADING_PERMISSION',
+                            'excess_qty': needed,
+                        })
+                        continue
+
+                    is_phase_temp = last_cat == 'TRANSIENT' and last_detail == 'BROKER_TEMP_STATE'
+                    is_transient = (
+                        last_cat == 'TRANSIENT'
+                        or (last_fail['broker_state'] == 'CANCELLED' and last_fail.get('cancel_reason') is None)
+                    )
+                    if is_transient:
+                        # Count consecutive transient failures; BROKER_TEMP_STATE (market phase) does not penalize failure count.
+                        trans_streak = 0
+                        for item in reversed(recent_failures):
+                            icat = item.get('broker_rejection_category')
+                            if icat == 'TRANSIENT' or (item['broker_state'] == 'CANCELLED' and item.get('cancel_reason') is None):
+                                trans_streak += 1
+                            else:
+                                break
+                        if not is_phase_temp:
+                            contract_failures += trans_streak
+                        schedule = (0, 1, 2, 4, 8, 15, 30)
+                        delay = schedule[min(max(0, trans_streak - 1), len(schedule) - 1)]
+                        fail_at = float(last_fail.get('convergence_failure_at') or wall_time)
+                        if float(wall_time) - fail_at < delay:
+                            contract_status = 'DEFERRED_TRANSIENT_RETRY_BACKOFF'
+                            contract_wait_reason = last_detail or 'TRANSIENT_RETRY_BACKOFF'
+                            events.append({
+                                'event': 'CONVERGENCE_DEFERRED',
+                                'contract_id': cid,
+                                'side': pos_side,
+                                'reason': contract_wait_reason,
+                                'excess_qty': needed,
+                            })
+                            continue
+                    else:
+                        is_structural = (
+                            last_cat == 'STRUCTURAL'
+                            or last_code in {'E_DSV_SDK_SEND_VALIDATION', 'E_DSV_SDK_SEND_RISK'}
+                        )
+                        matching = 0
+                        for item in reversed(recent_failures):
+                            icat = item.get('broker_rejection_category')
+                            icode = (item.get('local_send_rejection') or {}).get('error_code')
+                            item_fp = item.get('convergence_cond_fp')
+                            if icat == 'TRANSIENT':
+                                break
+                            if item_fp is not None and item_fp != cond_fp:
+                                break
+                            if icat == 'STRUCTURAL' or icode in {'E_DSV_SDK_SEND_VALIDATION', 'E_DSV_SDK_SEND_RISK'} or not is_structural:
+                                matching += 1
+                        contract_failures += matching
+                        cap = 2 if is_structural else 3
+                        if matching >= cap:
+                            contract_status = 'DEFERRED_STRUCTURAL_REJECTION'
+                            contract_wait_reason = last_detail or 'STRUCTURAL_REJECTION_CAP'
+                            events.append({
+                                'event': 'CONVERGENCE_DEFERRED',
+                                'contract_id': cid,
+                                'side': pos_side,
+                                'reason': contract_wait_reason,
+                                'excess_qty': needed,
+                            })
+                            continue
+                        fail_at = float(last_fail.get('convergence_failure_at') or wall_time)
+                        if matching >= 1 and float(wall_time) - fail_at < 1:
+                            contract_status = 'DEFERRED_TRANSIENT_RETRY_BACKOFF'
+                            contract_wait_reason = last_detail or 'RETRY_BACKOFF'
+                            continue
+
+                req = self.new_convergence_order(
+                    state, cid, pos_side, market, send_qty, desired, offset, cond_fp=cond_fp)
                 effects.append(req)
                 events.append({
                     'event': 'CONVERGENCE_ACTION',
@@ -1521,12 +1741,15 @@ class ExplicitOrderController:
             statuses[cid] = {
                 'configured': is_configured,
                 'status': contract_status,
+                'wait_reason': contract_wait_reason,
+                'failure_count': contract_failures,
                 'actual_long': actual_long,
                 'actual_short': actual_short,
                 'target_long': owned_long,
                 'target_short': owned_short,
                 'excess_long': excess_long,
                 'excess_short': excess_short,
+                **perm_meta,
             }
         return effects, statuses, events
 
@@ -1610,6 +1833,11 @@ class ExplicitOrderController:
                 if result == 'DEFINITELY_NOT_SENT':
                     order['cancel_status'] = None
                     order['local_cancel_rejection'] = {'effect_id': effect['id'], **details}
+                    if details.get('error_code') == 'E_DSV_MARKET_PHASE':
+                        if not is_ext_cancel:
+                            order['cancel_attempt'] = max(0, int(order.get('cancel_attempt') or 1) - 1)
+                    elif is_ext_cancel:
+                        order['cancel_failure_count'] = int(order.get('cancel_failure_count') or 0) + 1
                 else:
                     order['cancel_status'] = result
                 if is_ext_cancel and effect['kind'] == 'CANCEL':

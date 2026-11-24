@@ -13,6 +13,11 @@ from online_trader.contracts.codec import canonical_bytes
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
 from online_trader.dsv_runtime.controller import CancelNotAttempted, SendNotAttempted, legal_price, terminal
 from online_trader.dsv_runtime.market_health import evaluate_market_health
+from online_trader.dsv_runtime.market_permissions import (
+    classify_market_phase_rejection,
+    evaluate_market_permissions,
+    normalize_trading_status,
+)
 from online_trader.dsv_runtime.order_diagnostics import OrderDiagnosticTracker, classify_broker_rejection
 from online_trader.errors import TraderError, exception_record
 from online_trader.gateway.dsv_facts import native_integer, utc
@@ -35,6 +40,13 @@ _PRICE_FIELDS = {'last': 'last_price', 'day_high': 'highest', 'day_low': 'lowest
 _POSITION = {'long_qty': 'pos_long', 'short_qty': 'pos_short',
              'long_today': 'pos_long_today', 'long_historical': 'pos_long_his',
              'short_today': 'pos_short_today', 'short_historical': 'pos_short_his'}
+
+
+def _phase_query(cal, code, at_utc):
+    fn = getattr(cal, 'phase_query', None)
+    if callable(fn):
+        return fn(code, at_utc)
+    return cal.query(code, at_utc)
 
 
 def _amount(value, *, rounding=None):
@@ -130,6 +142,12 @@ class DsvSdkAdapter:
         self._minute_chart_raw_cache = {}
         self._minute_chart_signature = {}
         self._schedule_display_cache = {}
+        self._unconfigured_calendars = {}
+        self._unconfigured_calendar_failed_at = {}
+        self._trading_status_supported = None
+        self._trading_status_objs = {}
+        self._trading_status_failed = set()
+        self._broker_phase_overrides = {}
 
     def matches_online_scope(self, account, provider, *, owner_mode='REPLACEMENT'):
         return (self.grant is not None and self.owner_mode == owner_mode
@@ -222,6 +240,13 @@ class DsvSdkAdapter:
             self._verified_order_facts.clear()
         if hasattr(self, '_verified_trade_facts'):
             self._verified_trade_facts.clear()
+        if hasattr(self, '_trading_status_objs'):
+            self._trading_status_objs.clear()
+        if hasattr(self, '_trading_status_failed'):
+            self._trading_status_failed.clear()
+        if hasattr(self, '_broker_phase_overrides'):
+            self._broker_phase_overrides.clear()
+        self._trading_status_supported = None
         self._last_committed_round_mono_ns = None
         self._last_idle_signature = None
         self.market_health = evaluate_market_health(
@@ -601,6 +626,13 @@ class DsvSdkAdapter:
                 self._verified_order_facts.clear()
             if hasattr(self, '_verified_trade_facts'):
                 self._verified_trade_facts.clear()
+            if hasattr(self, '_trading_status_objs'):
+                self._trading_status_objs.clear()
+            if hasattr(self, '_trading_status_failed'):
+                self._trading_status_failed.clear()
+            if hasattr(self, '_broker_phase_overrides'):
+                self._broker_phase_overrides.clear()
+            self._trading_status_supported = None
             self._last_committed_round_mono_ns = None
             self._last_idle_signature = None
             self._local_returns.clear()
@@ -646,7 +678,7 @@ class DsvSdkAdapter:
     def _frame(self, state, sample, day, *, day_held=False):
         if day not in self.trading_days or day < state['trading_day']:
             raise TraderError('E_DSV_SDK_SCOPE', 'Cabinet day is outside of the selected calendar')
-        windows = {code: self.calendar.query(code, sample.now_utc) for code in self.contracts}
+        windows = {code: _phase_query(self.calendar, code, sample.now_utc) for code in self.contracts}
         active = [window for window in windows.values() if window['is_trading']]
         if day != state['trading_day'] and (not active or any(window['trading_day'] != day for window in active)):
             raise TraderError('E_DSV_SDK_SCOPE', 'A cabinet-day change requires matching active calendar sessions')
@@ -685,7 +717,7 @@ class DsvSdkAdapter:
             market = self._market(code, day, sample.utc, funds, state['symbols'][code],
                                   code in foreign_orders or code in foreign_trades, state['orders'],
                                   quote_time=quote_time, window=windows[code], observation=observation,
-                                  external_active=code in foreign_orders)
+                                  external_active=code in foreign_orders, sample=sample)
             if code in deferred:
                 market.update(ticks=[], native_coverage=False, calendar_reason='CABINET_DAY_UNPROVED')
             markets.append(market)
@@ -742,6 +774,228 @@ class DsvSdkAdapter:
                 })
         return result
 
+    def _calendar_for(self, code):
+        if code in getattr(self, 'contracts', ()):
+            return self.calendar
+        unconf = getattr(self, '_unconfigured_calendars', None) or {}
+        if code in unconf:
+            return unconf[code]
+        cal = getattr(self, 'calendar', None)
+        if cal is not None:
+            try:
+                if code in {row.get('contract_id') for row in cal.to_record().get('contracts', ())}:
+                    return cal
+            except Exception:
+                pass
+        return None
+
+    def _live_trading_status(self, code):
+        if getattr(self, 'owner_mode', None) != 'STANDALONE':
+            return None
+        getter = getattr(self.api, 'get_trading_status', None)
+        if not callable(getter) or getattr(self.api, '_backtest', False):
+            return None
+        if getattr(self, '_trading_status_supported', None) is False:
+            return None
+        objs = getattr(self, '_trading_status_objs', None)
+        if objs is None:
+            objs = {}
+            self._trading_status_objs = objs
+        if code in objs:
+            return normalize_trading_status(getattr(objs[code], 'trade_status', None))
+        failed = getattr(self, '_trading_status_failed', None)
+        if failed is None:
+            failed = set()
+            self._trading_status_failed = failed
+        if code in failed:
+            return None
+        auth = getattr(self.api, '_auth', None)
+        has_feature = getattr(auth, '_has_feature', None)
+        if callable(has_feature):
+            try:
+                if not has_feature('tq_trading_status'):
+                    self._trading_status_supported = False
+                    return None
+            except Exception:
+                pass
+        try:
+            ts = getter(code)
+        except Exception as error:
+            msg = str(error)
+            if '不支持' in msg or 'tq_trading_status' in msg or '回测' in msg:
+                self._trading_status_supported = False
+            else:
+                failed.add(code)
+            return None
+        self._trading_status_supported = True
+        objs[code] = ts
+        return normalize_trading_status(getattr(ts, 'trade_status', None))
+
+    def _unconfigured_calendar_for(self, code, quote, sample, day):
+        existing = self._calendar_for(code)
+        if existing is not None:
+            return existing
+        if quote is None or not self._protection_clock_ready():
+            return None
+        failed_at = getattr(self, '_unconfigured_calendar_failed_at', None)
+        if failed_at is None:
+            failed_at = {}
+            self._unconfigured_calendar_failed_at = failed_at
+        last_fail = failed_at.get(code)
+        if last_fail is not None and (sample.monotonic - last_fail) < 2 * NS_PER_SECOND:
+            return None
+        try:
+            _, schedule = self._validate_added_quote(code, quote, require_schedule=True)
+        except TraderError:
+            failed_at[code] = sample.monotonic
+            return None
+        cal_rec = self.calendar.to_record()
+        target_days = sorted({
+            period['trading_day']
+            for row in cal_rec.get('contracts', ())
+            for period in row.get('sessions', ())
+        }) or [day]
+        # Inspect configured contract sessions for each day to identify night sessions and prior day cleanly.
+        ref_sessions = {}
+        for row in cal_rec.get('contracts', ()):
+            for period in row.get('sessions', ()):
+                ref_sessions.setdefault(period['trading_day'], []).append(period)
+        calendar_dates = None
+        get_calendar = getattr(self.api, 'get_trading_calendar', None)
+        if callable(get_calendar):
+            try:
+                cal_start = date.fromisoformat(target_days[0]) - timedelta(days=14)
+                cal_end = date.fromisoformat(target_days[-1])
+                calendar_dates = _calendar_dates(get_calendar(cal_start, cal_end), cal_start, cal_end)
+            except Exception:
+                calendar_dates = None
+        sessions = []
+        opened = [datetime.fromisoformat(cal_rec['coverage_from_utc'].replace('Z', '+00:00'))]
+        closed = [datetime.fromisoformat(cal_rec['coverage_to_utc'].replace('Z', '+00:00'))]
+        trading_date_list = (
+            sorted(d for d, trading in calendar_dates.items() if trading)
+            if calendar_dates is not None else None
+        )
+        for day_str in target_days:
+            target = date.fromisoformat(day_str)
+            day_refs = ref_sessions.get(day_str, ())
+            if calendar_dates is not None and calendar_dates.get(target, False) and trading_date_list is not None:
+                prior = next((d for d in reversed(trading_date_list) if d < target), None)
+                if prior is None:
+                    prior = target - timedelta(days=3 if target.weekday() == 0 else 1)
+                gap = [prior + timedelta(days=i) for i in range(1, (target - prior).days)]
+                holiday_gap = any(d.weekday() < 5 and not calendar_dates[d] for d in gap)
+            else:
+                night_refs = [p for p in day_refs if '-night-' in str(p.get('session_id', ''))]
+                if night_refs:
+                    holiday_gap = False
+                    prior = datetime.fromisoformat(night_refs[0]['open_utc'].replace('Z', '+00:00')).astimezone(_BEIJING).date()
+                else:
+                    prior = target - timedelta(days=3 if target.weekday() == 0 else 1)
+                    holiday_gap = any(
+                        p for p in day_refs
+                        if is_night_session(datetime.fromisoformat(p['open_utc'].replace('Z', '+00:00')))
+                    ) is False and bool(schedule['night']) and len(day_refs) == 0
+            session_kinds = (('day', target),) if (holiday_gap or not schedule['night']) else (('night', prior), ('day', target))
+            for kind, actual in session_kinds:
+                kind_periods = schedule[kind]
+                midnight = datetime.combine(actual, datetime.min.time(), _BEIJING)
+                for index, (start_sec, end_sec) in enumerate(kind_periods):
+                    begin = midnight + timedelta(seconds=start_sec)
+                    finish = midnight + timedelta(seconds=end_sec)
+                    sessions.append({
+                        'session_id': f'{day_str}-{kind}-{index}',
+                        'trading_day': day_str,
+                        'open_utc': _utc(begin),
+                        'close_utc': _utc(finish),
+                        'is_opening_session': index == 0,
+                        'force_close_at_end': index == len(kind_periods) - 1,
+                    })
+                    opened.append(begin.astimezone(timezone.utc))
+                    closed.append(finish.astimezone(timezone.utc) + timedelta(seconds=1))
+        if not sessions:
+            failed_at[code] = sample.monotonic
+            return None
+        try:
+            cal = TradingCalendar.from_record({
+                'schema_version': cal_rec['schema_version'],
+                'calendar_id': f'{cal_rec["calendar_id"]}-unconf-{code}',
+                'calendar_version': cal_rec['calendar_version'],
+                'complete': True,
+                'coverage_from_utc': _utc(min(opened)),
+                'coverage_to_utc': _utc(max(closed)),
+                'contracts': [{'contract_id': code, 'sessions': sessions}],
+            })
+        except TraderError:
+            failed_at[code] = sample.monotonic
+            return None
+        self._unconfigured_calendars[code] = cal
+        failed_at.pop(code, None)
+        return cal
+
+    def _record_broker_phase_rejection(self, code, last_msg):
+        override = classify_market_phase_rejection(last_msg)
+        if override is None:
+            return
+        overrides = getattr(self, '_broker_phase_overrides', None)
+        if overrides is None:
+            overrides = {}
+            self._broker_phase_overrides = overrides
+        quote = (getattr(self, 'quotes', None) or {}).get(code)
+        try:
+            mono = time.monotonic_ns()
+        except Exception:
+            mono = 0
+        overrides[code] = override | {
+            'quote_stamp': None if quote is None else getattr(quote, 'datetime', None),
+            'recorded_mono_ns': mono,
+        }
+
+    def _active_broker_phase_override(self, code, cal_phase, live_status, has_valid_quote, sample):
+        overrides = getattr(self, '_broker_phase_overrides', None) or {}
+        override = overrides.get(code)
+        if override is None:
+            return None
+        if live_status == 'CONTINUOUS':
+            overrides.pop(code, None)
+            return None
+        phase_name = (cal_phase or {}).get('market_phase')
+        if phase_name == 'CONTINUOUS' and has_valid_quote:
+            quote = (getattr(self, 'quotes', None) or {}).get(code)
+            cur_stamp = None if quote is None else getattr(quote, 'datetime', None)
+            if cur_stamp and cur_stamp != override.get('quote_stamp'):
+                overrides.pop(code, None)
+                return None
+            if (sample.monotonic - int(override.get('recorded_mono_ns') or 0)) >= 5 * NS_PER_SECOND:
+                overrides.pop(code, None)
+                return None
+        return override
+
+    def _current_permission(self, code, sample, *, quote_time=None, calendar_phase=None, cal=None,
+                            has_valid_quote=None, require_live_quote=True):
+        cal_obj = cal if cal is not None else self._calendar_for(code)
+        if calendar_phase is None and cal_obj is not None:
+            try:
+                calendar_phase = _phase_query(cal_obj, code, sample.now_utc)
+            except TraderError:
+                calendar_phase = None
+        if has_valid_quote is None:
+            has_valid_quote = quote_time is not None
+            if not has_valid_quote and not require_live_quote:
+                has_valid_quote = False
+        clock_unverified = not self._protection_clock_ready() or bool((getattr(self, '_health', None) or {}).get('reason'))
+        live_status = self._live_trading_status(code)
+        override = self._active_broker_phase_override(code, calendar_phase, live_status, bool(has_valid_quote), sample)
+        return evaluate_market_permissions(
+            contract_id=code,
+            calendar_phase=calendar_phase,
+            live_trading_status=live_status,
+            has_valid_quote=bool(has_valid_quote),
+            clock_unverified=clock_unverified,
+            broker_phase_override=override,
+            require_live_quote=require_live_quote,
+        )
+
     def _collect_unconfigured_markets(self, state, non_strategy, sample, day, funds):
         all_positions = self._safe_all_positions()
         ext_codes = {item['contract_id'] for item in non_strategy}
@@ -771,36 +1025,47 @@ class DsvSdkAdapter:
                         self.quotes[code] = quote
                 except Exception:
                     quote = None
+            cal = self._unconfigured_calendar_for(code, quote, sample, day)
             window = None
             cal_session_id = None
             cal_reason = None
-            try:
-                window = self.calendar.query(code, sample.now_utc)
-            except TraderError:
-                window = None
+            qt = None
+            observation = None
+            if cal is not None:
+                try:
+                    window = _phase_query(cal, code, sample.now_utc)
+                except TraderError:
+                    window = None
             if window is not None and window.get('complete') and window.get('is_trading') is not None:
-                active = bool(window['is_trading'] and window['trading_day'] == day)
                 session = window['session']
                 if session is None:
                     cal_contracts = {
                         c['contract_id']: c.get('sessions', ())
-                        for c in self.calendar.to_record().get('contracts', ())
+                        for c in cal.to_record().get('contracts', ())
                     }
                     periods = [p for p in cal_contracts.get(code, ()) if p.get('trading_day') == day]
-                    session = periods[0] if periods else {
-                        'session_id': f'{code}:{day}:closed',
-                        'open_utc': utc(sample.utc - timedelta(hours=1)),
-                        'close_utc': utc(sample.utc + timedelta(hours=1)),
-                        'is_opening_session': False,
-                        'force_close_at_end': False,
-                    }
+                    next_sess = window.get('next_session')
+                    session = next_sess if (next_sess and next_sess.get('trading_day') == day) else (
+                        periods[0] if periods else {
+                            'session_id': f'{code}:{day}:closed',
+                            'open_utc': utc(sample.utc - timedelta(hours=1)),
+                            'close_utc': utc(sample.utc + timedelta(hours=1)),
+                            'is_opening_session': False,
+                            'force_close_at_end': False,
+                        }
+                    )
+                if quote is not None:
+                    qt, observation = self._observe_quote(code, sample, window, day, cal=cal)
+                perm = self._current_permission(
+                    code, sample, quote_time=qt, calendar_phase=window, cal=cal,
+                    has_valid_quote=(qt is not None),
+                )
+                active = bool(perm['continuous_matching'] and window['is_trading'] and window['trading_day'] == day)
                 if active:
                     cal_session_id = session['session_id']
                 else:
-                    cal_reason = 'OUTSIDE_SESSION'
-                qt = self._observe_quote(code, sample, window, day)[0] if quote is not None else None
+                    cal_reason = perm['wait_reason'] or 'OUTSIDE_SESSION'
             else:
-                qt = None
                 active = False
                 session = {
                     'session_id': f'{code}:{day}:unconfigured',
@@ -809,34 +1074,24 @@ class DsvSdkAdapter:
                     'is_opening_session': False,
                     'force_close_at_end': False,
                 }
-                if quote is not None and self._protection_clock_ready():
-                    try:
-                        moment = self._quote_time(quote)
-                    except (TypeError, ValueError, OverflowError):
-                        moment = None
-                    if moment is not None:
-                        raw = getattr(quote, 'datetime', None)
-                        age = source_age_ns(sample.utc, moment, raw)
-                        health = self.clock.health(sample) if hasattr(self.clock, 'health') else self._health
-                        if quote_age_quality(age, health)[0] != 'SOURCE_ANOMALY':
-                            qt = moment
-                            active = True
-                    if not active:
-                        cal_reason = 'UNCONFIGURED_QUOTE_UNAVAILABLE'
-                else:
-                    cal_reason = 'UNCONFIGURED_QUOTE_UNAVAILABLE'
+                perm = self._current_permission(
+                    code, sample, quote_time=None, calendar_phase=None, cal=None,
+                    has_valid_quote=False,
+                )
+                cal_reason = perm['wait_reason'] or 'UNCONFIGURED_SCHEDULE_UNKNOWN'
             tick = self._tick(code, quote, session, qt) if (active and quote is not None and qt is not None) else None
             entry = {
                 'contract_id': code,
                 'configured': False,
                 'market_session_active': bool(active),
-                'native_coverage': window['complete'] if window is not None else True,
+                'native_coverage': window['complete'] if window is not None else False,
                 'calendar_reason': cal_reason,
                 'session_open': session['open_utc'],
                 'session_close': session['close_utc'],
                 'ticks': [] if tick is None else [tick],
                 'external_active_orders': code in ext_codes,
                 'standalone_external_model': True,
+                'market_permission': perm,
                 'long_qty': 0 if pos is None else native_integer(getattr(pos, 'pos_long', 0)),
                 'short_qty': 0 if pos is None else native_integer(getattr(pos, 'pos_short', 0)),
                 'long_today': 0 if pos is None else native_integer(getattr(pos, 'pos_long_today', 0)),
@@ -844,6 +1099,8 @@ class DsvSdkAdapter:
                 'short_today': 0 if pos is None else native_integer(getattr(pos, 'pos_short_today', 0)),
                 'short_historical': 0 if pos is None else native_integer(getattr(pos, 'pos_short_his', 0)),
             }
+            if observation is not None:
+                entry['quote_observation'] = observation
             if cal_session_id is not None:
                 entry['calendar_session_id'] = cal_session_id
             prof = getattr(self, 'profile', None)
@@ -1008,6 +1265,7 @@ class DsvSdkAdapter:
                     for nid, o in (self.api.get_order(account=self.account) or {}).items()
                     if getattr(o, 'status', None) == 'ALIVE'
                 )),
+                tuple((c, self._live_trading_status(c)) for c in self.contracts),
             )
         return (
             trading_day,
@@ -1085,8 +1343,9 @@ class DsvSdkAdapter:
             filled = binding['original_qty'] - native_integer(order.volume_left)
             rejected = getattr(order, 'is_error', None) is True
             if type(stamp) is int and stamp > 0:
+                cal_for_contract = self._calendar_for(binding['contract_id']) or self.calendar
                 try:
-                    actual = native_day(self.calendar, binding['contract_id'], str(stamp))['trading_day']
+                    actual = native_day(cal_for_contract, binding['contract_id'], str(stamp))['trading_day']
                 except TraderError:
                     if getattr(self, 'owner_mode', None) == 'STANDALONE' and binding['contract_id'] not in self.contracts:
                         actual = binding['native_trading_day']
@@ -1120,10 +1379,14 @@ class DsvSdkAdapter:
             if status == 'REJECTED':
                 category, detail = classify_broker_rejection(last_msg)
                 rejection = {'rejection_category': category, 'rejection_detail': detail}
+                if getattr(self, 'owner_mode', None) == 'STANDALONE':
+                    self._record_broker_phase_rejection(binding['contract_id'], last_msg)
             elif status == 'CANCELLED':
                 category, detail = classify_broker_rejection(last_msg)
                 if category != 'UNCLASSIFIED':
                     rejection = {'rejection_category': category, 'rejection_detail': detail}
+                if getattr(self, 'owner_mode', None) == 'STANDALONE':
+                    self._record_broker_phase_rejection(binding['contract_id'], last_msg)
             fact = self._fact('ORDER', binding, native_id) | {'status': status, 'filled_qty': filled} | temporal | rejection
             if order.status == 'FINISHED':
                 cache[native_id] = (sig, fact)
@@ -1168,8 +1431,9 @@ class DsvSdkAdapter:
                 raise TraderError('E_DSV_SDK_FACT', 'SDK trade needs an exact nanosecond timestamp')
             if stamp + 5_000_000_000 < int(ordered):
                 raise TraderError('E_DSV_SDK_FACT', 'Native trade precedes its original order timestamp')
+            cal_for_contract = self._calendar_for(binding['contract_id']) or self.calendar
             try:
-                proof = native_day(self.calendar, binding['contract_id'], str(stamp))
+                proof = native_day(cal_for_contract, binding['contract_id'], str(stamp))
             except TraderError:
                 if getattr(self, 'owner_mode', None) == 'STANDALONE' and binding['contract_id'] not in self.contracts:
                     proof = {'trading_day': day}
@@ -1244,7 +1508,8 @@ class DsvSdkAdapter:
     def _contract(item):
         return item.exchange_id + '.' + item.instrument_id
 
-    def _observe_quote(self, code, sample, current_window, day):
+    def _observe_quote(self, code, sample, current_window, day, *, cal=None):
+        cal_obj = cal if cal is not None else self.calendar
         quote = self.quotes[code]
         previous = self.quote_observations.get(code)
         last_change = None if previous is None else previous[2]
@@ -1255,8 +1520,10 @@ class DsvSdkAdapter:
         except (TypeError, ValueError, OverflowError):
             source, malformed = None, True
         session = None
+        source_phase = None
         if source is not None:
-            session = self.calendar.query(code, utc(source))['session']
+            source_phase = _phase_query(cal_obj, code, utc(source))
+            session = source_phase['session']
         raw_age = None if source is None else source_age_ns(sample.utc, source, raw)
         quality, reason = 'UNKNOWN', 'QUOTE_UNAVAILABLE'
         if not self._protection_clock_ready():
@@ -1268,7 +1535,14 @@ class DsvSdkAdapter:
             precise_time = source, source_fraction_tail(raw)
             active = current_window['session']
             if session is None:
-                quality, reason = 'SOURCE_ANOMALY', 'QUOTE_SESSION_UNKNOWN'
+                if source_phase and source_phase.get('market_phase') in {'AUCTION_ORDERING', 'AUCTION_MATCH'}:
+                    quality, age_reason = quote_age_quality(raw_age, self._health)
+                    reason = 'AUCTION_QUOTE' if quality == 'VALID' else age_reason
+                    if quality != 'SOURCE_ANOMALY' and (previous is None or raw != previous[1]):
+                        last_change = sample.monotonic
+                        self.quote_observations[code] = precise_time, raw, last_change
+                else:
+                    quality, reason = 'SOURCE_ANOMALY', 'QUOTE_SESSION_UNKNOWN'
             elif active is None:
                 reason = 'QUOTE_OUTSIDE_CURRENT_SESSION'
             elif (session['session_id'], session['trading_day']) != (active['session_id'], day):
@@ -1292,9 +1566,9 @@ class DsvSdkAdapter:
         return (source if quality in {'VALID', 'CLOCK_UNVERIFIED'} else None), observation
 
     def _market(self, code, day, now, funds, previous, external, orders, *, quote_time=None, window=None,
-                observation=None, external_active=None):
+                observation=None, external_active=None, sample=None):
         if window is None:
-            window = self.calendar.query(code, utc(now))
+            window = _phase_query(self.calendar, code, utc(now))
         active = bool(window['is_trading'] and window['trading_day'] == day)
         periods = [period for period in self.periods[code] if period['trading_day'] == day]
         session = window['session'] if active else next(
@@ -1314,6 +1588,15 @@ class DsvSdkAdapter:
         if standalone_model:
             result['standalone_external_model'] = True
             result['external_active_orders'] = active_ext
+            sample_for_perm = sample if sample is not None else ClockSample(
+                utc(now), str(time.monotonic_ns()), getattr(self, '_clock_epoch', None))
+            has_valid_quote = bool(
+                tick is not None and (observation is None or observation.get('age_quality') == 'VALID')
+            )
+            result['market_permission'] = self._current_permission(
+                code, sample_for_perm, quote_time=quote_time, calendar_phase=window,
+                has_valid_quote=has_valid_quote,
+            )
         prof = getattr(self, 'profile', None)
         if prof is not None:
             result['limit_fallback_ratio'] = str(
@@ -1617,8 +1900,15 @@ class DsvSdkAdapter:
                 rejection_reason = 'FOREIGN_ACTIVE_ORDER' if ext_blocked and standalone_model else 'QUOTE_OR_PRICE_SCOPE'
                 raise TraderError('E_DSV_SDK_SCOPE', 'A native dispatch requires a legal price and current scoped quote')
             clock = self._clock_sample()
+            if (standalone_model or 'market_permission' in market) and getattr(self, 'calendar', None) is not None:
+                perm = self._current_permission(effect['contract_id'], clock, has_valid_quote=(tick is not None))
+                opening = effect['native_offset'] == 'OPEN'
+                if (opening and not perm['can_open']) or (not opening and not perm['can_close']):
+                    rejection_reason = perm['wait_reason'] or 'MARKET_PHASE_DISALLOWED'
+                    raise TraderError('E_DSV_MARKET_PHASE', 'Market phase currently disallows order submission')
             if 'calendar_session_id' in market:
-                window = self.calendar.query(effect['contract_id'], clock.now_utc)
+                cal_obj = self._calendar_for(effect['contract_id']) or self.calendar
+                window = _phase_query(cal_obj, effect['contract_id'], clock.now_utc)
                 if (self._continuity.compare(clock)['reason'] or not window['is_trading']
                         or window['trading_day'] != effect['trading_day']
                         or window['session']['session_id'] != market['calendar_session_id']):
@@ -1771,6 +2061,14 @@ class DsvSdkAdapter:
                 raise TraderError('E_DSV_SDK_OWNER', 'SDK cancellation is waiting for the owner dispatch phase')
             if native != effect['native_order_id']:
                 raise TraderError('E_DSV_SDK_SCOPE', 'SDK cancellation requires the original native order identity')
+            if getattr(self, 'owner_mode', None) == 'STANDALONE' and getattr(self, 'calendar', None) is not None:
+                perm = self._current_permission(
+                    effect['contract_id'], self._clock_sample(), require_live_quote=False)
+                if not perm['can_cancel']:
+                    raise TraderError(
+                        'E_DSV_MARKET_PHASE',
+                        perm['wait_reason'] or 'Market phase currently disallows order cancellation',
+                    )
             if effect.get('external_order') and getattr(self, 'owner_mode', None) == 'STANDALONE':
                 live_orders = self.api.get_order(account=self.account) or {}
                 live = live_orders.get(native)

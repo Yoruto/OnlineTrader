@@ -123,7 +123,7 @@ class StandaloneDsvOwner:
             market = getattr(adapter, 'dispatch_market', {}).get(contract) or {}
             dispatch_copy[contract] = {
                 key: market.get(key)
-                for key in ('long_qty', 'short_qty', 'margin_per_lot', 'multiplier', 'market_session_active')
+                for key in ('long_qty', 'short_qty', 'margin_per_lot', 'multiplier', 'market_session_active', 'market_permission')
             }
             if callable(detail_reader):
                 sym = (snapshot.get('symbols') or {}).get(contract) or {}
@@ -147,7 +147,8 @@ class StandaloneDsvOwner:
                 'long_historical': market.get('long_historical', 0),
                 'short_today': market.get('short_today', 0),
                 'short_historical': market.get('short_historical', 0),
-                'market_session_active': market.get('market_session_active', True),
+                'market_session_active': market.get('market_session_active', False),
+                'market_permission': market.get('market_permission'),
                 'last_price': None if utick is None else utick.get('last'),
                 'calendar_reason': market.get('calendar_reason'),
             }

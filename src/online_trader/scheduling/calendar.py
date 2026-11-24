@@ -224,6 +224,47 @@ class TradingCalendar:
                 result["next_session"] = upcoming.record() | refs
         return result
 
+    def phase_query(self, contract_id, at_utc):
+        """Derive physical market phase (including pre-open auction) without altering TRADING_CALENDAR/1."""
+        base = self.query(contract_id, at_utc)
+        if not base["complete"]:
+            return base | {
+                "market_phase": "UNKNOWN",
+                "continuous_matching": False,
+                "seconds_to_open": None,
+            }
+        if base["is_trading"]:
+            return base | {
+                "market_phase": "CONTINUOUS",
+                "continuous_matching": True,
+                "seconds_to_open": 0,
+            }
+        now = _utc(at_utc)
+        sessions = self._scope(contract_id) or ()
+        prev_session = next((session for session in reversed(sessions) if session.end <= now), None)
+        next_session = next((session for session in sessions if session.start > now), None)
+        seconds_to_open = None
+        if next_session is None:
+            phase = "CLOSED"
+        else:
+            gap_seconds = (next_session.start - now).total_seconds()
+            seconds_to_open = max(0, int(gap_seconds))
+            if next_session.is_opening_session and 0 < gap_seconds <= 300:
+                phase = "AUCTION_MATCH" if gap_seconds <= 60 else "AUCTION_ORDERING"
+            elif prev_session is None:
+                phase = "PRE_OPEN"
+            elif prev_session.trading_day != next_session.trading_day:
+                phase = "CLOSED"
+            elif next_session.is_opening_session:
+                phase = "PRE_OPEN"
+            else:
+                phase = "INTRADAY_BREAK"
+        return base | {
+            "market_phase": phase,
+            "continuous_matching": False,
+            "seconds_to_open": seconds_to_open,
+        }
+
     def active_milliseconds(self, contract_id, from_utc, to_utc):
         """Sum covered session intersections; breaks contribute zero duration."""
         start, end = _utc(from_utc), _utc(to_utc)

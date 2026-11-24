@@ -2573,6 +2573,41 @@
       ],
       "case_overrides": {}
     },
+    "test_market_permissions_and_auction": {
+      "tier": "T1",
+      "domains": [
+        "trading",
+        "runtime",
+        "desktop",
+        "clock"
+      ],
+      "risk": "P1",
+      "profiles": [
+        "FullOffline",
+        "Trading",
+        "Runtime"
+      ],
+      "platform": [
+        "Windows"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": false,
+      "requirements": [
+        "PySide6"
+      ],
+      "timeout_seconds": 180,
+      "cases": [
+        "AuctionAndConvergenceRuntimeTests.test_auction_to_open_jump_cancels_external_in_ordering_defers_close_then_flattens_at_210015",
+        "AuctionAndConvergenceRuntimeTests.test_structural_reject_recovers_when_buckets_change_and_transient_never_permanently_locks",
+        "AuctionAndConvergenceRuntimeTests.test_workbench_displays_auction_wait_status_and_remaining_lots",
+        "FakeBrokerAuctionScenarioTests.test_fake_broker_auction_wait_and_recovery_flow",
+        "MarketPermissionsUnitTests.test_calendar_phase_query_preserves_schema_and_identifies_auction_phases",
+        "MarketPermissionsUnitTests.test_layered_permissions_handle_tqsdk_spelling_halt_fallback_and_broker_override",
+        "SdkAdapterAuctionAndPermissionsTests.test_first_minute_2100_allows_convergence_close_while_blocking_ordinary_open_and_unsupported_status_degrades",
+        "SdkAdapterAuctionAndPermissionsTests.test_presend_and_precancel_market_phase_guard_never_consumes_cancel_budget"
+      ],
+      "case_overrides": {}
+    },
     "test_marketdata": {
       "tier": "T1",
       "domains": [
@@ -5075,6 +5110,9 @@
       "requirements": [],
       "timeout_seconds": 30,
       "cases": [
+        "UpdateInstallTests.test_check_on_launch_downloads_and_upgrades_in_same_startup",
+        "UpdateInstallTests.test_check_on_launch_network_error_falls_back_to_current_version",
+        "UpdateInstallTests.test_check_on_launch_uses_active_version_when_already_upgraded",
         "UpdateInstallTests.test_extract_bundle_rejects_missing_payload_marker_and_root_configs",
         "UpdateInstallTests.test_failed_start_rolls_back_to_original_portable_program",
         "UpdateInstallTests.test_first_launch_selects_original_portable_program",

@@ -38,6 +38,46 @@ from online_trader.runtime.comparison import dsv_log_category
 from online_trader.runtime.strategy_log import BLOCK_MESSAGES, ENTRY_FILTERS
 
 
+CONVERGENCE_WAIT_MESSAGES = {
+    'DEFERRED_AUCTION_ORDERING': '集合竞价申报期暂停主动平仓，保留目标等待连续交易',
+    'DEFERRED_AUCTION_MATCH': '集合竞价撮合期禁止报撤单，等待连续交易',
+    'DEFERRED_HALTED': '市场临时停牌或延迟开市，等待恢复交易',
+    'DEFERRED_STATUS_UNKNOWN': '市场交易状态或时段暂未确认，保留目标等待',
+    'DEFERRED_OUTSIDE_SESSION': '当前休市或未开盘，保留目标等待开盘',
+    'DEFERRED_SESSION_OR_QUOTE': '等待连续交易时段与有效行情',
+    'DEFERRED_QUOTE_UNAVAILABLE': '等待当前盘次有效行情',
+    'DEFERRED_LIMIT_LOCKED': '涨跌停封板暂无成交盘口，保留目标等待流动性',
+    'DEFERRED_NO_LEGAL_PRICE': '当前盘口缺少合法委托价，等待有效报价',
+    'DEFERRED_TRANSIENT_RETRY_BACKOFF': '柜台临时状态或流控退避中，稍后自动重试',
+    'DEFERRED_NO_TRADING_PERMISSION': '账号缺少该合约交易权限，已暂停自动报单',
+    'DEFERRED_STRUCTURAL_REJECTION': '柜台拒单条件未变化，等待持仓/挂单或盘口变化后重试',
+    'WAITING_NON_STRATEGY_CANCEL': '正在撤销非策略活动挂单',
+}
+
+
+def _convergence_status_label(conv_state, wait_reason, *, configured=True):
+    code = conv_state or wait_reason
+    if code == 'DEFERRED_AUCTION_ORDERING' or wait_reason == 'DEFERRED_AUCTION_ORDERING':
+        return '集合竞价申报待平' if configured else '集合竞价待清仓'
+    if code == 'DEFERRED_AUCTION_MATCH' or wait_reason == 'DEFERRED_AUCTION_MATCH':
+        return '集合竞价撮合待平' if configured else '竞价撮合待清仓'
+    if code == 'DEFERRED_HALTED' or wait_reason == 'DEFERRED_HALTED':
+        return '暂停待平' if configured else '停牌待清仓'
+    if code == 'DEFERRED_LIMIT_LOCKED':
+        return '封板待平'
+    if code == 'DEFERRED_NO_TRADING_PERMISSION':
+        return '无权限阻断'
+    if code == 'DEFERRED_STRUCTURAL_REJECTION':
+        return '拒单待核对'
+    if code == 'DEFERRED_TRANSIENT_RETRY_BACKOFF':
+        return '退避重报中'
+    if code == 'DEFERRED_STATUS_UNKNOWN' or wait_reason == 'DEFERRED_STATUS_UNKNOWN':
+        return '状态待确认'
+    if code in {'DEFERRED_SESSION_OR_QUOTE', 'DEFERRED_OUTSIDE_SESSION', 'DEFERRED_QUOTE_UNAVAILABLE'}:
+        return '休市待平'
+    if code == 'CANCELLING_NON_STRATEGY_ORDERS':
+        return '撤销委托中'
+    return '收敛平仓中' if configured else '清仓收敛中'
 BEIJING = timezone(timedelta(hours=8))
 ENTRY_MESSAGES = {
     'GEOMETRY_BLOCK': '日内振幅超出开仓上限',
@@ -45,6 +85,7 @@ ENTRY_MESSAGES = {
     'MARKET_PATH_INCOMPLETE': '行情路径待补齐',
     'OPENING_WAIT': '开盘等待',
     'AUCTION_DISABLED': '集合竞价期间暂停普通开仓',
+    'MARKET_HALTED': '市场当前暂停交易或延迟开市',
     'CLOSE_SESSION_NO_OPEN': '收盘前禁开',
     'RECONCILIATION_REQUIRED': '柜台待核对',
     'CONTROL_BARRIER': '开仓权限受限',
@@ -1469,16 +1510,18 @@ class WorkbenchLayout:
                     parts.append(f'实际空 {as_}')
                 position = (' / '.join(parts) if parts else '0') + ' (目标 0)'
                 conv_state = acc.get('status') or 'PREVIEW_NEEDS_CONVERGENCE'
+                wait_reason = acc.get('wait_reason')
                 if not available:
                     status = '状态待同步'
                 elif view['entry_authority'] != 'ARMED':
                     status = '待清仓 (未启动)'
-                elif conv_state.startswith('DEFERRED_'):
-                    status = '休市待平' if 'SESSION' in conv_state else '待条件清仓'
-                elif conv_state == 'CANCELLING_NON_STRATEGY_ORDERS':
-                    status = '撤销委托中'
                 else:
-                    status = '清仓收敛中'
+                    status = _convergence_status_label(conv_state, wait_reason, configured=False)
+                unconf_notes = ['非本配置合约，点击启动策略后将自动清仓收敛至 0']
+                if view['entry_authority'] == 'ARMED':
+                    wait_text = CONVERGENCE_WAIT_MESSAGES.get(wait_reason or conv_state)
+                    if wait_text:
+                        unconf_notes = [f'{wait_text}（待清仓：多 {al} / 空 {as_} 手）']
                 rows.append((
                     f'{code} [非配置]',
                     display_value(acc.get('last') if self.market_view_current(view) or previous_snapshot else None),
@@ -1491,7 +1534,7 @@ class WorkbenchLayout:
                     {'contract_id': code, 'last': acc.get('last'), 'configured': False},
                     {},
                     None,
-                    ['非本配置合约，点击启动策略后将自动清仓收敛至 0'],
+                    unconf_notes,
                     None,
                 )
                 continue
@@ -1523,6 +1566,7 @@ class WorkbenchLayout:
                 time_reason = {
                     'CALENDAR_COVERAGE_UNKNOWN': '当前时段无完整日历',
                     'QUOTE_OUTSIDE_CURRENT_SESSION': '当前休市',
+                    'AUCTION_QUOTE': '当前处于集合竞价阶段',
                     'QUOTE_UNAVAILABLE': '尚无当前报价',
                     'QUOTE_TIMESTAMP_INVALID': '报价时间格式无效',
                     'QUOTE_SESSION_MISMATCH': '报价属于其他交易时段',
@@ -1531,6 +1575,19 @@ class WorkbenchLayout:
                 }.get(quote.get('quote_time_reason'))
                 if time_reason:
                     explanation.append(time_reason)
+                if is_standalone and acc:
+                    conv_wait = acc.get('wait_reason') or quote.get('convergence_wait_reason')
+                    conv_state = acc.get('status') or quote.get('convergence_status')
+                    if view['entry_authority'] == 'ARMED' and (
+                        acc.get('excess_long') or acc.get('excess_short')
+                        or str(conv_state or '').startswith('DEFERRED_')
+                        or conv_state == 'CANCELLING_NON_STRATEGY_ORDERS'
+                    ):
+                        wait_text = CONVERGENCE_WAIT_MESSAGES.get(conv_wait or conv_state)
+                        if wait_text:
+                            rem = int(acc.get('excess_long') or 0) + int(acc.get('excess_short') or 0)
+                            suffix = f'（待平 {rem} 手）' if rem else ''
+                            explanation.insert(0, f'{wait_text}{suffix}')
             quote_state = quote_states[code]
             quote_current = self.market_view_current(view) and quote_state == '新鲜'
             lines = (quote.get('trigger_prices') or {}) if quote_current else {}
@@ -1550,7 +1607,9 @@ class WorkbenchLayout:
             elif 'CONVERGENCE_FLATTEN_PENDING' in reasons or (
                     is_standalone and acc and (acc.get('excess_long') or acc.get('excess_short'))
                     and view['entry_authority'] == 'ARMED'):
-                status = '收敛平仓中'
+                conv_state = (acc or {}).get('status') or quote.get('convergence_status')
+                conv_wait = (acc or {}).get('wait_reason') or quote.get('convergence_wait_reason')
+                status = _convergence_status_label(conv_state, conv_wait, configured=True)
             elif is_standalone and acc and (acc.get('excess_long') or acc.get('excess_short')) and view['entry_authority'] != 'ARMED':
                 status = '待收敛 (未启动)'
             elif 'STARTUP_PROVED_AWAITING_START' in reasons:
@@ -1613,6 +1672,9 @@ class WorkbenchLayout:
             color = ('#087453' if status == '持仓中' else '#965619'
                      if status in {'平仓待确认', '收敛平仓中', '清仓收敛中', '撤销委托中',
                                    '待收敛 (未启动)', '待清仓 (未启动)', '休市待平',
+                                   '集合竞价申报待平', '集合竞价待清仓', '集合竞价撮合待平',
+                                   '竞价撮合待清仓', '暂停待平', '停牌待清仓', '封板待平',
+                                   '无权限阻断', '拒单待核对', '退避重报中', '状态待确认',
                                    '待条件清仓', '持仓待启动', '行情滞后', '当日停开', '已停用'}
                      else '#075de5')
             status_color = QColor(color)

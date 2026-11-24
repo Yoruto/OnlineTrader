@@ -17,6 +17,7 @@ from online_trader.dsv_core.month_stop import observe_month_stop
 from online_trader.dsv_core.transition import continuation_entry, ordinary_entry, price_value, protect
 from online_trader.dsv_core.price_rules import scheduled_close_mode
 from online_trader.dsv_runtime.controller import ExplicitOrderController, terminal, tighten_target
+from online_trader.dsv_runtime.market_permissions import infer_offline_market_permission
 from online_trader.dsv_runtime.order_diagnostics import OrderDiagnosticTracker
 from online_trader.dsv_runtime.owner_binding import StandaloneOwnerBinding
 from online_trader.dsv_runtime.startup_inference import infer_startup_symbol_state
@@ -781,17 +782,40 @@ class DsvSession:
                 timing.recover(row, contract)
                 if position := row['position']:
                     timing.recover(position, position['id'])
+                clock_fault = state.get('clock_recovery_required')
+                observed['calendar_clock_unverified'] = clock_fault not in (
+                    None, 'OWNER_SCHEDULING_GAP')
+            perm = infer_offline_market_permission(
+                observed,
+                symbol_frame['wall_time'],
+                clock_unverified=bool(
+                    observed.get('calendar_clock_unverified') or state.get('clock_recovery_required')),
+            )
+            observed['market_permission'] = perm
+            row['market_permission'] = perm
+            if timing:
                 in_sess = self._in_session(frame, observed)
                 clock_fault = state.get('clock_recovery_required')
                 manual_exit = bool(position and position.get('manual_close_mode') is not None)
-                observed['allow_new_entry'] = not clock_fault and in_sess
-                observed['allow_protective_exit'] = in_sess and (
+                observed['allow_new_entry'] = not clock_fault and in_sess and perm['can_open']
+                observed['allow_protective_exit'] = in_sess and perm['can_close'] and (
                     not clock_fault or clock_fault == 'OWNER_SCHEDULING_GAP' or manual_exit)
+                clock_only_unknown = (
+                    perm.get('status_source') == 'CLOCK_UNVERIFIED'
+                    and perm.get('live_trading_status') not in {'NOTRADING', 'AUCTIONMATCH'}
+                )
+                observed['allow_cancel'] = perm['can_cancel'] or clock_only_unknown
                 observed['allow_new_order'] = observed['allow_new_entry'] or (
                     bool(position and position['exit_target'] is not None and position['owned'] > position['exit_target'])
                     and observed['allow_protective_exit'])
-                observed['calendar_clock_unverified'] = clock_fault not in (
-                    None, 'OWNER_SCHEDULING_GAP')
+            else:
+                observed['allow_cancel'] = perm['can_cancel']
+                if 'allow_new_entry' not in observed:
+                    observed['allow_new_entry'] = perm['can_open']
+                if 'allow_protective_exit' not in observed:
+                    observed['allow_protective_exit'] = perm['can_close']
+                if 'allow_new_order' not in observed:
+                    observed['allow_new_order'] = perm['can_open'] or perm['can_close']
             if frame.get('market_clock') and tick is not None:
                 native_time = _utc(tick['native_time'])
                 silence_ms = int(frame['monotonic_ms']) - int(row['quote_clock']['anchor']['mono'])
@@ -810,15 +834,18 @@ class DsvSession:
                               **value} for i, value in enumerate(values))
             if timing or frozen_plan_b:
                 continue
-            if self._in_session(symbol_frame, observed):
+            if self._in_session(symbol_frame, observed) and perm['continuous_matching']:
                 self._diag().observe_block(('exit_session_gate', contract), active=False, contract_id=contract)
                 now = _utc(observed.get('wall_reads', {}).get('pending', symbol_frame['wall_time'])).timestamp()
                 if tick is None:
+                    if perm['can_cancel'] and callable(getattr(self._controller, 'plan_maintenance', None)):
+                        maint, _ = self._controller.plan_maintenance(state, row, observed)
+                        effects.extend(maint)
                     self._controller.settle(state, row)
                 else:
                     gap = row['position'] and row['position'].get('gap_exit')
                     if gap and not self._fresh_after_gap(observed, gap):
-                        observed = observed | {'allow_new_order': False}
+                        observed = observed | {'allow_new_order': False, 'allow_new_entry': False, 'allow_protective_exit': False}
                         self._diag().observe_block(
                             ('gap_gate', contract), active=True, contract_id=contract,
                             position_id=row['position']['id'], reason='GAP_WAIT_FRESH_TICK',
@@ -828,36 +855,45 @@ class DsvSession:
                     effects.extend(self._controller.plan(state, row, observed, now))
             else:
                 if row['position'] is not None and row['position']['owned']:
+                    gate_reason = perm.get('wait_reason') or 'OUTSIDE_SESSION'
+                    if gate_reason == 'DEFERRED_OUTSIDE_SESSION':
+                        gate_reason = 'OUTSIDE_SESSION'
                     self._diag().observe_block(
                         ('exit_session_gate', contract), active=True, contract_id=contract,
-                        position_id=row['position']['id'], reason='OUTSIDE_SESSION',
+                        position_id=row['position']['id'], reason=gate_reason,
                         detail='POSITION_WAITING_FOR_MARKET')
                 else:
                     self._diag().observe_block(('exit_session_gate', contract), active=False, contract_id=contract)
-                if self._sdk_port is not None:
-                    position = row['position']
-                    if position is not None and position['entry_stopped'] and not position.get('preserve_open_on_stop'):
-                        for order in self._controller.child_orders(state, position, 'OPEN'):
-                            if request := self._controller.cancel(order, 'TARGET_REDUCED'):
-                                effects.append(request)
+                if perm['can_cancel']:
+                    maint, _ = self._controller.plan_maintenance(state, row, observed)
+                    effects.extend(maint)
+                    if self._sdk_port is not None:
+                        position = row['position']
+                        if position is not None and position['entry_stopped'] and not position.get('preserve_open_on_stop'):
+                            for order in self._controller.child_orders(state, position, 'OPEN'):
+                                if request := self._controller.cancel(order, 'TARGET_REDUCED'):
+                                    effects.append(request)
                 self._controller.settle(state, row)
         if getattr(self, '_standalone_convergence', False) and state['synchronized']:
             unconfigured_observed = []
             for um in frame.get('unconfigured_markets', ()):
+                um_perm = infer_offline_market_permission(
+                    um, frame['wall_time'], clock_unverified=bool(state.get('clock_recovery_required')))
                 uticks = um.get('ticks') or ()
-                utick = uticks[-1] if (uticks and um.get('market_session_active', True)) else None
-                unconfigured_observed.append(um | {'tick': utick})
+                utick = uticks[-1] if (uticks and um_perm['continuous_matching']) else None
+                unconfigured_observed.append(um | {'tick': utick, 'market_permission': um_perm})
             ext_orders = frame.get('non_strategy_orders', ())
             if state['running']:
                 conv_effects, conv_status, conv_events = self._controller.plan_convergence(
                     state, observed_configured, unconfigured_observed, ext_orders,
-                    _utc(frame['wall_time']).timestamp())
+                    _utc(frame['wall_time']).timestamp(), wall_iso=frame['wall_time'])
                 effects.extend(conv_effects)
                 state['convergence_status'] = conv_status
                 self._emit_convergence_diagnostics(conv_status, conv_events)
             else:
                 state['convergence_status'] = self._compute_convergence_preview(
-                    state, observed_configured, unconfigured_observed, ext_orders)
+                    state, observed_configured, unconfigured_observed, ext_orders,
+                    wall_iso=frame['wall_time'], clock_unverified=bool(state.get('clock_recovery_required')))
         return decisions, effects
 
     def _infer_startup_targets(self, state, frame, day):
@@ -972,11 +1008,14 @@ class DsvSession:
                 row.pop('ownership_conflict', None)
 
     @staticmethod
-    def _compute_convergence_preview(state, configured_markets, unconfigured_markets, non_strategy_orders):
+    def _compute_convergence_preview(state, configured_markets, unconfigured_markets, non_strategy_orders,
+                                     *, wall_iso=None, clock_unverified=False):
         ext_contracts = {o['contract_id'] for o in (non_strategy_orders or ())}
         preview = {}
         for cid in sorted(configured_markets):
             m = configured_markets[cid]
+            perm = m.get('market_permission') or infer_offline_market_permission(
+                m, wall_iso, clock_unverified=clock_unverified)
             pos = state['symbols'][cid]['position']
             t_long = pos['owned'] if (pos is not None and pos['direction'] == 'LONG') else 0
             t_short = pos['owned'] if (pos is not None and pos['direction'] == 'SHORT') else 0
@@ -988,27 +1027,47 @@ class DsvSession:
             preview[cid] = {
                 'configured': True,
                 'status': 'PREVIEW_NEEDS_CONVERGENCE' if (ex_long or ex_short or has_ext) else 'ALIGNED',
+                'wait_reason': perm.get('wait_reason') if (ex_long or ex_short or has_ext) else None,
+                'failure_count': 0,
                 'actual_long': a_long,
                 'actual_short': a_short,
                 'target_long': t_long,
                 'target_short': t_short,
                 'excess_long': ex_long,
                 'excess_short': ex_short,
+                'market_phase': perm.get('market_phase'),
+                'evidence_state': perm.get('evidence_state'),
+                'status_source': perm.get('status_source'),
+                'continuous_matching': bool(perm.get('continuous_matching')),
+                'can_open': bool(perm.get('can_open')),
+                'can_close': bool(perm.get('can_close')),
+                'can_cancel': bool(perm.get('can_cancel')),
             }
         for m in sorted(unconfigured_markets, key=lambda item: item['contract_id']):
             cid = m['contract_id']
+            perm = m.get('market_permission') or infer_offline_market_permission(
+                m, wall_iso, clock_unverified=clock_unverified)
             a_long = int(m.get('long_qty') or 0)
             a_short = int(m.get('short_qty') or 0)
             has_ext = cid in ext_contracts
             preview[cid] = {
                 'configured': False,
                 'status': 'PREVIEW_NEEDS_CONVERGENCE' if (a_long or a_short or has_ext) else 'ALIGNED',
+                'wait_reason': perm.get('wait_reason') if (a_long or a_short or has_ext) else None,
+                'failure_count': 0,
                 'actual_long': a_long,
                 'actual_short': a_short,
                 'target_long': 0,
                 'target_short': 0,
                 'excess_long': a_long,
                 'excess_short': a_short,
+                'market_phase': perm.get('market_phase'),
+                'evidence_state': perm.get('evidence_state'),
+                'status_source': perm.get('status_source'),
+                'continuous_matching': bool(perm.get('continuous_matching')),
+                'can_open': bool(perm.get('can_open')),
+                'can_close': bool(perm.get('can_close')),
+                'can_cancel': bool(perm.get('can_cancel')),
             }
         return preview
 
@@ -1088,7 +1147,10 @@ class DsvSession:
         active_exit = position and position['exit_target'] is not None and position['owned'] > position['exit_target']
         reason = None
         if active_exit:
-            if not market.get('market_session_active'):
+            perm = market.get('market_permission') or {}
+            if not market.get('market_session_active') or perm.get('market_phase') in {
+                'AUCTION_ORDERING', 'AUCTION_MATCH', 'PRE_OPEN', 'INTRADAY_BREAK', 'HALTED', 'CLOSED',
+            }:
                 reason = 'EXIT_WAITING_FOR_SESSION'
             elif state.get('clock_recovery_required') and not market.get('allow_protective_exit', False):
                 reason = 'EXIT_WAITING_FOR_CLOCK_REVIEW'
@@ -1239,7 +1301,7 @@ class DsvSession:
         position_id = None if position is None else position.get('id')
         blocking_reasons = {
             'LATE_FILL_OWNERSHIP_REVIEW', 'UNRESOLVED_PRIOR_CHILD', 'USER_STOPPED',
-            'FEED_HEALTH_BLOCK', 'OUTSIDE_SESSION', 'QUOTE_UNAVAILABLE', 'QUOTE_AGE',
+            'FEED_HEALTH_BLOCK', 'OUTSIDE_SESSION', 'MARKET_HALTED', 'QUOTE_UNAVAILABLE', 'QUOTE_AGE',
             'CONVERGENCE_FLATTEN_PENDING', 'E_FOREIGN_ACTIVE_ORDER', 'EXTERNAL_POSITION_PRESENT',
             'UNOWNED_POSITION',
             'MINUTE_BAR_UNAVAILABLE', 'POSITION_WAITING_FOR_MARKET', 'DATA_GAP_EXIT_PENDING',
@@ -1351,10 +1413,26 @@ class DsvSession:
                 o.get('convergence_order') and o['contract_id'] == market['contract_id'] and not terminal(o)
                 for o in state['orders'].values()
             )
-            if has_conv_pending:
+            if market.get('external_active_orders') or market['long_qty'] or market['short_qty'] or has_conv_pending:
                 return [{'reason': 'CONVERGENCE_FLATTEN_PENDING', 'rule_ids': ['I01', 'I02']}]
+        perm = market.get('market_permission') or {}
         if tick is None:
+            phase = perm.get('market_phase')
+            if phase in {'AUCTION_ORDERING', 'AUCTION_MATCH'} and not self._trade.get('participate_auction', False):
+                return [{'reason': 'AUCTION_DISABLED', 'rule_ids': ['D06']}]
+            if phase == 'HALTED':
+                return [{'reason': 'MARKET_HALTED', 'rule_ids': ['D06']}]
+            if phase in {'PRE_OPEN', 'INTRADAY_BREAK', 'CLOSED'}:
+                return [{'reason': 'OUTSIDE_SESSION', 'rule_ids': ['D06']}]
             return [{'reason': 'QUOTE_UNAVAILABLE', 'rule_ids': ['D01']}]
+        if perm and not perm.get('can_open', True):
+            phase = perm.get('market_phase')
+            if phase in {'AUCTION_ORDERING', 'AUCTION_MATCH'} and not self._trade.get('participate_auction', False):
+                return [{'reason': 'AUCTION_DISABLED', 'rule_ids': ['D06']}]
+            if phase == 'HALTED':
+                return [{'reason': 'MARKET_HALTED', 'rule_ids': ['D06']}]
+            if phase in {'PRE_OPEN', 'INTRADAY_BREAK', 'CLOSED'}:
+                return [{'reason': 'OUTSIDE_SESSION', 'rule_ids': ['D06']}]
         if timing:
             if not self._in_session(frame, market):
                 return [{'reason': 'OUTSIDE_SESSION', 'rule_ids': ['D06']}]

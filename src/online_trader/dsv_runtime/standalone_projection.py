@@ -313,10 +313,14 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         excess_short = max(0, actual_short - target_short)
         conv = convergence_status.get(contract) or {}
         inf = startup_inference.get(contract) or {}
+        perm = market.get('market_permission') or {}
         conv_state = conv.get('status') or (
             'ALIGNED' if (actual_long == target_long and actual_short == target_short)
             else ('PREVIEW_NEEDS_CONVERGENCE' if not snapshot['running'] else 'CONVERGING')
         )
+        conv_wait_reason = conv.get('wait_reason') or (perm.get('wait_reason') if (excess_long or excess_short) else None)
+        market_phase = conv.get('market_phase') or perm.get('market_phase')
+        evidence_state = conv.get('evidence_state') or perm.get('evidence_state')
         account_positions.append({
             'contract_id': contract,
             'name': symbols[contract]['name'],
@@ -328,6 +332,10 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
             'excess_long': excess_long,
             'excess_short': excess_short,
             'status': conv_state,
+            'wait_reason': conv_wait_reason,
+            'failure_count': int(conv.get('failure_count') or 0),
+            'market_phase': market_phase,
+            'evidence_state': evidence_state,
             'startup_reason': inf.get('reason'),
             'market_session_active': market.get('market_session_active', True),
         })
@@ -358,6 +366,9 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
             'target_long': target_long,
             'target_short': target_short,
             'convergence_status': conv_state,
+            'convergence_wait_reason': conv_wait_reason,
+            'market_phase': market_phase,
+            'evidence_state': evidence_state,
             'day_stop_reason': day_stop_reason,
             'entry_reasons': list(dict.fromkeys(entry_reasons)),
             'trigger_prices': _trigger_lines(tick, symbols[contract]),
@@ -448,6 +459,7 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
     for cid in sorted(unconf_seen):
         um = unconfigured_dispatch.get(cid) or {}
         conv = convergence_status.get(cid) or {}
+        perm = um.get('market_permission') or {}
         actual_long = int(um.get('long_qty', conv.get('actual_long', 0)) or 0)
         actual_short = int(um.get('short_qty', conv.get('actual_short', 0)) or 0)
         last_px = um.get('last_price')
@@ -469,8 +481,12 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
             'excess_short': actual_short,
             'last': last_px,
             'status': conv_state,
+            'wait_reason': conv.get('wait_reason') or perm.get('wait_reason'),
+            'failure_count': int(conv.get('failure_count') or 0),
+            'market_phase': conv.get('market_phase') or perm.get('market_phase'),
+            'evidence_state': conv.get('evidence_state') or perm.get('evidence_state'),
             'startup_reason': 'UNCONFIGURED_CONTRACT',
-            'market_session_active': um.get('market_session_active', True),
+            'market_session_active': um.get('market_session_active', False),
         })
     trades.sort(key=lambda item: (int(item.get('event_seq') or 0), str(item.get('child_order_id') or '')))
     for child_id, order in snapshot['orders'].items():
