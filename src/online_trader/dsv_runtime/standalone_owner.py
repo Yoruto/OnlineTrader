@@ -7,6 +7,7 @@ an already synchronized SDK connection to the current temporary Journal.
 
 import copy
 from concurrent.futures import Future
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from threading import Event
 
@@ -23,7 +24,12 @@ from online_trader.dsv_runtime.standalone_projection import (
     projection_batch, workbench_positions, workbench_view,
 )
 from online_trader.errors import TraderError
+from online_trader.runtime.maintenance_policy import evaluate_responsibility
 from online_trader.runtime.startup_metadata import SDK_VERSION
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
 def _parameters_saved(receipt):
@@ -41,6 +47,8 @@ class StandaloneDsvOwner:
         # returns a token that ``on_parameters_restore`` uses to undo the write.
         self.on_parameters_saved = None
         self.on_parameters_restore = None
+        self.on_parameters_marker_write = None
+        self.on_parameters_marker_clear = None
         self.closed = False
         self.runtime_protocol = 'DSV_TARGET/1'
         self.kernel_epoch = 1
@@ -58,6 +66,11 @@ class StandaloneDsvOwner:
         self.publication_status = None
         self.stop_event = Event()
         self._shutdown_after_flatten = False
+        self.strategy_intent = 'STOPPED'
+        self.has_start_pending = False
+        self.maintenance = None
+        self.maintenance_completion = None
+        self._maintenance_verified_step = False
 
     def set_stream_tracking(self, enabled):
         self._track_commit_views = bool(enabled)
@@ -87,6 +100,19 @@ class StandaloneDsvOwner:
     def _check_owner(self):
         self.session._check_owner()
 
+    def set_initial_start_pending(self, pending):
+        self.has_start_pending = bool(pending)
+
+    def responsibility_summary(self, *, snapshot=None, ignore_maintenance=False):
+        state = self.snapshot() if snapshot is None else snapshot
+        return evaluate_responsibility(
+            state,
+            strategy_intent=self.strategy_intent,
+            has_start_pending=self.has_start_pending,
+            maintenance=None if ignore_maintenance else self.maintenance,
+            pending_commands=bool(self._pending),
+        )
+
     def snapshot(self):
         state = self.session.snapshot()
         state['projection_seq'] = self._projection_seq
@@ -99,6 +125,16 @@ class StandaloneDsvOwner:
             state['run_directory'] = self.run_directory
         state['runtime_commands'] = [copy.deepcopy(value)
                                      for value in list(self._command_receipts.values())[-64:]]
+        state['strategy_intent'] = self.strategy_intent
+        state['has_start_pending'] = self.has_start_pending
+        state['maintenance'] = copy.deepcopy(self.maintenance)
+        state['responsibility_summary'] = evaluate_responsibility(
+            state,
+            strategy_intent=self.strategy_intent,
+            has_start_pending=self.has_start_pending,
+            maintenance=self.maintenance,
+            pending_commands=bool(self._pending),
+        )
         return state
 
     def projection(self):
@@ -216,10 +252,54 @@ class StandaloneDsvOwner:
         command = translate_workbench_command(
             body, self.session.snapshot(), runtime_boot_id=self.boot_id,
             configuration_revision=self.configuration_revision)
+        if self.maintenance is not None and command['action'] in {'START', 'SAVE_PARAMETERS'}:
+            raise TraderError('E_NOT_READY', '维护停机进行中，已禁止启动或修改生效配置')
+        if command['action'] == 'SAFE_STOP_FOR_MAINTENANCE':
+            summary = self.responsibility_summary()
+            prep = self.session.prepare_shutdown()
+            if not summary['maintenance_allowed'] or not prep['ready']:
+                blockers = ','.join(summary['blockers']) or 'RESPONSIBILITY_ACTIVE'
+                raise TraderError(
+                    'E_NOT_READY',
+                    f'当前存在未结交易责任或异常，无法执行无平仓维护停机（{blockers}）',
+                )
+            self.session.record_maintenance_event('MAINTENANCE_STOP_REQUESTED', {
+                'command_id': command['id'],
+                'reason': command['reason'],
+                'boot_id': self.boot_id,
+                'account_key': self.account_key,
+                'responsibility': summary,
+            })
+            self.maintenance = {
+                'command_id': command['id'],
+                'reason': command['reason'],
+                'state': 'VERIFYING',
+            }
+            self.strategy_intent = 'STOPPED'
+            self.has_start_pending = False
+            self._maintenance_verified_step = False
+            self._authority_generation += 1
+            self._projection_seq += 1
+            if self._track_commit_views:
+                self._commit_views.append(self.snapshot())
+            self._update_stop_ready()
+            return {
+                'type': 'COMMAND',
+                'input_id': command['id'],
+                'state_after_digest': content_hash(summary),
+                'decisions': [{'reason': 'MAINTENANCE_STOP_REQUESTED', 'rule_ids': ['M01']}],
+                'effects': [],
+            }
         if command['action'] == 'SAVE_PARAMETERS':
             receipt = self._save_parameters(command)
         else:
             receipt = self.adapter.command(self.session, command)
+        if command['action'] == 'START':
+            self.strategy_intent = 'RUNNING'
+            self.has_start_pending = False
+        elif command['action'] in {'STOP', 'FLATTEN_STOP'}:
+            self.strategy_intent = 'STOPPED'
+            self.has_start_pending = False
         if command['action'] in {'START', 'STOP', 'FLATTEN_STOP'}:
             self._authority_generation += 1
         if command['action'] == 'FLATTEN_STOP':
@@ -255,6 +335,12 @@ class StandaloneDsvOwner:
             )
         if candidate is None or not callable(self.on_parameters_saved):
             return self._run_adapter_save(command, prepared)
+        if callable(self.on_parameters_marker_write):
+            self.on_parameters_marker_write(
+                old_hash=self.profile.content_hash,
+                new_hash=candidate.content_hash,
+                apply_id=command.get('id'),
+            )
         restore_token = self.on_parameters_saved(candidate)
         try:
             receipt = self._run_adapter_save(command, prepared)
@@ -264,10 +350,27 @@ class StandaloneDsvOwner:
                     'E_DSV_OWNER',
                     '参数已提交执行账本但未能完整应用；Runtime 停止以免参数事实分裂。') from error
             self._restore_parameters(restore_token)
+            self._clear_parameters_marker(strict=False)
             raise
         if not _parameters_saved(receipt):
             self._restore_parameters(restore_token)
+            self._clear_parameters_marker(strict=False)
+            return receipt
+        self._clear_parameters_marker(strict=True)
         return receipt
+
+    def _clear_parameters_marker(self, *, strict=True):
+        if not callable(self.on_parameters_marker_clear):
+            return
+        try:
+            self.on_parameters_marker_clear()
+        except Exception as error:
+            if strict:
+                self.session._failed = True
+                raise TraderError(
+                    'E_DSV_OWNER',
+                    '参数已生效，但清理待应用标记失败；下次启动需核对配置一致性。',
+                ) from error
 
     def _restore_parameters(self, token):
         if not callable(self.on_parameters_restore):
@@ -281,10 +384,14 @@ class StandaloneDsvOwner:
 
     def start_confirmed(self):
         """Enable entries after the desktop request and first complete frame."""
+        if self.maintenance is not None:
+            raise TraderError('E_NOT_READY', '维护停机进行中，已禁止自动启动策略')
         receipt = self.adapter.command(self.session, {
             'id': 'standalone-confirmed-start-' + self.boot_id,
             'action': 'START',
         })
+        self.strategy_intent = 'RUNNING'
+        self.has_start_pending = False
         self._authority_generation += 1
         self._projection_seq += 1
         self._commit_views.append(self.snapshot())
@@ -295,6 +402,8 @@ class StandaloneDsvOwner:
 
     def step(self, *, trading_day, complete):
         receipt = self.adapter.step(self.session, trading_day=trading_day, complete=complete)
+        if self.maintenance is not None:
+            self._maintenance_verified_step = True
         if receipt is not None:
             configured_contracts = getattr(self.adapter, 'contracts', None)
             if not configured_contracts:
@@ -349,6 +458,51 @@ class StandaloneDsvOwner:
     def _update_stop_ready(self):
         if self._shutdown_after_flatten and self.session.prepare_shutdown()['ready']:
             self.stop_event.set()
+            return
+        if self.maintenance is not None and self.maintenance.get('state') == 'VERIFYING':
+            if not self._maintenance_verified_step:
+                return
+            summary = self.responsibility_summary(ignore_maintenance=True)
+            prep = self.session.prepare_shutdown()
+            if summary['maintenance_allowed'] and prep['ready']:
+                completed = {
+                    'command_id': self.maintenance['command_id'],
+                    'reason': self.maintenance['reason'],
+                    'state': 'COMPLETED',
+                }
+                self.maintenance = completed
+                self.maintenance_completion = {
+                    'schema_version': 'DSV_MAINTENANCE_COMPLETION/1',
+                    'runtime_boot_id': self.boot_id,
+                    'account_key': self.account_key,
+                    'command_id': completed['command_id'],
+                    'reason': completed['reason'],
+                    'state': 'COMPLETED',
+                    'responsibility': summary,
+                    'completed_at_utc': _utc_now(),
+                }
+                try:
+                    self.session.record_maintenance_event('MAINTENANCE_STOP_COMPLETED', self.maintenance_completion)
+                except Exception:
+                    pass
+                self.stop_event.set()
+            else:
+                aborted = {
+                    'schema_version': 'DSV_MAINTENANCE_COMPLETION/1',
+                    'runtime_boot_id': self.boot_id,
+                    'account_key': self.account_key,
+                    'command_id': self.maintenance['command_id'],
+                    'reason': self.maintenance['reason'],
+                    'state': 'ABORTED',
+                    'responsibility': summary,
+                    'completed_at_utc': _utc_now(),
+                }
+                self.maintenance = None
+                self.maintenance_completion = aborted
+                try:
+                    self.session.record_maintenance_event('MAINTENANCE_STOP_ABORTED', aborted)
+                except Exception:
+                    pass
 
     def take_committed_views(self):
         views, self._commit_views = self._commit_views, []

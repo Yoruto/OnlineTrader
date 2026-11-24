@@ -1901,6 +1901,44 @@ class WorkbenchLayout:
         picker = self.account_picker
         picker.clear()
         if self.window._runtime_mode:
+            root = self.window._resolve_runtime_root()
+            if root is not None:
+                try:
+                    from online_trader.runtime.portable_config import PortableAccountStore
+                    pstore = PortableAccountStore(root, self.window._runtime_account)
+                    rows = pstore.read().get('accounts', [])
+                except Exception:
+                    rows = []
+                if rows:
+                    active_key = (self.window.view.get('account_key')
+                                  if self.window.view is not None else None)
+                    for account in sorted(rows, key=lambda item: item['provider'] != 'TQ_SIMNOW'):
+                        provider = 'SimNow' if account['provider'] == 'TQ_SIMNOW' else '快期模拟'
+                        picker.addItem(
+                            f"{provider} · {account['alias']} · {account['masked_login']}",
+                            account['account_id'],
+                        )
+                    target_id = None
+                    if active_key:
+                        target_id = next(
+                            (item['account_id'] for item in rows if item['account_key'] == active_key),
+                            None,
+                        )
+                    if target_id is None:
+                        target_id = pstore.read().get('selected_id')
+                    index = picker.findData(target_id) if target_id else -1
+                    if index >= 0:
+                        picker.setCurrentIndex(index)
+                    busy = (
+                        self.window._closing
+                        or self.window._runtime_shutdown_in_progress
+                        or self.window._runtime_bootstrap is not None
+                    )
+                    picker.setEnabled(not busy)
+                    self.account_switch.setEnabled(not busy)
+                    self.window.accounts_button.setEnabled(False)
+                    self.window.attach_button.setEnabled(False)
+                    return
             display = self.window.view.get('account_display') if self.window.view else None
             if isinstance(display, Mapping):
                 provider = {'TQ_SIMNOW': 'SimNow', 'TQKQ': '快期模拟'}.get(
@@ -2061,7 +2099,16 @@ class WorkbenchLayout:
             state, description = '授时恢复待续开', '等待授时和行情恢复 · 停止策略可取消续开'
         else:
             state = '已停止新开仓'
-            description = f'仍有 {quantity} 手策略持仓 · 保护状态见「策略持仓」' if quantity else '账户已连接 · 等待启动'
+            mode = (view or {}).get('runtime_mode')
+            if mode == 'DRAINING':
+                description = (
+                    f'收尾保护中 · 仍有 {quantity} 手已激活持仓或未终态委托'
+                    if quantity else '收尾保护中 · 等待未终态委托或异常核对结清'
+                )
+            elif mode == 'MONITORING':
+                description = '监控模式（未启动策略）· 账户已连接，可预览目标或切换账号/更新'
+            else:
+                description = f'仍有 {quantity} 手策略持仓 · 保护状态见「策略持仓」' if quantity else '账户已连接 · 等待启动'
         account = w.selected_account
         view_key = view['account_key'] if view else w.paired_account_key
         if account and view_key in (None, account['account_key']):

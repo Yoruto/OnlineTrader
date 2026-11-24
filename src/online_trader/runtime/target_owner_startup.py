@@ -7,6 +7,7 @@ DISARMED and the first complete native frame remains mandatory.
 
 from datetime import datetime, timezone
 from pathlib import Path
+import sqlite3
 import time
 
 from online_trader.contracts.codec import canonical_bytes
@@ -199,6 +200,43 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
         if configured_store is not None:
             owner.on_parameters_saved = configured_store.replace_profile
             owner.on_parameters_restore = configured_store.restore_overrides
+            repo = configured_store.config_repository() if hasattr(configured_store, 'config_repository') else None
+            if repo is not None:
+                owner.on_parameters_marker_write = (
+                    lambda *, old_hash, new_hash, apply_id=None, _repo=repo: _repo.write_pending_apply_marker(
+                        account_key=binding.account_key,
+                        boot_id=binding.boot_id,
+                        old_hash=old_hash,
+                        new_hash=new_hash,
+                        apply_id=apply_id,
+                    )
+                )
+                owner.on_parameters_marker_clear = repo.clear_pending_apply_marker
+                try:
+                    pending_marker = repo.read_pending_apply_marker()
+                except TraderError as error:
+                    if diagnostic_sink is not None:
+                        diagnostic_sink.record(
+                            'CONFIG_APPLY_MARKER_CORRUPTED', component='CONFIG', severity='ERROR',
+                            priority='HIGH', error_code=error.code,
+                            payload={'authority_effect': 'DISARMED'},
+                        )
+                    raise
+                if pending_marker is not None and diagnostic_sink is not None:
+                    matched_state = (
+                        'NEW_HASH_PRESENT' if pending_marker.get('new_hash') == profile.content_hash
+                        else 'OLD_HASH_PRESENT' if pending_marker.get('old_hash') == profile.content_hash
+                        else 'HASH_CONFLICT'
+                    )
+                    diagnostic_sink.record(
+                        'CONFIG_APPLY_MARKER_PENDING', component='CONFIG', severity='WARNING',
+                        priority='HIGH',
+                        payload={
+                            'authority_effect': 'DISARMED',
+                            'marker_state': matched_state,
+                            'apply_id': pending_marker.get('apply_id'),
+                        },
+                    )
         resolved_pid = _resolve_trusted_pid(trusted_control_pid)
         resolved_entry_point = entry_point or (
             'online-trader-desktop'
@@ -249,9 +287,21 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                     payload={'authority_effect': 'NONE', 'exception_type': type(error).__name__},
                 )
 
-        history_writer = BrokerHistoryWriter(
-            history_cache, binding.account_key, binding.provider,
-            on_error=history_error)
+        try:
+            history_writer = BrokerHistoryWriter(
+                history_cache, binding.account_key, binding.provider,
+                on_error=history_error)
+        except (sqlite3.Error, OSError, TraderError) as error:
+            history_writer = None
+            history_error(error)
+            if diagnostic_sink is not None:
+                code = getattr(error, 'code', 'E_HISTORY_CACHE_INIT')
+                diagnostic_sink.record(
+                    'HISTORY_CACHE_UNAVAILABLE', component='HISTORY', severity='WARNING',
+                    priority='HIGH',
+                    error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_HISTORY_CACHE_INIT',
+                    payload={'authority_effect': 'NONE', 'exception_type': type(error).__name__},
+                )
         publish_replace_bytes(canonical_bytes({
             'phase': 'WAITING_FOR_NATIVE_SYNC', 'runtime_boot_id': binding.boot_id,
             'account_key': binding.account_key, 'entry_authority': 'DISARMED',
@@ -325,6 +375,15 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
         with attach_order_blocking_log(output), market_diagnostics:
             server.serve(stop_event=owner.stop_event, owner_tick=tick, publish_workbench=True)
         shutdown = owner.session.prepare_shutdown()
+        maintenance_completion = getattr(owner, 'maintenance_completion', None)
+        if maintenance_completion is not None:
+            try:
+                publish_replace_bytes(
+                    canonical_bytes(maintenance_completion),
+                    output / 'maintenance-completion.json',
+                )
+            except (OSError, TraderError):
+                pass
         if diagnostic_sink is not None:
             final_state = owner.snapshot()
             journal_sequence = final_state.get('sequence')
@@ -339,14 +398,20 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                     'clean_shutdown': True,
                     'shutdown_status': shutdown.get('status'),
                     'entry_authority': 'DISARMED',
+                    'maintenance_state': (
+                        None if maintenance_completion is None else maintenance_completion.get('state')
+                    ),
                 },
             )
-        publish_replace_bytes(canonical_bytes({
+        stopped_payload = {
             'phase': 'STOPPED', 'runtime_boot_id': binding.boot_id,
             'account_key': binding.account_key, 'entry_authority': 'DISARMED',
             'execution_core': 'DSV_TARGET_EXECUTION', 'shutdown': shutdown,
             'observed_at_utc': _utc_now(),
-        }), status)
+        }
+        if maintenance_completion is not None:
+            stopped_payload['maintenance_completion'] = maintenance_completion
+        publish_replace_bytes(canonical_bytes(stopped_payload), status)
         if diagnostic_sink is not None:
             diagnostic_sink.record(
                 'OWNER_STOPPED', component='LIFECYCLE', priority='CRITICAL',
@@ -372,7 +437,13 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
         raise
     finally:
         if history_writer is not None:
-            history_writer.close()
+            closed_cleanly = history_writer.close()
+            if closed_cleanly is False and diagnostic_sink is not None:
+                diagnostic_sink.record(
+                    'HISTORY_CACHE_CLOSE_PARTIAL', component='HISTORY', severity='WARNING',
+                    priority='HIGH',
+                    payload={'authority_effect': 'NONE', 'coverage_status': 'PARTIAL'},
+                )
         if owner is not None:
             owner.close()
         elif connection is not None:

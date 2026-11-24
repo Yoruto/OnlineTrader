@@ -1039,6 +1039,22 @@
       ],
       "additionalProperties": false
     },
+    "Params_SAFE_STOP_FOR_MAINTENANCE": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "enum": [
+            "SWITCH_ACCOUNT",
+            "UPDATE",
+            "RESTART_CONFIG"
+          ]
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "additionalProperties": false
+    },
     "Params_STOP_DSV_STRATEGY": {
       "type": "object",
       "properties": {"evidence_hash": {"$ref": "#/$defs/hash"}, "recover_flat": {"const": true}},
@@ -1298,6 +1314,7 @@
             "BEGIN_TAKEOVER",
             "CONFIRM_TAKEOVER",
             "ENTER_MAINTENANCE",
+            "SAFE_STOP_FOR_MAINTENANCE",
             "MANUAL_OPEN",
             "ADOPT_EXTERNAL_POSITION",
             "CANCEL_NATIVE_ACCOUNT",
@@ -1407,6 +1424,16 @@
                 },
                 "parameters": {
                   "$ref": "#/$defs/Params_ENTER_MAINTENANCE"
+                }
+              }
+            },
+            {
+              "properties": {
+                "operation": {
+                  "const": "SAFE_STOP_FOR_MAINTENANCE"
+                },
+                "parameters": {
+                  "$ref": "#/$defs/Params_SAFE_STOP_FOR_MAINTENANCE"
                 }
               }
             },

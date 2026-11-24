@@ -12,6 +12,7 @@ from online_trader.dsv_core.entry_rules import trigger_prices
 from online_trader.errors import TraderError
 from online_trader.gateway.dsv_facts import native_integer
 from online_trader.gateway.tqkq import number
+from online_trader.runtime.maintenance_policy import evaluate_responsibility
 
 
 def _utc_now():
@@ -514,6 +515,15 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
     storage_failed = bool(snapshot.get('storage_failed', False))
     clock_fault = snapshot.get('clock_recovery_required')
     owner_fault = snapshot.get('owner_fault_code')
+    maintenance = snapshot.get('maintenance')
+    responsibility = snapshot.get('responsibility_summary')
+    if not isinstance(responsibility, dict):
+        responsibility = evaluate_responsibility(
+            snapshot,
+            strategy_intent=snapshot.get('strategy_intent') or ('RUNNING' if snapshot.get('running') else 'STOPPED'),
+            has_start_pending=bool(snapshot.get('has_start_pending')),
+            maintenance=maintenance,
+        )
     operation_scopes = {
         'ARM_ENTRIES': 'ACCOUNT',
         'PAUSE_NEW_ENTRIES': 'ACCOUNT',
@@ -523,6 +533,7 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         'CANCEL_SELECTED': 'SELECTED_ORDERS',
         'CANCEL_OWNED': 'OWNED_ORDERS',
         'FLATTEN_THEN_STOP': 'ACCOUNT',
+        'SAFE_STOP_FOR_MAINTENANCE': 'ACCOUNT',
         'REQUEST_RECONCILIATION': 'ACCOUNT',
         'SAVE_DSV_PARAMETERS': 'ACCOUNT',
     }
@@ -530,15 +541,22 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
     for operation, scope_type in operation_scopes.items():
         if storage_failed:
             allowed, reason = False, 'E_STORAGE'
-        elif operation == 'ARM_ENTRIES':
-            allowed = synchronized and not snapshot['running'] and not clock_fault and not owner_fault
+        elif operation == 'SAFE_STOP_FOR_MAINTENANCE':
+            allowed = bool(responsibility['maintenance_allowed']) and connected and adapter_synchronized
             reason = (None if allowed else
+                      (responsibility['blockers'][0] if responsibility.get('blockers') else 'RUNTIME_NOT_READY'))
+        elif operation == 'ARM_ENTRIES':
+            allowed = (synchronized and not snapshot['running'] and not clock_fault
+                       and not owner_fault and maintenance is None)
+            reason = (None if allowed else
+                      'MAINTENANCE_IN_FLIGHT' if maintenance is not None else
                       'CLOCK_FAULT' if clock_fault else
                       owner_fault if owner_fault else
                       'ALREADY_ARMED' if snapshot['running'] else 'RUNTIME_NOT_READY')
         elif operation == 'SAVE_DSV_PARAMETERS':
-            allowed = synchronized and not clock_fault and not owner_fault
+            allowed = synchronized and not clock_fault and not owner_fault and maintenance is None
             reason = (None if allowed else
+                      'MAINTENANCE_IN_FLIGHT' if maintenance is not None else
                       'CLOCK_FAULT' if clock_fault else
                       owner_fault if owner_fault else 'RUNTIME_NOT_READY')
         elif operation == 'FLATTEN_THEN_STOP':
@@ -643,6 +661,26 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
             'owned_quantity': sum(row['remaining_quantity'] for row in cycles),
             'active_orders': sum(1 for order in snapshot['orders'].values() if not terminal(order)),
         },
+        'runtime_mode': responsibility['mode'],
+        'strategy_intent': responsibility['strategy_intent'],
+        'responsibility': {
+            'state': responsibility['state'],
+            'protected_lots_total': responsibility['protected_lots_total'],
+            'unresolved_children': len(responsibility['unresolved_child_ids']),
+            'unresolved_convergence_cancels': len(responsibility['unresolved_convergence_cancel_ids']),
+            'conflict_contracts': list(responsibility['conflict_contracts'])[:64],
+            'preview_only_contracts': list(responsibility['preview_only_contracts'])[:64],
+            'blockers': list(responsibility['blockers'])[:32],
+            'maintenance_allowed': bool(responsibility['maintenance_allowed']) and connected and adapter_synchronized,
+        },
+        'maintenance': (
+            {
+                'command_id': str(maintenance['command_id']),
+                'reason': str(maintenance['reason']),
+                'state': str(maintenance['state']),
+            }
+            if isinstance(maintenance, dict) else None
+        ),
     }
     account_snapshot = snapshot.get('account_snapshot')
     if account_snapshot is not None:

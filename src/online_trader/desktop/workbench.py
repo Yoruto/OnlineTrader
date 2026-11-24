@@ -232,6 +232,7 @@ class WorkbenchWindow(StatusWindow):
             sys.excepthook = diagnostic_excepthook
         self._runtime_shutdown_verified = False
         self._runtime_shutdown_in_progress = False
+        self._update_restart_in_progress = False
         self._runtime_bootstrap = None
         self._runtime_client_store = None
         self._runtime_coordinator = None
@@ -346,7 +347,7 @@ class WorkbenchWindow(StatusWindow):
         if self._guard_launch and self.store is not None:
             QTimer.singleShot(0, self.check_timed_start)
         self._enable_commands(False)
-        if runtime_view:
+        if runtime_view and pipe_name:
             self._attach_runtime_pipe(pipe_name)
 
     def _attach_runtime_pipe(self, pipe_name):
@@ -451,6 +452,8 @@ class WorkbenchWindow(StatusWindow):
             account_type = '模拟账户' if key.startswith('SIM:') else '正常账户' if key.startswith('LIVE:') else '账户类型未知'
             login = self._account_login if key == self.paired_account_key else None
             return account_type, login or '未提供'
+        if self._runtime_mode and self.view is None:
+            return '未连接', '未同步'
         return '', '未选择'
 
     def show_home_feedback(self, message):
@@ -524,6 +527,12 @@ class WorkbenchWindow(StatusWindow):
                 self._start_runtime_receipt(args)
             else:
                 self.show_home_feedback('此操作尚未提供独立运行时入口。')
+            return
+        if self._runtime_mode:
+            if action == 'refresh':
+                self.show_home_feedback('当前尚未连接到 Runtime，请切换账号或重新启动连接。')
+            else:
+                self.show_home_feedback('当前尚未连接到 Runtime，无法提交控制操作。')
             return
         if (action == 'command' and self.published_snapshot_expired()
                 and args[0] not in OWNER_RECHECK_OPERATIONS):
@@ -1783,6 +1792,11 @@ class WorkbenchWindow(StatusWindow):
         self.dashboard.reload_accounts()
 
     def select_account(self):
+        if self._runtime_mode:
+            account_id = self.dashboard.account_picker.currentData()
+            if account_id is not None:
+                self.switch_runtime_account(account_id)
+            return
         if self.store is None or self.paired_launcher is not None:
             return
         account_id = self.dashboard.account_picker.currentData()
@@ -1793,6 +1807,151 @@ class WorkbenchWindow(StatusWindow):
         except TraderError as error:
             self.notice_label.setText(f'账号未切换 · {error} · {error.code}')
             self.dashboard.reload_accounts()
+
+    def switch_runtime_account(self, target_account_id):
+        if (self._closing or self._runtime_shutdown_in_progress
+                or self._runtime_bootstrap is not None
+                or (self._runtime_command_bus is not None and self._runtime_command_bus.has_inflight)):
+            QMessageBox.information(self, '切换交易账号', '请等待当前操作或连接步骤结束后再切换账号。')
+            return False
+        root = self._resolve_runtime_root()
+        if root is None:
+            QMessageBox.warning(self, '切换交易账号', '当前会话未绑定 runtime 目录，无法执行账号切换。')
+            return False
+        from online_trader.desktop.runtime_bootstrap import BootstrapController
+        from online_trader.runtime.portable_config import PortableAccountStore
+        from online_trader.runtime.shutdown import (
+            inspect_runtime_for_exit, maintenance_stop_runtime_and_wait,
+        )
+        try:
+            store = PortableAccountStore(root)
+            account = store.get(target_account_id)
+        except (TraderError, OSError, KeyError) as error:
+            QMessageBox.warning(self, '切换交易账号', f'所选账号配置无效：{error}')
+            self.dashboard.reload_accounts()
+            return False
+
+        if self.view is not None and self.view.get('account_key') == account['account_key']:
+            self.show_home_feedback('当前已连接到所选账号。')
+            self.dashboard.reload_accounts()
+            return True
+
+        if self.pipe_name:
+            view, pid, inspect_error = inspect_runtime_for_exit(self.pipe_name)
+            if view is None and pid is not None:
+                QMessageBox.warning(
+                    self,
+                    '未能切换账号',
+                    f'{inspect_error or "无法读取当前后台交易服务状态。"}\n\n为确保账户安全，未切换账号。',
+                )
+                self.dashboard.reload_accounts()
+                return False
+            if view is not None:
+                resp = view.get('responsibility')
+                if isinstance(resp, Mapping) and not resp.get('maintenance_allowed'):
+                    blockers = '、'.join(str(code) for code in (resp.get('blockers') or ())) or '存在未结交易责任'
+                    QMessageBox.warning(
+                        self,
+                        '当前不可切换账号',
+                        f'当前账户仍处于交易或保护收尾状态，不能安全切换（{blockers}）。\n\n'
+                        '请先停止策略并等待所有已激活持仓与在途委托结清后再试；系统不会自动强行平仓。',
+                    )
+                    self.dashboard.reload_accounts()
+                    return False
+                ok, stop_error = self._run_runtime_shutdown(
+                    lambda pipe, **kw: maintenance_stop_runtime_and_wait(
+                        pipe, reason='SWITCH_ACCOUNT', **kw,
+                    ),
+                    pid=pid,
+                    view=view,
+                    title='OnlineTrader · 切换交易账号',
+                    label=f"正在安全停止当前会话并切换到 {account['alias']}…",
+                )
+                if not ok:
+                    QMessageBox.critical(
+                        self,
+                        '当前会话未能安全停止',
+                        f'{stop_error or "未能确认原后台服务安全退出。"}\n\n原会话与状态保持不变。',
+                    )
+                    self.dashboard.reload_accounts()
+                    return False
+
+        self._detach_runtime_client()
+        self.view = None
+        self._boot = None
+        self._stale = True
+        self._account_key = None
+        self.snapshot_published_ns = None
+        self._publication_after_ns = 0
+        self.receipt_identity = None
+        self._control_notice = None
+        self._last_account_record = {}
+        self._base_cycle_ids = []
+        self._runtime_account = account['account_id']
+        self.pipe_name = store.pipe_name(account)
+        self.home_issue = ''
+        if self._reports_window is not None:
+            self._reports_window.close()
+            self._reports_window = None
+        for grid in (*self.tables.values(), self.cycles, *self.dashboard.manual_tables.values()):
+            grid.setRowCount(0)
+        self.funds_label.setText('资金未知 · 等待所选账号同步')
+        self.connection_label.setText('等待所选账户同步')
+        self.connection_detail.setText('尚未连接 · 等待柜台同步')
+        self.kernel_label.setText('内核：未知 · 新仓权限：未知')
+        self.dashboard.reset_account_view(preserve_logs=True)
+        self.dashboard.render_home()
+        self.dashboard.reload_accounts()
+        self.show_home_feedback(f"正在切换到 {account['alias']}（仅监控，不自动开仓）…")
+
+        controller = BootstrapController(
+            store.directory,
+            account=account['account_id'],
+            attach_policy='attach-exact',
+            expected_account_key=account['account_key'],
+            parent=self,
+        )
+        self._runtime_bootstrap = controller
+
+        def cleanup():
+            if self._runtime_bootstrap is controller:
+                self._runtime_bootstrap = None
+            controller.deleteLater()
+
+        def on_ready(new_pipe):
+            cleanup()
+            if self._closing:
+                return
+            self._attach_runtime_pipe(new_pipe)
+            try:
+                store.select_saved_account(account['account_id'])
+                self.show_home_feedback(f"已切换到 {account['alias']}（监控模式，新增开仓保持关闭）。")
+            except (TraderError, OSError):
+                self.show_home_feedback(
+                    f"已连接到 {account['alias']}（监控模式），但未能保存默认启动选择，可稍后重试。",
+                )
+            self.dashboard.reload_accounts()
+
+        def on_failed(error):
+            cleanup()
+            code = getattr(error, 'code', 'E_RUNTIME_START')
+            self.home_issue = f'{error}\n\n错误代码：{code}'
+            self.show_home_feedback(f'切换账号失败（{code}）；当前未连接，可重新选择账号或检查配置。')
+            self.dashboard.render_home()
+            self.dashboard.reload_accounts()
+            QMessageBox.critical(self, '切换交易账号失败', self.home_issue)
+
+        def on_cancelled():
+            cleanup()
+            self.show_home_feedback('已取消等待新账号连接；当前处于未连接状态。')
+            self.dashboard.render_home()
+            self.dashboard.reload_accounts()
+
+        controller.ready.connect(on_ready)
+        controller.failed.connect(on_failed)
+        controller.cancelled.connect(on_cancelled)
+        controller.start()
+        return True
 
     def attach_selected(self):
         if self.store is None or self.paired_launcher is not None:return
@@ -1999,7 +2158,8 @@ class WorkbenchWindow(StatusWindow):
             self._tray.on_minimized()
 
     def _confirm_and_stop_runtime(self):
-        if not self._runtime_mode or not self.pipe_name or self._runtime_shutdown_verified:
+        if (not self._runtime_mode or not self.pipe_name
+                or self._runtime_shutdown_verified or self._update_restart_in_progress):
             return True
         from online_trader.runtime.shutdown import inspect_runtime_for_exit, shutdown_runtime_and_wait
 
@@ -2162,27 +2322,33 @@ class WorkbenchWindow(StatusWindow):
             changes.append('已修改交易日历或定时设置')
         summary = '\n'.join(f'· {line}' for line in changes)
 
-        open_cycles = [row for row in (view or {}).get('cycles', ()) if row.get('remaining_quantity', 0) > 0]
-        active_orders = [row for row in (view or {}).get('orders', ()) if row.get('potential_remaining', 0) > 0]
-        external_positions = (view or {}).get('external_positions') or []
-        conn = (view or {}).get('connection') or {}
-        unaligned_positions = [
-            row for row in (conn.get('account_positions') or ())
-            if (not row.get('configured') and (row.get('actual_long') or row.get('actual_short')))
-            or row.get('excess_long') or row.get('excess_short')
-        ]
-        armed = bool(view and view.get('entry_authority') == 'ARMED')
+        resp = (view or {}).get('responsibility')
         busy_reasons = []
         if not fresh_view:
             busy_reasons.append('当前后台状态快照未就绪或已过期')
-        if armed:
-            busy_reasons.append('策略当前已启用开仓（请先按 F6 停止策略）')
-        if open_cycles:
-            busy_reasons.append(f'存在 {len(open_cycles)} 个未平仓持仓周期')
-        if active_orders:
-            busy_reasons.append(f'存在 {len(active_orders)} 笔未终结委托')
-        if external_positions or unaligned_positions or conn.get('recovery_required') or conn.get('clock_fault'):
-            busy_reasons.append('存在未收敛持仓或连接/时钟异常')
+        if isinstance(resp, Mapping):
+            if not resp.get('maintenance_allowed'):
+                blockers = [str(code) for code in (resp.get('blockers') or ())]
+                busy_reasons.append('存在未结交易责任或异常：' + '、'.join(blockers or ['NOT_READY']))
+        else:
+            open_cycles = [row for row in (view or {}).get('cycles', ()) if row.get('remaining_quantity', 0) > 0]
+            active_orders = [row for row in (view or {}).get('orders', ()) if row.get('potential_remaining', 0) > 0]
+            external_positions = (view or {}).get('external_positions') or []
+            conn = (view or {}).get('connection') or {}
+            unaligned_positions = [
+                row for row in (conn.get('account_positions') or ())
+                if (not row.get('configured') and (row.get('actual_long') or row.get('actual_short')))
+                or row.get('excess_long') or row.get('excess_short')
+            ]
+            armed = bool(view and view.get('entry_authority') == 'ARMED')
+            if armed:
+                busy_reasons.append('策略当前已启用开仓（请先按 F6 停止策略）')
+            if open_cycles:
+                busy_reasons.append(f'存在 {len(open_cycles)} 个未平仓持仓周期')
+            if active_orders:
+                busy_reasons.append(f'存在 {len(active_orders)} 笔未终结委托')
+            if external_positions or unaligned_positions or conn.get('recovery_required') or conn.get('clock_fault'):
+                busy_reasons.append('存在未收敛持仓或连接/时钟异常')
 
         if busy_reasons:
             box = QMessageBox(self)
@@ -2235,11 +2401,16 @@ class WorkbenchWindow(StatusWindow):
         if self._runtime_shutdown_in_progress or self._runtime_bootstrap is not None:
             return False
         from online_trader.desktop.runtime_bootstrap import BootstrapController
-        from online_trader.runtime.shutdown import inspect_runtime_for_exit, shutdown_runtime_and_wait
+        from online_trader.runtime.shutdown import (
+            inspect_runtime_for_exit, maintenance_stop_runtime_and_wait,
+        )
 
         view, pid, _ = inspect_runtime_for_exit(self.pipe_name)
         ok, stop_error = self._run_runtime_shutdown(
-            shutdown_runtime_and_wait, pid=pid, view=view or self.view,
+            lambda pipe, **kw: maintenance_stop_runtime_and_wait(
+                pipe, reason='RESTART_CONFIG', **kw,
+            ),
+            pid=pid, view=view or self.view,
             title='OnlineTrader · 应用新合约配置',
             label='正在安全停止当前后台服务并保存新合约配置…',
         )
@@ -2387,11 +2558,44 @@ class WorkbenchWindow(StatusWindow):
     def prepare_update_restart(self):
         if (self._startup_in_progress or self._worker is not None
                 or self._runtime_bootstrap is not None
+                or self._runtime_shutdown_in_progress
                 or (self._runtime_command_bus is not None and self._runtime_command_bus.has_inflight)
                 or (self._strategy_starter is not None and self._strategy_starter.is_preparing())
                 or (self._session_dialog is not None
                     and getattr(self._session_dialog, 'is_preparing', lambda: False)())):
             raise TraderError('E_ACCOUNT_BUSY', '请等待当前账户操作结束后再更新')
+        if not self._runtime_mode or not self.pipe_name:
+            return
+        from online_trader.runtime.shutdown import (
+            inspect_runtime_for_exit, maintenance_stop_runtime_and_wait,
+        )
+        view, pid, inspect_error = inspect_runtime_for_exit(self.pipe_name)
+        if view is None and pid is not None:
+            raise TraderError(
+                'E_RUNTIME_STOP',
+                inspect_error or f'后台交易服务（PID {pid}）仍在运行，暂不能安装更新',
+            )
+        if view is not None:
+            resp = view.get('responsibility')
+            if isinstance(resp, Mapping) and not resp.get('maintenance_allowed'):
+                blockers = '、'.join(str(code) for code in (resp.get('blockers') or ())) or '存在未结交易责任'
+                raise TraderError(
+                    'E_NOT_READY',
+                    f'当前存在未结交易责任或策略仍在运行（{blockers}），请先停止策略并结清持仓/委托后再更新',
+                )
+            ok, stop_error = self._run_runtime_shutdown(
+                lambda pipe, **kw: maintenance_stop_runtime_and_wait(
+                    pipe, reason='UPDATE', **kw,
+                ),
+                pid=pid,
+                view=view,
+                title='OnlineTrader · 准备软件更新',
+                label='正在核对账户无未结责任并安全退出后台服务…',
+            )
+            if not ok:
+                raise TraderError('E_RUNTIME_STOP', stop_error or '未能确认后台交易服务安全退出')
+        self._update_restart_in_progress = True
+        self._runtime_shutdown_verified = True
 
 
 def run(pipe_name,*,store=None,account_id=None,paired_launcher=None,dsv_config=None,autostart=False,

@@ -6,10 +6,14 @@ from pathlib import Path
 from online_trader.accounts import AccountStore, account_identity
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.files import load_profile, publish_replace_bytes
+from online_trader.configuration.repository import (
+    ParameterConfigRepository, merge_settings as _merge_settings, settings_diff as _settings_diff,
+)
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.domain.values import identifier
 from online_trader.errors import TraderError
 from online_trader.ledger.store import Ledger
+from online_trader.runtime.instance import AccountLock
 
 
 _MAX_CONFIG_BYTES = 262_144
@@ -67,14 +71,22 @@ class PortableAccountStore(AccountStore):
                     or type(private['accounts']) is not dict):
                 raise ValueError()
             self._aliases = {}
+            self._config = config
+            self._private = private
             rows = [self._account(item, private['accounts']) for item in config['accounts']]
             if private['accounts'].keys() != self._aliases.keys():
                 raise ValueError()
             default_id = self._aliases[config['selected_account']]
+            self._by_account_id = {row['account_id']: item['id'] for item, row in zip(config['accounts'], rows)}
             self._state = {'revision': 1, 'previous_hash': '0' * 64, 'accounts': rows, 'selected_id': default_id}
             self._validate(self._state)
             if selected_id is not None:
-                self._state['selected_id'] = self._aliases[selected_id]
+                if selected_id in self._aliases:
+                    self._state['selected_id'] = self._aliases[selected_id]
+                elif selected_id in self._by_account_id:
+                    self._state['selected_id'] = selected_id
+                else:
+                    raise KeyError(selected_id)
         except (ValueError, KeyError, TypeError):
             raise TraderError('E_RUNTIME_CONFIG', 'Account, provider or private login configuration is invalid') from None
 
@@ -108,65 +120,76 @@ class PortableAccountStore(AccountStore):
         rows = [row.copy() for row in self._state['accounts']]
         return self._state | {'accounts': rows, 'journal_hash': content_hash(self._state)}
 
+    def catalogue_hash(self):
+        return content_hash(self._config)
+
+    def select_saved_account(self, alias_or_account_id, *, expected_catalogue_hash=None):
+        """Atomically persist ``selected_account`` in runtime.json under the catalogue lock."""
+        with AccountLock('CATALOGUE:' + str(self.directory).casefold()):
+            config = _read(self.directory, 'runtime.json')
+            private = _read(self.directory, 'private/OnlineTrader-defaults.json')
+            if (type(config) is not dict
+                    or config.keys() != {'schema_version', 'selected_account', 'accounts'}
+                    or config['schema_version'] != 'ONLINE_TRADER_RUNTIME/1'
+                    or type(config['accounts']) is not list or not 1 <= len(config['accounts']) <= 64
+                    or type(private) is not dict or private.keys() != {'accounts'}):
+                raise TraderError('E_RUNTIME_CONFIG', 'Account or private configuration is invalid')
+            if expected_catalogue_hash is not None and content_hash(config) != expected_catalogue_hash:
+                raise TraderError('E_REVISION_CONFLICT', 'Runtime account catalogue changed before selection')
+            target_alias = None
+            target_row = None
+            for item in config['accounts']:
+                name = identifier(item['id'])
+                simnow = item['provider'] == 'TQ_SIMNOW'
+                secret = private['accounts'].get(name)
+                if type(secret) is not dict:
+                    raise TraderError('E_RUNTIME_CONFIG', 'Selected account lacks private login configuration')
+                username = secret['simnow_username'] if simnow else secret['username']
+                key, masked = account_identity(username, item['provider'])
+                account_id = 'account-' + content_hash(key)[:32]
+                if alias_or_account_id in (name, account_id):
+                    target_alias = name
+                    target_row = {
+                        'account_id': account_id, 'environment': 'ONLINE_SIM', 'account_key': key,
+                        'alias': item['alias'], 'provider': item['provider'], 'masked_login': masked,
+                        'broker': item['broker'], 'line': item['line'],
+                    }
+                    break
+            if target_alias is None or target_row is None:
+                raise TraderError('E_RUNTIME_CONFIG', 'The selected account does not exist in runtime.json')
+            updated = dict(config, selected_account=target_alias)
+            publish_replace_bytes(canonical_bytes(updated), self.directory / 'runtime.json')
+            self._config = updated
+            self._state['selected_id'] = target_row['account_id']
+            return target_row
+
     def change(self, *args, **kwargs):
         raise TraderError('E_RUNTIME_CONFIG', 'Edit the runtime account configuration through its local entry')
 
     save_credentials = forget_credentials = initialize_simulation_accounts = change
 
+    def config_repository(self):
+        return ParameterConfigRepository(self.directory)
+
     def profile(self):
-        path = (self.directory / 'OnlineTrader-parameters.json').resolve()
-        if not path.is_relative_to(self.directory):
-            raise TraderError('E_RUNTIME_CONFIG', 'The parameter file must resolve inside the runtime directory')
-        return self.profile_with_defaults(path)
+        repo = self.config_repository()
+        return repo.load_effective(repo.defaults_path())
 
     def profile_with_defaults(self, path):
         """Validate user overrides against an explicit version-default file."""
-        path = Path(path).resolve()
-        baseline = load_profile(path, dsv=True)
-        overrides = self.directory / _OVERRIDES_FILE
-        if not overrides.exists():
-            return baseline
-        value = _read(self.directory, _OVERRIDES_FILE)
-        if (type(value) is not dict or value.keys() != {'schema_version', 'overrides'}
-                or value['schema_version'] != _OVERRIDES_SCHEMA or type(value['overrides']) is not dict):
-            raise TraderError('E_RUNTIME_CONFIG', 'The Runtime parameter overrides are invalid')
-        try:
-            settings = _merge_settings(baseline.to_record()['settings'], value['overrides'])
-            return DsvProfile.from_record({'schema_version': 'DSV_SETTINGS/1', 'settings': settings})
-        except (KeyError, TypeError, ValueError, TraderError):
-            raise TraderError('E_RUNTIME_CONFIG',
-                              'The saved parameter overrides do not apply to this version defaults') from None
+        return self.config_repository().load_effective(path)
 
     def save_profile(self, profile):
         """Persist only explicit differences from the current version defaults."""
-        if not isinstance(profile, DsvProfile):
-            raise TraderError('E_RUNTIME_CONFIG', 'Expected validated Runtime parameters')
-        baseline = load_profile(self.directory / 'OnlineTrader-parameters.json', dsv=True)
-        overrides = _settings_diff(baseline.to_record()['settings'], profile.to_record()['settings'])
-        value = {'schema_version': _OVERRIDES_SCHEMA, 'overrides': overrides}
-        publish_replace_bytes(canonical_bytes(value), self.directory / _OVERRIDES_FILE)
-        return value
+        return self.config_repository().save_overrides(profile)
 
     def replace_profile(self, profile):
         """Persist ``profile`` and return the previous overrides bytes (``None`` when absent)."""
-        path = self.directory / _OVERRIDES_FILE
-        try:
-            previous = path.read_bytes() if path.exists() else None
-        except OSError as error:
-            raise TraderError('E_CONFIG_FILE', 'Cannot read the current parameter overrides') from error
-        self.save_profile(profile)
-        return previous
+        return self.config_repository().replace_overrides(profile)
 
     def restore_overrides(self, previous):
         """Undo ``replace_profile`` with the bytes it returned."""
-        path = self.directory / _OVERRIDES_FILE
-        if previous is None:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as error:
-                raise TraderError('E_CONFIG_FILE', 'Cannot restore the parameter overrides') from error
-            return
-        publish_replace_bytes(previous, path)
+        return self.config_repository().restore_overrides(previous)
 
     def history_path(self, row):
         base = self.directory / 'data'
@@ -194,30 +217,3 @@ class PortableAccountStore(AccountStore):
     def effective_profile(self, row, default):
         """Configuration files, never a prior execution database, define the next boot."""
         return self.profile()
-
-
-def _merge_settings(defaults, overrides):
-    if type(defaults) is not dict or type(overrides) is not dict:
-        raise ValueError()
-    result = copy.deepcopy(defaults)
-    for key, value in overrides.items():
-        if key not in defaults:
-            raise ValueError()
-        result[key] = (_merge_settings(defaults[key], value)
-                       if type(defaults[key]) is dict and type(value) is dict else copy.deepcopy(value))
-    return result
-
-
-def _settings_diff(defaults, desired):
-    if type(defaults) is not dict or type(desired) is not dict or defaults.keys() != desired.keys():
-        raise TraderError('E_RUNTIME_CONFIG', 'The saved parameters differ from the version configuration schema')
-    result = {}
-    for key in defaults:
-        before, after = defaults[key], desired[key]
-        if type(before) is dict and type(after) is dict:
-            nested = _settings_diff(before, after)
-            if nested:
-                result[key] = nested
-        elif before != after:
-            result[key] = copy.deepcopy(after)
-    return result

@@ -199,12 +199,15 @@ class BootstrapWorker(QThread):
     failed = Signal(object)
     cancelled = Signal()
 
-    def __init__(self, root, *, account=None, mode='strategy', timeout=90, parent=None):
+    def __init__(self, root, *, account=None, mode='strategy', timeout=90,
+                 attach_policy='attach-any', expected_account_key=None, parent=None):
         super().__init__(parent)
         self.root = Path(root)
         self.account = account
         self.mode = mode
         self.timeout = timeout
+        self.attach_policy = attach_policy
+        self.expected_account_key = expected_account_key
 
     def _phase(self, state, message, selected=None):
         detail = '' if selected is None else f"{selected['alias']} · {selected['masked_login']}"
@@ -223,14 +226,20 @@ class BootstrapWorker(QThread):
                 return
 
             self._phase('ATTACHING', '正在附着已有 Runtime；不会改变当前权限…', selected)
+            expected_key = self.expected_account_key or selected['account_key']
             discovered = _discover_runtime()
             if discovered is not None:
+                if self.attach_policy == 'attach-exact' and discovered.get('account_key') != expected_key:
+                    raise TraderError(
+                        'E_INSTANCE_EXISTS',
+                        '当前本机仍有其他账号的 Runtime 正在运行，请先完成安全退出后再切换。',
+                    )
                 attached = {'alias': discovered['account_alias'],
                             'masked_login': discovered['masked_login']}
                 self._phase('READY', '已取得本机唯一 Runtime 基线。', attached)
                 self.ready.emit(discovered['pipe'])
                 return
-            if _probe(pipe, selected['account_key']) is not None:
+            if _probe(pipe, expected_key if self.attach_policy == 'attach-exact' else selected['account_key']) is not None:
                 self._phase('READY', '已取得现有 Runtime 基线。', selected)
                 self.ready.emit(pipe)
                 return
@@ -240,6 +249,11 @@ class BootstrapWorker(QThread):
 
             from online_trader.runtime.instance import runtime_owner_exists
             if runtime_owner_exists():
+                if self.attach_policy == 'attach-exact':
+                    raise TraderError(
+                        'E_INSTANCE_EXISTS',
+                        '原 Runtime 进程尚未完全释放运行锁，请稍后重试。',
+                    )
                 process = None
                 stdout_path = None
                 stderr_path = runtime_root / 'logs' / 'desktop-bootstrap'
@@ -259,13 +273,15 @@ class BootstrapWorker(QThread):
                     self.cancelled.emit()
                     return
                 discovered = _discover_runtime()
-                if discovered is not None:
+                if discovered is not None and (
+                    self.attach_policy != 'attach-exact' or discovered.get('account_key') == expected_key
+                ):
                     attached = {'alias': discovered['account_alias'],
                                 'masked_login': discovered['masked_login']}
                     self._phase('READY', 'Runtime 已就绪，正在打开唯一交易工作台。', attached)
                     self.ready.emit(discovered['pipe'])
                     return
-                value = _probe(pipe, selected['account_key'])
+                value = _probe(pipe, expected_key if self.attach_policy == 'attach-exact' else selected['account_key'])
                 if value is not None:
                     self._phase('READY', 'Runtime 已就绪，正在打开交易工作台。', selected)
                     self.ready.emit(pipe)
@@ -320,7 +336,8 @@ class BootstrapController(QObject):
     cancelled = Signal()
     state_changed = Signal(str)
 
-    def __init__(self, root, *, account=None, mode='strategy', timeout=90, parent=None):
+    def __init__(self, root, *, account=None, mode='strategy', timeout=90,
+                 attach_policy='attach-any', expected_account_key=None, parent=None):
         super().__init__(parent)
         self.progress = QProgressDialog('', '', 0, 0)
         self.progress.setWindowTitle('OnlineTrader · 启动交易服务')
@@ -329,7 +346,9 @@ class BootstrapController(QObject):
         self.progress.setAutoClose(False)
         self.progress.setAutoReset(False)
         self.worker = BootstrapWorker(
-            root, account=account, mode=mode, timeout=timeout, parent=self)
+            root, account=account, mode=mode, timeout=timeout,
+            attach_policy=attach_policy, expected_account_key=expected_account_key,
+            parent=self)
         self._terminal = False
         self._cancel_requested = False
         self.worker.phase_changed.connect(self._phase_changed)

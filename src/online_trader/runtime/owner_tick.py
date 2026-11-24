@@ -57,6 +57,11 @@ def execute_owner_tick(
 ):
     """Execute one Target Owner step, preserving pending auto-arm across transient errors."""
     loop_started_ns = time.monotonic_ns()
+    if getattr(owner, 'maintenance', None) is not None and loop_state.get('initial_start_pending'):
+        loop_state['initial_start_pending'] = False
+    setter = getattr(owner, 'set_initial_start_pending', None)
+    if callable(setter):
+        setter(bool(loop_state.get('initial_start_pending')))
     pumper = getattr(owner, "pump_fault_hold", None)
     now_mono = time.monotonic()
     cur_state = owner.snapshot()
@@ -79,12 +84,14 @@ def execute_owner_tick(
         state = owner.snapshot()
         if loop_state.get("initial_start_pending"):
             expected_gen = loop_state.get("initial_arm_generation", 0)
-            if getattr(owner, "authority_generation", 0) != expected_gen:
+            if getattr(owner, "authority_generation", 0) != expected_gen or getattr(owner, "maintenance", None) is not None:
                 loop_state["initial_start_pending"] = False
             elif state["synchronized"] and not state.get("owner_fault_code"):
                 owner.start_confirmed()
                 loop_state["initial_start_pending"] = False
                 state = owner.snapshot()
+        if callable(setter):
+            setter(bool(loop_state.get("initial_start_pending")))
         now = time.monotonic()
         if history_writer is not None and now - loop_state.get("last_history_capture", 0.0) >= 10:
             snapshot = owner.native_account_snapshot()

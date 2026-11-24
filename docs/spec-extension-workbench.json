@@ -4,8 +4,8 @@
     "schemas/ipc.schema.json": "def8789c02b5f55ec9207b223d18579861449293d5ff4fe5d41e6657da2feb62"
   },
   "resources": {
-    "ipc.schema.json": "85e5b5dff56702a60674b90005e0f9d26e2211fb5e1637248f9192ecff93d054",
-    "workbench-ipc.schema.json": "1370379a9967f25ebd3655d0203b3b01d3fe2072fc774d7d0db400e3744a326a"
+    "ipc.schema.json": "e1bc59b32794e9fcef410304c787a98ee34ac59e5cb7912684ddd70220821c36",
+    "workbench-ipc.schema.json": "708b6a7d18916129577426b40d8229f86ae1d13dbead1ebd6e9d77d12590c705"
   },
   "note": "Workbench projections, runtime parameter save, the capability-gated WorkbenchMonitor request, and the optional flat-account recovery stop. The copied G0 IPC digest is retained."
 }

@@ -234,6 +234,16 @@ class DsvSession:
                 row['min_days_to_expiry'] = self._trade['min_days_to_expiry']
         return {'history_status': result['history_status'], 'activity': activity, 'fills': fills}
 
+    def record_maintenance_event(self, kind, payload):
+        """Record a non-order maintenance lifecycle event in the current boot Journal."""
+        self._check_owner()
+        try:
+            with self._journal.transaction():
+                self._journal.event(kind, payload)
+        except sqlite3.Error as error:
+            self._failed = True
+            raise TraderError('E_DSV_STORE', 'Maintenance lifecycle journal write failed') from error
+
     def command_receipt(self, command_id):
         self._check_owner()
         return self._journal.command_receipt(identifier(command_id))
@@ -378,20 +388,45 @@ class DsvSession:
                 row['quote_observation'] = None
 
     def prepare_shutdown(self):
-        """Report unresolved child identities and owned lots without issuing commands."""
+        """Report unresolved child identities and activated owned lots without issuing commands."""
         self._check_owner()
         orders = [order['child_order_id'] for order in self._state['orders'].values() if not terminal(order)]
-        conflicts = [code for code, row in self._state['symbols'].items() if row.get('native_conflicts')]
-        positions = {key: row['position']['owned'] for key, row in self._state['symbols'].items()
-                     if row['position'] is not None and row['position']['owned']}
+        conv_cancels = [
+            str(nid) for nid, rec in (self._state.get('convergence_cancels') or {}).items()
+            if isinstance(rec, dict) and rec.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}
+        ]
+        conflicts = [
+            code for code, row in self._state['symbols'].items()
+            if row.get('native_conflicts') or row.get('detached_positions') or row.get('ownership_conflict')
+        ]
+        positions = {}
+        preview_only = []
+        for key, row in self._state['symbols'].items():
+            pos = row.get('position')
+            if pos is None:
+                continue
+            if pos.get('awaiting_start_arm') and not pos.get('activated_in_boot') and not pos.get('children'):
+                preview_only.append(key)
+                continue
+            if pos.get('owned'):
+                positions[key] = pos['owned']
         for contract, row in self._state['symbols'].items():
             if detached := row.get('detached_positions'):
                 positions[contract] = positions.get(contract, 0) + sum(
                     self._state['retired_positions'][key]['owned'] for key in detached)
-        result = {'ready': not orders and not positions and not conflicts, 'unresolved_children': orders,
-                  'owned_lots': positions}
+        synchronized = bool(self._state.get('synchronized', False))
+        result = {
+            'ready': not orders and not conv_cancels and not positions and not conflicts,
+            'unresolved_children': orders,
+            'owned_lots': positions,
+        }
+        if preview_only:
+            result['preview_only_contracts'] = sorted(preview_only)
+        if conv_cancels:
+            result['unresolved_convergence_cancels'] = sorted(conv_cancels)
         if conflicts:
             result['allocation_conflicts'] = conflicts
+        result['synchronized'] = synchronized
         return result
 
     def active_timers(self):
@@ -1880,6 +1915,7 @@ class DsvSession:
                 for row in state['symbols'].values():
                     if row['position'] is not None:
                         row['position'].pop('awaiting_start_arm', None)
+                        row['position']['activated_in_boot'] = True
             effects = []
             if action == 'STOP':
                 for row in state['symbols'].values():
@@ -1945,6 +1981,8 @@ class DsvSession:
                 position.get('calendar_exit') is not None
                 or (prior_exit == 0 and position.get('rollback_exit', {}).get('reason') not in {None, 'MANUAL_EXIT'}))
             tighten_target(position, target, new_request=True)
+            position.pop('awaiting_start_arm', None)
+            position['activated_in_boot'] = True
             position['target_reason'] = 'USER_REDUCE'
             if command.get('price_mode') is not None and not (urgent_auto_exit and command['price_mode'] == '排队价'):
                 position['manual_close_mode'] = command['price_mode']
@@ -1987,6 +2025,8 @@ class DsvSession:
                              if state.get('time_sample') and state['time_sample'].get('now_utc') else None)
             for position_id in requested:
                 position = current[position_id]
+                position.pop('awaiting_start_arm', None)
+                position['activated_in_boot'] = True
                 urgent_auto_exit = (
                     position.get('calendar_exit') is not None
                     or (position['exit_target'] == 0
