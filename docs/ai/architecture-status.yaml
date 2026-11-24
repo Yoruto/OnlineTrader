@@ -104,6 +104,22 @@ documents:
       Does not supersede current Standalone, desktop-exit, update or DSV contracts until implementation
       and owning-contract review.
 
+  - path: docs/refactor/configuration-persistence-runtime-implementation-20261124.md
+    scope: standalone/configuration-persistence-runtime-minimal-implementation
+    status: CANDIDATE
+    verified_at_sha: 7a9df4dbe612642544a0fb0048a768301573e271
+    evidence:
+      design: USER_REQUESTED_MINIMAL_IMPLEMENTATION_SPEC_NEEDS_REVIEW
+      source: DESIGN_ONLY_NOT_IMPLEMENTED
+      tests: NOT_RUN
+      product_acceptance: NOT_RUN
+    notes: Concrete PR0-PR6 implementation plan under V1.1; prioritizes derived runtime modes,
+      owner-verified non-flattening maintenance, cold account switch, update coordination,
+      minimal config and history changes, and separately approved business continuity.
+      Reconciles the later CURRENT account-target convergence, startup inference and market
+      permission contracts; distinguishes never-armed previews from activated responsibilities.
+      Does not authorize new persistence, code changes, testing, account connections or releases.
+
   - path: docs/refactor/runtime-business-state-restart-continuity-adr-20261124.md
     scope: standalone/business-state-restart-continuity-adr
     status: CANDIDATE
