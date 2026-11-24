@@ -22,7 +22,7 @@ Trading Workbench 使用只接受启动用户 SID 的本机控制通道，不显
 
 较早 Runtime 候选的离线定向自动化由独立测试 Agent 执行 69 项，69 PASS、0 FAIL、0 SKIP；范围覆盖当时的操作员协议、版本化视图、Workbench 直接提交、公共 IPC 账户读取/平仓/回执和受影响回归。该结果不适用于本次修正候选，不能据此报告完整产品通过。
 
-[当前 Workbench 合同总览](docs/refactor/runtime-workbench-current-20261120.md) · [Target Owner 冷切换合同](docs/refactor/target-execution-and-standalone-cutover-20261121.md) · [完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [当前权威与单实例设计](docs/refactor/runtime-broker-authority-single-instance-20261120.md) · [复测缺陷修正记录](docs/refactor/runtime-full-retest-remediation-20261120.md) · [运维、配置与账本约定](docs/runtime-operations-and-storage-20261119.md) · [测试体系重构](docs/refactor/testing-system-redesign-20261121.md) · [测试入口迁移](docs/refactor/standalone-trading-runtime-test-migration-20261119.md) · [实现与验收记录](docs/refactor/standalone-trading-runtime-acceptance-20261119.md)
+[当前 Workbench 合同总览](docs/refactor/runtime-workbench-current-20261120.md) · [柜台核对用户流程](docs/refactor/runtime-workbench-reconciliation-guidance-20261124.md) · [Target Owner 冷切换合同](docs/refactor/target-execution-and-standalone-cutover-20261121.md) · [完整设计与操作入口](docs/refactor/standalone-trading-runtime-20261119.md) · [当前权威与单实例设计](docs/refactor/runtime-broker-authority-single-instance-20261120.md) · [复测缺陷修正记录](docs/refactor/runtime-full-retest-remediation-20261120.md) · [运维、配置与账本约定](docs/runtime-operations-and-storage-20261119.md) · [测试体系重构](docs/refactor/testing-system-redesign-20261121.md) · [测试入口迁移](docs/refactor/standalone-trading-runtime-test-migration-20261119.md) · [实现与验收记录](docs/refactor/standalone-trading-runtime-acceptance-20261119.md)
 
 该入口当前只支持已验收的模拟账户范围，不表示 DSV replacement 链已经切换，也不表示真实资金账户或发行制品已验收。当前源码验收状态见[功能清单](docs/功能实现与待办清单_20261110.md)。
 

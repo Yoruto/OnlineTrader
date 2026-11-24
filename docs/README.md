@@ -10,6 +10,7 @@
 
 - [当前功能状态与开放问题](功能实现与待办清单_20261110.md)
 - [Standalone Runtime Workbench 当前合同总览](refactor/runtime-workbench-current-20261120.md)
+- [Workbench 柜台核对用户流程](refactor/runtime-workbench-reconciliation-guidance-20261124.md)
 - [Standalone Trading Runtime 设计](refactor/standalone-trading-runtime-20261119.md)
 - [Runtime 本机单实例与柜台权威设计](refactor/runtime-broker-authority-single-instance-20261120.md)
 - [Configuration、Persistence 与 Runtime 基础架构与生命周期解耦设计 V1.1](refactor/configuration-persistence-runtime-architecture-20261124.md)（运行模式、账户切换、更新协调及数据连续性；待评审，未实施）

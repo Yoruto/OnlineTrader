@@ -10,6 +10,17 @@ rules:
     remain authoritative. A dirty worktree or later HEAD requires rechecking affected entries.
 
 documents:
+  - path: docs/refactor/runtime-workbench-reconciliation-guidance-20261124.md
+    scope: standalone/workbench-reconciliation-user-guidance
+    status: CANDIDATE
+    verified_at_sha: WORKTREE
+    evidence:
+      design: REVIEWED
+      source: IMPLEMENTED_CANDIDATE
+      tests: SOURCE_COMPILE_PASS_FUNCTIONAL_NOT_RUN
+      product_acceptance: NOT_RUN
+    notes: Separates automatic broker synchronization, persistent owner faults, UNKNOWN own orders, and external or unattributed account positions so the Workbench can show the responsible next action without weakening any trading gate.
+
   - path: docs/refactor/target-execution-and-standalone-cutover-20261121.md
     scope: replacement/target-execution-and-standalone-cutover
     status: CURRENT

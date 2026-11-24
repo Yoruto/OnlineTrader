@@ -107,6 +107,21 @@ CLOCK_PROTECTION_REASONS = {
     'E_FACT_BARRIER': '柜台委托及逐笔成交待核对',
 }
 
+OWNER_RECOVERY_MESSAGES = {
+    'E_DSV_NATIVE_FACT': '柜台返回的持仓、委托或成交事实相互冲突',
+    'E_DSV_NATIVE_ID': '柜台委托或成交身份无法唯一核对',
+    'E_DSV_SDK_FACT': '柜台事实字段不完整或不合法',
+    'E_DSV_OWNERSHIP': '本 Runtime 的持仓或委托归属与柜台事实不一致',
+    'E_DSV_SCOPE': '账号、合约或柜台交易日超出本次运行范围',
+    'E_DSV_SDK_SCOPE': 'SDK 返回的账号或合约范围与本次运行不一致',
+    'E_DSV_ROUND': '柜台更新轮次不完整',
+    'E_DSV_ROUND_SEQUENCE': '柜台更新顺序异常',
+    'E_DSV_TIME_VERSION': '柜台时间证据版本发生冲突',
+    'E_DSV_SDK_CLOCK': 'SDK 时间与本次交易日无法一致核对',
+    'E_DSV_NIGHT_BOUNDARY': '夜盘交易日边界无法确认',
+    'E_CLOCK_INPUT': '本机时间输入无法用于安全交易',
+}
+
 
 class WorkbenchLogLine(NamedTuple):
     text: str
@@ -261,9 +276,17 @@ QLabel#chartSource, QLabel#workspaceNote { color: #5b6d84; }
 QLabel#homeMoney { font-size: 22px; font-weight: 700; }
 QLabel#homeAccountType { color: #214da5; background: #eaf1ff; border-radius: 4px; padding: 3px 7px; }
 QLabel#homeAccountType[live="true"] { color: #7c4c08; background: #fff3df; }
+QFrame#homeAttention {
+    background: #fff6e4; border: 1px solid #f3dfb8; border-radius: 6px;
+}
 QLabel#homePending {
-    color: #8b4e0e; background: #fff6e4; border: 1px solid #f3dfb8;
-    border-radius: 6px; padding: 5px 9px;
+    color: #8b4e0e; background: transparent; border: 0; padding: 5px 9px;
+}
+QPushButton#homeAttentionAction {
+    color: #7c4c08; background: #fffaf0; border-color: #e6c985; padding: 4px 10px;
+}
+QPushButton#homeAttentionAction:hover {
+    background: #ffedc6; border-color: #d9b35c;
 }
 QLabel#waiting, QLabel#blocked, QLabel#pending { padding: 7px; }
 QLabel#waiting { background: #ecfaf2; color: #195d40; }
@@ -1052,10 +1075,110 @@ class WorkbenchLayout:
             value.setAlignment(Qt.AlignCenter)
             funds.addWidget(value, 1)
             self.dashboard_money[key] = value, caption
+        self.home_attention = QFrame(objectName='homeAttention')
+        attention = QHBoxLayout(self.home_attention)
+        attention.setContentsMargins(0, 0, 5, 0)
+        attention.setSpacing(6)
         self.home_pending = QLabel(objectName='homePending')
         self.home_pending.setTextFormat(Qt.PlainText)
         self.home_pending.setWordWrap(True)
-        layout.addWidget(self.home_pending)
+        attention.addWidget(self.home_pending, 1)
+        self.home_reconcile_button = QPushButton('重新核对')
+        self.home_reconcile_button.setObjectName('homeAttentionAction')
+        self.home_reconcile_button.setToolTip('使用当前 Runtime 的最新柜台事实重新核对；不会重发订单')
+        self.home_reconcile_button.clicked.connect(self.window.reconcile)
+        attention.addWidget(self.home_reconcile_button)
+        self.home_detail_button = QPushButton('查看详情')
+        self.home_detail_button.setObjectName('homeAttentionAction')
+        self.home_detail_button.clicked.connect(self.show_home_attention_detail)
+        attention.addWidget(self.home_detail_button)
+        self._home_detail_target = None
+        layout.addWidget(self.home_attention)
+
+    def show_home_attention_detail(self):
+        if self._home_detail_target == 'external':
+            self.tabs.setCurrentWidget(self.home_tab)
+            self.home_sections.setCurrentWidget(self.position_tab)
+            self.monitor_details.setCurrentWidget(self.external_positions_tab)
+        elif self._home_detail_target == 'orders':
+            self.tabs.setCurrentWidget(self.order_sections.parentWidget())
+            self.order_sections.setCurrentWidget(self.order_tab)
+        elif self._home_detail_target == 'markets':
+            self.tabs.setCurrentWidget(self.home_tab)
+            self.home_sections.setCurrentWidget(self.market_tab)
+
+    def home_attention_summary(self, view, pending, *, stale, truncated):
+        if view is None:
+            return None
+        connection = view['connection']
+        connected = connection.get('broker_connected', False)
+        synchronized = connection.get('synchronized', False)
+        blocks = [row.get('reason_code') for row in view.get('blocks', ()) if row.get('active')]
+        owner_faults = [code for code in blocks if code in OWNER_RECOVERY_MESSAGES]
+        fallback_faults = [code for code in blocks
+                           if code not in {'BROKER_FACTS_INCOMPLETE', 'CLOCK_FAULT',
+                                           'E_FOREIGN_ACTIVE_ORDER'}
+                           and not str(code).startswith('MARKET_FEED_')]
+        external = view.get('external_positions') or []
+        unknown_orders = [row for row in view.get('orders', ())
+                          if row.get('send_state') == 'UNKNOWN' or row.get('cancel_status') == 'UNKNOWN']
+
+        result = {'title': '', 'items': [], 'reconcile': False,
+                  'detail_target': None, 'detail_text': '查看详情'}
+        if stale:
+            result.update(title='界面重连中', items=['Runtime 仍独立运行；正在重新取得最新状态，无需重复操作'])
+        elif truncated:
+            result.update(title='状态数据不完整', items=['请查看“日志与诊断”，不要依据当前省略的数据重复操作'])
+        elif connection.get('storage_failed'):
+            result.update(title='运行存储异常', items=['Runtime 已禁止继续交易；请保留现场并查看运行事件（E_STORAGE）'])
+        elif connection.get('clock_fault'):
+            result.update(title='需要校准时间并核对', reconcile=True,
+                          items=['先修复 Windows 时间或交易日证据，再点击“重新核对”；不会重发订单'])
+        elif owner_faults:
+            result.update(title='需要人工核对', reconcile=True,
+                          items=[f'{OWNER_RECOVERY_MESSAGES[code]}（{code}）' for code in owner_faults])
+        elif connection.get('recovery_required') and fallback_faults:
+            suffix = '、'.join(str(code) for code in fallback_faults)
+            result.update(title='需要人工核对', reconcile=True,
+                          items=[f'Runtime 已停开并等待当前柜台事实复核（{suffix}）'])
+        elif not connected:
+            return None
+        elif not synchronized:
+            result.update(title='柜台自动同步中',
+                          items=['系统正在同步持仓、委托和成交，无需人工核对或重复启动'])
+        elif unknown_orders:
+            contracts = len({row.get('contract_id') for row in unknown_orders})
+            result.update(title='委托结果核对中', detail_target='orders', detail_text='查看委托',
+                          items=[f'{len(unknown_orders)} 笔、{contracts} 个合约的报单或撤单结果尚未确认；'
+                                 '系统会自动对照完整柜台快照，数量仍保留，请勿重复下单'])
+        elif 'E_FOREIGN_ACTIVE_ORDER' in blocks:
+            result.update(title='外部活动委托冲突', detail_target='markets', detail_text='查看受影响合约',
+                          items=['其他电脑或人工终端存在活动委托，已阻止本机同合约冲突发送；'
+                                 '可等待委托结束，或到产生委托的终端处理'])
+        elif external:
+            contracts = len({row.get('contract_id') for row in external})
+            quantity = sum(int(row.get('quantity') or 0) for row in external)
+            result.update(title='账号存在非本机策略持仓（无需本机处理）',
+                          detail_target='external', detail_text='查看持仓差异',
+                          items=[f'{contracts} 个合约、共 {quantity} 手由其他电脑或人工产生；本机策略不会接管。'
+                                 '如需消除提示，请在产生持仓的终端处理'])
+        elif self.window.home_issue:
+            result.update(title='命令结果待核对', detail_target='orders', detail_text='查看当前委托',
+                          items=[self.window.home_issue])
+        elif pending:
+            result.update(title='订单处理中', detail_target='orders', detail_text='查看委托',
+                          items=list(pending))
+        else:
+            return None
+
+        if result['reconcile'] and not (connected and synchronized):
+            result['items'].append('柜台仍在重新连接或同步；完成后“重新核对”按钮才可用')
+
+        if pending and result['title'] not in {'订单处理中', '命令结果待核对'}:
+            for item in pending:
+                if item not in result['items']:
+                    result['items'].append(item)
+        return result
 
     def home_page(self, layout):
         split = QSplitter(Qt.Horizontal)
@@ -1844,10 +1967,29 @@ class WorkbenchLayout:
         pending, positions = self.home_position_rows(view, cycles, available)
         if w.home_issue:
             pending.insert(0, w.home_issue)
-        self.home_pending.setVisible(bool(pending))
-        self.home_pending.setText('待处理  ·  ' + '；'.join(pending[:2]) +
-                                  (f'；另有 {len(pending) - 2} 项' if len(pending) > 2 else '') if pending else '')
-        self.home_pending.setToolTip('\n'.join(pending))
+        attention = self.home_attention_summary(view, pending, stale=stale, truncated=truncated)
+        self.home_attention.setVisible(attention is not None)
+        if attention is not None:
+            items = attention['items']
+            text = attention['title']
+            if items:
+                text += '  ·  ' + '；'.join(items[:2])
+                if len(items) > 2:
+                    text += f'；另有 {len(items) - 2} 项'
+            self.home_pending.setText(text)
+            self.home_pending.setToolTip('\n'.join([attention['title'], *items]))
+            self.home_reconcile_button.setVisible(attention['reconcile'])
+            self.home_reconcile_button.setEnabled(
+                attention['reconcile'] and connected and synced
+                and self.buttons['reconcile'].isEnabled())
+            self._home_detail_target = attention['detail_target']
+            self.home_detail_button.setText(attention['detail_text'])
+            self.home_detail_button.setVisible(attention['detail_target'] is not None)
+        else:
+            self.home_pending.clear()
+            self.home_reconcile_button.hide()
+            self.home_detail_button.hide()
+            self._home_detail_target = None
         self.home_position_title.setText(f"策略持仓  {'上次 ' if not available else ''}{quantity} 手" if quantity else '策略持仓')
         self.fill_selectable(self.home_positions, positions, self.position_groups)
         self.render_position_detail()
@@ -1914,8 +2056,6 @@ class WorkbenchLayout:
         protection_blocked = protection.get('blocked_cycles', {}) if connection.get('clock_fault') else {}
         protection_active = protection.get('active_cycles', ()) if connection.get('clock_fault') else ()
         if available:
-            if connection.get('recovery_required'):
-                pending.append('柜台持仓待核对')
             if view['configuration'].get('stop_cancel_pending'):
                 pending.append('停止时撤单待确认')
             if view['configuration'].get('strategy_stop_wait'):
@@ -1939,8 +2079,6 @@ class WorkbenchLayout:
                     pending.append(item)
                 if order['effect'] == 'REDUCE' and order.get('position_cycle_id'):
                     by_cycle.setdefault(order['position_cycle_id'], []).append(message)
-            if view.get('external_positions'):
-                pending.append('柜台持仓或委托待核对')
         grouped = {}
         for cycle in cycles:
             cid, code = cycle['position_cycle_id'], cycle['contract_id']
@@ -2531,7 +2669,8 @@ class WorkbenchLayout:
         details.addTab(execution, '执行参数')
         details.addTab(self.market_panel(), '实时行情')
         details.addTab(self.tables['protection'], '保护明细')
-        details.addTab(self.external_panel(), '柜台持仓差异')
+        self.external_positions_tab = self.external_panel()
+        details.addTab(self.external_positions_tab, '柜台持仓差异')
         details.addTab(self.tables['blocks'], '阻挡详情')
         positions = group('实时持仓', layout, stretch=3)
         positions.addWidget(details)
