@@ -65,6 +65,20 @@ documents:
       product_acceptance: ACTIVE_SESSION_AND_PACKAGED_NOT_RUN
     notes: Implements Stage 0 stale-recheck CommandBus/UI passthrough, PR1 non-blocking TargetMarketDiagnostics JSONL summary/anomaly black-box, PR2 off-thread workbench projection/bar formatting and 0.1s idle-round skipping, PR3-A centralized tqsdk 3.10.5 upgrade with bytecode/timeout hook tests, PR3-B separate feed_health/symbol_health classification with max_quote_age_seconds=0 feed gate, and PR4 offline multi-contract fake_broker fault injection (FaultE2E 4/4 PASS). Active trading-session SimNow tick telemetry and packaged acceptance remain NOT_RUN.
 
+  - path: docs/refactor/configuration-persistence-runtime-architecture-20261124.md
+    scope: standalone/configuration-persistence-runtime-architecture
+    status: CANDIDATE
+    verified_at_sha: e43e9d9cbaeb5b929c92877a761e690c55a6de78
+    evidence:
+      design: USER_REQUESTED_DESIGN_NEEDS_REVIEW
+      source: DESIGN_ONLY_NOT_IMPLEMENTED
+      tests: NOT_RUN
+      product_acceptance: NOT_RUN
+    notes: Proposed Configuration/Persistence/Runtime responsibility and data-lifetime boundaries,
+      Desired/Active configuration and crash-consistency protocol, history failure isolation and
+      provider-aware coverage, and separately approved business-state continuity without restoring
+      old boot execution authority. Does not supersede current Standalone or DSV contracts.
+
   - path: docs/refactor/runtime-business-state-restart-continuity-adr-20261124.md
     scope: standalone/business-state-restart-continuity-adr
     status: CANDIDATE
