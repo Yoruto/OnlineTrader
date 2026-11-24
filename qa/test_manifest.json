@@ -3897,9 +3897,15 @@
       ],
       "timeout_seconds": 120,
       "cases": [
+        "RuntimeWorkbenchTests.test_adding_silver_while_live_submits_hot_add_and_focuses_monitor",
         "RuntimeWorkbenchTests.test_command_bus_rejection_is_shown_without_a_receipt_identity",
         "RuntimeWorkbenchTests.test_frozen_runtime_account_display_is_used_by_header_and_picker",
+        "RuntimeWorkbenchTests.test_hot_add_rejection_offers_next_boot_overrides_without_interrupting_runtime",
         "RuntimeWorkbenchTests.test_new_workbench_process_starts_without_legacy_pending_state",
+        "RuntimeWorkbenchTests.test_removing_contract_with_silver_while_armed_persists_next_boot_overrides_without_interrupting_runtime",
+        "RuntimeWorkbenchTests.test_replacing_contract_while_disarmed_saves_overrides_and_restarts_runtime_to_monitor",
+        "RuntimeWorkbenchTests.test_runtime_catalog_load_uses_portable_store_when_legacy_store_is_absent",
+        "RuntimeWorkbenchTests.test_runtime_view_syncs_effective_profile_without_overwriting_unsaved_draft",
         "RuntimeWorkbenchTests.test_submit_delegates_the_current_intent_to_command_bus",
         "RuntimeWorkbenchTests.test_submit_without_a_current_view_does_not_reach_command_bus"
       ],
@@ -4643,12 +4649,14 @@
         "SymbolEditorTests.test_add_alias_name_and_parameters_are_applied_atomically",
         "SymbolEditorTests.test_advanced_editor_new_form_cancel_and_accept_preserve_other_drafts",
         "SymbolEditorTests.test_cancel_add_and_edit_never_publish_partial_changes",
+        "SymbolEditorTests.test_contract_dropdown_suggests_up_to_six_months_offline_and_from_catalog",
         "SymbolEditorTests.test_duplicate_and_invalid_values_stay_open_with_inline_errors",
         "SymbolEditorTests.test_edit_retains_unedited_values_and_custom_name",
         "SymbolEditorTests.test_fixed_quantity_needs_positive_integer_and_auto_preserves_zero",
         "SymbolEditorTests.test_footer_is_inside_small_dialog_with_advanced_fields_and_error",
         "SymbolEditorTests.test_main_entry_add_edit_cancel_and_saved_file_round_trip",
-        "SymbolEditorTests.test_name_tracks_known_product_until_manually_changed"
+        "SymbolEditorTests.test_name_tracks_known_product_until_manually_changed",
+        "SymbolEditorTests.test_runtime_symbol_limit_enforces_eleven_contracts"
       ],
       "case_overrides": {}
     },
@@ -4723,8 +4731,12 @@
         "TargetOwnerRuntimeTests.test_public_pipe_command_is_bound_idempotent_and_conflicting_content_is_rejected",
         "TargetOwnerRuntimeTests.test_public_pipe_rejects_wrong_account_boot_and_configuration_bindings",
         "TargetOwnerRuntimeTests.test_workbench_projection_bounds_history_and_declares_omissions",
+        "TargetOwnerWorkbenchProjectionTests.test_hot_add_with_existing_param_edit_while_holding_position_rejects_and_restores_file",
         "TargetOwnerWorkbenchProjectionTests.test_run_target_owner_accepts_callable_trusted_control_pid_and_preserves_dynamic_lookup",
+        "TargetOwnerWorkbenchProjectionTests.test_sdk_adapter_hot_add_contract_updates_calendar_grant_subscriptions_and_trades_while_existing_position_open",
+        "TargetOwnerWorkbenchProjectionTests.test_sdk_adapter_hot_add_incomplete_calendar_rolls_back_cleanly",
         "TargetOwnerWorkbenchProjectionTests.test_standalone_owner_retains_latest_decisions_and_run_directory",
+        "TargetOwnerWorkbenchProjectionTests.test_workbench_projection_includes_strategy_profile_and_added_silver_trades",
         "TargetOwnerWorkbenchProjectionTests.test_workbench_view_projects_cycle_protection_order_and_fill_timestamps",
         "TargetOwnerWorkbenchProjectionTests.test_workbench_view_projects_market_triggers_reasons_day_stop_and_minute_bars"
       ],

@@ -52,10 +52,10 @@ class FakeBroker:
                  run_id: str | None = None):
         if not isinstance(account_key, str) or not account_key.startswith("DEV:"):
             raise FakeBrokerError("Fake Broker requires a DEV account key")
-        if contract != CONTRACT:
-            raise FakeBrokerError(f"This first Fake Broker model supports only {CONTRACT}")
-        if trading_day != DAY:
-            raise FakeBrokerError(f"This first Fake Broker model is fixed to {DAY}")
+        if not isinstance(contract, str) or "." not in contract:
+            raise FakeBrokerError("Fake Broker requires a valid exchange.symbol contract")
+        if not isinstance(trading_day, str) or len(trading_day) != 10:
+            raise FakeBrokerError("Fake Broker requires an ISO trading_day YYYY-MM-DD")
         if provider != "OFFLINE":
             raise FakeBrokerError("Fake Broker provider must be OFFLINE")
         if not isinstance(session_id, str) or not session_id:
@@ -123,6 +123,117 @@ class FakeBroker:
     def positions(self) -> dict[str, int]:
         with self._lock:
             return self._position_snapshot()
+
+    def roll_trading_day(self, new_trading_day: str) -> dict[str, int]:
+        """Advance broker cabinet trading day, moving today positions to historical."""
+        with self._lock:
+            if not isinstance(new_trading_day, str) or new_trading_day <= self.trading_day:
+                raise FakeBrokerError("New trading_day must advance strictly forward")
+            previous_day = self.trading_day
+            self._positions["long_historical"] += self._positions["long_today"]
+            self._positions["long_today"] = 0
+            self._positions["short_historical"] += self._positions["short_today"]
+            self._positions["short_today"] = 0
+            self.trading_day = new_trading_day
+            snap = self._position_snapshot()
+            self._record(
+                "BROKER_TRADING_DAY_ROLLED",
+                previous_day=previous_day,
+                new_trading_day=new_trading_day,
+                positions=snap,
+            )
+            return snap
+
+    def reset_session_sequence(self) -> None:
+        """Reset inbound frame sequence for a newly started Runtime boot reconnecting to the same broker."""
+        with self._lock:
+            if self._inflight is not None:
+                raise FakeBrokerError("Cannot reset sequence with an inflight frame")
+            self._sequence = 0
+            self._record("BROKER_SESSION_RECONNECTED")
+
+    def snapshot(self) -> dict[str, object]:
+        """Return an isolated read-only snapshot of current broker truth."""
+        with self._lock:
+            active_children = [
+                child for child, order in self._orders.items()
+                if order.status == "ALIVE" and order.native_order_id is not None
+            ]
+            return {
+                "account_key": self.account_key,
+                "provider": self.provider,
+                "contract_id": self.contract,
+                "trading_day": self.trading_day,
+                "session_id": self.session_id,
+                "positions": self._position_snapshot(),
+                "orders": self.orders,
+                "active_children": active_children,
+                "trades": deepcopy(self._trades),
+                "pending_fact_count": len(self._pending_facts),
+            }
+
+    def prepare_broker_snapshot(
+        self,
+        *,
+        frame_id: str,
+        sequence: int,
+        complete: bool = True,
+        synchronized: bool | None = None,
+        broker_order_snapshot_complete: bool | None = None,
+        absent_orders: list[str] | None = None,
+    ) -> dict[str, object]:
+        """Snapshot broker positions, active orders and pending native facts for a frame.
+
+        Call ``acknowledge_frame(frame_id)`` once the Owner reports ``FACT_FRAME_APPLIED``.
+        """
+        with self._lock:
+            if self._inflight is not None:
+                raise FakeBrokerError("A broker frame is already prepared; deliver or resolve it first")
+            if not isinstance(frame_id, str) or not frame_id:
+                raise FakeBrokerError("Prepared broker snapshot requires a frame_id")
+            if type(sequence) is not int or sequence <= self._sequence:
+                raise FakeBrokerError("Scenario sequence must move forward explicitly")
+            if type(complete) is not bool:
+                raise FakeBrokerError("Frame completeness must be explicit")
+            if synchronized is None:
+                synchronized = complete
+            if type(synchronized) is not bool or (synchronized and not complete):
+                raise FakeBrokerError("An incomplete frame cannot claim synchronization")
+            position = self._position_snapshot()
+            facts = deepcopy(self._pending_facts) if complete else []
+            active_children = [
+                child for child, order in self._orders.items()
+                if order.status == "ALIVE" and order.native_order_id is not None
+            ]
+            snapshot = {
+                "frame_id": frame_id,
+                "sequence": sequence,
+                "session_id": self.session_id,
+                "complete": complete,
+                "synchronized": synchronized,
+                "sync_orders": active_children,
+                "positions": position,
+                "native": facts,
+            }
+            if broker_order_snapshot_complete is not None:
+                snapshot["broker_order_snapshot_complete"] = bool(broker_order_snapshot_complete)
+            if absent_orders is not None:
+                snapshot["absent_orders"] = list(absent_orders)
+            self._sequence = sequence
+            self._inflight = {"id": frame_id, "sequence": sequence}
+            self._inflight_fact_count = len(facts)
+            self._delivery_cursor = None
+            self._delivery_started = False
+            self._record(
+                "BROKER_SNAPSHOT_PREPARED",
+                frame_id=frame_id,
+                sequence=sequence,
+                native_fact_count=len(facts),
+                complete=complete,
+                synchronized=synchronized,
+                positions=position,
+            )
+            return deepcopy(snapshot)
 
     def observe_adapter_event(self, event: dict[str, object]) -> None:
         """Record a Fake Adapter call without inventing a broker response."""
@@ -195,7 +306,7 @@ class FakeBroker:
             native_id = native_order_id or f"fake-native-order-{self._next_order_id:06d}"
             self._next_order_id += 1
             self._bind_native_id(child_order_id, order, native_id)
-            fact = self._queue_order_fact(order, "ALIVE", 0)
+            fact = self._queue_order_fact(order, "ALIVE", 0, allow_accept=True)
             self._record("ORDER_ACCEPTED", child_order_id=child_order_id,
                          native_order_id=native_id, fact=fact)
             return deepcopy(fact)
@@ -213,6 +324,15 @@ class FakeBroker:
             self._record("ORDER_REJECTED", child_order_id=child_order_id,
                          native_order_id=native_id, fact=fact)
             return deepcopy(fact)
+
+    def confirm_absent(self, child_order_id: str) -> None:
+        """Record that an undecided send never reached the broker (negative reconciliation)."""
+        with self._lock:
+            order = self._send_order(child_order_id)
+            if order.status != "SEND_REQUESTED" or order.native_order_id is not None or order.traded_qty:
+                raise FakeBrokerError("Only an undecided send without native id can be marked absent")
+            order.status = "ABSENT"
+            self._record("ORDER_ABSENT_CONFIRMED", child_order_id=child_order_id)
 
     def report_order(self, child_order_id: str, status: str, filled_qty: int) -> dict[str, object]:
         """Queue a native order status independently from trade detail."""
@@ -238,7 +358,7 @@ class FakeBroker:
             if order.status not in {"ALIVE", "CANCELLED", "FILLED"}:
                 raise FakeBrokerError("Trade requires an accepted, non-rejected order")
             if fill_day is not None and fill_day != self.trading_day:
-                raise FakeBrokerError("This first Fake Broker model supports same-day fills only")
+                raise FakeBrokerError("Trade fill_day must match current broker trading_day")
             trade_id = native_trade_id or f"fake-native-trade-{self._next_trade_id:06d}"
             if (not isinstance(trade_id, str) or not trade_id or len(trade_id) > 512
                     or not trade_id.isprintable()):
@@ -465,7 +585,7 @@ class FakeBroker:
         self._native_orders[native_order_id] = child_order_id
 
     def _queue_order_fact(self, order: FakeBrokerOrder, status: str,
-                          filled_qty: int) -> dict[str, object]:
+                          filled_qty: int, *, allow_accept: bool = False) -> dict[str, object]:
         if order.native_order_id is None:
             raise FakeBrokerError("Native order status requires an assigned native id")
         if status not in {"ALIVE", "FILLED", "CANCELLED", "REJECTED"}:
@@ -483,7 +603,7 @@ class FakeBroker:
             raise FakeBrokerError("A fully filled order cannot remain ALIVE")
         current = order.status
         if current == "SEND_REQUESTED":
-            if status == "ALIVE":
+            if status == "ALIVE" and not allow_accept:
                 raise FakeBrokerError("Use accept_order to report initial acceptance")
         elif current in {"CANCELLED", "FILLED", "REJECTED"}:
             if status != current:

@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Quick', 'Affected', 'Trading', 'Runtime', 'FullOffline')]
+    [ValidateSet('Quick', 'Affected', 'Trading', 'Runtime', 'FullOffline', 'SmokeE2E', 'TradingE2E', 'TradingExtended', 'DesktopE2E')]
     [string]$Profile,
     [switch]$ListOnly,
     [switch]$ShowIds,

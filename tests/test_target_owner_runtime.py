@@ -1,6 +1,6 @@
 """Public-entry acceptance for the isolated Standalone target owner."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from threading import get_ident
@@ -12,7 +12,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from online_trader.contracts.codec import content_hash, strict_loads
+from online_trader.configuration.dsv import DsvProfile
+from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.contracts.validation import validate_message
 from online_trader.dsv_runtime.controller import ExplicitOrderController, SendNotAttempted, terminal
 from online_trader.dsv_runtime.order_diagnostics import attach_order_blocking_log, classify_broker_rejection
@@ -23,11 +24,17 @@ from online_trader.dsv_runtime.standalone_owner import StandaloneDsvOwner
 from online_trader.dsv_runtime.standalone_projection import workbench_view
 from online_trader.dsv_storage.journal import Journal
 from online_trader.errors import TraderError
+from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.account_cache import BrokerHistoryWriter
+from online_trader.runtime.portable_config import PortableAccountStore
+from online_trader.runtime.instance import AccountLock, RuntimeLock
+from online_trader.runtime.session_storage import RuntimeSessionStorage
+from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.runtime.target_owner_startup import (
     _resolve_trusted_pid, classify_owner_tick_error, execute_owner_tick,
     resolve_active_trading_day, run_target_owner,
 )
+from online_trader.scheduling.calendar import TradingCalendar
 from online_trader.transport.status_client import StatusClient
 from qa.target_owner.offline_runtime import CONTRACT, DAY, OfflineTargetRuntime, frame, order_fact, profile
 from qa.target_owner.process_runtime import OfflineTargetOwnerProcess
@@ -1507,6 +1514,583 @@ class TargetOwnerWorkbenchProjectionTests(unittest.TestCase):
             identity_two = strict_loads((output_two / 'runtime-identity.json').read_bytes())
             self.assertEqual(identity_two['entry_point'], 'runtime run')
             self.assertEqual(captured_clients[-1][2], inactive_process.trusted_pid)
+
+    def test_workbench_projection_includes_strategy_profile_and_added_silver_trades(self):
+        from online_trader.configuration.dsv import DsvProfile
+        from online_trader.runtime.portable_config import PortableAccountStore
+
+        base = profile()
+        raw = base.to_record()
+        raw['settings']['symbols'].append({
+            'name': '白银', 'code': 'SHFE.ag2702',
+            'open_offset': '96', 'stop_offset': '15', 'profit_offset': '139',
+            'order_volume': 1, 'half_close_ratio': '0.5', 'hysteresis_points': '0',
+        })
+        added_profile = DsvProfile.from_record(raw)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        (root / 'private').mkdir(parents=True, exist_ok=True)
+        (root / 'runtime.json').write_text(json.dumps({
+            'schema_version': 'ONLINE_TRADER_RUNTIME/1',
+            'selected_account': 'sim1',
+            'accounts': [{'id': 'sim1', 'alias': '测试', 'provider': 'TQKQ', 'broker': '快期模拟', 'line': '默认'}],
+        }, ensure_ascii=False), encoding='utf-8')
+        (root / 'private' / 'OnlineTrader-defaults.json').write_text(json.dumps({
+            'accounts': {'sim1': {'username': 'user-one', 'password': 'secret'}},
+        }, ensure_ascii=False), encoding='utf-8')
+        (root / 'OnlineTrader-parameters.json').write_text(
+            json.dumps(base.to_settings(), ensure_ascii=False), encoding='utf-8')
+        store = PortableAccountStore(root)
+        store.save_profile(added_profile)
+        reloaded = PortableAccountStore(root).profile()
+        self.assertEqual(reloaded.content_hash, added_profile.content_hash)
+
+        from qa.recording_port import RecordingPort
+        port = RecordingPort()
+        with DsvSession(root / 'journal.db', account_key='DEV:ag-proj', provider='OFFLINE',
+                        trading_day=DAY, profile=reloaded, port=port) as session:
+            adapter = self._make_adapter()
+            adapter.dispatch_market = {
+                'DCE.p2701': {'margin_per_lot': '5000', 'multiplier': 10, 'market_session_active': True},
+                'SHFE.ag2702': {'margin_per_lot': '6000', 'multiplier': 15, 'market_session_active': True},
+            }
+            snapshot = session.snapshot()
+            snapshot['scope'] = snapshot['scope'] | {'runtime_boot_id': 'runtime-ag-proj'}
+            view = workbench_view(snapshot, profile=reloaded, adapter=adapter, configuration_revision='1')
+            validate_message(StatusClient._message('WorkbenchSnapshot', {'payload': view, 'content_hash': content_hash(view)}))
+            self.assertEqual(view['configuration']['strategy_profile'], reloaded.to_record())
+            self.assertEqual(view['configuration']['scoped_contracts'], ['DCE.p2701', 'SHFE.ag2702'])
+            self.assertEqual([item['contract_id'] for item in view['markets']], ['DCE.p2701', 'SHFE.ag2702'])
+
+            session.command({'id': 'start-ag', 'action': 'START'})
+            # Open 1 lot of SHFE.ag2702 when price triggers LONG above 7500 + 96 = 7596
+            # after the 5-minute opening block, then confirm fill and verify manual close (REDUCE).
+            first = {
+                'id': 'qa-ag-1', 'sequence': 1, 'session_id': 'qa-session',
+                'wall_time': '2026-11-13T01:10:01Z', 'monotonic_ms': 1000,
+                'synchronized': True, 'sync_orders': [],
+                'market': [
+                    {
+                        'contract_id': 'DCE.p2701',
+                        'ticks': [{'native_time': '2026-11-13T01:10:01Z', 'candle_id': 'bar-p-1',
+                                   'last': '1000', 'day_low': '995', 'day_high': '1005',
+                                   'bid1': '999', 'ask1': '1001', 'tick_size': '1',
+                                   'lower_limit': '900', 'upper_limit': '1200'}],
+                        'opening_session': True,
+                        'session_open': '2026-11-13T01:00:00Z', 'session_close': '2026-11-13T02:15:00Z',
+                        'long_qty': 0, 'short_qty': 0, 'available': '100000', 'margin_per_lot': '5000',
+                    },
+                    {
+                        'contract_id': 'SHFE.ag2702',
+                        'ticks': [
+                            {'native_time': '2026-11-13T01:10:01Z', 'candle_id': 'bar-ag-1',
+                             'last': '7598', 'day_low': '7500', 'day_high': '7598',
+                             'bid1': '7597', 'ask1': '7598', 'tick_size': '1',
+                             'lower_limit': '7000', 'upper_limit': '8000'},
+                        ],
+                        'opening_session': True,
+                        'session_open': '2026-11-13T01:00:00Z', 'session_close': '2026-11-13T02:15:00Z',
+                        'long_qty': 0, 'short_qty': 0, 'available': '100000', 'margin_per_lot': '6000',
+                    },
+                ],
+                'native': [],
+            }
+            session.apply_round(first)
+            ag_orders = [o for o in session.snapshot()['orders'].values() if o['contract_id'] == 'SHFE.ag2702']
+            self.assertEqual(len(ag_orders), 1)
+            self.assertEqual(ag_orders[0]['effect'], 'OPEN')
+            self.assertEqual(ag_orders[0]['original_qty'], 1)
+            open_child = ag_orders[0]['child_order_id']
+            second = {
+                'id': 'qa-ag-2', 'sequence': 2, 'session_id': 'qa-session',
+                'wall_time': '2026-11-13T01:10:02Z', 'monotonic_ms': 2000,
+                'synchronized': True, 'sync_orders': [],
+                'market': [
+                    {
+                        'contract_id': 'DCE.p2701', 'ticks': [], 'opening_session': True,
+                        'session_open': '2026-11-13T01:00:00Z', 'session_close': '2026-11-13T02:15:00Z',
+                        'long_qty': 0, 'short_qty': 0, 'available': '100000', 'margin_per_lot': '5000',
+                    },
+                    {
+                        'contract_id': 'SHFE.ag2702',
+                        'ticks': [{'native_time': '2026-11-13T01:10:02Z', 'candle_id': 'bar-ag-2',
+                                   'last': '7602', 'day_low': '7500', 'day_high': '7605',
+                                   'bid1': '7601', 'ask1': '7603', 'tick_size': '1',
+                                   'lower_limit': '7000', 'upper_limit': '8000'}],
+                        'opening_session': True,
+                        'session_open': '2026-11-13T01:00:00Z', 'session_close': '2026-11-13T02:15:00Z',
+                        'long_qty': 1, 'short_qty': 0, 'available': '94000', 'margin_per_lot': '6000',
+                    },
+                ],
+                'native': [
+                    order_fact(open_child, 'FILLED', filled=1),
+                    {'kind': 'TRADE', 'child_order_id': open_child, 'native_order_id': open_child + '|qa-native',
+                     'native_trade_id': 'trd-ag-1', 'quantity': 1, 'price': '7598'},
+                ],
+            }
+            session.apply_round(second)
+            ag_pos = session.snapshot()['symbols']['SHFE.ag2702']['position']
+            self.assertIsNotNone(ag_pos)
+            self.assertEqual(ag_pos['owned'], 1)
+            close_receipt = session.command({
+                'id': 'close-ag', 'action': 'REDUCE', 'contract_id': 'SHFE.ag2702',
+                'position_id': ag_pos['id'], 'quantity': 1,
+                'expected_target_revision': ag_pos['target_revision'],
+            })
+            self.assertTrue(any(d.get('reason') == 'USER_REDUCE' for d in close_receipt['decisions']))
+            self.assertEqual(session.snapshot()['symbols']['SHFE.ag2702']['position']['exit_target'], 0)
+            third = {
+                'id': 'qa-ag-3', 'sequence': 3, 'session_id': 'qa-session',
+                'wall_time': '2026-11-13T01:10:03Z', 'monotonic_ms': 3000,
+                'synchronized': True, 'sync_orders': [],
+                'market': [
+                    {
+                        'contract_id': 'DCE.p2701', 'ticks': [], 'opening_session': True,
+                        'session_open': '2026-11-13T01:00:00Z', 'session_close': '2026-11-13T02:15:00Z',
+                        'long_qty': 0, 'short_qty': 0, 'available': '100000', 'margin_per_lot': '5000',
+                    },
+                    {
+                        'contract_id': 'SHFE.ag2702',
+                        'ticks': [{'native_time': '2026-11-13T01:10:03Z', 'candle_id': 'bar-ag-2',
+                                   'last': '7603', 'day_low': '7500', 'day_high': '7605',
+                                   'bid1': '7602', 'ask1': '7604', 'tick_size': '1',
+                                   'lower_limit': '7000', 'upper_limit': '8000'}],
+                        'opening_session': True,
+                        'session_open': '2026-11-13T01:00:00Z', 'session_close': '2026-11-13T02:15:00Z',
+                        'long_qty': 1, 'short_qty': 0, 'available': '94000', 'margin_per_lot': '6000',
+                    },
+                ],
+                'native': [],
+            }
+            session.apply_round(third)
+            ag_close_orders = [o for o in session.snapshot()['orders'].values()
+                               if o['contract_id'] == 'SHFE.ag2702' and o['effect'] == 'REDUCE']
+            self.assertEqual(len(ag_close_orders), 1)
+
+    def _make_hot_add_harness(self, temp_root, *, calendar_rows=True, expired_silver=False):
+        root = Path(temp_root)
+        (root / 'private').mkdir(parents=True, exist_ok=True)
+        base = profile()
+        raw_base = base.to_record()
+        raw_base['settings']['symbols'][0]['stop_offset'] = '30'
+        raw_base['settings']['symbols'][0]['order_volume'] = 1
+        base = DsvProfile.from_record(raw_base)
+        (root / 'runtime.json').write_text(json.dumps({
+            'schema_version': 'ONLINE_TRADER_RUNTIME/1',
+            'selected_account': 'sim1',
+            'accounts': [{
+                'id': 'sim1', 'alias': '开发模拟', 'provider': 'TQKQ',
+                'broker': '快期模拟', 'line': '默认',
+            }],
+        }, ensure_ascii=False), encoding='utf-8')
+        (root / 'private' / 'OnlineTrader-defaults.json').write_text(json.dumps({
+            'accounts': {'sim1': {'username': 'user-one', 'password': 'secret'}},
+        }, ensure_ascii=False), encoding='utf-8')
+        (root / 'OnlineTrader-parameters.json').write_text(
+            json.dumps(base.to_settings(), ensure_ascii=False), encoding='utf-8',
+        )
+        store = PortableAccountStore(root)
+
+        calendar = TradingCalendar.from_record({
+            'schema_version': 'TRADING_CALENDAR/1',
+            'calendar_id': 'cal-hotadd',
+            'calendar_version': 'tqsdk-3.10.4',
+            'complete': True,
+            'coverage_from_utc': '2026-11-12T12:00:00Z',
+            'coverage_to_utc': '2026-11-13T08:00:00Z',
+            'contracts': [{
+                'contract_id': 'DCE.p2701',
+                'sessions': [{
+                    'session_id': '2026-11-13-day-0',
+                    'trading_day': '2026-11-13',
+                    'open_utc': '2026-11-13T01:00:00Z',
+                    'close_utc': '2026-11-13T02:15:00Z',
+                    'is_opening_session': True,
+                    'force_close_at_end': True,
+                }],
+            }],
+        })
+        kline_calls = []
+        bar_ns = int(datetime(2026, 11, 13, 1, 5, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+        serials = {}
+
+        def make_serial(code):
+            rows = [
+                {'datetime': bar_ns - 60_000_000_000, 'open': 7490.0, 'high': 7510.0, 'low': 7480.0, 'close': 7500.0}
+                if code == 'SHFE.ag2702'
+                else {'datetime': bar_ns - 60_000_000_000, 'open': 1045.0, 'high': 1055.0, 'low': 1040.0, 'close': 1050.0},
+                {'datetime': bar_ns, 'open': 7500.0, 'high': 7520.0, 'low': 7490.0, 'close': 7510.0}
+                if code == 'SHFE.ag2702'
+                else {'datetime': bar_ns, 'open': 1050.0, 'high': 1060.0, 'low': 1045.0, 'close': 1052.0},
+            ]
+
+            class _FakeSerial:
+                @property
+                def iloc(self):
+                    return rows
+
+                def tail(self, count):
+                    return SimpleNamespace(to_dict=lambda _mode: rows[-count:])
+
+            return _FakeSerial()
+
+        quotes = {
+            'DCE.p2701': SimpleNamespace(
+                instrument_id='DCE.p2701', expired=False, ins_class='FUTURE', volume_multiple=10,
+                trading_time={'day': [['09:00:00', '10:15:00']], 'night': []},
+                datetime='2026-11-13 09:10:00.000000', last_price=1052.0, highest=1060.0, lowest=1040.0,
+                bid_price1=1051.0, ask_price1=1053.0, price_tick=1.0, lower_limit=950.0, upper_limit=1150.0,
+                margin=5000.0, open=1045.0, pre_settlement=1045.0, settlement=None,
+                volume=100, open_interest=200, bid_volume1=5, ask_volume1=5, commission=2.5,
+            ),
+            'SHFE.ag2702': SimpleNamespace(
+                instrument_id='SHFE.ag2702', expired=expired_silver, ins_class='FUTURE', volume_multiple=15,
+                trading_time={'day': [['09:00:00', '10:15:00']], 'night': [['21:00:00', '23:00:00']]},
+                datetime='2026-11-13 09:10:00.000000', last_price=7505.0, highest=7520.0, lowest=7480.0,
+                bid_price1=7504.0, ask_price1=7506.0, price_tick=1.0, lower_limit=7000.0, upper_limit=8000.0,
+                margin=6000.0, open=7500.0, pre_settlement=7490.0, settlement=None,
+                volume=200, open_interest=300, bid_volume1=5, ask_volume1=5, commission=3.5,
+            ),
+        }
+        orders = {}
+        trades = {}
+        inserted = []
+        positions = {
+            'DCE.p2701': SimpleNamespace(
+                pos_long=0, pos_short=0, pos_long_today=0, pos_long_his=0,
+                pos_short_today=0, pos_short_his=0, margin=0.0,
+            ),
+            'SHFE.ag2702': SimpleNamespace(
+                pos_long=0, pos_short=0, pos_long_today=0, pos_long_his=0,
+                pos_short_today=0, pos_short_his=0, margin=0.0,
+            ),
+        }
+
+        def get_kline_serial(code, interval, data_length=500):
+            kline_calls.append((code, interval, data_length))
+            if code not in serials:
+                serials[code] = make_serial(code)
+            return serials[code]
+
+        def get_trading_calendar(start_dt, end_dt):
+            if not calendar_rows:
+                return []
+            days = []
+            cur = start_dt
+            while cur <= end_dt:
+                days.append({'date': cur, 'trading': cur.weekday() < 5})
+                cur += timedelta(days=1)
+            return days
+
+        def insert_order(**kwargs):
+            inserted.append(kwargs)
+            symbol = kwargs['symbol']
+            exch, inst = symbol.split('.')
+            oid = kwargs['order_id']
+            vol = int(kwargs['volume'])
+            price = float(kwargs['limit_price'])
+            orders[oid] = SimpleNamespace(
+                order_id=oid, exchange_id=exch, instrument_id=inst,
+                direction=kwargs['direction'], offset=kwargs['offset'],
+                volume_orign=vol, limit_price=price, volume_left=0,
+                status='FINISHED', insert_date_time=bar_ns, is_error=False,
+            )
+            tid = f'tr-{len(trades) + 1}'
+            trades[tid] = SimpleNamespace(
+                trade_id=tid, order_id=oid, exchange_id=exch, instrument_id=inst,
+                direction=kwargs['direction'], offset=kwargs['offset'],
+                volume=vol, price=price, trade_date_time=bar_ns,
+            )
+            if kwargs['offset'] == 'OPEN':
+                if kwargs['direction'] == 'BUY':
+                    positions[symbol].pos_long += vol
+                    positions[symbol].pos_long_today += vol
+                else:
+                    positions[symbol].pos_short += vol
+                    positions[symbol].pos_short_today += vol
+            return orders[oid]
+
+        clock_tick = [0]
+
+        def test_clock():
+            sec = clock_tick[0]
+            clock_tick[0] += 1
+            return (datetime(2026, 11, 13, 1, 10, 0, tzinfo=timezone.utc) + timedelta(seconds=sec),
+                    1000 + sec * 1000)
+
+        api = SimpleNamespace(
+            get_quote=lambda code: quotes[code],
+            get_kline_serial=get_kline_serial,
+            get_trading_calendar=get_trading_calendar,
+            wait_update=lambda deadline=None: False,
+            get_order=lambda account=None: orders,
+            get_trade=lambda account=None: trades,
+            get_account=lambda account=None: SimpleNamespace(
+                balance=200000.0, available=150000.0, margin=5000.0, frozen_margin=0.0, risk_ratio=0.1,
+            ),
+            get_position=lambda code, account=None: positions[code],
+            insert_order=insert_order,
+            is_serial_ready=lambda _serial: True,
+        )
+        account = object()
+        account_key = 'SIM:KQ:' + '0' * 16
+        grant = DsvSimulationGrant.parse(canonical_bytes({
+            'schema_version': 'KQ_DSV_DESKTOP/1',
+            'grant_id': 'grant-hotadd-1',
+            'account_fingerprint': '0' * 16,
+            'ledger_path': str((root / 'ledger.db').resolve()),
+            'contracts': ['DCE.p2701'],
+            'trading_day': '2026-11-13',
+            'trading_days': ['2026-11-13'],
+            'resume_entries_on_day_change': False,
+            'not_before_utc': '2026-11-13T00:00:00Z',
+            'not_after_utc': '2026-11-13T08:00:00Z',
+            'max_order_quantity': 2,
+            'daily_targets_per_contract': 4,
+            'risk_budget': '600',
+            'profile_hash': base.content_hash,
+            'calendar_hash': calendar.content_hash,
+            'authorization_reference': 'DESKTOP_CONFIRM:' + 'a' * 64,
+        }))
+        connection = SimpleNamespace(
+            grant=grant, api=api, account=account, broker_connected=True, read_only=False,
+            source_epoch=1, complete=lambda: True, poll_updates=lambda _wait: True,
+            close=lambda: None,
+            snapshot=lambda: {
+                'account_key': account_key, 'complete': True, 'trading_day': '2026-11-13',
+                'source_epoch': 1, 'funds': {'balance': '200000', 'available': '150000'},
+            },
+        )
+        adapter = DsvSdkAdapter(
+            api, account, account_key=account_key, profile=base, calendar=calendar,
+            sdk_version=SDK_VERSION, _connection=connection, owner_mode='STANDALONE',
+            clock=test_clock,
+        )
+        adapter.synchronized = True
+
+        class _TestAccountLock(AccountLock):
+            def __init__(self, key):
+                self.account_key = key
+                self._handle = object()
+                self.owner_thread = get_ident()
+
+            def matches(self, key):
+                return self.account_key == key and self.owner_thread == get_ident()
+
+        class _TestRuntimeLock(RuntimeLock):
+            def __init__(self):
+                self.owner_thread = get_ident()
+
+            def matches(self):
+                return self.owner_thread == get_ident()
+
+        def make_binding(boot_id):
+            return StandaloneOwnerBinding(
+                boot_id, account_key, 'TQKQ', _TestRuntimeLock(), _TestAccountLock(account_key),
+            )
+
+        return SimpleNamespace(
+            root=root, store=store, base=base, adapter=adapter, api=api, quotes=quotes,
+            positions=positions, connection=connection, account_key=account_key,
+            kline_calls=kline_calls, serials=serials, inserted=inserted,
+            make_binding=make_binding,
+        )
+
+    def test_sdk_adapter_hot_add_contract_updates_calendar_grant_subscriptions_and_trades_while_existing_position_open(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._make_hot_add_harness(temp_dir)
+            with RuntimeSessionStorage() as storage:
+                binding = env.make_binding(storage.boot_id)
+                session = DsvSession(
+                    storage.ledger, account_key=env.account_key, provider='TQKQ',
+                    trading_day='2026-11-13', profile=env.base, port=env.adapter,
+                    _execution_lock=binding.account_lock, _owner_binding=binding,
+                )
+                owner = StandaloneDsvOwner(
+                    session, env.adapter, env.connection, env.base, binding,
+                    configuration_revision='1',
+                )
+                try:
+                    owner.on_parameters_saved = env.store.replace_profile
+                    owner.on_parameters_restore = lambda token: env.store.replace_profile(token) if token is not None else None
+                    env.adapter.step(session, trading_day='2026-11-13', complete=True)
+                    owner.command({
+                        'command_id': 'start-hotadd-1',
+                        'operation': 'ARM_ENTRIES',
+                        'scope': {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                        'binding': {'account_key': env.account_key, 'kernel_boot_id': storage.boot_id,
+                                    'config_revision': owner.configuration_revision},
+                        'parameters': {'origin': 'USER'},
+                    })
+                    # Trigger breakout entry on DCE.p2701 and reconcile its fill.
+                    env.quotes['DCE.p2701'].lowest = 1020.0
+                    env.quotes['DCE.p2701'].highest = 1060.0
+                    env.quotes['DCE.p2701'].last_price = 1060.0
+                    env.quotes['DCE.p2701'].bid_price1 = 1059.0
+                    env.quotes['DCE.p2701'].ask_price1 = 1060.0
+                    env.quotes['DCE.p2701'].datetime = '2026-11-13 09:10:02.000000'
+                    env.adapter.step(session, trading_day='2026-11-13', complete=True)
+                    env.quotes['DCE.p2701'].datetime = '2026-11-13 09:10:03.000000'
+                    env.adapter.step(session, trading_day='2026-11-13', complete=True)
+                    self.assertEqual(session.snapshot()['symbols']['DCE.p2701']['position']['owned'], 1)
+
+                    candidate_raw = env.base.to_record()
+                    ag_row = copy.deepcopy(candidate_raw['settings']['symbols'][0])
+                    ag_row.update({
+                        'name': '白银', 'code': 'SHFE.ag2702',
+                        'open_offset': '100', 'stop_offset': '15', 'profit_offset': '60',
+                    })
+                    candidate_raw['settings']['symbols'].append(ag_row)
+                    candidate = DsvProfile.from_record(candidate_raw)
+
+                    receipt = owner.command({
+                        'command_id': 'save-hotadd-1',
+                        'operation': 'SAVE_DSV_PARAMETERS',
+                        'scope': {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                        'binding': {'account_key': env.account_key, 'kernel_boot_id': storage.boot_id,
+                                    'config_revision': owner.configuration_revision},
+                        'parameters': {'profile': candidate.to_record()},
+                    })
+                    saved_decisions = [d for d in receipt['decisions'] if d.get('reason') == 'DSV_PARAMETERS_SAVED']
+                    self.assertEqual(len(saved_decisions), 1)
+                    self.assertEqual(saved_decisions[0].get('added_contracts'), ['SHFE.ag2702'])
+                    self.assertEqual(env.adapter.contracts, ('DCE.p2701', 'SHFE.ag2702'))
+                    self.assertIn(('SHFE.ag2702', 60, 500), env.kline_calls)
+                    self.assertEqual(env.adapter.grant.value['contracts'], ['DCE.p2701', 'SHFE.ag2702'])
+                    self.assertEqual(env.adapter.grant.value['profile_hash'], candidate.content_hash)
+                    # Initial risk_budget 600 + 15 * 15 (multiplier) * 2 (max_order_quantity) = 1050.
+                    self.assertEqual(env.adapter.grant.value['risk_budget'], '1050')
+                    self.assertEqual(
+                        [row['code'] for row in env.store.profile().to_settings()['symbols']],
+                        ['DCE.p2701', 'SHFE.ag2702'],
+                    )
+
+                    # Feed breakout quote on newly hot-added SHFE.ag2702 and verify live entry + projection.
+                    env.quotes['DCE.p2701'].datetime = '2026-11-13 09:10:05.000000'
+                    env.quotes['SHFE.ag2702'].lowest = 7480.0
+                    env.quotes['SHFE.ag2702'].highest = 7580.0
+                    env.quotes['SHFE.ag2702'].last_price = 7580.0
+                    env.quotes['SHFE.ag2702'].bid_price1 = 7579.0
+                    env.quotes['SHFE.ag2702'].ask_price1 = 7580.0
+                    env.quotes['SHFE.ag2702'].datetime = '2026-11-13 09:10:05.000000'
+                    env.adapter.step(session, trading_day='2026-11-13', complete=True)
+                    env.quotes['DCE.p2701'].datetime = '2026-11-13 09:10:06.000000'
+                    env.quotes['SHFE.ag2702'].datetime = '2026-11-13 09:10:06.000000'
+                    env.adapter.step(session, trading_day='2026-11-13', complete=True)
+                    view = owner.workbench()
+                    self.assertEqual(
+                        [row['contract_id'] for row in view['markets']],
+                        ['DCE.p2701', 'SHFE.ag2702'],
+                    )
+                    self.assertEqual(
+                        [row['code'] for row in view['configuration']['strategy_profile']['settings']['symbols']],
+                        ['DCE.p2701', 'SHFE.ag2702'],
+                    )
+                    self.assertEqual(session.snapshot()['symbols']['DCE.p2701']['position']['owned'], 1)
+                    self.assertEqual(session.snapshot()['symbols']['SHFE.ag2702']['position']['owned'], 1)
+                    self.assertTrue(any(call['symbol'] == 'SHFE.ag2702' for call in env.inserted))
+                finally:
+                    owner.close()
+
+    def test_sdk_adapter_hot_add_incomplete_calendar_rolls_back_cleanly(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._make_hot_add_harness(temp_dir, calendar_rows=False)
+            with RuntimeSessionStorage() as storage:
+                binding = env.make_binding(storage.boot_id)
+                session = DsvSession(
+                    storage.ledger, account_key=env.account_key, provider='TQKQ',
+                    trading_day='2026-11-13', profile=env.base, port=env.adapter,
+                    _execution_lock=binding.account_lock, _owner_binding=binding,
+                )
+                owner = StandaloneDsvOwner(
+                    session, env.adapter, env.connection, env.base, binding,
+                    configuration_revision='1',
+                )
+                try:
+                    owner.on_parameters_saved = env.store.replace_profile
+                    owner.on_parameters_restore = lambda token: env.store.replace_profile(token) if token is not None else None
+                    candidate_raw = env.base.to_record()
+                    ag_row = copy.deepcopy(candidate_raw['settings']['symbols'][0])
+                    ag_row.update({'name': '白银', 'code': 'SHFE.ag2702', 'open_offset': '100', 'stop_offset': '15'})
+                    candidate_raw['settings']['symbols'].append(ag_row)
+                    candidate = DsvProfile.from_record(candidate_raw)
+
+                    with self.assertRaises(TraderError) as ctx:
+                        owner.command({
+                            'command_id': 'save-hotadd-fail',
+                            'operation': 'SAVE_DSV_PARAMETERS',
+                            'scope': {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                            'binding': {'account_key': env.account_key, 'kernel_boot_id': storage.boot_id,
+                                        'config_revision': owner.configuration_revision},
+                            'parameters': {'profile': candidate.to_record()},
+                        })
+                    self.assertEqual(ctx.exception.code, 'E_CALENDAR_INCOMPLETE')
+                    self.assertEqual(env.adapter.contracts, ('DCE.p2701',))
+                    self.assertEqual(env.adapter.grant.value['contracts'], ['DCE.p2701'])
+                    self.assertNotIn(('SHFE.ag2702', 60, 500), env.kline_calls)
+                    self.assertEqual([row['code'] for row in env.store.profile().to_settings()['symbols']], ['DCE.p2701'])
+                finally:
+                    owner.close()
+
+    def test_hot_add_with_existing_param_edit_while_holding_position_rejects_and_restores_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = self._make_hot_add_harness(temp_dir)
+            with RuntimeSessionStorage() as storage:
+                binding = env.make_binding(storage.boot_id)
+                session = DsvSession(
+                    storage.ledger, account_key=env.account_key, provider='TQKQ',
+                    trading_day='2026-11-13', profile=env.base, port=env.adapter,
+                    _execution_lock=binding.account_lock, _owner_binding=binding,
+                )
+                owner = StandaloneDsvOwner(
+                    session, env.adapter, env.connection, env.base, binding,
+                    configuration_revision='1',
+                )
+                try:
+                    owner.on_parameters_saved = env.store.replace_profile
+                    owner.on_parameters_restore = lambda token: env.store.replace_profile(token) if token is not None else None
+                    env.adapter.step(session, trading_day='2026-11-13', complete=True)
+                    owner.command({
+                        'command_id': 'start-hotadd-2',
+                        'operation': 'ARM_ENTRIES',
+                        'scope': {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                        'binding': {'account_key': env.account_key, 'kernel_boot_id': storage.boot_id,
+                                    'config_revision': owner.configuration_revision},
+                        'parameters': {'origin': 'USER'},
+                    })
+                    env.quotes['DCE.p2701'].lowest = 1020.0
+                    env.quotes['DCE.p2701'].highest = 1060.0
+                    env.quotes['DCE.p2701'].last_price = 1060.0
+                    env.quotes['DCE.p2701'].bid_price1 = 1059.0
+                    env.quotes['DCE.p2701'].ask_price1 = 1060.0
+                    env.quotes['DCE.p2701'].datetime = '2026-11-13 09:10:02.000000'
+                    env.adapter.step(session, trading_day='2026-11-13', complete=True)
+                    env.quotes['DCE.p2701'].datetime = '2026-11-13 09:10:03.000000'
+                    env.adapter.step(session, trading_day='2026-11-13', complete=True)
+                    self.assertEqual(session.snapshot()['symbols']['DCE.p2701']['position']['owned'], 1)
+
+                    candidate_raw = env.base.to_record()
+                    candidate_raw['settings']['symbols'][0]['open_offset'] = '99'
+                    ag_row = copy.deepcopy(candidate_raw['settings']['symbols'][0])
+                    ag_row.update({'name': '白银', 'code': 'SHFE.ag2702', 'open_offset': '100', 'stop_offset': '15'})
+                    candidate_raw['settings']['symbols'].append(ag_row)
+                    candidate = DsvProfile.from_record(candidate_raw)
+
+                    with self.assertRaises(TraderError) as ctx:
+                        owner.command({
+                            'command_id': 'save-hotadd-conflict',
+                            'operation': 'SAVE_DSV_PARAMETERS',
+                            'scope': {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                            'binding': {'account_key': env.account_key, 'kernel_boot_id': storage.boot_id,
+                                        'config_revision': owner.configuration_revision},
+                            'parameters': {'profile': candidate.to_record()},
+                        })
+                    self.assertEqual(ctx.exception.code, 'E_DSV_SCOPE')
+                    self.assertEqual(env.adapter.contracts, ('DCE.p2701',))
+                    self.assertEqual([row['code'] for row in env.store.profile().to_settings()['symbols']], ['DCE.p2701'])
+                finally:
+                    owner.close()
 
 
 if __name__ == '__main__':

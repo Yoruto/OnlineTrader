@@ -84,7 +84,7 @@ Build Identity
 
 ### 2.6 P1-3：配置快照固定与真实产品解析
 
-- 预检阶段即对配置目录完成完整产品级校验（`PortableAccountStore`、`DsvProfile.from_dsv_json`、`OnlineTrader-overrides.json` 合并、白银排除、禁止/遗留文件排除与大小限制）。
+- 预检阶段即对配置目录完成完整产品级校验（`PortableAccountStore`、`DsvProfile.from_dsv_json`、`OnlineTrader-overrides.json` 合并、全部品种含白银的配置有效性、禁止/遗留文件排除与大小限制）。白银主连及上期所 `ag` 具体合约月不再作为阻断条件，按其他品种的相同规则校验。
 - 组装前先将已确认配置固定到私有短生命周期快照并计算全量 `config_hashes`；后续组装、目录校验和 ZIP 成员校验全部仅读取该快照并交叉比对哈希，结束后通过 `try/finally` 清理含凭据的临时目录。
 
 ### 2.7 P1-4 与 P2：明确延后边界

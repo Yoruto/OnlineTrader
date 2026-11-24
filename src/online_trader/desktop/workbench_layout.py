@@ -758,6 +758,9 @@ class WorkbenchLayout:
         self.account_history_pending = set()
         self.account_history_error = None
         self.parameter_save_buttons = []
+        self._runtime_synced_hash = None
+        self._saved_next_boot_hash = None
+        self.symbol_feedback_label = None
 
         original = window.takeCentralWidget()
         for widget in (window.connection_label, window.account_label, window.kernel_label,
@@ -1184,7 +1187,62 @@ class WorkbenchLayout:
         populate(self.parameter_comparison, rows)
         for index, (_, current, edited) in enumerate(rows):
             self.parameter_comparison.item(index, 2).setForeground(
-                QColor('#075de5' if current != '—' and current != edited else '#172438'))
+                QColor('#075de5' if current != edited else '#172438'))
+
+    def has_unsaved_symbol_changes(self):
+        dialog = self.window._settings_dialog
+        current_profile = dialog.profile if dialog is not None else self.profile
+        if current_profile.content_hash == self.profile.content_hash:
+            return False
+        if self._saved_next_boot_hash == current_profile.content_hash:
+            return False
+        current_symbols = current_profile.to_record()['settings']['symbols']
+        active_symbols = self.profile.to_record()['settings']['symbols']
+        return current_symbols != active_symbols
+
+    def set_parameter_feedback(self, message, *, error=False):
+        label = getattr(self, 'symbol_feedback_label', None)
+        if label is not None:
+            label.setText(message)
+            label.setStyleSheet('color: #b42318; font-weight: 600;' if error
+                                else 'color: #08764d; font-weight: 600;' if message else '')
+            label.setVisible(bool(message))
+
+    def mark_next_boot_saved(self, profile):
+        self._saved_next_boot_hash = profile.content_hash
+        self.set_parameter_feedback('新合约配置已保存到启动配置（OnlineTrader-overrides.json），重启后台服务后生效。')
+        self.render_parameters(profile)
+
+    def sync_runtime_profile(self, view):
+        raw = (view or {}).get('configuration', {}).get('strategy_profile')
+        if not isinstance(raw, Mapping):
+            return
+        def _unfreeze(value):
+            if isinstance(value, Mapping):
+                return {key: _unfreeze(item) for key, item in value.items()}
+            if isinstance(value, tuple):
+                return [_unfreeze(item) for item in value]
+            return value
+        try:
+            remote = DsvProfile.from_record(_unfreeze(raw))
+        except TraderError:
+            return
+        if remote.content_hash == self._runtime_synced_hash and remote.content_hash == self.profile.content_hash:
+            return
+        self._runtime_synced_hash = remote.content_hash
+        self.profile_source = '当前 Runtime 运行配置'
+        dialog = self.window._settings_dialog
+        dirty = dialog is not None and dialog.profile.content_hash != self.profile.content_hash
+        self.profile = remote
+        self.symbols = remote.to_record()['settings']['symbols']
+        self.names = {item['code']: item['name'] for item in self.symbols}
+        if self._saved_next_boot_hash == remote.content_hash:
+            self._saved_next_boot_hash = None
+        if dialog is not None:
+            dialog.set_runtime_baseline(remote, self.profile_source, preserve_draft=True)
+        elif not dirty:
+            self.render_parameters(remote)
+        self.update_runtime_capabilities()
 
     @staticmethod
     def fill_selectable(grid, rows, keys):
@@ -1279,6 +1337,14 @@ class WorkbenchLayout:
                          focus, position, status))
             self.dashboard_market_rows[code] = (status, quote, lines, decision, explanation, nearby)
         self.fill_selectable(self.dashboard_markets, rows, codes)
+        pending_focus = getattr(self.window, '_pending_focus_contracts', ())
+        if pending_focus:
+            target = next((code for code in pending_focus if code in codes), None)
+            if target is not None:
+                self.window._pending_focus_contracts = ()
+                self.dashboard_markets.setCurrentCell(codes.index(target), 0)
+                if self.candle_contract.findText(target) >= 0:
+                    self.candle_contract.setCurrentText(target)
         table_height = (self.dashboard_markets.horizontalHeader().sizeHint().height()
                         + max(1, min(6, len(codes)))
                         * self.dashboard_markets.verticalHeader().defaultSectionSize() + 4)
@@ -1968,8 +2034,12 @@ class WorkbenchLayout:
     def symbols_page(self, layout):
         contracts = group('品种列表', layout, stretch=1)
         self.symbol_preview_state = QLabel()
+        self.symbol_feedback_label = QLabel()
+        self.symbol_feedback_label.setWordWrap(True)
+        self.symbol_feedback_label.hide()
         contracts.addLayout(row(self.symbol_preview_state,
                                button('查看执行参数', self.show_execution_parameters)))
+        contracts.addWidget(self.symbol_feedback_label)
         if not self.paired:
             actions = row(button('重读 DSV 参数', lambda: self.reload_dsv_parameters()),
                           button('选择 DSV 配置', self.choose_dsv_parameters))
@@ -2005,13 +2075,34 @@ class WorkbenchLayout:
             self.calculator.set_base_profile(profile)
             self.offset_preview.setText('参数预览已更新，请重新计算偏移。')
         self.parameter_state.setText(self.profile_source)
-        if profile.content_hash!=self.profile.content_hash:
-            live = (self.window.view or {}).get('configuration', {}).get('live_parameter_save')
-            self.parameter_state.setText('本地参数草稿 · 保存后应用到当前策略' if live else '本地参数草稿 · 用于下次启动')
+        if profile.content_hash != self.profile.content_hash:
+            if self._saved_next_boot_hash == profile.content_hash:
+                self.parameter_state.setText('已保存至启动配置 · 下次重启后台服务后生效')
+            else:
+                active_settings = self.profile.to_record()['settings']
+                old_codes = {item['code'] for item in active_settings['symbols']}
+                new_codes = {item['code'] for item in settings['symbols']}
+                added = [item['code'] for item in settings['symbols'] if item['code'] not in old_codes]
+                removed = [item['code'] for item in active_settings['symbols'] if item['code'] not in new_codes]
+                live = (self.window.view or {}).get('configuration', {}).get('live_parameter_save')
+                if added and not removed and live:
+                    self.parameter_state.setText(
+                        f'待保存草稿（新增 {"、".join(added)}）· 点击「保存参数」立即加入监控并生效'
+                    )
+                elif added or removed:
+                    parts = []
+                    if added:
+                        parts.append('新增 ' + '、'.join(added))
+                    if removed:
+                        parts.append('移除 ' + '、'.join(removed))
+                    self.parameter_state.setText(f'待保存草稿（{"；".join(parts)}）· 点击「保存参数」生效')
+                else:
+                    self.parameter_state.setText('本地参数草稿 · 保存后应用到当前策略' if live else '本地参数草稿 · 用于下次启动')
         if self.dsv_config is not None:
             self.parameter_state.setToolTip(str(self.dsv_config))
             self.symbol_preview_state.setToolTip(str(self.dsv_config))
         self.symbol_preview_state.setText(self.parameter_state.text())
+        self.update_runtime_capabilities()
         for key,field in self.parameter_fields.items():
             field.setText(str(settings['trade'][key]))
         for key,check in self.parameter_switches.items():
@@ -2124,12 +2215,13 @@ class WorkbenchLayout:
             self.start_market_read(account['account_id'], codes)
         self.window._action(start)
 
-    def start_market_read(self, account_id, codes=(), *, catalog=False, offset_query=None):
+    def start_market_read(self, account_id, codes=(), *, catalog=False, offset_query=None, store=None):
         from online_trader.desktop.startup import QuoteReferenceWorker
         options = {'catalog': True} if catalog else {}
         if offset_query is not None:
             options['offset_query'] = offset_query
-        worker = QuoteReferenceWorker(self.window.store, account_id, codes, self.window, **options)
+        target_store = store if store is not None else self.window.store
+        worker = QuoteReferenceWorker(target_store, account_id, codes, self.window, **options)
         self.quote_worker = worker
         self.set_market_read_busy(True)
         worker.received.connect(self.window._quote_reference_received)
@@ -2144,10 +2236,18 @@ class WorkbenchLayout:
             if control is not None:
                 control.setEnabled(not busy)
 
+    def _active_market_account_id(self):
+        if self.window.selected_account is not None:
+            return self.window.selected_account['account_id']
+        if self.window._runtime_mode:
+            _, account_id = self.window._portable_store_and_account()
+            return account_id
+        return None
+
     def reference_quotes_received(self, rows):
         worker = self.quote_worker
-        account = self.window.selected_account
-        if self.window._closing or worker is None or account is None or account['account_id'] != worker.account_id:
+        account_id = self._active_market_account_id()
+        if self.window._closing or worker is None or account_id is None or account_id != worker.account_id:
             return
         if getattr(worker, 'offset_query', None) is not None:
             if self.offset_requested_input != self.calculator.calculation_input():
@@ -2179,9 +2279,9 @@ class WorkbenchLayout:
         self.update_logs()
 
     def reference_quotes_failed(self, code):
-        account = self.window.selected_account
-        if (not self.window._closing and self.quote_worker is not None and account is not None
-                and self.quote_worker.account_id == account['account_id']):
+        account_id = self._active_market_account_id()
+        if (not self.window._closing and self.quote_worker is not None and account_id is not None
+                and self.quote_worker.account_id == account_id):
             if getattr(self.quote_worker, 'offset_query', None) is not None:
                 messages = {
                     'E_OFFSET_DAY': '截止交易日与可核对的当前交易日不一致。',
@@ -2287,7 +2387,8 @@ class WorkbenchLayout:
         if self.parameter_dialog().edit_preview(add_symbol=True):
             self.symbol_grid.selectRow(self.symbol_grid.rowCount() - 1)
             self.symbol_grid.scrollToBottom()
-            self.window.show_home_feedback('品种已添加到列表。点击“保存参数”可保存到文件。')
+            self.set_parameter_feedback('已加入草稿列表，请点击「保存参数」使配置生效。')
+            self.window.show_home_feedback('品种已添加到草稿列表。点击“保存参数”可保存并应用。')
 
     def edit_selected_symbol(self):
         selected = self.symbol_grid.selectionModel().selectedRows()
@@ -2295,7 +2396,8 @@ class WorkbenchLayout:
             index = selected[0].row()
             if self.parameter_dialog().edit_preview(symbol_row=index):
                 self.symbol_grid.selectRow(index)
-                self.window.show_home_feedback('品种修改已保存到列表。点击“保存参数”可保存到文件。')
+                self.set_parameter_feedback('品种修改已更新到草稿，请点击「保存参数」使配置生效。')
+                self.window.show_home_feedback('品种修改已保存到草稿列表。点击“保存参数”可保存并应用。')
         else:
             self.window.show_home_feedback('请先选中一个品种，再点击“编辑选中”；也可以双击品种。')
 
@@ -2309,7 +2411,8 @@ class WorkbenchLayout:
                 QMessageBox.Yes | QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:
             return
         settings['symbols'] = [symbol for index,symbol in enumerate(settings['symbols']) if index not in selected]
-        dialog.apply_edited_preview(DsvProfile.from_settings(settings),expected_hash=dialog.profile.content_hash)
+        if dialog.apply_edited_preview(DsvProfile.from_settings(settings),expected_hash=dialog.profile.content_hash):
+            self.set_parameter_feedback('品种移除已更新到草稿，请点击「保存参数」使配置生效。')
 
     def import_symbols_preview(self):
         dialog = self.parameter_dialog()
@@ -2328,9 +2431,8 @@ class WorkbenchLayout:
         window = self.window
         view = window.view or {}
         live = view.get('configuration', {}).get('live_parameter_save')
-        if live:
-            window.send('SAVE_DSV_PARAMETERS', {'scope_type':'ACCOUNT','scope_ids':[]},
-                        {'profile':dialog.profile.to_record()})
+        if window._runtime_mode or live:
+            window.save_runtime_parameters(dialog.profile)
             return
         path,_ = QFileDialog.getSaveFileName(window,'保存业务参数','dsv-business-settings.json','JSON (*.json)')
         if path:
@@ -2857,8 +2959,10 @@ class WorkbenchLayout:
     def update_runtime_capabilities(self):
         view = self.window.view or {}
         live_parameter_save = bool(view.get('configuration', {}).get('live_parameter_save'))
+        has_runtime_store = self.window._runtime_mode and self.window._resolve_runtime_root() is not None
         parameter_allowed = (not live_parameter_save
-                             or self.runtime_operation_allowed('SAVE_DSV_PARAMETERS'))
+                             or self.runtime_operation_allowed('SAVE_DSV_PARAMETERS')
+                             or (has_runtime_store and self.has_unsaved_symbol_changes()))
         for control in self.parameter_save_buttons:
             control.setEnabled(parameter_allowed)
 
@@ -2884,18 +2988,22 @@ class WorkbenchLayout:
 
     def load_manual_catalog(self):
         account = self.window.selected_account
+        store = self.window.store
+        account_id = account['account_id'] if account is not None else None
+        if account_id is None and self.window._runtime_mode:
+            store, account_id = self.window._portable_store_and_account()
         dialog = self.window._settings_dialog
         if self.quote_worker is not None:
             if dialog is not None:
                 dialog.set_contract_catalog_error('E_BUSY')
             return False
-        if account is None:
+        if account_id is None or store is None:
             self.manual_catalog_status.setText('请先选择提供行情的模拟账号')
             if dialog is not None:
                 dialog.set_contract_catalog_error('E_ACCOUNT')
             return False
         self.manual_catalog_status.setText('正在加载期货合约…')
-        self.start_market_read(account['account_id'],catalog=True)
+        self.start_market_read(account_id, catalog=True, store=store)
         return True
 
     def manual_catalog_edited(self, text):
@@ -3892,6 +4000,7 @@ class WorkbenchLayout:
 
     def render(self, view):
         self.rendered_view = view
+        self.sync_runtime_profile(view)
         self.render_session_hours(view)
         orders = self.tables['orders']
         populate(orders, [order_cells(item) for item in view['orders']])

@@ -160,9 +160,17 @@ def translate_workbench_command(body, snapshot, *, runtime_boot_id, configuratio
             raise TraderError('E_SCHEMA', 'Saving live parameters requires a DSV profile payload')
         candidate = dsv_startup_profile(DsvProfile.from_record(parameters['profile']))
         symbols = candidate.to_record()['settings']['symbols']
-        if {row['code'] for row in symbols} != set(snapshot['symbols']):
-            raise TraderError('E_SCOPE', '运行中只能调整当前已授权合约的参数。')
-        return common | {'action': 'SAVE_PARAMETERS', 'profile': candidate.to_record()}
+        old_codes = set(snapshot['symbols'])
+        new_codes = {row['code'] for row in symbols}
+        if not 1 <= len(symbols) <= 11:
+            raise TraderError('E_SCOPE', '监控合约数量必须在 1 到 11 个之间。')
+        if not old_codes <= new_codes:
+            raise TraderError('E_SCOPE', '运行中只能保留或新增合约，不能移除已有合约。')
+        added_contracts = [row['code'] for row in symbols if row['code'] not in old_codes]
+        result = common | {'action': 'SAVE_PARAMETERS', 'profile': candidate.to_record()}
+        if added_contracts:
+            result['added_contracts'] = added_contracts
+        return result
     if operation == 'REQUEST_RECONCILIATION':
         _account_scope(scope)
         if set(parameters) - {'requested_scope', 'position_cycle_id', 'clock_recovery_id'}:

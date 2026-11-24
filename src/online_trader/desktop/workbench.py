@@ -8,6 +8,7 @@ from PySide6.QtCore import QEvent,QEventLoop,QItemSelectionModel,QSettings,QStan
 from PySide6.QtWidgets import (QApplication,QLabel,QLineEdit,QPushButton,QTableWidget,
     QTableWidgetItem,QInputDialog,QFileDialog,QMessageBox,QProgressDialog)
 
+from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import strict_loads
 from online_trader.desktop.app import StatusWindow
 from online_trader.desktop.dingtalk import WorkbenchDingTalk
@@ -185,15 +186,22 @@ def display_cell(key,value):
 class WorkbenchWindow(StatusWindow):
     def __init__(self,pipe_name,*,store=None,account_id=None,client_factory=StatusClient,paired_launcher=None,
                  dsv_config=None, use_desktop_dsv=False, autostart=False, notification=None, runtime_view=False,
-                 update_root=None, update_restart=None):
+                 update_root=None, update_restart=None, runtime_root=None, runtime_account=None):
         super().__init__(pipe_name,client_factory=client_factory)
         self._runtime_mode = runtime_view
+        self._runtime_root = Path(runtime_root).resolve() if runtime_root is not None else None
+        self._runtime_account = runtime_account
         self._runtime_shutdown_verified = False
         self._runtime_shutdown_in_progress = False
+        self._runtime_bootstrap = None
         self._runtime_client_store = None
         self._runtime_coordinator = None
         self._runtime_command_bus = None
         self._runtime_receipt_restored_for = None
+        self._pending_parameter_command_ids = set()
+        self._pending_hot_add_profile = None
+        self._pending_parameter_fallback = {}
+        self._pending_focus_contracts = ()
         self.store=store;self.selected_account=store.get(account_id) if store is not None and account_id is not None else None
         self.paired_launcher=paired_launcher
         self.paired_account_key=None
@@ -300,28 +308,76 @@ class WorkbenchWindow(StatusWindow):
             QTimer.singleShot(0, self.check_timed_start)
         self._enable_commands(False)
         if runtime_view:
-            from online_trader.desktop.runtime_client import (
-                ClientStateStore, CommandBus, RuntimeClientCoordinator)
-            client_store = ClientStateStore(self)
-            coordinator = RuntimeClientCoordinator(pipe_name, client_store, self)
-            command_bus = CommandBus(coordinator, client_store, self)
-            command_bus.migrate_legacy_pending()
-            client_store.runtime_changed.connect(self._runtime_client_state_changed)
-            client_store.connection_changed.connect(self._runtime_client_connection_changed)
-            coordinator.publication_observed.connect(self._runtime_observed)
-            coordinator.query_result.connect(self._runtime_query_result)
-            coordinator.query_failed.connect(self._runtime_query_failed)
-            command_bus.command_changed.connect(self._runtime_command_changed)
-            command_bus.feedback.connect(self.show_home_feedback)
-            self._runtime_client_store = client_store
-            self._runtime_coordinator = coordinator
-            self._runtime_command_bus = command_bus
-            # The first generic disable pass ran before the Runtime command
-            # path existed and therefore preserved the legacy "start without
-            # a view" affordance.  Re-evaluate with the fail-closed Runtime
-            # store before any subscription baseline can arrive.
-            self._enable_commands(False)
-            coordinator.start()
+            self._attach_runtime_pipe(pipe_name)
+
+    def _attach_runtime_pipe(self, pipe_name):
+        from online_trader.desktop.runtime_client import (
+            ClientStateStore, CommandBus, RuntimeClientCoordinator)
+        self._detach_runtime_client()
+        self.pipe_name = pipe_name
+        self._runtime_shutdown_verified = False
+        client_store = ClientStateStore(self)
+        coordinator = RuntimeClientCoordinator(pipe_name, client_store, self)
+        command_bus = CommandBus(coordinator, client_store, self)
+        command_bus.migrate_legacy_pending()
+        client_store.runtime_changed.connect(self._runtime_client_state_changed)
+        client_store.connection_changed.connect(self._runtime_client_connection_changed)
+        coordinator.publication_observed.connect(self._runtime_observed)
+        coordinator.query_result.connect(self._runtime_query_result)
+        coordinator.query_failed.connect(self._runtime_query_failed)
+        command_bus.command_changed.connect(self._runtime_command_changed)
+        command_bus.feedback.connect(self.show_home_feedback)
+        self._runtime_client_store = client_store
+        self._runtime_coordinator = coordinator
+        self._runtime_command_bus = command_bus
+        # The first generic disable pass ran before the Runtime command
+        # path existed and therefore preserved the legacy "start without
+        # a view" affordance.  Re-evaluate with the fail-closed Runtime
+        # store before any subscription baseline can arrive.
+        self._enable_commands(False)
+        coordinator.start()
+
+    def _detach_runtime_client(self):
+        self._pending_parameter_command_ids.clear()
+        self._pending_hot_add_profile = None
+        self._pending_parameter_fallback.clear()
+        if self._runtime_coordinator is not None:
+            self._runtime_coordinator.close()
+            self._runtime_coordinator.deleteLater()
+        self._runtime_coordinator = None
+        if self._runtime_command_bus is not None:
+            self._runtime_command_bus.deleteLater()
+        self._runtime_command_bus = None
+        if self._runtime_client_store is not None:
+            self._runtime_client_store.deleteLater()
+        self._runtime_client_store = None
+
+    def _resolve_runtime_root(self):
+        if self._runtime_root is not None:
+            return self._runtime_root
+        run_dir = (self.view or {}).get('configuration', {}).get('run_directory')
+        if isinstance(run_dir, str) and run_dir:
+            candidate = Path(run_dir).resolve()
+            if (candidate.parent.parent.name == 'desktop-starts'
+                    and (candidate.parent.parent.parent / 'runtime.json').is_file()):
+                return candidate.parent.parent.parent
+        return None
+
+    def _portable_store_and_account(self):
+        root = self._resolve_runtime_root()
+        if root is None:
+            return None, None
+        from online_trader.runtime.portable_config import PortableAccountStore
+        store = PortableAccountStore(root, self._runtime_account)
+        state = store.read()
+        account_id = state['selected_id']
+        if self.view is not None:
+            account_key = self.view.get('account_key')
+            matched = next((row['account_id'] for row in state['accounts']
+                            if row['account_key'] == account_key), None)
+            if matched is not None:
+                account_id = matched
+        return store, account_id
 
     def _read_account_login(self):
         account = self.selected_account
@@ -492,6 +548,37 @@ class WorkbenchWindow(StatusWindow):
                 self.receipt_identity = None
         elif pending.status.value != 'LOCAL_NOT_ENQUEUED':
             self.receipt_identity = {'command_id': pending.command_id}
+        is_param_cmd = (pending.command_id in self._pending_parameter_command_ids
+                        or pending.operation == 'SAVE_DSV_PARAMETERS')
+        if is_param_cmd and pending.status.value in {'COMPLETED', 'REJECTED'}:
+            self._pending_parameter_command_ids.discard(pending.command_id)
+            fallback = self._pending_parameter_fallback.pop(pending.command_id, None)
+            if pending.status.value == 'COMPLETED':
+                if fallback is not None:
+                    self.dashboard.set_parameter_feedback('新合约已加入运行中策略，正在监控面板同步行情。')
+                else:
+                    self.dashboard.set_parameter_feedback('参数已保存并立即生效。')
+            else:
+                if fallback is not None:
+                    self._pending_focus_contracts = ()
+                reason = (pending.receipt or {}).get('reason') or pending.reason or '保存未通过校验'
+                self.dashboard.set_parameter_feedback(f'参数保存未生效：{reason}', error=True)
+                store, _ = self._portable_store_and_account() if fallback is not None else (None, None)
+                if store is not None:
+                    box = QMessageBox(self)
+                    box.setIcon(QMessageBox.Icon.Warning)
+                    box.setWindowTitle('热新增合约未生效')
+                    box.setText(
+                        f'运行时未能直接加入新合约：{reason}\n\n'
+                        '是否先保存到本地启动配置（OnlineTrader-overrides.json），待下次安全重启后生效？'
+                    )
+                    save_btn = box.addButton('保存为下次启动配置', QMessageBox.ButtonRole.AcceptRole)
+                    box.addButton('取消', QMessageBox.ButtonRole.RejectRole)
+                    box.exec()
+                    if box.clickedButton() is save_btn:
+                        self._persist_next_boot_profile(store, fallback)
+                elif self.dashboard.tabs.currentWidget() is self.dashboard.parameter_tab:
+                    QMessageBox.warning(self, '保存参数未生效', f'后台拒绝了本次参数保存：\n{reason}')
         self._sync_runtime_pending()
         self._enable_commands(not self._closing and not self._stale and self.view is not None
                               and not self.view['truncated'])
@@ -553,18 +640,36 @@ class WorkbenchWindow(StatusWindow):
             self.render_view()
 
     def _start_runtime_submit(self, operation, scope, parameters):
+        hot_add_profile = (
+            self._pending_hot_add_profile if operation == 'SAVE_DSV_PARAMETERS' else None
+        )
+        if operation == 'SAVE_DSV_PARAMETERS':
+            self._pending_hot_add_profile = None
         if self.view is None or self._stale or self.published_snapshot_expired() or self.view['truncated']:
+            if hot_add_profile is not None:
+                self._pending_focus_contracts = ()
             self.show_home_feedback('请先取得当前完整 Runtime 状态，再提交命令。')
             return
         bus = self._runtime_command_bus
         if bus is None:
+            if hot_add_profile is not None:
+                self._pending_focus_contracts = ()
             self.show_home_feedback('Runtime CommandBus 尚未就绪；命令未发送。')
             return
         try:
             command_id = bus.submit(operation, scope, parameters)
         except TraderError as error:
+            if hot_add_profile is not None:
+                self._pending_focus_contracts = ()
             self.show_home_feedback(f'Runtime 命令未提交 · {error.code} · {error}')
+            if operation == 'SAVE_DSV_PARAMETERS':
+                self.dashboard.set_parameter_feedback(f'参数未提交 · {error.code} · {error}', error=True)
             return
+        if operation == 'SAVE_DSV_PARAMETERS':
+            self._pending_parameter_command_ids.add(command_id)
+            if hot_add_profile is not None:
+                self._pending_parameter_fallback[command_id] = hot_add_profile
+            self.dashboard.set_parameter_feedback('正在提交参数到运行中的 Runtime…')
         self.receipt_identity = {'command_id': command_id}
         self.show_home_feedback(f'正在提交 Runtime 命令 · {command_id}')
         self._enable_commands(False)
@@ -1127,6 +1232,18 @@ class WorkbenchWindow(StatusWindow):
             if config.get('strategy_stop_requested'):
                 self.show_home_feedback(config.get('strategy_stop_wait') or '正在核对原策略的退出条件。')
                 return
+            if self.dashboard.has_unsaved_symbol_changes():
+                answer = QMessageBox.question(
+                    self,
+                    '存在未保存的品种草稿',
+                    '您在「策略参数 → 监控合约」中有尚未保存生效的品种修改。\n\n'
+                    '如果直接启动策略，将按当前运行中的合约与参数执行。\n是否仍按当前运行配置启动策略？',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self.dashboard.show_details(self.dashboard.symbol_tab)
+                    return
             self.send('ARM_ENTRIES',{'scope_type':'ACCOUNT','scope_ids':[]},
                 {'authority_policy_id':policy,'rule_set_id':identity[-2],'config_revision':identity[-1]})
         self._action(action)
@@ -1731,10 +1848,24 @@ class WorkbenchWindow(StatusWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 return False
 
-        progress = QProgressDialog(
-            '正在停止后台交易服务并等待进程完全退出…', '', 0, 0, self
+        ok, stop_error = self._run_runtime_shutdown(
+            shutdown_runtime_and_wait, pid=pid, view=view,
+            title='OnlineTrader · 安全退出',
+            label='正在停止后台交易服务并等待进程完全退出…',
         )
-        progress.setWindowTitle('OnlineTrader · 安全退出')
+        if not ok:
+            QMessageBox.critical(
+                self,
+                '交易服务仍在运行，未完成退出',
+                f'{stop_error or "未能确认后台交易服务退出。"}\n\n为确保账户和持仓安全，桌面工作台保持打开，请检查实时持仓与状态后再试。',
+            )
+            return False
+        self._runtime_shutdown_verified = True
+        return True
+
+    def _run_runtime_shutdown(self, shutdown_fn, *, pid=None, view=None, title, label):
+        progress = QProgressDialog(label, '', 0, 0, self)
+        progress.setWindowTitle(title)
         progress.setCancelButton(None)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
@@ -1744,7 +1875,7 @@ class WorkbenchWindow(StatusWindow):
         done = [False]
         loop = QEventLoop(self)
         worker = _RuntimeShutdownWorker(
-            shutdown_runtime_and_wait, self.pipe_name, pid=pid, view=view, timeout=20.0
+            shutdown_fn, self.pipe_name, pid=pid, view=view, timeout=20.0
         )
 
         def finished(ok, stop_error):
@@ -1767,21 +1898,221 @@ class WorkbenchWindow(StatusWindow):
         finally:
             self._runtime_shutdown_in_progress = False
             progress.close()
-        ok, stop_error = outcome
+        return tuple(outcome)
+
+    def save_runtime_parameters(self, candidate_profile):
+        if not isinstance(candidate_profile, DsvProfile):
+            return False
+        settings = candidate_profile.to_record()['settings']
+        symbols = settings['symbols']
+        if not 1 <= len(symbols) <= 11:
+            message = '监控合约数量必须在 1 到 11 个之间，请调整后再保存。'
+            self.dashboard.set_parameter_feedback(message, error=True)
+            QMessageBox.warning(self, '保存策略参数', message)
+            return False
+        if settings['trade']['max_volume'] <= 0 or not 0 < settings['trade']['max_daily_orders'] <= 2147483647:
+            message = '请在交易参数中设置有效的最大手数和每品种最大报单数。'
+            self.dashboard.set_parameter_feedback(message, error=True)
+            QMessageBox.warning(self, '保存策略参数', message)
+            return False
+
+        current_profile = self.dashboard.profile
+        current_settings = current_profile.to_record()['settings']
+        new_codes = [row['code'] for row in symbols]
+        old_codes = [row['code'] for row in current_settings['symbols']]
+        added = [row for row in symbols if row['code'] not in set(old_codes)]
+        removed = [row for row in current_settings['symbols'] if row['code'] not in set(new_codes)]
+        startup_only_changed = (
+            settings['schedule'] != current_settings['schedule']
+            or any(settings['trade'][field] != current_settings['trade'][field]
+                   for field in ('holidays', 'night_session_close'))
+        )
+
+        if not added and not removed and not startup_only_changed:
+            if candidate_profile.content_hash == current_profile.content_hash:
+                self.dashboard.set_parameter_feedback('当前参数与运行中一致，无需重复保存。')
+                return True
+            self.send('SAVE_DSV_PARAMETERS', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                      {'profile': candidate_profile.to_record()})
+            return True
+
+        view = self.view
+        fresh_view = (self._runtime_mode and bool(self.pipe_name) and view is not None
+                      and not self._stale and not self.published_snapshot_expired()
+                      and not view.get('truncated'))
+        live_allowed = bool(view and (view.get('configuration') or {}).get('live_parameter_save'))
+        if (added and not removed and not startup_only_changed and fresh_view
+                and live_allowed and self._runtime_command_bus is not None):
+            self._pending_focus_contracts = tuple(row['code'] for row in added)
+            self._pending_hot_add_profile = candidate_profile
+            self.send('SAVE_DSV_PARAMETERS', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                      {'profile': candidate_profile.to_record()})
+            return True
+
+        store, _ = self._portable_store_and_account()
+        if store is None:
+            message = '当前连接未绑定可写 Runtime 配置目录，无法保存新增合约。\n请通过带 runtime 目录的正常入口启动工作台。'
+            self.dashboard.set_parameter_feedback('未绑定可写 Runtime 目录，无法持久化启动配置。', error=True)
+            QMessageBox.warning(self, '保存策略参数', message)
+            return False
+
+        changes = []
+        if added:
+            changes.append('新增合约：' + '、'.join(f"{row['name']}({row['code']})" for row in added))
+        if removed:
+            changes.append('移除合约：' + '、'.join(f"{row['name']}({row['code']})" for row in removed))
+        if startup_only_changed:
+            changes.append('已修改交易日历或定时设置')
+        summary = '\n'.join(f'· {line}' for line in changes)
+
+        open_cycles = [row for row in (view or {}).get('cycles', ()) if row.get('remaining_quantity', 0) > 0]
+        active_orders = [row for row in (view or {}).get('orders', ()) if row.get('potential_remaining', 0) > 0]
+        external_positions = (view or {}).get('external_positions') or []
+        conn = (view or {}).get('connection') or {}
+        armed = bool(view and view.get('entry_authority') == 'ARMED')
+        busy_reasons = []
+        if not fresh_view:
+            busy_reasons.append('当前后台状态快照未就绪或已过期')
+        if armed:
+            busy_reasons.append('策略当前已启用开仓（请先按 F6 停止策略）')
+        if open_cycles:
+            busy_reasons.append(f'存在 {len(open_cycles)} 个未平仓持仓周期')
+        if active_orders:
+            busy_reasons.append(f'存在 {len(active_orders)} 笔未终结委托')
+        if external_positions or conn.get('recovery_required') or conn.get('clock_fault'):
+            busy_reasons.append('存在待核对仓位或连接/时钟异常')
+
+        if busy_reasons:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle('保存为下次启动配置')
+            box.setText(
+                f'{summary}\n\n由于{"、".join(busy_reasons)}，当前不能立即重启后台服务。\n'
+                '是否先将以上修改保存到本地启动配置（OnlineTrader-overrides.json），待下次安全重启后生效？'
+            )
+            save_btn = box.addButton('保存为下次启动配置', QMessageBox.ButtonRole.AcceptRole)
+            box.addButton('取消', QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is not save_btn:
+                return False
+            return self._persist_next_boot_profile(store, candidate_profile)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle('保存并应用合约变更')
+        box.setText(
+            f'{summary}\n\n以上变更需要重启后台交易服务，以重新加载完整交易日历并订阅行情。\n'
+            '当前处于安全停开且空仓状态，建议立即重启使其在监控面板生效。'
+        )
+        restart_btn = box.addButton('保存并立即重启生效', QMessageBox.ButtonRole.AcceptRole)
+        later_btn = box.addButton('仅保存，下次启动生效', QMessageBox.ButtonRole.ActionRole)
+        box.addButton('取消', QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is later_btn:
+            return self._persist_next_boot_profile(store, candidate_profile)
+        if clicked is not restart_btn:
+            return False
+        return self._restart_runtime_with_profile(
+            store, candidate_profile, focus_contracts=[row['code'] for row in added]
+        )
+
+    def _persist_next_boot_profile(self, store, candidate_profile):
+        try:
+            store.save_profile(candidate_profile)
+        except (TraderError, OSError) as error:
+            message = f'未能保存启动配置：{error}'
+            self.dashboard.set_parameter_feedback(message, error=True)
+            QMessageBox.critical(self, '保存配置失败', message)
+            return False
+        self.dashboard.mark_next_boot_saved(candidate_profile)
+        self.show_home_feedback('已保存新合约到启动配置（OnlineTrader-overrides.json），重启后台服务后生效。')
+        return True
+
+    def _restart_runtime_with_profile(self, store, candidate_profile, *, focus_contracts=()):
+        if self._runtime_shutdown_in_progress or self._runtime_bootstrap is not None:
+            return False
+        from online_trader.desktop.runtime_bootstrap import BootstrapController
+        from online_trader.runtime.shutdown import inspect_runtime_for_exit, shutdown_runtime_and_wait
+
+        view, pid, _ = inspect_runtime_for_exit(self.pipe_name)
+        ok, stop_error = self._run_runtime_shutdown(
+            shutdown_runtime_and_wait, pid=pid, view=view or self.view,
+            title='OnlineTrader · 应用新合约配置',
+            label='正在安全停止当前后台服务并保存新合约配置…',
+        )
         if not ok:
             QMessageBox.critical(
                 self,
-                '交易服务仍在运行，未完成退出',
-                f'{stop_error or "未能确认后台交易服务退出。"}\n\n为确保账户和持仓安全，桌面工作台保持打开，请检查实时持仓与状态后再试。',
+                '后台服务未能安全停止',
+                f'{stop_error or "未能确认原后台服务安全退出。"}\n\n为确保账户安全，原配置与监控状态保持不变。',
             )
             return False
-        self._runtime_shutdown_verified = True
+        try:
+            store.save_profile(candidate_profile)
+        except (TraderError, OSError) as error:
+            QMessageBox.critical(
+                self,
+                '保存新配置失败',
+                f'后台服务已停止，但写入本地配置失败：{error}',
+            )
+            return False
+
+        self._detach_runtime_client()
+        self.view = None
+        self._boot = None
+        self._stale = True
+        self.snapshot_published_ns = None
+        self._publication_after_ns = 0
+        self.receipt_identity = None
+        self._control_notice = None
+        self._last_account_record = {}
+        self._base_cycle_ids = []
+        self._pending_focus_contracts = tuple(focus_contracts)
+        self.dashboard.reset_account_view(preserve_logs=True)
+        self.dashboard.set_parameter_feedback('配置已保存，正在重启后台服务并同步最新合约…')
+        self.show_home_feedback('正在重启后台交易服务并初始化新合约订阅…')
+
+        controller = BootstrapController(store.directory, account=self._runtime_account, parent=self)
+        self._runtime_bootstrap = controller
+
+        def cleanup():
+            if self._runtime_bootstrap is controller:
+                self._runtime_bootstrap = None
+            controller.deleteLater()
+
+        def on_ready(new_pipe):
+            cleanup()
+            if self._closing:
+                return
+            self._attach_runtime_pipe(new_pipe)
+            self.dashboard.set_parameter_feedback('后台服务已重启，新合约已同步到监控面板。')
+            self.show_home_feedback('新合约配置已生效，正在获取最新行情。')
+
+        def on_failed(error):
+            cleanup()
+            message = f'{error}\n\n错误代码：{getattr(error, "code", "E_RUNTIME_START")}'
+            self.dashboard.set_parameter_feedback('后台重启失败，请核对新合约代码或网络后重试。', error=True)
+            QMessageBox.critical(self, '重启交易服务失败', message)
+
+        def on_cancelled():
+            cleanup()
+            self.dashboard.set_parameter_feedback('已取消等待后台重启；新配置已保存，下次启动生效。')
+            self.show_home_feedback('已取消等待重启；新合约配置已保存，下次启动时生效。')
+
+        controller.ready.connect(on_ready)
+        controller.failed.connect(on_failed)
+        controller.cancelled.connect(on_cancelled)
+        controller.start()
         return True
 
     def closeEvent(self,event):
         if self._runtime_shutdown_in_progress:
             event.ignore()
             return
+        if self._runtime_bootstrap is not None:
+            self._runtime_bootstrap.shutdown()
+            self._runtime_bootstrap = None
         if self._strategy_starter is not None and self._strategy_starter.is_preparing():
             self._closing = True
             self.hide()
@@ -1827,6 +2158,7 @@ class WorkbenchWindow(StatusWindow):
 
     def prepare_update_restart(self):
         if (self._startup_in_progress or self._worker is not None
+                or self._runtime_bootstrap is not None
                 or (self._runtime_command_bus is not None and self._runtime_command_bus.has_inflight)
                 or (self._strategy_starter is not None and self._strategy_starter.is_preparing())
                 or (self._session_dialog is not None

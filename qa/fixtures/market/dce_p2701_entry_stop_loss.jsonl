@@ -1,0 +1,9 @@
+{"phase":"SYNC_BASELINE","wall_time":"2026-11-13T01:10:00Z","last":"1054","bid1":"1053","ask1":"1054","day_low":"1020","day_high":"1088","candle_id":"bar-0110"}
+{"phase":"TRIGGER_ENTRY","wall_time":"2026-11-13T01:10:05Z","last":"1060","bid1":"1059","ask1":"1060","day_low":"1020","day_high":"1088","candle_id":"bar-0110"}
+{"phase":"AFTER_ACCEPT","wall_time":"2026-11-13T01:10:06Z","last":"1060","bid1":"1059","ask1":"1060","day_low":"1020","day_high":"1088","candle_id":"bar-0110"}
+{"phase":"AFTER_PARTIAL_3","wall_time":"2026-11-13T01:10:07Z","last":"1061","bid1":"1060","ask1":"1061","day_low":"1020","day_high":"1088","candle_id":"bar-0110"}
+{"phase":"AFTER_FILL_2","wall_time":"2026-11-13T01:10:08Z","last":"1062","bid1":"1061","ask1":"1062","day_low":"1020","day_high":"1088","candle_id":"bar-0110"}
+{"phase":"HOLD_POSITION","wall_time":"2026-11-13T01:10:12Z","last":"1058","bid1":"1057","ask1":"1058","day_low":"1020","day_high":"1088","candle_id":"bar-0110"}
+{"phase":"TRIGGER_STOP_LOSS","wall_time":"2026-11-13T01:10:15Z","last":"1052","bid1":"1052","ask1":"1053","day_low":"1020","day_high":"1088","candle_id":"bar-0110"}
+{"phase":"AFTER_CLOSE_ACCEPT","wall_time":"2026-11-13T01:10:16Z","last":"1052","bid1":"1052","ask1":"1053","day_low":"1020","day_high":"1088","candle_id":"bar-0110"}
+{"phase":"AFTER_CLOSE_FILL","wall_time":"2026-11-13T01:10:18Z","last":"1051","bid1":"1050","ask1":"1051","day_low":"1020","day_high":"1088","candle_id":"bar-0110"}

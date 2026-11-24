@@ -1,3 +1,3 @@
 """OnlineTrader independent kernel; optional simulated execution needs exact scope."""
 
-__version__ = "0.1.0.dev40"
+__version__ = "0.1.0.dev41"

@@ -7,9 +7,13 @@ from PySide6.QtWidgets import (QCompleter, QDialog, QFormLayout, QGroupBox, QHBo
     QLineEdit, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget, QComboBox)
 
 from online_trader.configuration.editor import EditError, form_values, integer_text, number_text, profile_from_form
-from online_trader.configuration.symbol_csv import PRODUCT_NAMES, match_contract_catalog, resolve_contract
+from online_trader.configuration.symbol_csv import PRODUCT_NAMES, match_contract_catalog, resolve_contract, suggest_contracts
 from online_trader.domain.values import decimal_text
 from online_trader.errors import TraderError
+
+
+MAX_CONTRACT_SUGGESTIONS = 6
+MAX_RUNTIME_SYMBOLS = 11
 
 
 def fit_dialog(dialog, width, height):
@@ -24,10 +28,12 @@ def fit_dialog(dialog, width, height):
 
 
 class SymbolEditorDialog(QDialog):
-    def __init__(self, profile, parent=None, *, symbol_row=None, contract_catalog=(), catalog_loader=None):
+    def __init__(self, profile, parent=None, *, symbol_row=None, contract_catalog=(), catalog_loader=None,
+                 max_symbols=MAX_RUNTIME_SYMBOLS):
         super().__init__(parent)
         self.base_profile, self.base_hash = profile, profile.content_hash
         self.symbol_row = symbol_row
+        self.max_symbols = max_symbols
         self.result_profile = self.result_symbol = None
         self._catalog_loader = catalog_loader
         self._catalog_loading = False
@@ -68,7 +74,7 @@ class SymbolEditorDialog(QDialog):
         parameters = QGroupBox('交易参数'); form = QFormLayout(parameters); form.setVerticalSpacing(9)
         for key, label in (('open_offset', '开仓（点）'), ('stop_offset', '止损（点）'), ('profit_offset', '止盈（点）')):
             field(key, label, source[key], form)
-        defaults = QLabel('偏移填 0 时沿用策略启动值：开仓 100、止损 15、止盈 60。')
+        defaults = QLabel('偏移填 0 时启动将沿用默认值：开仓 100、止损 15、止盈 60（开启自动偏移时按日线重算）。')
         defaults.setWordWrap(True); defaults.setStyleSheet('color: #63738a;'); form.addRow(defaults)
         volume = QWidget(); volume_row = QHBoxLayout(volume); volume_row.setContentsMargins(0, 0, 0, 0)
         self.volume_mode = QComboBox(); self.volume_mode.setAccessibleName('下单方式')
@@ -104,12 +110,13 @@ class SymbolEditorDialog(QDialog):
         self._auto_name = ''
         self._catalog_model = QStringListModel(self)
         self._catalog_completer = QCompleter(self._catalog_model, self)
-        self._catalog_completer.setCompletionMode(QCompleter.PopupCompletion)
+        self._catalog_completer.setCompletionMode(QCompleter.UnfilteredPopupCompletion)
         self._catalog_completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self._catalog_completer.setMaxVisibleItems(12)
+        self._catalog_completer.setMaxVisibleItems(MAX_CONTRACT_SUGGESTIONS)
         self.fields['code'].setCompleter(self._catalog_completer)
-        self.fields['code'].textChanged.connect(self._sync_contract)
-        self.fields['code'].textEdited.connect(self._refresh_contract_suggestions)
+        self._catalog_completer.activated[str].connect(self._on_suggestion_activated)
+        self.fields['code'].textChanged.connect(self._on_code_changed)
+        self.fields['code'].textEdited.connect(lambda text: self._refresh_contract_suggestions(text, popup=True))
         self.fields['code'].editingFinished.connect(self._normalize_contract)
         self._sync_contract()
         fit_dialog(self, 620, 610)
@@ -142,35 +149,55 @@ class SymbolEditorDialog(QDialog):
         try:
             resolve_contract(text)
         except TraderError:
-            self.contract_hint.setText(f'合约目录加载失败（{code}），仍可手动输入完整合约代码。')
+            matches, _ = suggest_contracts(text, self._contract_catalog, limit=MAX_CONTRACT_SUGGESTIONS)
+            if matches:
+                self._catalog_model.setStringList(matches)
+                self.contract_hint.setText(f'目录暂不可用（{code}），已生成 {len(matches)} 个常用月份供选择。')
+            else:
+                self.contract_hint.setText(f'合约目录加载失败（{code}），仍可输入简称后从下拉选择或手动填写完整代码。')
 
-    def _refresh_contract_suggestions(self, text):
-        matches = match_contract_catalog(text, self._contract_catalog, limit=50)
+    def _on_code_changed(self, text):
+        resolved = self._sync_contract()
+        self._refresh_contract_suggestions(text, popup=False, resolved=resolved)
+
+    def _on_suggestion_activated(self, text):
+        self.fields['code'].setText(text)
+        self._sync_contract()
+
+    def _refresh_contract_suggestions(self, text, *, popup=False, resolved=None):
+        matches, from_catalog = suggest_contracts(text, self._contract_catalog, limit=MAX_CONTRACT_SUGGESTIONS)
         self._catalog_model.setStringList(matches)
+        if resolved is None:
+            try:
+                resolved = resolve_contract(text.strip())
+            except TraderError:
+                resolved = None
         if matches:
-            self.contract_hint.setText(f'找到 {len(matches)} 个匹配合约，可用上下键选择并按 Enter 确认。')
-            if self.fields['code'].hasFocus():
+            if resolved is None:
+                if from_catalog:
+                    self.contract_hint.setText(f'找到 {len(matches)} 个可选合约，可用上下键选择并按 Enter 确认。')
+                else:
+                    self.contract_hint.setText(f'已匹配 {len(matches)} 个常用月份，可用上下键或点击下拉选择。')
+            if popup or (self.fields['code'].hasFocus() and resolved is None):
                 self._catalog_completer.setCompletionPrefix('')
                 self._catalog_completer.complete()
-        elif text.strip() and self._contract_catalog:
-            try:
-                resolve_contract(text.strip())
-            except TraderError:
-                self.contract_hint.setText('当前目录没有匹配合约；可继续输入或手动填写完整代码。')
-        elif text.strip() and self._catalog_loading:
+        elif resolved is None and text.strip() and self._contract_catalog:
+            self.contract_hint.setText('当前目录没有匹配合约；可继续输入或手动填写完整代码。')
+        elif resolved is None and text.strip() and self._catalog_loading:
             self.contract_hint.setText('正在加载可选期货合约；也可以直接输入完整合约代码。')
 
     def _sync_contract(self):
         try: code = resolve_contract(self.fields['code'].text().strip())
         except TraderError:
             if not self._catalog_loading and not self._contract_catalog:
-                self.contract_hint.setText('支持品种简称或完整合约代码，必须填写月份。')
-            return
+                self.contract_hint.setText('支持品种简称（如 ag、白银）从下拉选月份，或直接输入完整代码。')
+            return None
         name = PRODUCT_NAMES.get(re.sub(r'\d+$', '', code), '')
         self.contract_hint.setText('已识别：' + code)
         current = self.fields['name'].text()
         if name and current in ('', self._auto_name): self.fields['name'].setText(name)
         self._auto_name = name
+        return code
 
     def _normalize_contract(self):
         try: self.fields['code'].setText(resolve_contract(self.fields['code'].text().strip()))
@@ -188,8 +215,8 @@ class SymbolEditorDialog(QDialog):
         for widget in self.fields.values():
             widget.setProperty('invalid', False); widget.style().unpolish(widget); widget.style().polish(widget)
         self.error_label.hide()
-        if self.adding and len(self.base_profile.to_settings()['symbols']) >= 64:
-            return self._failure('code', '最多添加 64 个品种，请先移除不需要的品种。')
+        if self.adding and len(self.base_profile.to_settings()['symbols']) >= self.max_symbols:
+            return self._failure('code', f'最多监控 {self.max_symbols} 个品种，请先移除不需要的品种。')
         self._sync_contract()
         row = {key: widget.text().strip() for key, widget in self.fields.items()}
         try: row['code'] = resolve_contract(row['code'])

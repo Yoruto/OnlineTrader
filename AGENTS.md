@@ -18,7 +18,7 @@ Preserve existing work; do not import V7, vnpy, DSV, their credentials, database
 
 - OnlineTrader 每次出包都必须带齐本次交付所需的配置。安装器、便携包、更新 ZIP、客户专用包和测试包均适用。打包前确认目标设备或接收方使用的配置来源和文件清单。需要预配账户和交易参数时，必须随包带入已确认的 `OnlineTrader-defaults.json` 和 `OnlineTrader-parameters.json`，以及该包所需的启动和更新配置。独立 Trading Runtime 的新交付必须显式带入 `runtime.json`；`runtime-control.json` 和 `private/operators.json` 是被忽略的旧文件，不得作为新交付依赖。
 - 禁止将缺少交付配置的通用包、空配置包或占位配置包作为制品交付。客户包使用为该客户或设备确认的配置。测试包使用能完成指定场景的隔离测试配置。配置缺失、归属不明，或分发渠道无法承载经授权的配置时，停止出包或发布并说明原因。含账户口令的制品只通过获准的私有渠道交付。
-- 正式交付的安装器、便携包和更新 ZIP 禁止随包配置白银。检查品种列表、交易参数、默认策略和自动加载的预设，排除白银主连及上期所全部 `ag` 合约月。发现任何白银配置项时停止交付。
+- 正式交付的安装器、便携包和更新 ZIP 允许随包配置白银，包括白银主连及上期所 `ag` 具体合约月。白银与其他品种适用相同的配置来源确认、参数有效性、目标设备适配和最终制品内容核对要求；不得仅因存在白银配置而停止交付，也不得未经确认擅自新增、删除或替换白银合约。
 - 交付前检查最终制品本身。对 ZIP 检查实际归档内容，对安装器在隔离目录安装验证，核对配置文件的路径、有效内容及其与已确认输入的一致性。使用用户实际启动入口验证配置可读取。交付记录写明版本、制品 SHA-256 和配置验证结果，省略口令等秘密。任一检查缺失或失败，该制品不能交付。
 
 ## 完整制品与关键流程评审
@@ -90,7 +90,9 @@ product tests before building and independently verify the final artifact after 
 user explicitly declines testing, packaging and handoff may proceed without pre-build tests or
 post-build functional/independent acceptance; clearly label the artifact as untested, list the
 omitted checks, and do not claim that testing or acceptance passed. Non-test artifact integrity,
-configuration-content, forbidden-silver, and SHA-256 checks still apply. A prior packaging or
+configuration-content and SHA-256 checks still apply. Silver main/continuous contracts and
+specific SHFE `ag` contract months are permitted when they are part of the confirmed delivery
+configuration and pass the same validation as other instruments. A prior packaging or
 testing choice does not answer this question for a later packaging request. When full source
 regression is in scope, run
 `.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v` with `PYTHONPATH=src`.

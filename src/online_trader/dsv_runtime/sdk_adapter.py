@@ -1,7 +1,7 @@
 """Bridge the explicit DSV owner to an already constructed TqSdk-shaped API."""
 
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, localcontext
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, localcontext
 from hashlib import sha256
 from threading import get_ident
 import time
@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from online_trader.configuration.dsv import DsvProfile
 from online_trader.configuration.rollover import expiry_date
+from online_trader.contracts.codec import canonical_bytes
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
 from online_trader.dsv_runtime.controller import CancelNotAttempted, SendNotAttempted, legal_price, terminal
 from online_trader.dsv_runtime.order_diagnostics import OrderDiagnosticTracker, classify_broker_rejection
@@ -17,7 +18,7 @@ from online_trader.gateway.dsv_facts import native_integer, utc
 from online_trader.gateway.native_days import native_day
 from online_trader.gateway.tqkq import number
 from online_trader.online_scope import DsvSimulationGrant
-from online_trader.runtime.startup_metadata import SDK_VERSION
+from online_trader.runtime.startup_metadata import SDK_VERSION, _calendar_dates, _get, _periods, _utc
 from online_trader.scheduling.calendar import TradingCalendar
 from online_trader.scheduling.clock import (
     ClockContinuity, ClockSample, NS_PER_SECOND, SystemClock, TIME_SEMANTICS, quote_age_quality, quote_timestamp, sdk_deadline,
@@ -206,11 +207,188 @@ class DsvSdkAdapter:
         self.epoch = uuid4().hex
         session.disconnect('SDK_DISCONNECTED')
 
-    def command(self, session, command):
+    def _validate_added_quote(self, code, quote, *, require_schedule):
+        if _get(quote, 'expired') is not False:
+            raise TraderError('E_STARTUP_METADATA', f'所选合约 {code} 已到期或状态尚未确认。')
+        if _get(quote, 'ins_class') != 'FUTURE':
+            raise TraderError('E_STARTUP_METADATA', f'所选代码 {code} 不是已确认的期货合约。')
+        if _get(quote, 'instrument_id') != code:
+            raise TraderError('E_STARTUP_METADATA', f'行情服务返回的合约身份与 {code} 不符。')
+        try:
+            multiplier = Decimal(str(_get(quote, 'volume_multiple')))
+        except InvalidOperation:
+            multiplier = Decimal('NaN')
+        if not multiplier.is_finite() or not 0 < multiplier <= 1_000_000_000 or multiplier != multiplier.to_integral_value():
+            raise TraderError('E_STARTUP_METADATA', f'所选合约 {code} 的合约乘数尚未确认。')
+        schedule = None
+        if require_schedule:
+            periods = _get(quote, 'trading_time')
+            schedule = {
+                'day': _periods(_get(periods, 'day'), night=False),
+                'night': _periods(_get(periods, 'night'), night=True),
+            }
+        return multiplier, schedule
+
+    def _read_added_contract_quotes(self, added, *, require_schedule, timeout_seconds=5.0):
+        quotes = {code: (self.quotes[code] if code in self.quotes else self.api.get_quote(code)) for code in added}
+        if not require_schedule and self.grant is None:
+            return quotes, {}, {}
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                multipliers, schedules = {}, {}
+                for code in added:
+                    mult, sched = self._validate_added_quote(code, quotes[code], require_schedule=require_schedule)
+                    multipliers[code] = mult
+                    if sched is not None:
+                        schedules[code] = sched
+                return quotes, multipliers, schedules
+            except TraderError:
+                if time.monotonic() >= deadline:
+                    break
+                if self.connection is None:
+                    updated = self.api.wait_update(deadline=sdk_deadline(0.5))
+                else:
+                    self.connection.poll_updates(0.5)
+                    updated = getattr(self.connection, 'last_poll_updated', True)
+                if updated is False:
+                    break
+        multipliers, schedules = {}, {}
+        for code in added:
+            mult, sched = self._validate_added_quote(code, quotes[code], require_schedule=require_schedule)
+            multipliers[code] = mult
+            if sched is not None:
+                schedules[code] = sched
+        return quotes, multipliers, schedules
+
+    def _merge_added_calendar(self, state, added, schedules):
+        calendar_record = self.calendar.to_record()
+        periods_map = {row['contract_id']: list(row['sessions']) for row in calendar_record['contracts']}
+        missing = [code for code in added if not periods_map.get(code)]
+        if not missing:
+            return self.calendar, self.periods, self.trading_days
+        get_calendar = getattr(self.api, 'get_trading_calendar', None)
+        if not callable(get_calendar):
+            raise TraderError('E_CALENDAR_INCOMPLETE', '新增合约缺少交易日历信息，请检查行情连接或重启服务后再试。')
+        target_days = sorted({period['trading_day'] for sessions in periods_map.values() for period in sessions})
+        if not target_days:
+            raise TraderError('E_CALENDAR_INCOMPLETE', '当前运行会话缺少已确认的交易日历。')
+        cal_start = date.fromisoformat(target_days[0]) - timedelta(days=14)
+        cal_end = date.fromisoformat(target_days[-1])
+        calendar_dates = _calendar_dates(get_calendar(cal_start, cal_end), cal_start, cal_end)
+        trading_date_list = sorted(day for day, trading in calendar_dates.items() if trading)
+        sample = self._clock_sample()
+        local_day = sample.utc.astimezone(_BEIJING).date()
+        all_opened = [datetime.fromisoformat(calendar_record['coverage_from_utc'].replace('Z', '+00:00'))]
+        all_closed = [datetime.fromisoformat(calendar_record['coverage_to_utc'].replace('Z', '+00:00'))]
+        for code in missing:
+            sessions = []
+            for day_str in target_days:
+                target = date.fromisoformat(day_str)
+                if not calendar_dates.get(target, False):
+                    raise TraderError('E_CALENDAR_INCOMPLETE', f'交易日 {day_str} 未出现在行情日历中。')
+                prior = next((day for day in reversed(trading_date_list) if day < target), None)
+                if prior is None:
+                    raise TraderError('E_CALENDAR_INCOMPLETE', '未取得上一完整交易日。')
+                gap = [prior + timedelta(days=i) for i in range(1, (target - prior).days)]
+                holiday_gap = any(day.weekday() < 5 and not calendar_dates[day] for day in gap)
+                if holiday_gap and local_day < target and schedules[code]['night']:
+                    raise TraderError('E_CALENDAR_INCOMPLETE', '节假日前后的夜盘安排尚未确认，暂不支持运行时热新增。')
+                session_kinds = (('day', target),) if holiday_gap else (('night', prior), ('day', target))
+                for kind, actual in session_kinds:
+                    kind_periods = schedules[code][kind]
+                    midnight = datetime.combine(actual, datetime.min.time(), _BEIJING)
+                    for index, (start_sec, end_sec) in enumerate(kind_periods):
+                        begin = midnight + timedelta(seconds=start_sec)
+                        finish = midnight + timedelta(seconds=end_sec)
+                        sessions.append({
+                            'session_id': f'{day_str}-{kind}-{index}',
+                            'trading_day': day_str,
+                            'open_utc': _utc(begin),
+                            'close_utc': _utc(finish),
+                            'is_opening_session': index == 0,
+                            'force_close_at_end': index == len(kind_periods) - 1,
+                        })
+                        all_opened.append(begin.astimezone(timezone.utc))
+                        all_closed.append(finish.astimezone(timezone.utc) + timedelta(seconds=1))
+            if not sessions:
+                raise TraderError('E_CALENDAR_INCOMPLETE', f'新增合约 {code} 没有有效交易时段。')
+            periods_map[code] = sessions
+        merged_record = {
+            'schema_version': calendar_record['schema_version'],
+            'calendar_id': calendar_record['calendar_id'],
+            'calendar_version': calendar_record['calendar_version'],
+            'complete': True,
+            'coverage_from_utc': _utc(min(all_opened)),
+            'coverage_to_utc': _utc(max(all_closed)),
+            'contracts': [{'contract_id': code, 'sessions': sessions} for code, sessions in periods_map.items()],
+        }
+        merged_calendar = TradingCalendar.from_record(merged_record)
+        for code in missing:
+            window = merged_calendar.query(code, sample.now_utc)
+            if not window['complete'] or (window['is_trading'] and window['trading_day'] != state['trading_day']):
+                raise TraderError('E_CALENDAR_INCOMPLETE', f'新增合约 {code} 当前交易时段与运行中交易日不一致。')
+        merged_periods = {row['contract_id']: row['sessions'] for row in merged_calendar.to_record()['contracts']}
+        all_contracts = tuple(dict.fromkeys((*self.contracts, *added)))
+        day_sets = [{period['trading_day'] for period in merged_periods[code]} for code in all_contracts]
+        merged_days = sorted(set.intersection(*day_sets)) if day_sets else []
+        return merged_calendar, merged_periods, merged_days
+
+    def _extend_grant_for_contracts(self, added, candidate_profile, merged_calendar, multipliers):
+        if self.grant is None:
+            return None
+        value = self.grant.value
+        symbols = candidate_profile.to_record()['settings']['symbols']
+        value['contracts'] = [row['code'] for row in symbols]
+        value['profile_hash'] = candidate_profile.content_hash
+        value['calendar_hash'] = merged_calendar.content_hash
+        added_set = set(added)
+        added_exposure = Decimal(0)
+        max_qty = value['max_order_quantity']
+        for row in symbols:
+            if row['code'] in added_set:
+                stop = Decimal(row['stop_offset'])
+                if stop > 0:
+                    added_exposure += stop * multipliers[row['code']] * max_qty
+        value['risk_budget'] = decimal_text(Decimal(value['risk_budget']) + added_exposure)
+        return DsvSimulationGrant.parse(canonical_bytes(value))
+
+    def prepare_added_contracts(self, session, added_contracts, candidate_profile):
+        """Prepare quote, calendar, and grant updates before persisting hot-added contracts."""
+        state = self._bind(session)
+        added = tuple(added_contracts or ())
+        if not added:
+            return None
+        previous_enabled = self.enabled
+        self.enabled = False
+        try:
+            require_schedule = any(not self.periods.get(code) for code in added)
+            quotes, multipliers, schedules = self._read_added_contract_quotes(
+                added, require_schedule=require_schedule,
+            )
+            merged_calendar, merged_periods, merged_days = self._merge_added_calendar(state, added, schedules)
+            updated_grant = self._extend_grant_for_contracts(
+                added, candidate_profile, merged_calendar, multipliers,
+            )
+            return {
+                'calendar': merged_calendar,
+                'periods': merged_periods,
+                'trading_days': merged_days,
+                'grant': updated_grant,
+                'quotes': quotes,
+            }
+        finally:
+            self.enabled = previous_enabled
+
+    def command(self, session, command, *, prepared_contracts=None):
         """Run a user command through the same owner and committed effect path."""
         state = self._bind(session)
         if command.get('action') in {'START', 'STOP', 'CLOCK_RECOVER'}:
             self._clock_resume_day = None
+        added = tuple(command.get('added_contracts') or ()) if command.get('action') == 'SAVE_PARAMETERS' else ()
+        if added and prepared_contracts is None:
+            candidate = DsvProfile.from_record(command['profile'])
+            prepared_contracts = self.prepare_added_contracts(session, added, candidate)
         self.enabled = self.synchronized and state['synchronized']
         try:
             receipt = session.command(command)
@@ -220,6 +398,17 @@ class DsvSdkAdapter:
                 updated = DsvProfile.from_record(command['profile'])
                 self.profile = updated
                 self.contracts = tuple(row['code'] for row in updated.to_record()['settings']['symbols'])
+                if added and prepared_contracts is not None:
+                    self.calendar = prepared_contracts['calendar']
+                    self.periods = prepared_contracts['periods']
+                    self.trading_days = prepared_contracts['trading_days']
+                    if prepared_contracts['grant'] is not None:
+                        self.grant = prepared_contracts['grant']
+                    for code in added:
+                        self.quotes[code] = prepared_contracts['quotes'].get(code) or self.api.get_quote(code)
+                        self.minutes[code] = self.api.get_kline_serial(code, 60, data_length=500)
+                    self._minute_chart_sample_at = None
+                    self._foreign_trades = None
             return receipt
         finally:
             self.enabled = False

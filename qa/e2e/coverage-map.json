@@ -1,0 +1,67 @@
+{
+  "schema_version": "ONLINE_TRADER_COVERAGE_MAP/1",
+  "policy": "Keep all legacy tests active until replacement E2E + mutation verification is independently approved.",
+  "mappings": [
+    {
+      "legacy_module": "tests.test_target_owner_runtime",
+      "classification": "CURRENT_CRITICAL_AND_E2E_OVERLAP",
+      "replacement": [
+        "E2E-SMOKE-001-5lot-partial-stop-loss",
+        "E2E-UNKNOWN-001-ack-loss-delayed-recovery",
+        "E2E-UNKNOWN-002-negative-reconcile",
+        "E2E-CANCEL-001-reprice-and-late-fill",
+        "E2E-EXIT-001-reject-recovery-and-dup-trade",
+        "E2E-RECOVERY-002-tick-error-and-crossday"
+      ],
+      "retirement_approved": false,
+      "notes": "Retain unit/contract assertions for error-tier matrix and projection schema."
+    },
+    {
+      "legacy_module": "tests.test_dsv_execution_regressions",
+      "classification": "COVERED_BY_E2E_CANDIDATE",
+      "replacement": [
+        "E2E-SMOKE-001-5lot-partial-stop-loss",
+        "E2E-CANCEL-001-reprice-and-late-fill",
+        "E2E-EXIT-001-reject-recovery-and-dup-trade"
+      ],
+      "retirement_approved": false,
+      "notes": "Requires mutation verification before retiring any individual regression test."
+    },
+    {
+      "legacy_module": "tests.test_runtime_client_foundation",
+      "classification": "CURRENT_CRITICAL",
+      "replacement": [
+        "E2E-DESKTOP-001-workbench-lifecycle"
+      ],
+      "retirement_approved": false,
+      "notes": "Keep Windows pipe protocol and CommandBus unit contracts."
+    },
+    {
+      "legacy_module": "tests.test_runtime_parallel_ledger_guard",
+      "classification": "CURRENT_CRITICAL",
+      "replacement": [
+        "E2E-RECOVERY-001-crash-restart"
+      ],
+      "retirement_approved": false,
+      "notes": "Keep temporary ledger isolation and SQLite lock unit contracts."
+    },
+    {
+      "legacy_module": "tests.test_dsv_clock_and_calendar",
+      "classification": "CURRENT_CRITICAL",
+      "replacement": [
+        "E2E-CLOCK-001-discontinuity-disarm"
+      ],
+      "retirement_approved": false,
+      "notes": "Keep combinatorial clock/calendar edge-case unit contracts."
+    },
+    {
+      "legacy_module": "tests.test_live_parameter_save",
+      "classification": "CURRENT_CRITICAL_AND_E2E_OVERLAP",
+      "replacement": [
+        "E2E-PARAMS-001-live-save-atomicity"
+      ],
+      "retirement_approved": false,
+      "notes": "Retain file-restore failure injection unit test; E2E covers end-to-end pipe and disk atomicity."
+    }
+  ]
+}

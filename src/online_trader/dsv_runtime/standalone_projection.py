@@ -423,6 +423,7 @@ def workbench_view(snapshot, *, profile, adapter, configuration_revision):
         'rule_set_id': 'DSV_TARGET_EXECUTION',
         'execution_core': 'DSV_TARGET_EXECUTION',
         'strategy_profile_hash': profile.content_hash,
+        'strategy_profile': profile.to_record(),
         'scoped_contracts': list(symbols), 'strategy_symbols': list(symbols.values()),
         'cancel_on_stop': settings['trade']['cancel_on_stop'],
         'manual_close_price_mode': settings['trade']['close_price_mode'],

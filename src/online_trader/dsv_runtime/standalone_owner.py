@@ -155,6 +155,11 @@ class StandaloneDsvOwner:
         self._update_stop_ready()
         return receipt
 
+    def _run_adapter_save(self, command, prepared=None):
+        if prepared is None:
+            return self.adapter.command(self.session, command)
+        return self.adapter.command(self.session, command, prepared_contracts=prepared)
+
     def _save_parameters(self, command):
         """Persist the user configuration first, then apply it in this owner turn.
 
@@ -164,11 +169,17 @@ class StandaloneDsvOwner:
         unrestorable or partially applied save fails the owner closed.
         """
         candidate = self.session.check_parameter_save(command)
+        prepared = None
+        if (candidate is not None and command.get('added_contracts')
+                and callable(getattr(self.adapter, 'prepare_added_contracts', None))):
+            prepared = self.adapter.prepare_added_contracts(
+                self.session, command['added_contracts'], candidate,
+            )
         if candidate is None or not callable(self.on_parameters_saved):
-            return self.adapter.command(self.session, command)
+            return self._run_adapter_save(command, prepared)
         restore_token = self.on_parameters_saved(candidate)
         try:
-            receipt = self.adapter.command(self.session, command)
+            receipt = self._run_adapter_save(command, prepared)
         except BaseException as error:
             if self.session._state.get('profile_hash') == candidate.content_hash:
                 raise TraderError(
@@ -299,11 +310,17 @@ class StandaloneDsvOwner:
         dsv_receipt = self.command(command_body)
         state = self.snapshot()
         seq = str(max(1, int(state.get('projection_seq') or state.get('sequence') or 0)))
+        added_contracts = any(
+            item.get('reason') == 'DSV_PARAMETERS_SAVED' and item.get('added_contracts')
+            for item in dsv_receipt.get('decisions', ())
+        )
         result = {'command_id': command_id, 'payload_hash': digest, 'status': 'SUCCEEDED',
                   'receipt_revision': '1', 'tx_id': 'target-' + content_hash(command_id)[:40],
                   'event_seq': seq, 'durable_seq': seq, 'state_revision': seq,
                   'error_code': 'NONE',
-                  'reason': ('参数已保存并生效，下一笔新鲜行情使用新参数。'
+                  'reason': ('新合约参数已保存并生效，已开始同步行情。'
+                             if body['operation'] == 'SAVE_DSV_PARAMETERS' and added_contracts
+                             else '参数已保存并生效，下一笔新鲜行情使用新参数。'
                              if body['operation'] == 'SAVE_DSV_PARAMETERS'
                              else 'Target execution command committed'),
                   'evidence_ids': [dsv_receipt['state_after_digest'][:32]]}

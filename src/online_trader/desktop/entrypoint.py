@@ -120,6 +120,8 @@ def main(argv=None):
                     window = WorkbenchWindow(
                         pipe, runtime_view=True, update_root=runtime_update_root,
                         update_restart=request_restart if runtime_update_root is not None else None,
+                        runtime_root=resolved_runtime_root,
+                        runtime_account=args.runtime_account,
                     )
                     window.setAttribute(Qt.WA_DeleteOnClose)
                     window.destroyed.connect(app.quit)

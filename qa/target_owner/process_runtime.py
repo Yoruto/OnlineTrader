@@ -22,10 +22,13 @@ import time
 import traceback
 from uuid import uuid4
 
+from online_trader.configuration.dsv import DsvProfile
 from online_trader.dsv_runtime.owner_binding import StandaloneOwnerBinding
 from online_trader.dsv_runtime.runner import DsvSession
 from online_trader.dsv_runtime.standalone_owner import StandaloneDsvOwner
+from online_trader.errors import TraderError
 from online_trader.kernel.server import ControlServer
+from online_trader.runtime.owner_tick import execute_owner_tick
 from online_trader.runtime.session_storage import RuntimeSessionStorage
 from qa.target_owner.offline_runtime import DAY, OfflineAdapter, profile
 from qa.recording_port import RecordingPort
@@ -78,6 +81,14 @@ class _ObservedAdapter(OfflineAdapter):
     def __init__(self, frames: _ObservedFrames, emit: Callable[..., None]):
         super().__init__(frames)
         self._emit = emit
+        self.next_step_error_code: str | None = None
+
+    def step(self, session, *, trading_day, complete):
+        if self.next_step_error_code is not None:
+            code = self.next_step_error_code
+            self.next_step_error_code = None
+            raise TraderError(code, f"Injected QA step error: {code}")
+        return super().step(session, trading_day=trading_day, complete=complete)
 
     def send(self, request):
         copied = deepcopy(request)
@@ -102,7 +113,15 @@ class _ObservedAdapter(OfflineAdapter):
         return result
 
 
-def _owner_process_main(storage_root: str, pipe_name: str, run_id: str, control) -> None:
+def _owner_process_main(
+    storage_root: str,
+    pipe_name: str,
+    run_id: str,
+    control,
+    profile_record: dict[str, object] | None = None,
+    trading_day: str = DAY,
+    use_production_tick_wrapper: bool = False,
+) -> None:
     """Spawn target. All owner construction and calls stay on this process thread."""
     event_seq = 0
     shutdown_cause = None
@@ -135,7 +154,7 @@ def _owner_process_main(storage_root: str, pipe_name: str, run_id: str, control)
         tempfile.tempdir = str(runtime_root)
         frames = _ObservedFrames()
         account = "DEV:target-owner-" + uuid4().hex
-        settings = profile()
+        settings = DsvProfile.from_record(profile_record) if profile_record is not None else profile()
         connection = None
         owner = None
 
@@ -146,7 +165,7 @@ def _owner_process_main(storage_root: str, pipe_name: str, run_id: str, control)
             connection = adapter.connection
             session = DsvSession(
                 storage.ledger, account_key=account, provider="OFFLINE",
-                trading_day=DAY, profile=settings, port=adapter,
+                trading_day=trading_day, profile=settings, port=adapter,
                 _owner_binding=binding)
             session.disconnect("QA_OWNER_CREATED_DISARMED")
             owner = StandaloneDsvOwner(
@@ -156,9 +175,17 @@ def _owner_process_main(storage_root: str, pipe_name: str, run_id: str, control)
             last_input_sequence = 0
             seen_frame_ids: set[str] = set()
             ready_sent = False
+            current_day = trading_day
+            status_path = runtime_root / "target-owner-status.json"
+            diagnostics_path = runtime_root / "target-owner-diagnostics.json"
+            loop_state = {
+                "last_status": None,
+                "last_history_capture": 0.0,
+                "initial_start_pending": False,
+            }
 
             def owner_tick():
-                nonlocal last_input_sequence, shutdown_cause, ready_sent
+                nonlocal last_input_sequence, shutdown_cause, ready_sent, current_day
                 if not ready_sent:
                     emit(
                         "OWNER_READY",
@@ -167,7 +194,7 @@ def _owner_process_main(storage_root: str, pipe_name: str, run_id: str, control)
                         execution_core="DSV_TARGET_EXECUTION",
                         configuration_revision="1",
                         profile_hash=settings.content_hash,
-                        trading_day=DAY,
+                        trading_day=trading_day,
                         source="QA_OFFLINE_FACT_ADAPTER",
                         real_broker_connection=False,
                         real_order_submission=False,
@@ -192,6 +219,16 @@ def _owner_process_main(storage_root: str, pipe_name: str, run_id: str, control)
                         emit("HARNESS_TEARDOWN_ACCEPTED", request_id=message.get("request_id"))
                         owner.stop_event.set()
                         return
+                    if kind == "SET_ADAPTER_FAULT":
+                        adapter.fail_send = bool(message.get("fail_send", False))
+                        if "next_step_error_code" in message:
+                            adapter.next_step_error_code = message.get("next_step_error_code")
+                        emit(
+                            "ADAPTER_FAULT_UPDATED",
+                            fail_send=adapter.fail_send,
+                            next_step_error_code=adapter.next_step_error_code,
+                        )
+                        continue
                     if kind != "FACT_FRAME":
                         emit("HARNESS_MESSAGE_REJECTED", reason_code="UNSUPPORTED_MESSAGE_TYPE")
                         continue
@@ -220,10 +257,31 @@ def _owner_process_main(storage_root: str, pipe_name: str, run_id: str, control)
                         continue
                     last_input_sequence = sequence
                     seen_frame_ids.add(frame_id)
+                    if isinstance(clean_frame.get("trading_day"), str):
+                        current_day = clean_frame["trading_day"]
                     emit("FACT_FRAME_ACCEPTED", frame_id=frame_id, input_sequence=sequence)
 
                 frames.last_popped = None
-                receipt = owner.step(trading_day=DAY, complete=connection.complete)
+                if use_production_tick_wrapper:
+                    previous_diag = diagnostics_path.read_text(encoding="utf-8") if diagnostics_path.is_file() else None
+                    receipt = None
+                    execute_owner_tick(
+                        owner,
+                        binding=binding,
+                        current_trading_day=current_day,
+                        is_complete=connection.complete,
+                        history_writer=None,
+                        status_path=status_path,
+                        diagnostics_path=diagnostics_path,
+                        loop_state=loop_state,
+                        sleep_fn=lambda _s: None,
+                    )
+                    if diagnostics_path.is_file():
+                        current_diag = diagnostics_path.read_text(encoding="utf-8")
+                        if current_diag != previous_diag:
+                            emit("STEP_ERROR_HANDLED", diagnostics=json.loads(current_diag))
+                else:
+                    receipt = owner.step(trading_day=current_day, complete=connection.complete)
                 applied = frames.last_popped
                 if applied is not None:
                     emit(
@@ -270,13 +328,19 @@ class OfflineTargetOwnerProcess:
     """
 
     def __init__(self, root: str | Path, *, startup_timeout: float = 10.0,
-                 shutdown_timeout: float = 10.0):
+                 shutdown_timeout: float = 10.0,
+                 profile_record: dict[str, object] | None = None,
+                 trading_day: str = DAY,
+                 use_production_tick_wrapper: bool = False):
         self.root = Path(root).resolve()
         self.runtime_root = self.root / "runtime-temp"
         self.pipe = "online-trader-target-process-qa-" + uuid4().hex
         self.run_id = "qa-process-" + uuid4().hex
         self.startup_timeout = startup_timeout
         self.shutdown_timeout = shutdown_timeout
+        self.profile_record = deepcopy(profile_record) if profile_record is not None else None
+        self.trading_day = trading_day
+        self.use_production_tick_wrapper = bool(use_production_tick_wrapper)
         self.boot_id = None
         self.account_key = None
         self.owner_pid = None
@@ -304,7 +368,7 @@ class OfflineTargetOwnerProcess:
 
     @property
     def is_alive(self) -> bool:
-        return self._process is not None and self._process.is_alive()
+        return not self._closed and self._process is not None and self._process.is_alive()
 
     @property
     def events(self) -> tuple[dict[str, object], ...]:
@@ -329,7 +393,15 @@ class OfflineTargetOwnerProcess:
         process = self._context.Process(
             target=_owner_process_main,
             name="online-trader-target-owner-qa",
-            args=(str(self.runtime_root), self.pipe, self.run_id, child),
+            args=(
+                str(self.runtime_root),
+                self.pipe,
+                self.run_id,
+                child,
+                self.profile_record,
+                self.trading_day,
+                self.use_production_tick_wrapper,
+            ),
             daemon=True,
         )
         try:
@@ -445,6 +517,24 @@ class OfflineTargetOwnerProcess:
                     raise OwnerProcessError(f"Timed out waiting for fact frame {frame_id}")
                 self._condition.wait(min(remaining, 0.25))
 
+    def set_adapter_fault(
+        self,
+        *,
+        fail_send: bool = False,
+        next_step_error_code: str | None = None,
+        timeout: float = 5.0,
+    ) -> dict[str, object]:
+        if not self.is_alive or self._control is None:
+            raise OwnerProcessError("Owner child is not running")
+        cursor = self.event_cursor
+        payload: dict[str, object] = {"type": "SET_ADAPTER_FAULT", "fail_send": bool(fail_send)}
+        if next_step_error_code is not None:
+            payload["next_step_error_code"] = next_step_error_code
+        with self._input_lock:
+            with self._send_lock:
+                self._control.send(payload)
+        return self.wait_for_event("ADAPTER_FAULT_UPDATED", timeout=timeout, after=cursor)
+
     def wait_for_frame_applied(self, frame_id: str, *, timeout: float = 5.0,
                                after: int = 0) -> dict[str, object]:
         return self.wait_for_event(
@@ -551,6 +641,7 @@ class OfflineTargetOwnerProcess:
                 })
         if process is not None and not process.is_alive():
             process.close()
+            self._process = None
         self._close_logs()
         self._closed = True
 

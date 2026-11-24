@@ -1,6 +1,7 @@
 """Whole-batch DSV symbol CSV previews; no live contract discovery or activation."""
 
 import csv
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from io import StringIO
 from pathlib import Path
@@ -71,8 +72,12 @@ def match_contract_catalog(value, contracts, *, limit=100):
     term = value.strip().casefold()
     if not term:
         return []
-    prefix = term.rstrip('0123456789')
-    alias = ALIASES.get(prefix)
+    exchange_part, dot, tail = term.partition('.')
+    raw_prefix = (tail if dot else term).rstrip('0123456789')
+    num_part = (tail if dot else term)[len(raw_prefix):]
+    alias = ALIASES.get(raw_prefix)
+    if dot and alias is not None and exchange_part.upper() != alias[0]:
+        alias = None
     matches = []
     for code in dict.fromkeys(contracts):
         product = future_product(code)
@@ -82,11 +87,46 @@ def match_contract_catalog(value, contracts, *, limit=100):
         name = PRODUCT_NAMES.get(symbol, '').casefold()
         suffix = code[len(symbol):]
         if (term in code.casefold() or term in name
-                or alias == product and suffix.endswith(term[len(prefix):])):
+                or (alias == product and (not num_part or suffix.startswith(num_part) or suffix.endswith(num_part)))):
             matches.append(code)
         if len(matches) >= limit:
             break
     return matches
+
+
+def suggest_contracts(value, contracts=(), *, limit=6, today=None):
+    """Return up to ``limit`` matching catalog contracts, or upcoming months for known aliases."""
+    if type(value) is not str or limit <= 0:
+        return [], False
+    if contracts:
+        matched = match_contract_catalog(value, sorted(dict.fromkeys(contracts)), limit=limit)
+        if matched:
+            return matched, True
+    term = value.strip().casefold()
+    if not term:
+        return [], False
+    exchange_part, dot, tail = term.partition('.')
+    body = tail if dot else term
+    prefix = body.rstrip('0123456789')
+    digits = body[len(prefix):]
+    alias = ALIASES.get(prefix)
+    if alias is None or (dot and exchange_part.upper() != alias[0]):
+        return [], False
+    exchange, product = alias
+    reference = today or datetime.now(timezone(timedelta(hours=8))).date()
+    start_offset = 1 if reference.day >= 20 else 0
+    results = []
+    for step in range(start_offset, start_offset + 12):
+        month_index = (reference.year * 12 + (reference.month - 1)) + step
+        year, month = divmod(month_index, 12)
+        month += 1
+        suffix = f'{year % 10}{month:02d}' if exchange == 'CZCE' else f'{year % 100:02d}{month:02d}'
+        if digits and not suffix.startswith(digits):
+            continue
+        results.append(f'{exchange}.{product}{suffix}')
+        if len(results) >= limit:
+            break
+    return results, False
 
 
 def resolve_contract(value):

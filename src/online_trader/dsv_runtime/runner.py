@@ -413,20 +413,30 @@ class DsvSession:
         candidate = DsvProfile.from_record(command['profile'])
         settings = candidate.to_record()['settings']
         previous = self._profile.to_record()['settings']
-        if {item['code'] for item in settings['symbols']} != set(self._symbols):
-            raise TraderError('E_DSV_SCOPE', '运行中只能调整当前已授权合约的参数。')
+        old_codes = set(self._symbols)
+        new_codes = {item['code'] for item in settings['symbols']}
+        if not 1 <= len(settings['symbols']) <= 11:
+            raise TraderError('E_DSV_SCOPE', '监控合约数量必须在 1 到 11 个之间。')
+        if not old_codes <= new_codes:
+            raise TraderError('E_DSV_SCOPE', '运行中只能保留或新增合约，不能移除已有合约。')
         if settings['schedule'] != previous['schedule'] or any(
             settings['trade'][field] != previous['trade'][field] for field in ('holidays', 'night_session_close')
         ):
             raise TraderError('E_DSV_SCOPE', '交易日历和定时设置需在下次启动时生效。')
         if candidate.content_hash == self._profile.content_hash:
             return None
+        existing_unchanged = (
+            settings['trade'] == previous['trade']
+            and settings['auto_offset'] == previous['auto_offset']
+            and [row for row in settings['symbols'] if row['code'] in old_codes] == previous['symbols']
+        )
         # Position lifetime rules (protection, timed/stale close, slip abort, cooldown)
-        # read the active profile.  Until a complete per-position policy snapshot
-        # exists, live changes are accepted only without owned exposure or work.
-        if self._position_sensitive_activity(state):
+        # read the active profile.  Purely appending new contracts keeps every existing
+        # contract and account-level protection rule intact; modifying existing rules
+        # remains restricted to flat/idle state.
+        if not existing_unchanged and self._position_sensitive_activity(state):
             raise TraderError('E_DSV_SCOPE',
-                              '存在自有持仓、待核对仓位或未终结委托时不能在运行中修改参数；'
+                              '存在自有持仓、待核对仓位或未终结委托时不能在运行中修改已有参数；'
                               '请在全部平仓且委托终结后再保存。')
         return candidate
 
@@ -1647,13 +1657,23 @@ class DsvSession:
             candidate = self._parameter_save_candidate(state, command)
             if candidate is None:
                 return [{'reason': 'PARAMETERS_UNCHANGED', 'rule_ids': ['D14']}], []
+            added_contracts = [
+                row['code'] for row in candidate.to_record()['settings']['symbols']
+                if row['code'] not in state['symbols']
+            ]
+            for code in added_contracts:
+                state['symbols'][code] = _initial_symbol()
             next_revision = str(int(state.get('config_revision') or 1) + 1)
             state['config_revision'] = next_revision
             state['profile_hash'] = candidate.content_hash
-            self._journal.event('DSV_PARAMETERS_SAVED', {
-                'profile_hash': candidate.content_hash, 'config_revision': next_revision})
-            return [{'reason': 'DSV_PARAMETERS_SAVED', 'profile_hash': candidate.content_hash,
-                     'config_revision': next_revision, 'rule_ids': ['D14']}], []
+            event_payload = {
+                'profile_hash': candidate.content_hash,
+                'config_revision': next_revision,
+            }
+            if added_contracts:
+                event_payload['added_contracts'] = added_contracts
+            self._journal.event('DSV_PARAMETERS_SAVED', event_payload)
+            return [{'reason': 'DSV_PARAMETERS_SAVED', **event_payload, 'rule_ids': ['D14']}], []
         if action == 'REDUCE_DETACHED':
             row = state['symbols'].get(command['contract_id'])
             identity = identifier(command['position_id'])

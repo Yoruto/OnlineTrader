@@ -241,6 +241,15 @@ class SettingsDialog(QDialog):
         self.error_label.clear()
         self._render()
 
+    def set_runtime_baseline(self, profile, source, *, preserve_draft=True):
+        if not preserve_draft or self._profile.content_hash == self._baseline.content_hash:
+            self.set_reference_profile(profile, source)
+            return
+        self._baseline = profile
+        self._manifest = {'rule_set_id': source}
+        self.reference_label.setText('参数来源：' + source)
+        self._render()
+
     def _render(self):
         current = self._profile.to_record()["settings"]
         baseline = self._baseline.to_record()["settings"]

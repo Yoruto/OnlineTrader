@@ -1,3 +1,4 @@
+from datetime import date
 import os
 from pathlib import Path
 import tempfile
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import QApplication, QDialog
 
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.files import load_profile
+from online_trader.configuration.symbol_csv import suggest_contracts
 from online_trader.desktop.editor import ParameterEditorDialog
 from online_trader.desktop.settings import SettingsDialog
 from online_trader.desktop.symbol_editor import SymbolEditorDialog
@@ -144,6 +146,46 @@ class SymbolEditorTests(unittest.TestCase):
         self.assertTrue(editor.validate_preview())
         self.assertEqual(editor.result_profile.to_settings()['trade']['max_volume'], 12)
         self.assertEqual(len(editor.result_profile.to_settings()['symbols']), 6)
+
+    def test_contract_dropdown_suggests_up_to_six_months_offline_and_from_catalog(self):
+        offline, from_catalog = suggest_contracts('ag', (), limit=6, today=date(2026, 11, 24))
+        self.assertFalse(from_catalog)
+        self.assertEqual(
+            offline,
+            ['SHFE.ag2612', 'SHFE.ag2701', 'SHFE.ag2702', 'SHFE.ag2703', 'SHFE.ag2704', 'SHFE.ag2705'],
+        )
+        dialog = self.dialog()
+        dialog.fields['code'].textEdited.emit('ag')
+        dialog.fields['code'].setText('ag')
+        self.assertEqual(dialog._catalog_completer.maxVisibleItems(), 6)
+        self.assertEqual(len(dialog._catalog_model.stringList()), 6)
+        self.assertTrue(all(item.startswith('SHFE.ag') for item in dialog._catalog_model.stringList()))
+
+        catalog = [f'SHFE.ag2612', *(f'SHFE.ag270{m}' for m in range(1, 9)), 'SHFE.cu2701']
+        dialog.set_contract_catalog(catalog)
+        dialog.fields['code'].setText('ag')
+        self.assertEqual(
+            dialog._catalog_model.stringList(),
+            ['SHFE.ag2612', 'SHFE.ag2701', 'SHFE.ag2702', 'SHFE.ag2703', 'SHFE.ag2704', 'SHFE.ag2705'],
+        )
+        dialog._on_suggestion_activated('SHFE.ag2701')
+        self.assertEqual(dialog.fields['code'].text(), 'SHFE.ag2701')
+        self.assertEqual(dialog.fields['name'].text(), '白银')
+
+    def test_runtime_symbol_limit_enforces_eleven_contracts(self):
+        settings = self.profile.to_settings()
+        base = settings['symbols'][0]
+        settings['symbols'] = [
+            dict(base, code=f'SHFE.cu27{month:02d}', name=f'铜{month:02d}')
+            for month in range(1, 12)
+        ]
+        from online_trader.configuration.dsv import DsvProfile
+        eleven_profile = DsvProfile.from_settings(settings)
+        dialog = SymbolEditorDialog(eleven_profile)
+        self.windows.append(dialog)
+        dialog.fields['code'].setText('ag2702')
+        self.assertFalse(dialog.validate_symbol())
+        self.assertIn('11', dialog.error_label.text())
 
 
 if __name__ == '__main__': unittest.main()
