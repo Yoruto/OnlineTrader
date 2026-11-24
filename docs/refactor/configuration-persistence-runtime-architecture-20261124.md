@@ -1,23 +1,25 @@
-# Configuration、Persistence 与 Runtime 基础架构收敛设计（V1.0）
+# Configuration、Persistence 与 Runtime 基础架构与生命周期解耦设计（V1.1）
 
 > 日期：2026-11-24  
 > 状态：`CANDIDATE / DESIGN_ONLY / NEEDS_REVIEW`  
-> 基线：`e43e9d9cbaeb5b929c92877a761e690c55a6de78`（main，文档编制时）  
+> 基线：`deadb3bb4c8617d96752935ef86cabdffa7935d9`（main，本次生命周期复核）；V1.0 基线 `e43e9d9cbaeb5b929c92877a761e690c55a6de78`。  
 > 范围：OnlineTrader 默认 Standalone Trading Runtime + DSV Target Owner；人工监督的 Windows 桌面自动交易终端。  
 > 本文是后续开发设计和分批验收合同，不代表新增功能已经实现或通过测试；不授权连接账户、下单、运行测试、打包或发布。
 
 ## 0. 摘要与核心决策
 
+**V1.1 核心修订：Runtime 进程、行情、账户连接与交易会话具有不同生命周期。软件运行不等于策略运行，账户连接不等于交易授权，策略停止不等于交易责任结束。** 普通打开软件进入监控模式；仅在有效授权后进入交易模式。策略停止且交易责任已证明清空时，不应再要求用户先退出 Runtime 才能发起账号切换或更新。首版允许 Supervisor 自动受控重启 Runtime 实现切换，不要求新增独立行情进程或两套 SDK。
+
 当前架构已经解决了 Workbench 与 Runtime 的进程隔离、单一交易发送者和基于 Target 的数量核算。下一阶段不需要再次拆分交易进程，而应收敛三个基础系统的边界：
 
 - **Configuration**：描述软件应该如何运行，管理参数、账户连接输入、默认值、用户覆盖、版本及静态验证。
 - **Persistence**：描述软件必须记住哪些事实、怎样保存以及怎样证明数据的有效性；不自行决定交易行为。
-- **Runtime**：唯一交易 Owner，负责事实顺序、策略、执行、配置生效、授权、业务状态恢复及生命周期。
+- **Runtime**：Supervisor 协调进程、行情服务、账户会话和交易会话；当前 Trading Session 的 Owner 仍是唯一交易裁决和发送者，负责有序事实、策略、执行、动态配置生效及业务状态恢复。Supervisor 无报撤单权。
 - **Gateway**：期货柜台与行情源的适配边界。真实资金、持仓、委托、成交由柜台权威决定，不由本地配置或数据库决定。
 
 建议继续使用 Python、JSON、SQLite、现有 IPC 和单 Owner 模型。只增加确有用途的类型、接口与持久化记录，不引入 Redis、消息中间件、ORM、微服务、第二 OMS 或独立交易 Reconciler。
 
-本文拟议的实质性业务合同变化仅包括：明确 Desired/Active Config、完善账户历史覆盖与补录、在严格限制下保存跨重启的策略业务事实。这些变化须经评审后分批实施，不得以目录重构为由修改 DSV 策略语义。
+本文拟议的业务合同变化包括：运行模式及责任判定、受控账号切换/更新/无平仓维护停机、生命周期逻辑拆分、Desired/Active Config、账户历史覆盖和补录、跨重启业务事实。优先解决可维护性阻塞，不改变 DSV 策略语义。涉及普通启动默认停开（含旧 auto_start_on_launch 语义）、新维护命令和长期业务库的合同，在实施前须明确批准并更新拥有合同；本文仍为设计候选。
 
 ## 1. 适用合同与当前实现
 
@@ -30,6 +32,7 @@
 | [ConfigSnapshot 旧合同](runtime-config-snapshot-contract-20261120.md) | 可参考版本与投影设计；原 Ledger 配置权威、原周期回读及重启恢复语义不得直接用于当前 Standalone |
 | [账户数据同步](../account-data-sync-design-20261119.md) | 必须先应用 2026-11-20 覆盖说明；旧 handoff、长期执行账本等不是现行默认设计 |
 | [诊断系统](runtime-workbench-diagnostics-reporting-20261124.md) | 统一诊断机制与收盘/退出上报，非交易权威 |
+| [桌面退出合同](desktop-lifecycle-user-flow-20261120.md) / [Windows 更新](../windows-gitlab-updates.md) | 既有明确退出与安装锁仍保留；新增无平仓维护路径及协调顺序是 V1.1 提案，不改变当前实现 |
 | [架构状态](../ai/architecture-status.yaml) / [模块边界](../ai/module-boundaries.yaml) | 当前合同导航；实现与合同冲突需明确标记 CONFLICT_NEEDS_REVIEW |
 
 ### 1.1 现状审视
@@ -45,48 +48,63 @@
 | [runtime/account_cache.py](../../src/online_trader/runtime/account_cache.py) | 有界异步 latest-wins 快照写入及历史查询 | 缺少按类别保证历史增量和覆盖的完整合同；仅快照不能证明整日完整历史 |
 | [runtime/target_owner_startup.py](../../src/online_trader/runtime/target_owner_startup.py) | 唯一 Owner、历史 writer、命令服务、生命周期协调 | BrokerHistoryWriter 初始化失败可能传播到启动失败，与历史缓存非交易前置的目标不一致 |
 | [dsv_runtime/sdk_adapter.py](../../src/online_trader/dsv_runtime/sdk_adapter.py) | 验证已准备 effect、SDK 事实和发单结果 | 私有 session 成员访问和 SDK 内部版本耦合；应封装但不放宽权限 |
+| [runtime/standalone.py](../../src/online_trader/runtime/standalone.py) | RuntimeLock、RuntimeSessionStorage 与账号启动流程绑定 | 单一进程锁不可用来判断是否存在交易责任 |
+| [desktop/update_ui.py](../../src/online_trader/desktop/update_ui.py) / [update_install.py](../../src/online_trader/update_install.py) | UI restart_now 在 request_restart 前取得 quiescent_installation；安装端仍有独占锁 | 在监控模式下先协调退出，再由稳定 Launcher 独占安装；不能把安装锁当请求前置门禁 |
+| [dsv_runtime/runner.py:prepare_shutdown](../../src/online_trader/dsv_runtime/runner.py#L351-L366) | 只读汇总未终态 child、自有/分离持仓及 native conflicts | 可复用，但 ready 不足以证明当前同步、归属冲突、未处理命令、授权与维护状态均安全 |
 
 上述是源码审视和设计建议，不是新的功能验收结论。当前支持的账户范围以已验收的模拟账户为准；不能据此声明实盘、任意历史接口或多物理机交易已经验证。
+
 
 ## 2. 目标架构与依赖规则
 
 ```mermaid
 flowchart TD
     W[Trading Workbench] <-->|CommandBus / Read Model| IPC[本机 IPC]
-    IPC --> R[Runtime Owner]
-    subgraph CORE[同一交易线程]
-      R --> L[Lifecycle / Round Processor]
-      L --> S[Strategy Rules + Business State]
-      L --> E[ExplicitOrderController]
-      S -->|版本化目标| E
-      L --> A[Config Apply / Recovery]
+    IPC --> SUP[Runtime Supervisor]
+    SUP -->|生命周期与维护协调| M[Market Service]
+    SUP -->|绑定 / 切换| A[Account Session]
+    SUP -->|启动 / 停止 / 收尾| T[Trading Session]
+    subgraph OWNER[单一交易 Owner / 同一执行线程]
+      T --> R[Round Processor]
+      R --> S[DSV Strategy + Business State]
+      S -->|版本化 Target| E[ExplicitOrderController]
+      R --> C[Config Apply / Recovery]
+      E --> J[Execution Journal]
     end
-    A --> C[Configuration]
-    C --> F[(JSON 默认 / 用户覆盖 / 私有输入)]
-    L --> J[Execution Store]
-    E --> J
-    J --> T[(临时 Journal)]
-    L --> B[Strategy State Store - 拟议]
-    B --> D[(长期业务状态 SQLite)]
-    L --> G[Gateway / SDK Port]
+    M --> G[Gateway / SDK Port]
+    A --> G
     E --> G
     G <--> X[行情源 / 期货柜台]
-    L -->|只读事实副本| H[Account History Writer]
-    H --> Q[(账户历史 SQLite)]
-    L -->|不可变投影输入| P[后台 Projection / Diagnostics]
+    M -->|有序行情事实| R
+    A -->|已核对账户事实| R
+    SUP --> CF[Configuration]
+    C --> CF
+    CF --> F[(JSON 默认 / 用户覆盖 / 私有输入)]
+    J --> TMP[(会话临时 SQLite)]
+    R --> B[Strategy State Store - 拟议]
+    B --> D[(长期业务状态 SQLite)]
+    A -->|不可变账户数据| H[Account History Writer]
+    H --> Q[(按账号隔离的历史 SQLite)]
+    M --> P[只读状态投影]
+    A --> P
+    T --> P
     P --> IPC
 ```
 
-图表示逻辑职责而非进程数量；现有 Controller、Session 和 SDK 仍在同一 Owner 中串行执行。无需为图中每个方框创建新类。
+图表示逻辑模块而非新增进程或 SDK 连接。第一批仍复用现有同一 Owner 和连接，Supervisor 可通过受控进程重启完成账号切换；后续才把行情/账户读侧从交易会话的生命周期中逐渐提取。共享 TqApi 时由同一个执行线程驱动，禁止并发操作 SDK 或产生第二 sender。
+
+四个逻辑生命周期：Supervisor 与应用进程同寿命；Market Service 在可认证时独立于策略；Account Session 对应一个明确的账户连接上下文；Trading Session 对应该账户的执行权威和临时 Journal，可以在停止且无责任后保持休眠以保留同日状态，但不得继续获得开仓授权。
 
 ### 2.1 数据权威矩阵
 
 | 对象 | 唯一事实来源或写入者 | 生命周期 | 是否参与交易裁决 |
 | --- | --- | --- | --- |
 | 当前资金、持仓、原生订单、成交 | 柜台 / 当前连接的已验证事实 | 当前连接和柜台日 | 是 |
-| 实际生效配置 | 当前 Owner 的 Active Config | boot 内 revision | 是 |
+| 实际生效配置 | 当前绑定会话经 Owner 应用的 Active Config | boot/account generation/trading context 内 revision | 是 |
+| 用户选择 / 已连接账户 | Configuration 持久化期望选择；Supervisor 发布实际绑定身份 | 跨重启 / 当前会话 | 仅真实绑定并核对后可交易 |
+| 维护权限 | Supervisor 串行协调、当前 Owner 根据实时事实裁决 | 当前维护 generation | 是；不能由进程锁或 UI 推断 |
 | 版本默认、用户期望配置 | Configuration 管理的文件 | 跨版本/重启 | 仅在验证和生效后 |
-| Target、child、UNKNOWN、执行回执 | 当前 Owner 的 Execution Store | 当前 boot | 是 |
+| Target、child、UNKNOWN、执行回执 | 当前 Owner 的 Execution Store | 当前 boot 下的单一账户交易上下文；普通停止/再启动保留 | 是 |
 | 日停、月停、已消费信号等 | 当前 Owner 产生的业务事实；拟议长期业务库 | 按业务规则 | 可约束开仓，不独立授权发送 |
 | 账户历史及收益 | 带来源、覆盖和版本的柜台观察/历史接口 | 长期 | 不作为当前仓位或订单权威 |
 | UI 草稿、布局、筛选、pending command | Workbench | UI 进程或本地偏好 | 否 |
@@ -101,7 +119,8 @@ flowchart TD
 5. 存储模块不依赖 Qt、SDK 或交易算法，不从历史数据推导发送权限。
 6. 发送必须经过原 Controller 的数量核算、权限、柜台事实、Journal 事务和 SDK 发送前校验；UNKNOWN/Cancel Pending 继续占量。
 7. 历史查询、投影、诊断可以背压和降级；不能成为交易决策输入，也不能堵塞交易主循环。
-8. 任何恢复都不得继承旧 boot 的发送权、旧 Target、旧 command_id 待发送责任或自动认领外部仓。
+8. 任何恢复都不得继承旧 boot 或旧账户上下文的发送权、旧 Target、旧 command_id 待发送责任或自动认领外部仓。普通同账户停开/再启动不是新 boot，不销毁仍有责任的会话。
+9a. 维护入口只能由实时、可信的责任门禁授予。停止策略或 DISARMED 不代表可维护；账号切换/更新本身无平仓或撤销外部订单的权力。
 9. 新配置或新业务状态只能在当前 Owner 的确定性边界被应用；禁止多个模块自行读文件后采用不同版本。
 10. DSV 原有算法、交易时段、价格和保护语义保持不变；行为改变须有独立依据和验收。
 
@@ -155,13 +174,21 @@ ConfigIdentity
 
 默认值更新应合并用户明确覆盖，而不是把旧 Effective 全量复制到新版本。现有 diff 格式对列表按整体替换，不能假定 symbols 是逐合约字段覆盖；不得在本轮重构中静默改变列表语义。等于默认值是否表示用户主动锁定该字段，需另行确认；迁移不可从旧数据猜测用户未表达的覆盖意图。
 
-### 3.3 配置生效策略
+### 3.3 账户选择与配置生效策略
+
+账户配置与账户实际连接分别建模：
+
+- Config 管账户目录（稳定 account_key/provider、别名、凭据引用）与期望选择；Supervisor 管 active_account 和连接/会话 generation。不能直接改 PortableAccountStore 的 active identity 或替换 Pipe 来完成切换。
+- 允许添加/编辑不影响当前活动账户的配置；影响活动连接的凭据、删除当前账户、线路/provider 等变更不得绕过维护门禁。持仓期间可显式保存合法 NEXT_BOOT 参数；不能因此修改当前保护规则。
+- 账户切换经 Supervisor 获取维护许可，目标账号静态验证后记录期望；只有 B 的真实完整基线确认后才标记 active B 并持久化 last_successful_account。B 登录失败时明确展示 UNBOUND/失败和 desired B，保留上次成功选择，不把 A 的数据冒充 B；用户可重试 B 或重新选择 A。旧文件 selected_account 字段与新增选择元数据须有唯一权威和原子/可恢复迁移设计，不能两处各自写入。
+- 配置热保存绑定 boot/account generation/active revision，旧 A 的草稿、回执和异步结果不得应用到 B。升级/切换重启使用明确的 MONITOR_ONLY 启动意图，不能消费旧 auto-start 或旧启动请求。
+
 
 | 配置或操作 | 处理原则 |
 | --- | --- |
 | UI 偏好 | 客户端直接生效 |
 | 通知、诊断参数 | 对应辅助模块独立处理 |
-| 账号/provider/线路/凭据 | 下次受控 Runtime 启动，不在持仓执行中热换连接 |
+| 账号/provider/线路/凭据 | MONITORING 且维护门禁通过后由 Supervisor 受控切换/重启；不在交易责任未清时热换连接 |
 | 交易日历、schedule、夜盘结束规则 | 延用当前限制，下次启动 |
 | 新增合约 | 保留当前动态检查，先验证范围、行情/日历元数据，再原子应用 |
 | 删除合约 | 当前运行不允许；下次启动前明确核对外部/自有责任 |
@@ -177,7 +204,7 @@ ConfigIdentity
 
 建议实施最小可恢复协议，不引入 2PC：
 
-1. UI 提交 candidate + expected boot/account/active_revision + expected desired revision + command_id。
+1. UI 提交 candidate + expected boot/account/account_generation/active_revision + expected desired revision + command_id；维护已受理时拒绝冲突热应用。
 2. Config Manager 生成静态合法 candidate 和 hash；Owner 重新检查当前状态、范围及生效条件。
 3. 必要时准备新增合约的元数据；准备失败不允许宣称参数生效。
 4. 原子持久化 Desired 和应用意图（apply_id、old/new hash、boundary、PENDING），使用单一逻辑文件权威。可采用版本化配置封装；如保持原文件，附加 marker 必须有明确的顺序、完整 hash 和恢复判定，不把两个可任意独立编辑的文件都当权威。
@@ -224,7 +251,7 @@ sequenceDiagram
 
 | Store | 物理实现建议 | writer / 一致性 | 生命周期 |
 | --- | --- | --- | --- |
-| ExecutionStore | 现有临时 Journal，沿用 RuntimeSessionStorage | 当前 Owner；关键事务同步，WAL/FULL | 单 boot |
+| ExecutionStore | 现有临时 Journal，沿用 RuntimeSessionStorage | 当前 Owner；关键事务同步，WAL/FULL | 单 boot 单账户上下文；普通停/启策略不销毁 |
 | AccountHistoryStore | 现有 account-history.db | 独立后台单 writer；有界批量/幂等 | 长期 |
 | StrategyStateStore | 拟议 strategy-state.db | 当前 Owner 的受控关键写入；无第二交易 writer | 跨 boot，按业务期限定 |
 | MarketStore | 可选短期独立文件或 SQLite | 后台批量、按容量和交易日清理 | 未来阶段 |
@@ -246,7 +273,7 @@ StrategyStateStore 不存旧订单发送任务或可重放 SDK effect。与历�
 - 明确未发送的 child 才能释放占量；UNKNOWN、SEND_POSSIBLE、Cancel Pending 继续保留最大可能剩余数量。
 - 不改变既有部分成交、晚到成交、平今平昨、退出目标持续推进、错误分类。
 - Journal 失败必须阻止相应新发送；严格沿用当前 fail-closed / fail-stop。不得为追求保护继续发送无记录订单。
-- 新 boot 不读取旧临时 Journal 作为执行权威，旧临时文件残留只能用于诊断且有保留政策。
+- 新 boot 或切换账号后不读取旧临时 Journal 作为执行权威，旧临时文件残留只能用于诊断且有保留政策。只有证明旧会话无未结责任且维护屏障生效后才可正常关闭；不能通过销毁 Journal 让 UNKNOWN 消失。
 - 关键事务提交不可异步化。非关键空转、序列化、展示应按已有 Owner 减负方案优化并测量。
 
 ### 4.3 AccountHistoryStore：记录来源而非伪造完整性
@@ -303,6 +330,8 @@ flowchart TD
 
 不得把 UNSUPPORTED 当作空集合，也不得仅凭 API 能登录就声明事实完整。模拟账号可缺少非必要历史能力，只要交易所需数据、权限和策略限制均得到证明即可按现有规则运行。实时交易所需字段不得因模拟账号而放宽正确性。
 
+本机 A/B 账号切换：AccountHistoryStore 按稳定 account_key/provider/environment 选择；旧 writer 捕获固定作用域，停止接收新样本并有界 flush，未写入范围标记缺口。旧查询游标、回调、快照及 UI worker 绑定 boot/account generation/query generation；迟到数据只可按原 A 作用域处理或丢弃，严禁进入 B。B 的历史库不影响 B 当前事实同步；损坏仅降级历史功能。
+
 A/B 换机：每台电脑从柜台同步当前事实，分别保存自己的历史库和策略状态，不复制活动 SQLite/WAL，不交接旧执行库。只要来源支持历史补录，新机按缺失柜台日获取并幂等写入。若 A 运行两日、B 再运行两日，而柜台无法返回旧日历史，则无法仅凭重新登录保证双机 SQL 的全部历史一致；必须如实显示缺口。
 
 若用户后续要求所有已观察历史跨机器汇聚，单独设计授权的增量历史同步：只同步带来源、稳定业务键、版本/覆盖的历史记录，不传递 Active 配置、保护责任、旧 Target 或交易凭据。当前不引入中心同步服务；不宣称换机完整历史已实现。多电脑同账户并行交易仍无法以单机锁提供全局原子风险额度。
@@ -358,7 +387,11 @@ strategy_scope_id 是稳定的本机策略作用域，不用随机 boot_id 或�
 
 具体事务协议需独立评审并进行故障注入；禁止将 StrategyStateStore 作为独立交易执行者。
 
-### 5.5 重启状态恢复策略
+### 5.5 停止、重新启动和重启状态恢复策略
+
+普通同账户 STOP -> MONITORING -> START 保留同一账户执行上下文、Journal 和策略业务状态。行情/K 线、历史、当日盈亏、计数、日停/月停及必要的信号去重继续保存；STOP 仅撤销自动开仓授权并按 cancel_on_stop 处理既有开仓委托，不重置规则。若还有持仓、UNKNOWN 或未终态责任，则保持 DRAINING 并继续 Owner 保护及核对。再 START 必须重新检查当前事实、配置和规则，不能消费旧自动 ARM。
+
+账号切换、更新、配置重启或异常退出若产生新 boot，则按照以下流程。Phase 2 在长期业务库完成前，必须有保守桥接策略：无法证明同日/月业务限制连续性时，新 boot 仍允许监控、账号查询和维护，但限制受影响的自动开仓直至按获批 ADR 核对；不得通过切换、更新、重启绕过停开或计数。若无法实现可靠证明，先实现安全监控和维护，不能声称完整交易连续性验收通过。
 
 ```mermaid
 flowchart TD
@@ -377,53 +410,242 @@ flowchart TD
     J -->|否| L[保持停开 / 人工核对]
 ```
 
-本方案建议保留新 boot 默认 DISARMED；不额外强制所有正常启动人工填写数据。当前合法启动授权/auto_start 合同只有在业务连续性、行情、柜台、配置等门槛满足并符合 authority_generation 时才可考虑生效；恢复故障不能绕过 STOP/PAUSE。ADR 定稿前按当前合同处理，不实施新的自动恢复。
+V1.1 建议普通桌面打开、账号切换和版本更新后默认 MONITORING（账户基线未齐时显示同步/待核），DISARMED 且无自动启动意图。普通桌面启动是否废止旧 auto_start_on_launch 行为属于明确合同变更，需获批后实施；维护重启必须强制 MONITOR_ONLY，不受旧配置 auto_start_on_launch 影响。用户之后显式 START 仍须核对业务连续性、柜台、行情、配置和 authority_generation；恢复故障不能绕过 STOP/PAUSE。ADR 定稿前不得实施新的自动恢复。
 
-## 6. Runtime：调度、事务与配置应用
 
-### 6.1 内部职责收敛
+## 6. Runtime：生命周期、交易会话与维护协议
+
+### 6.1 四个逻辑职责及生命周期
+
+| 模块 | 所有职责 | 不得承担 |
+| --- | --- | --- |
+| Runtime Supervisor | 进程单实例、模式判定、维护屏障、账号切换、退出/更新协调、服务组装和状态投影 | 策略计算、SDK 发单、修改订单/持仓事实 |
+| Market Service | 行情 Tick/K 线、合约元数据、行情健康；复用交易日历与时钟服务 | 交易授权、账户持仓认领 |
+| Account Session | 绑定稳定账号及 provider、登录/重连、同步资金/持仓/委托/成交、只读账户发布及历史采集 | 自主下单、从历史缓存生成实时事实 |
+| Trading Session | DsvSession、ExplicitOrderController、策略和执行状态、保护、订单占量、临时 Journal | 控制整个应用进程生死、修改账号身份、旁路发送 |
+
+Market Service 的逻辑职责不依赖策略运行。在行情认证允许时可在无交易账户的情况下接收行情；当前 TqSdk 可能需要同一 TqApi 承载认证与交易连接，因此第一版允许账号切换期间行情短暂中断和重建。不得因解耦同时驱动一个 SDK 对象或引入第二 sender。无行情认证时 UI 明确显示不可用，不伪造行情。
+
+Trading Session 可以休眠：同一账号、同一 boot 的 STOP 后保留业务状态和 Journal。只有在责任已证明清空、维护屏障成立且旧连接完成关闭后才释放相应上下文。第一、二批不必实际重建 Market Service 类；允许复用现有运行路径，用自动冷重启实现用户无感切换。Runtime 不可用期间 Workbench 仍能编辑配置、选择账号、查询已验证本地历史；不能展示旧账号为当前实时数据。
+
+### 6.2 正交状态与用户运行模式
+
+| 维度 | 建议状态 |
+| --- | --- |
+| Runtime 生命周期 | STARTING / RUNNING / STOPPING / STOPPED / FAIL_STOP |
+| 行情 | CONNECTING / READY / DEGRADED / DISCONNECTED（保留 feed/symbol/clock health） |
+| Account Session | UNBOUND / SYNCING / READY / DISCONNECTED / RECOVERY_REQUIRED |
+| 用户策略意图 | STOPPED / STARTING / RUNNING；仅显式合法操作或获批启动合同改变 |
+| 实际开仓权限 | DISARMED / ARMED + authority_generation；与策略意图区分 |
+| Execution responsibility | NONE / ACTIVE / DRAINING / UNKNOWN |
+| 维护状态 | IDLE / SWITCHING_ACCOUNT / UPDATING / RESTARTING / CLOSING |
+| 配置 | Desired/Active identity、apply status |
+| 业务连续性 | VERIFIED / PARTIAL / NEEDS_REVIEW / UNAVAILABLE（按作用域） |
+| 存储健康 | execution、history、strategy 独立 |
+
+用户只需理解监控和交易两种主要模式，DRAINING 是交易收尾过渡态。内部同步或故障阶段保留阻断原因：
+
+| 模式 | 判定 |
+| --- | --- |
+| MONITORING | 策略意图 STOPPED，当前无交易责任且该结论已证明；UNBOUND 的无旧会话场景也可监控，不代表已登录或可启动策略 |
+| TRADING | 策略意图 STARTING/RUNNING，或明确人工交易会话承担责任；即使时钟、行情或柜台异常使 DISARMED，也不是自动停止 |
+| DRAINING | 已请求停止且仍有待终结、保护、未知或归属核对责任；阻止维护，继续已有责任 |
+| 同步/故障提示 | 作为正交状态显示；无法证明 NONE 时不得宣称可维护，即便界面显示“监控/同步中” |
+
+不要从当前 DsvSession.running、DISARMED、Qt 是否存活、RuntimeLock/AccountLock 是否占用推导业务模式。维护状态不是第四种策略模式；进入维护后冻结新的交易启动/变更，并以明确错误告知用户。已有风控和退出责任如出现新事实仍须处理。
+
+```mermaid
+stateDiagram-v2
+    [*] --> MONITORING: 软件打开 / 不自动开仓
+    MONITORING --> TRADING: START + 实时授权检查
+    TRADING --> TRADING: 行情故障 / DISARMED
+    TRADING --> MONITORING: STOP + 责任已证清空
+    TRADING --> DRAINING: STOP + 未终态或保护责任
+    DRAINING --> MONITORING: 责任已证清空
+    MONITORING --> MAINTENANCE: 原子取得维护许可
+    MAINTENANCE --> MONITORING: 切换 / 更新 / 失败恢复
+```
+
+MAINTENANCE 在图中仅表示独占维护过渡，不是 operation_mode 新枚举。同步与故障不画成可自动 ARM 的边。FAIL_STOP 不自动发单、接管或释放未知责任。
+
+### 6.3 责任判定与统一 Capability（优先实施）
+
+Runtime 的维护门禁必须是实时 Owner 判定，而不是客户端状态推断。复用 prepare_shutdown() 的只读责任汇总，补齐现有缺失的条件。不能只检查 owned_lots==0 或未决委托列表为空：
+
+- 已明确停止策略；无启动/自动 ARM 意图，authority_generation 已撤销旧授权。
+- 当前账户、柜台日、source epoch 和事实覆盖匹配；最后一份可信同步不能在断线后冒充当前证明。
+- 无自有持仓保护、分离/待核持仓、未终态 child（含 SEND_POSSIBLE/UNKNOWN/Cancel Pending）、可能晚到成交、发送/撤单不确定结果、归属/分配冲突、尚需执行的退出 Target。
+- 无可能改变责任的已接收未处理命令、待执行 effect 或未确认控制结果；只读请求或已证明终态但 UI 尚未收到 ACK 的命令不应无限期阻塞。
+- 无已受理的互斥维护、配置应用或其他会改变账户上下文的操作。
+- 执行存储与 Owner 状态足以证明责任边界；异常后不得通过清库、强制结束进程或失联推断 NONE。
+- 对从未创建交易会话且能够证明不存在本机遗留未决责任的 UNBOUND 场景，不要求取得一个不存在的账号基线；登录失败或无凭据应允许改配置、选择账号和更新。若此前已有会话但断线/崩溃后责任不明，则进入待核，不能将 UNBOUND 当作安全。
+
+仅有已核实的外部持仓/委托且没有本机归属冲突、冲突活动订单或未结责任，不构成必须全平的理由。外部订单可能继续成交，UI 明确说明切换后不管理它们。不得按价格、时间、数量猜测归属。
+
+Capability 表（✓ 仍需各操作具体前置条件）：
+
+| 操作 | MONITORING | TRADING | DRAINING |
+| --- | --- | --- | --- |
+| 行情、账户、历史查看 | ✓ | ✓ | ✓ |
+| 添加/编辑非活动账户配置 | ✓ | ✓* | ✓* |
+| 保存下次启动参数 | ✓ | ✓* | ✓* |
+| 热应用参数 | 按现行动态校验 | 按现行动态校验 | 拒绝会改变当前责任的变更 |
+| 切换活动账户 | ✓* | — | — |
+| 发起安装更新 / 维护重启 | ✓* | — | — |
+| 检查/下载更新 | ✓ | ✓ | ✓ |
+| 启动策略 | ✓* | — | — |
+| 停止策略 | 幂等无操作 | ✓ | 幂等继续收尾 |
+| 撤单/平仓 | 仅在现有明确授权的人工交易路径中允许；否则禁止 | ✓* | ✓* |
+| 明确平仓后停止 | 按命令范围和授权 | ✓* | ✓* |
+
+* 添加非活动账户不能影响当前连接；下次启动参数不能改变 Active；START 需账户及行情、时钟、配置、风险、业务连续性等证据；维护需责任门禁；降风险命令仍以 Owner 最新实态校验。监控模式不得暗中发单；如果保留现有独立人工交易入口，应先建立明确交易授权和 Trading Session，存在责任即退出 MONITORING。不能以此次改造暗中退役用户已有合法人工操作。
+
+建议投影（仅为 V1.1 协议示意，复用当前版本化 Workbench schema/Capability/CommandBus，不另建权限中心）：
+
+```json
+{
+  "runtime_state": "RUNNING",
+  "operation_mode": "MONITORING",
+  "market_state": "READY",
+  "account_state": "READY",
+  "strategy_state": "STOPPED",
+  "entry_authority": "DISARMED",
+  "execution_responsibility": "NONE",
+  "maintenance_state": "IDLE",
+  "account_generation": "3",
+  "maintenance_generation": "8",
+  "capabilities": {
+    "switch_account": true,
+    "install_update": true,
+    "restart_runtime": true,
+    "start_strategy": true
+  },
+  "maintenance_blockers": []
+}
+```
+
+真实请求绑定 boot、account_key、account_generation、config revision、command_id 和适用的 target/maintenance revision。Workbench 消费 Capability 及原因码，仅用于展示；Owner 在执行前再次检查，原子进入维护屏障并撤销旧启动意图。已受理命令需有幂等回执；超时查询原 ID，不自动重发。新维护操作需要显式版本化 allowlist、同 Windows 用户控制通道和身份校验；不得开放公共只读 CLI 的交易权限。
+
+### 6.4 STOP、收尾与无平仓维护停机
+
+| 场景 | 行为 |
+| --- | --- |
+| 停止策略且无自有仓/单/未知/冲突 | 撤销开仓授权；可信核对后直接 MONITORING；保留行情、账户、同日业务状态及 Journal |
+| 有未完成开仓委托 | 按现有 cancel_on_stop 行为；等待终态及完整成交核对，不因撤单请求而释放占量 |
+| 仍有自有仓或晚到成交 | 停止新增开仓，保留原有保护和退出责任；DRAINING |
+| UNKNOWN 或断线 | 继续核对；不能宣布无责任 |
+| 用户明确要求平仓后停止 | 使用现有 FLATTEN_THEN_STOP 的授权及退出目标，不新增平仓旁路 |
+| 用户只要求切换、更新或维护重启 | 不自动执行平仓、外部撤单或改变既有目标；条件不足时显示阻断并允许等待或明确选择原平仓操作 |
+
+新增概念操作 SAFE_STOP_FOR_MAINTENANCE（名称待协议评审）：只在 Owner 证明无责任并取得维护屏障后关闭账户/行情连接和进程，不生成平仓目标。它与既有明确退出 FLATTEN_THEN_STOP 不同，不应复用会自动平仓的关闭回调作为维护路径。
+
+状态转换后的最后一个 SDK 轮次/连接关闭边界必须重新检查责任。如果出现晚到自有成交、未知或归属冲突，则中止维护并恢复原 Owner 收尾；不能因为已批准维护就忽略新事实。若退出后才得知原责任不明，新 boot 保持 DISARMED，核对并提示，不能恢复旧订单发送。
+
+### 6.5 账号切换
+
+首版采用受控冷切换：Workbench 保持可用，旧 Runtime 安全退出后启动 B 的 Runtime；目标阶段可在同一 Supervisor 内销毁 A Account Session / Trading Session 后建立 B，但不能原地改 account_key。
+
+```mermaid
+sequenceDiagram
+    participant U as Workbench
+    participant S as Supervisor
+    participant A as A Owner / Session
+    participant P as Persistence / Config
+    participant B as B Account Session
+    U->>S: SwitchAccount(B, expected identity, command_id)
+    S->>P: 静态验证 B 输入
+    S->>A: 实时责任核对并原子进入维护
+    alt 责任不清 / 存在冲突
+        A-->>U: 结构化 blockers，不平仓
+    else 已证明可维护
+        A->>P: 有界结束历史采集 / 记录业务连续性
+        A->>A: 最终核对，关闭 SDK / 释放账号资源
+        S->>S: 失效 A 的连接、IPC、generation
+        S->>B: 新绑定 / MONITOR_ONLY
+        B->>B: 登录并同步真实账户基线
+        alt B 登录或同步失败
+            B-->>U: 未连接 / 同步失败，可修改或重试
+        else B 基线完整
+            B->>P: 记录成功选择并绑定 B 历史库
+            B-->>U: 发布 B 监控基线，策略停止
+        end
+    end
+```
+
+- 启动前验证 B 的稳定身份及必需输入；先释放 A 的交易权和资源，再申请 B 的锁/连接，不并存两名交易 Owner。冷切换时由本机 Supervisor/Workbench 协调，等待旧 Owner 与 runtime-view 的 PID/身份真正退出并取得新 RuntimeLock；若失败不得启动第二个 Runtime。若未来同进程切换，RuntimeLock 可继续持有，account generation、临时 Journal 和执行身份必须更新。
+- 旧账户历史 writer 的 flush 设限，失败标记缺口，不因历史查询或上传失败无限阻塞。旧交易事实不得丢弃。
+- 冷切换期间 Workbench 使用明确的 account switch 状态；旧 IPC、命令回执、视图、查询结果、配置草稿及 SDK 回调均以 boot/account generation 拒绝串入 B；新账户无完整基线时不得展示空仓/零资金。
+- B 失败后保持 Workbench 可编辑、可选择账号、可查询相应账号已验证历史；允许明确重试或回选 A，不自动回滚到 A 的交易授权。
+- 切换或更新重启一律 MONITOR_ONLY；账号当前选择与 last_successful_account 分离。返回 A 时应保留/核对 A 的同日策略限制（见第 5 章），不能因为切换再切回绕过规则。
+- 外部仓存在且已核实无本软件责任时可以切换；不因“账号非空仓”擅自平仓。跨设备事实仍由柜台提供，无中央全局锁。
+
+### 6.6 软件更新和重启：请求门禁与安装锁分离
+
+现状 restart_now() 先取得 quiescent_installation(root) 再调用 request_restart()，Runtime 正在接收行情时锁自然存在，造成用户无法发起协调。修订后：
+
+| 锁/权限 | 作用 |
+| --- | --- |
+| RuntimeLock | 防本机出现多个 Runtime；监控也可持有 |
+| AccountLock | 防本机重复使用同一受控账号资源 |
+| 安装 lease / launcher lock | 保证旧程序进程退出后才能替换程序版本 |
+| 维护屏障 / 交易权限 | 由实时责任状态裁决；不以进程锁存在推断业务状态 |
+
+```mermaid
+sequenceDiagram
+    participant U as Workbench
+    participant S as Supervisor / Owner
+    participant L as Stable Launcher
+    participant I as Installer
+    U->>U: 后台检查 / 下载已验证候选
+    U->>S: InstallUpdate(candidate identity, command_id)
+    S->>S: 复核责任 + 原子 UPDATING
+    alt 不可维护
+        S-->>U: DEFERRED + blockers
+    else 可维护
+        S->>S: 安全无平仓停机，撤销启动意图
+        S-->>U: 受控退出完成及安装意图
+        U->>L: 交接重启意图并退出
+        L->>L: 等待旧进程、lease、RuntimeLock、AccountLock
+        L->>I: 独占校验及安装候选
+        I-->>L: 成功切换或保留旧可用版本
+        L->>U: 重新打开 MONITOR_ONLY
+    end
+```
+
+UI 不再在请求维护前获取 RuntimeLock/AccountLock；不删除安装端独占校验。维护许可不是安装许可：Launcher 独立验证目标版本、摘要、安装目录、原进程身份和真实退出，持有现有安装 lease / quiescent_installation 才能切换。不得持有等待退出进程所需的锁造成死锁。退出/交接超时、锁获取失败、候选损坏或新版本启动失败均停止切换或使用既有可用版本；不得覆盖私有配置和长期数据、不得自动启动策略。
+
+必须防止维护与 START、切账号、热应用同时获得权限；维护请求受理后设置互斥 generation，直到明确完成或安全取消，旧 generation 不可重放。跨进程退出到 Launcher 安装期间也需受控交接，竞争启动不得绕过更新锁；若另一实例已占用则安装失败而非强制覆盖。更新过程中不释放锁来提前宣布安装成功。
+
+### 6.7 Runtime 内部职责与窄接口
 
 | 职责 | 当前入口 | 收敛目标 |
 | --- | --- | --- |
-| Bootstrap / Lifecycle | runtime/standalone、desktop_bootstrap、target_owner_startup | 组装 Config、Store、Gateway 和 Owner；单实例、启动、重连、退出 |
-| Round Processor | DsvSession.apply_round / _commit | 按有序事实推进；统一内存变更与执行事务；不读 JSON |
-| Strategy | dsv_core + Session 的规则/状态 | 纯规则和受控业务状态变换，输入 Active Profile 与事实 |
-| Execution | ExplicitOrderController | 保留 Target 核算、订单状态机、持仓归属及发送责任 |
-| Config Apply | StandaloneDsvOwner._save_parameters、Session、Adapter | 集中动态校验和生效事务；公开结果协议 |
-| Recovery | 启动及同步、拟议业务恢复 | 读取经验证的业务事实；不恢复旧发送责任 |
-| Publication | standalone_projection / AccountPublication / WorkbenchPublication | 只读输入、后台投影、版本关联 |
-| Control | ControlServer、CommandBus | 同一 Owner 裁决；不设第二交易路径 |
-
-不要把这些职责机械拆成六个 Manager。初期优先提取函数/小型值对象；新类只在有独立状态、接口或可测试边界时引入。
-
-### 6.2 状态应正交建模
-
-不要用一个 running bool 同时表达连接、策略和进程状态。复用当前已有字段，统一投影与门禁来源：
-
-| 维度 | 建议表达 |
-| --- | --- |
-| 生命周期 | BOOTSTRAPPING / RUNNING / DRAINING / STOPPED / FAIL_STOP |
-| 柜台同步 | CONNECTING / SYNCING / READY / DEGRADED / RECOVERY_REQUIRED |
-| 交易授权 | DISARMED / ARMED + authority_generation |
-| 行情和时钟 | feed_health、symbol_health、clock_health（沿用当前合同） |
-| 配置 | Desired identity、Active identity、apply status |
-| 业务连续性 | VERIFIED / PARTIAL / NEEDS_REVIEW / UNAVAILABLE（按作用域） |
-| 存储健康 | execution、history、strategy 分开 |
-| 命令/执行 | 当前目标、未决 child、UNKNOWN 和退出责任 |
-
-Capability 必须由 Owner 当前事实派生。Workbench 的状态或缓存仅用于展示和路由，不能授权实际报单。保留过期快照时现有 OWNER_RECHECK_OPERATIONS 降风险通道，最终由 Owner 验证 boot/account/config/target revision。
-
-### 6.3 建议公开接口（概念示意）
+| Lifecycle / Supervisor | standalone、desktop_bootstrap、target_owner_startup | 统一状态、维护、账户切换、更新协调 |
+| Market / Account | DsvSdkAdapter、AccountPublication | 事实采集、认证与生命周期独立于策略 |
+| Round Processor | DsvSession.apply_round / _commit | 同一 Owner 有序事务 |
+| Strategy / Execution | dsv_core、DsvSession、ExplicitOrderController | 保留现有决策、目标、占量、归属与保护 |
+| Config Apply / Recovery | StandaloneDsvOwner._save_parameters、Session、Adapter | 动态生效及持久化核对 |
+| Publication / Control | standalone_projection、ControlServer、CommandBus | 只读投影、唯一维护/交易命令入口 |
 
 ```python
-# 实现优先复用现有 DsvProfile、Journal、TargetAccounting 和命令协议。
-# 不引入可伪造的布尔值授权，不用通用 ORM session 泄漏内部事务。
+# 逻辑接口示意；不新增第二交易线程，不替代已验证业务核心。
+class RuntimeSupervisor:
+    def request_maintenance(self, request): ...
+    def switch_account(self, request): ...
+    def request_update(self, request): ...
+    def publish_capabilities(self): ...
+
+class TradingSession:
+    def responsibility_snapshot(self): ...
+    def check_maintenance(self, request): ...   # Owner 实态裁决
+    def stop_strategy(self, command): ...
+    def apply_round(self, ordered_facts): ...
+    def apply_config(self, command): ...
 
 class Configuration:
     def load_desired(self, scope): ...
     def validate(self, candidate): ...
     def save_desired(self, candidate, expected_revision, apply_id): ...
-    def read_apply_status(self, apply_id): ...
     def finalize_apply(self, apply_id, result): ...
 
 class ExecutionStore:
@@ -439,17 +661,9 @@ class AccountHistoryStore:
 class StrategyStateStore:
     def read_scope(self, scope): ...
     def commit_business_facts(self, facts, expected_revision): ...
-
-# 仅当前 Runtime Owner 调用
-class RuntimeOwner:
-    def apply_config(self, command): ...
-    def apply_round(self, ordered_facts): ...
-    def reconcile_business_state(self, broker_baseline, persisted_facts): ...
 ```
 
-Adapter 需要的“effect 已准备、Owner 存活且身份匹配”的验证应通过受 Owner 控制的窄接口或 capability 对象实现，不直接访问 session._journal/_controller/_closed 等私有成员。这个接口必须继续验证真正的已提交 effect、account/provider、owner/boot、未重放身份和调用线程，不能退化为由调用者自行声明的 prepared=True。
-
-Market/Broker Port 可在逻辑上拆分，但当前继续由一个 TqSdk 实例和线程实现。SDK 私有内部发送边界判断、版本固定、UNKNOWN 分类单独保留在 adapter 实现中；替换 provider 前必须重新验证语义，不能假定所有 API 的下单、回报、撤单和快照完整性相同。
+不要为每个名词机械创建 Manager。现有 Adapter 需通过 Owner 控制的窄接口验证 effect 已提交、Owner 存活、account/provider/boot/context、调用线程及未重放身份；不可将 session._journal/_controller/_closed 等私有访问替换为可由调用者任意声明的 prepared=True。TqSdk 固定版本及私有发送边界判定保留在 adapter。Market/Broker Port 可以逻辑拆分，但现阶段允许共享同一个 TqApi 和线程。
 
 ## 7. 故障隔离、性能及数据安全
 
@@ -465,6 +679,10 @@ Market/Broker Port 可在逻辑上拆分，但当前继续由一个 TqSdk 实例
 | UI/IPC/日志/上报失败 | 不改变交易权威；接口恢复后取得当前基线 |
 | SDK 连接中断 | 使用现有重连、事实核对与权限代际；不盲目重新 ARM |
 | Runtime 退出或断电 | 柜台订单和仓位可能仍存活；下次从柜台重建，默认停开并检查业务覆盖 |
+| STOP 之后仍有保护或 UNKNOWN | DRAINING，继续核对与保护，拒绝维护，不强制平仓 |
+| 维护期间发现晚到成交或归属冲突 | 中止维护、维持已有 Owner 责任；不能销毁旧 Journal |
+| 账号 B 登录失败 / 旧进程退出超时 | Workbench 保持可用；明确失败，不启动第二 Owner，不自动恢复 A 授权 |
+| 更新交接或安装失败 | 维持独占校验，保留已知可用版本，重启 MONITOR_ONLY |
 
 特别说明：第一批即可修复 BrokerHistoryWriter 构造失败导致启动失败的问题；需按故障类别处理，不能吞掉账户身份冲突后继续使用错误历史库。停用历史功能时须明确显示原因，重建需要保留/隔离原文件，不自动清库掩盖错误。
 
@@ -530,6 +748,9 @@ src/online_trader/
   runtime/
     session_storage.py
     target_owner_startup.py
+    supervisor.py         # 拟议：生命周期与互斥维护
+    market_service.py     # 拟议：逻辑行情服务
+    account_session.py    # 拟议：账户会话
     config_apply.py       # 拟议：从现有热保存提取
     recovery.py          # 拟议：恢复策略
   dsv_core/
@@ -542,22 +763,26 @@ src/online_trader/
 
 此树为目标职责地图。第一阶段只修改边界和接口，保留现有 import/打包入口；目录迁移仅在消除实际依赖后进行。维护 Legacy 时遵守旧合同，不让 Legacy 成为新 Runtime 的第二发送者。
 
-## 9. 分批开发计划
 
-各批次单独提交、单独评审，功能改动与纯结构调整分离。涉及策略行为、存储合同或生产数据迁移的步骤，必须先获明确批准。
+## 9. 分批开发计划（V1.1 调整优先级）
 
-| 批次 | 主要任务 | 预期交付和退出条件 |
+各批次单独提交、单独评审，结构调整不混入策略语义变更。先解决用户已经遇到的账号切换/更新阻塞，再做内部模块收敛。现有测试、打包仍需明确授权。
+
+| 阶段 | 内容 | 退出条件 |
 | --- | --- | --- |
-| PR0 合同冻结 | 列出现有状态所有权、配置来源、存储生命周期、故障边界；核对旧文档冲突 | 状态索引、边界约束、基线证据；不改执行算法 |
-| PR1 低风险隔离 | 将历史初始化故障隔离；从 PortableAccountStore 分离数据路径和参数仓储；复用 DsvProfile | 历史不可用时交易启动边界不变；同配置输入/输出一致；无第二 sender |
-| PR2 Config 生效协议 | Desired/Active、revision/hash、热保存待核及明确 NEXT_BOOT；完善崩溃与回滚处理 | 重复 command_id、过期 revision、断电和失败窗口可证；既有热保存限制保持 |
-| PR3 账户历史仓储 | 分类写入、原生身份、覆盖、补录、稳定分页及能力映射；迁移兼容现有 history cache | 重复数据幂等、无假完整、历史故障隔离；现有报表可查询 |
-| PR4A 业务连续性 ADR | 确认状态身份、DSV 计数/停开/月停语义、恢复策略及写入协议 | 用户批准 ADR；明确不可自动接管仓位的边界；不直接实施新交易规则 |
-| PR4B 业务连续性实现 | 先实现日停、月停、次数、信号去重和负向操作限制 | 同日重启与故障窗口可证，未知保持限制，不恢复订单发送权 |
-| PR4C 保护连续性 | 单独评审保护记录身份、峰值、半仓阶段和人工接管 | 仅可证仓位责任可恢复；不得因本地记录自动认领外部仓；未批准则保持现状 |
-| PR5 Runtime 内聚 | 提取 Config Apply、Recovery、Round Processor 的窄接口；封装 SDK 私有访问；逐步清理旧 Kernel 依赖 | 单 Owner、原交易顺序、原协议和保护不变量保持；测试无行为漂移 |
+| Phase 0 / 合同冻结 | 更新状态所有权、维护操作、安全停机、默认监控、同账户 STOP 连续性合同；确认 ADR 的保守桥接规则 | 明确旧文档适用边界；命令/schema 兼容及失败合同；不改交易算法 |
+| Phase 1 / 模式和责任门禁 | 新增 MONITORING/TRADING/DRAINING 投影、独立策略意图与授权、统一 Capability；复用 prepare_shutdown 并补齐可信同步和未决核对 | 停止无责任能监控，有责任仍收尾，DISARMED 不误判安全；维护和 START 串行裁决 |
+| Phase 2A / 无平仓维护停机 | SAFE_STOP_FOR_MAINTENANCE、维护屏障及最终事实重查；区分显式平仓退出 | 无责任可安全退出；有责任拒绝且不隐式平仓；迟到成交中止 |
+| Phase 2B / 账户切换 | 首版自动冷重启、WorkBench 可恢复、账号选择持久化最小接口、作用域隔离 | A/B 登录和历史隔离；B 失败仍可操作；新 boot MONITOR_ONLY；同日状态未知时保守限制 |
+| Phase 2C / 安装更新 | UI 先申请维护，Launcher 后取得独占锁；交接、失败/回退与监控重启 | 用户不手动退出 Runtime 即可发起更新；安装端锁不变，竞争启动安全 |
+| Phase 3 / 逻辑生命周期解耦 | 提取 Supervisor、Market Service、Account Session、Trading Session；无账号 UI 仍工作；复用同一 SDK | 无第二 sender、不必双连接、同账号普通 STOP/START 不重建 Journal；必要时行情暂时重建 |
+| Phase 4A / Configuration | 从 PortableAccountStore 收敛账户/参数/数据路径；Desired/Active、revision、回滚、NEXT_BOOT | 配置断电/失败边界可证、作用域正确 |
+| Phase 4B / Persistence 账户历史 | 优先隔离 BrokerHistoryWriter 初始化失败；分类写入、能力/覆盖、补录、稳定分页、迁移 | 历史故障不阻塞独立交易能力；不造假完整、不跨账号写入 |
+| Phase 4C / 策略业务连续性 | 审批 ADR；先日停/月停、次数、信号去重、负向意图，保护连续性另批 | 同日重启、切回原账号与更新不绕过限制；不恢复旧发送权/自动认领 |
+| Phase 4D / Runtime 内聚 | 提取 Config Apply、Recovery、Round Processor，封装 SDK 私有依赖，渐进退役 Legacy 依赖 | 交易顺序和行为不漂移，单 Owner |
+| Phase 5 / 完整场景验收 | FakeBroker 多合约、Desktop E2E、ReleaseGate、真实模拟柜台及最终制品分开验收 | 按场景、候选和制品提供可核证据 |
 
-建议 PR1 优先，PR2/PR3 可在合同明确后分别开发，PR4 依赖相关业务规则及可靠持久化合同，PR5 不应阻塞实际故障修复。MarketStore、跨设备历史增量同步和新增实盘 provider 不在本轮强制范围内。
+Phase 1/2 是当前产品阻塞优先级。Phase 2 前须先解决最小账号选择、旧新作用域、维护意图及业务连续性保守桥接（第 5.5 节），不能把必要的正确性推迟到 Phase 4。若不能证明跨 boot 业务连续性，允许账号切换与更新后监控，但禁止受影响策略盲目重新开仓。历史库初始化故障隔离等低风险缺陷可提前单独修复。MarketStore、跨设备历史增量同步、新实盘 provider 不在本轮强制范围内。
 
 ## 10. 验收计划（规划，尚未执行）
 
@@ -565,6 +790,20 @@ src/online_trader/
 
 | 编号 | 场景 | 必须观察的结果 |
 | --- | --- | --- |
+| L01 | 刚打开软件、未启动策略；停止无仓无单 | Runtime 与行情保持运行，模式 MONITORING，允许请求维护 |
+| L02 | 策略运行 / 仅因故障 DISARMED 时请求切换、更新 | 拒绝并给具体 blocker，不误判已停止 |
+| L03 | STOP 后 Cancel Pending、UNKNOWN、自有仓、归属冲突 | DRAINING；保留核对/保护，不隐式平仓 |
+| L04 | 仅有已证明外部仓/委托、无本软件责任 | 允许维护，不认领、不自动平仓/撤单 |
+| L05 | 账号未绑定、首次登录失败与旧会话断线分别请求维护 | 无遗留责任可改配置/换账号；旧责任不明不得按 UNBOUND 放行 |
+| L06 | 已取得维护许可但最后一轮出现晚到成交 | 取消停机并继续当前责任，不销毁 Journal |
+| L07 | 维护、START、切换、热应用并发或旧 command 重放 | 一个互斥操作获得许可；过期 generation 拒绝，回执幂等 |
+| L08 | A 切 B、B 登录失败、旧 A 迟到快照/回调/查询 | 无第二 Owner；Workbench 保持可用；不串账号，不继承旧授权 |
+| L09 | B 切回 A 或更新后启动、同账户 STOP/START | 同 boot 保留业务限制；新 boot 无法证明连续性则限制开仓 |
+| L10 | 监控模式发起安装，旧 Runtime 尚持锁 | 请求可受理；实际安装必须等待独占锁与进程退出 |
+| L11 | 安装失败、交接超时、竞争启动或候选不一致 | 保留可用版本，禁止强制替换或自动 ARM |
+| L12 | 切换时历史写入失败或队列堵塞 | 有界结束，标记 A 历史缺口，不写 B 或阻塞无责任维护 |
+| L13 | 用户明确平仓退出与普通维护退出分别操作 | 前者沿用原授权，后者不创建平仓目标 |
+| L14 | 已启用旧 auto_start_on_launch 后账号切换、更新及普通启动 | 维护重启强制 MONITOR_ONLY；普通启动按已批准的新默认合同，旧自动启动意图不复活 |
 | C01 | 相同默认+覆盖反复加载 | Effective hash 和实际 Profile 一致，不丢用户覆盖 |
 | C02 | 新版默认新增字段、删除/改类型字段 | 合法未覆盖项采用新默认，非法覆盖明确拒绝；用户数据不静默重置 |
 | C03 | 重复命令 / 旧 revision / 两次编辑 | 幂等或明确冲突，不能覆盖新修订 |
@@ -593,7 +832,11 @@ src/online_trader/
 
 ## 11. 待评审决策及非目标
 
-建议用户优先确认以下事项，再实施有业务行为影响的 PR：
+建议优先确认以下事项，再实施有业务行为影响的 PR：
+
+- 认可 V1.1 普通打开默认监控、维护冷重启强制 MONITOR_ONLY，以及如何兼容旧 auto_start_on_launch；明确普通 STOP 与显式平仓退出的区别。
+- 认可第一版账号切换允许自动冷重启和短暂行情中断；B 失败仍保留工作台可用，绝不自动恢复 A 的授权。
+- 认可监控状态下人工交易操作的现有授权兼容边界、新维护命令与 Capability 版本、待核时的保守策略。
 
 1. 是否批准独立长期策略业务库作为柜台之外的本地业务事实来源（不包括发送权）。
 2. 同日、同月策略状态的作用域及配置版本兼容规则；未知状态默认保守限制，不自动清零。
@@ -608,6 +851,9 @@ src/online_trader/
 
 本轮架构收敛的最终标准不是新增了多少文件，而是：
 
+- 软件打开、账号连接、策略运行、交易责任和维护状态分别表达；停止无责任后即可请求切换、更新，无需手动关闭 Runtime。
+- 维护许可由实时 Owner 原子裁决，无未决责任才允许无平仓退出；安装锁仍由 Launcher 独占验证。
+- 账号切换后旧上下文失效，SQL、配置、回调按稳定账号/代际隔离，默认监控且不自动交易。
 - 任何策略决策都能追溯到唯一有效的配置、事实水位和当前 Owner。
 - 配置改动在允许的边界生效，未完成或失败不冒充成功。
 - 历史数据可独立查询、补录、降级，交易事实与历史观察不混淆。
