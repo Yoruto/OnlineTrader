@@ -50,9 +50,31 @@ documents:
     evidence:
       design: CONSOLIDATED_FROM_CURRENT_CONTRACTS
       source: IMPLEMENTED_CANDIDATE
-      tests: TARGETED_LIFECYCLE_AND_PROJECTION_PASS
+      tests: OFFLINE_WORKBENCH_AND_CONTINUITY_PASS
       product_acceptance: NOT_RUN
-    notes: Current user entry, state ownership, lifecycle (tray hide on X; controlled safe full-process shutdown on explicit exit), live SAVE_DSV_PARAMETERS, command, failure, diagnostic and acceptance routing for Runtime Workbench work.
+    notes: Current user entry, state ownership, lifecycle (tray hide on X; controlled safe full-process shutdown on explicit exit), live SAVE_DSV_PARAMETERS, stale/synchronizing OWNER_RECHECK_OPERATIONS risk-reducing passthrough with 4-tier snapshot age display, command, failure, diagnostic and acceptance routing for Runtime Workbench work.
+
+  - path: docs/refactor/runtime-market-continuity-and-owner-offload-20261124.md
+    scope: standalone/runtime-market-continuity-and-owner-offload
+    status: CANDIDATE
+    verified_at_sha: WORKTREE
+    evidence:
+      design: REVIEWED_WITH_DSV_COMPARISON
+      source: STAGE0_PR1_PR2_PR3A_PR3B_IMPLEMENTED_ON_TQSDK_3_10_5
+      tests: OFFLINE_1974_OF_1974_PASS_MIDDAY_SIMNOW_READONLY_RECONNECT_PASS
+      product_acceptance: ACTIVE_SESSION_AND_PACKAGED_NOT_RUN
+    notes: Implements Stage 0 stale-recheck CommandBus/UI passthrough, PR1 non-blocking TargetMarketDiagnostics JSONL summary/anomaly black-box, PR2 off-thread workbench projection/bar formatting and 0.1s idle-round skipping, PR3-A centralized tqsdk 3.10.5 upgrade with bytecode/timeout hook tests, and PR3-B separate feed_health/symbol_health classification with max_quote_age_seconds=0 feed gate. PR4 multi-contract fake_broker injection, active trading-session tick telemetry, and packaged acceptance remain NOT_RUN.
+
+  - path: docs/refactor/runtime-business-state-restart-continuity-adr-20261124.md
+    scope: standalone/business-state-restart-continuity-adr
+    status: CANDIDATE
+    verified_at_sha: WORKTREE
+    evidence:
+      design: ADR_DRAFT_NEEDS_REVIEW
+      source: DESIGN_ONLY_NOT_IMPLEMENTED
+      tests: NOT_APPLICABLE
+      product_acceptance: NOT_APPLICABLE
+    notes: Draft ADR defining non-order-sending cross-boot recovery policy candidates (day_stop, half_stage, peak protection line, and last_signal_bar deduplication) from account-history cache and broker facts while preserving DISARMED fail-closed behavior and single-boot ledger isolation.
 
   - path: docs/refactor/runtime-workbench-diagnostics-reporting-20261124.md
     scope: standalone/runtime-workbench-diagnostics-reporting
@@ -177,13 +199,13 @@ documents:
   - path: docs/refactor/runtime-command-bus-contract-20261120.md
     scope: standalone/workbench-command-correlation
     status: CURRENT
-    verified_at_sha: 8fd412e1f960cc0a8c3b23b8ca68f289f5db49d2
+    verified_at_sha: WORKTREE
     evidence:
       design: APPROVED
       source: IMPLEMENTED_CANDIDATE
-      tests: INDEPENDENT_RETEST_REQUIRED
+      tests: OFFLINE_WORKBENCH_AND_CONTINUITY_PASS
       product_acceptance: NOT_RUN
-    notes: Pending command correlation is process-local and is never handed across Workbench boots.
+    notes: Pending command correlation is process-local and never handed across Workbench boots; STALE/SYNCHRONIZING states permit OWNER_RECHECK_OPERATIONS (except E_STORAGE) while keeping entry opening and parameter edits blocked.
 
   - path: docs/refactor/runtime-full-retest-remediation-20261120.md
     scope: standalone/current-fix-candidate
