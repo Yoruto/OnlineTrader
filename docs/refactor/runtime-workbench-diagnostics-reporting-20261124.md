@@ -11,7 +11,7 @@
 用户复审后确认本节覆盖本文中更严格的冻结、水位和上传凭据草案：
 
 - 诊断允许丢失、重叠和单次上报失败；不建设跨进程屏障、可靠补传、遥测服务或新的诊断控制协议。
-- 收盘切片只在当前 boot 内按完整交易日历观察到“曾进入盘段，随后所有绑定合约结束最终适用盘段”时触发一次。日历不完整、冲突或 Runtime 在盘后才启动时不猜测、不补报。
+- 收盘切片（2026-11-24 用户修订）：当前 boot 内每 10 秒检查一次；对绑定日历中所有 scope 合约都有最终 `force_close_at_end` 的交易日，取最晚收盘时间为截止点，当前 UTC 时间（`datetime` 比较）不早于该截止点即触发一次。不再要求曾观察到盘段，也不要求当前仍在日历覆盖范围内；Runtime 在盘后启动且日历仍为该交易日时会补报一次。日历缺失某合约收盘时间时不触发。
 - Reporter 对活跃文件固定读取打开时观察到的字节长度，舍弃末尾不完整 JSON 行；不等待业务队列清空。任何必需活跃流都使包成为 `PARTIAL`。
 - Workbench 允许跨越多个 Runtime boot。Reporter 按事件 `runtime_boot_id` 选取目标 boot，只把同一进程的启动、连接和异常等 bootless 记录作为 `UNATTRIBUTED_PROCESS_CONTEXT`，且不以它们证明完整。
 - 统一桌面 bootstrap 显式声明本次预期 Workbench；若目标 boot 没有对应 Workbench 事件则包为 `PARTIAL`。运维 `runtime run` 不强行要求 Workbench，runtime-view 订阅日志只提供辅助发现。
@@ -421,7 +421,7 @@ diagnostics/
 
 Runtime 可以产生 `REPORT_CUT_REQUEST`，内容包括目标 boot、交易日、日历 hash 和触发原因。它只表示“尽力收集请求时已经持久化的前缀”，不表示队列已经刷新、交易日后续没有迟到回报或所有进程处于同一精确时刻。
 
-多合约存在不同收盘时间。第一版不新增交易日历：复用当前绑定日历；当前 boot 必须先观察到该交易日的活动盘段，随后所有 scope 合约均越过该交易日最后一个 `force_close_at_end`，才以 `runtime_boot_id + trading_day + calendar_hash` 在进程内触发一次。无法证明时不触发，等待正常退出或人工导出。
+多合约存在不同收盘时间。第一版不新增交易日历：复用当前绑定日历；对每个交易日取所有 scope 合约最后一个 `force_close_at_end` 中最晚的收盘时间作为截止点。Owner tick 每 10 秒检查一次，当前 UTC 时间以 `datetime` 比较不早于截止点即以 `runtime_boot_id + trading_day + calendar_hash` 在进程内触发一次，`REPORT_CUT_REQUEST` 记录 `close_deadline_utc` 与 `observed_at_utc`。不要求本 boot 曾观察到盘段，盘后启动会补报一次；任一 scope 合约缺少收盘时间时不触发，等待正常退出或人工导出。
 
 ### 12.2 临时 Journal 删除前的顺序
 

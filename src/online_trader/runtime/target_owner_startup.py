@@ -198,7 +198,6 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             'last_history_capture': 0.0,
             'initial_start_pending': bool(arm),
             'initial_arm_generation': getattr(owner, 'authority_generation', 0),
-            'diagnostic_seen_active_day': None,
             'diagnostic_reported_close_keys': set(),
             'diagnostic_close_check_monotonic': 0.0,
             'diagnostic_close_failure_recorded': False,
@@ -213,8 +212,18 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             for session in row.get('sessions', ()):
                 if session.get('force_close_at_end'):
                     day = session.get('trading_day')
-                    close_schedule.setdefault(day, {})[code] = max(
-                        close_schedule.get(day, {}).get(code, ''), session.get('close_utc') or '')
+                    close_text = session.get('close_utc')
+                    if not day or not close_text:
+                        continue
+                    close_at = datetime.fromisoformat(close_text.replace('Z', '+00:00'))
+                    previous = close_schedule.setdefault(day, {}).get(code)
+                    close_schedule[day][code] = close_at if previous is None else max(previous, close_at)
+        # One deadline per trading day: the last forced close across all scoped contracts.
+        close_deadlines = {
+            day: max(closes.values())
+            for day, closes in close_schedule.items()
+            if set(closes) == set(contracts)
+        }
 
         def current_trading_day(current_day=None, now=None):
             base_day = current_day or owner.snapshot().get('trading_day') or grant.value['trading_day']
@@ -241,42 +250,33 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                 return
             try:
                 check_at = time.monotonic()
-                if check_at - loop_state['diagnostic_close_check_monotonic'] < 1.0:
+                if check_at - loop_state['diagnostic_close_check_monotonic'] < 10.0:
                     return
                 loop_state['diagnostic_close_check_monotonic'] = check_at
-                now = clock.now()
-                now_utc = utc_text(now)
-                windows = [calendar.query(code, now_utc) for code in contracts]
-                if not windows or any(not window.get('complete') for window in windows):
+                if not close_deadlines:
                     return
-                active_days = {
-                    (window.get('session') or {}).get('trading_day')
-                    for window in windows if window.get('is_trading')
-                }
-                active_days.discard(None)
-                if len(active_days) == 1:
-                    loop_state['diagnostic_seen_active_day'] = next(iter(active_days))
-                    return
-                if active_days:
-                    return
-                day = loop_state.get('diagnostic_seen_active_day')
-                closes = close_schedule.get(day) or {}
-                if (not day or set(closes) != set(contracts)
-                        or any(not close for close in closes.values())
-                        or now_utc < max(closes.values())):
-                    return
-                close_key = f'{binding.boot_id}:{day}:{calendar.content_hash}'
+                # Compare aware datetimes, never UTC strings (seconds vs microseconds).
+                now = clock.now().astimezone(timezone.utc)
                 reported = loop_state['diagnostic_reported_close_keys']
-                if close_key in reported:
-                    return
-                reported.add(close_key)
-                if diagnostic_sink is not None:
-                    diagnostic_sink.record(
-                        'REPORT_CUT_REQUEST', component='LIFECYCLE', priority='HIGH',
-                        correlation={'trading_day': day},
-                        payload={'trigger': 'MARKET_CLOSE', 'calendar_hash': calendar.content_hash},
-                    )
-                diagnostic_report_request(report_reason='MARKET_CLOSE', trigger_key=close_key)
+                for day, deadline in sorted(close_deadlines.items()):
+                    if now < deadline:
+                        continue
+                    close_key = f'{binding.boot_id}:{day}:{calendar.content_hash}'
+                    if close_key in reported:
+                        continue
+                    reported.add(close_key)
+                    if diagnostic_sink is not None:
+                        diagnostic_sink.record(
+                            'REPORT_CUT_REQUEST', component='LIFECYCLE', priority='HIGH',
+                            correlation={'trading_day': day},
+                            payload={
+                                'trigger': 'MARKET_CLOSE',
+                                'calendar_hash': calendar.content_hash,
+                                'close_deadline_utc': utc_text(deadline),
+                                'observed_at_utc': utc_text(now),
+                            },
+                        )
+                    diagnostic_report_request(report_reason='MARKET_CLOSE', trigger_key=close_key)
             except Exception as error:
                 if diagnostic_sink is not None and not loop_state['diagnostic_close_failure_recorded']:
                     loop_state['diagnostic_close_failure_recorded'] = True
