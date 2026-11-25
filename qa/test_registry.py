@@ -361,6 +361,47 @@ def validate_manifest(manifest: dict[str, object], discovered: dict[str, list[st
     return problems
 
 
+def refresh_manifest(manifest: dict[str, object], discovered: dict[str, list[str]],
+                     static_policies: dict[str, dict[str, object]]) -> tuple[dict[str, object], list[str]]:
+    """Incrementally sync manifest cases/modules while preserving existing triage metadata."""
+    old_modules = manifest["modules"]
+    assert isinstance(old_modules, dict)
+    updated_modules: dict[str, object] = {}
+    changes: list[str] = []
+
+    for module in sorted(set(old_modules) | set(discovered)):
+        if module not in discovered:
+            old_cases = old_modules[module].get("cases", []) if isinstance(old_modules[module], dict) else []
+            changes.append(
+                f"REMOVED MODULE {module} ({len(old_cases)} cases; if renamed, review the new module manually)"
+            )
+            continue
+        if module not in old_modules:
+            policy = dict(static_policies[module])
+            updated_modules[module] = policy
+            changes.append(f"ADDED MODULE {module} (risk={policy['risk']}, {len(policy['cases'])} cases)")
+            continue
+
+        entry = dict(old_modules[module])
+        old_cases = list(entry.get("cases", [])) if isinstance(entry.get("cases"), list) else []
+        new_cases = list(static_policies[module]["cases"])
+        added_cases = sorted(set(new_cases) - set(old_cases))
+        removed_cases = sorted(set(old_cases) - set(new_cases))
+        entry["cases"] = new_cases
+        new_overrides = dict(static_policies[module].get("case_overrides", {}))
+        if new_overrides or "case_overrides" in entry:
+            entry["case_overrides"] = new_overrides
+        updated_modules[module] = entry
+        for case in added_cases:
+            changes.append(f"ADDED CASE {module}.{case}")
+        for case in removed_cases:
+            changes.append(f"REMOVED CASE {module}.{case}")
+
+    refreshed = dict(manifest)
+    refreshed["modules"] = updated_modules
+    return refreshed, changes
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Check the offline unittest registry without importing test modules.")
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
@@ -368,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--show-ids", action="store_true", help="print statically discovered test IDs")
     parser.add_argument("--write-initial-manifest", action="store_true",
                         help="write a baseline inventory; all risks remain UNTRIAGED")
+    parser.add_argument("--refresh", action="store_true",
+                        help="incrementally sync added/removed cases and new UNTRIAGED modules into existing manifest")
     args = parser.parse_args(argv)
     try:
         discovered, policies = discover_case_data()
@@ -399,6 +442,28 @@ def main(argv: list[str] | None = None) -> int:
             args.manifest.parent.mkdir(parents=True, exist_ok=True)
             args.manifest.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             print(f"wrote {sum(map(len, discovered.values()))} case IDs in {len(discovered)} modules to {args.manifest}")
+            return 0
+        if args.refresh:
+            manifest = load_manifest(args.manifest)
+            refreshed, changes = refresh_manifest(manifest, discovered, policies)
+            problems = validate_manifest(refreshed, discovered, policies)
+            if problems:
+                for problem in problems:
+                    print(f"registry error: {problem}", file=sys.stderr)
+                return 2
+            if changes:
+                args.manifest.write_text(
+                    json.dumps(refreshed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                for change in changes:
+                    print(change)
+                print(
+                    f"refreshed manifest: {sum(map(len, discovered.values()))} cases in {len(discovered)} modules"
+                )
+            else:
+                print(
+                    f"manifest already up to date: {sum(map(len, discovered.values()))} cases in {len(discovered)} modules"
+                )
             return 0
         manifest = load_manifest(args.manifest)
         problems = validate_manifest(manifest, discovered, policies)

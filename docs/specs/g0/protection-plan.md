@@ -2,7 +2,7 @@
 
 规格标识：OT-G0-PP-1.0；日期：2026-11-09（Asia/Shanghai）。状态：**工程契约可开发；交易公式及参数仍为 PROPOSED 候选**。本轮没有运行产品、SDK、账户或在线交易。
 
-本文件承接[架构拆解](../early-design/在线量化交易软件_架构设计与实施拆解_20261109.md)、[规则裁决表 v0.3](../early-design/在线量化交易软件_规则裁决表_v0.3.md)及 P01–P10，不改变最终功能范围。机器校验入口为 [protection-plan.schema.json](schemas/protection-plan.schema.json)，对应状态、事务及传输分别见[状态机](state-machines.md)、[数据模型](data-model.md)、[IPC](ipc-protocol.md)。需用户批准的结论集中在[业务确认表](business-decisions.md)。
+本文件承接早期设计基线 `架构设计与实施拆解 20261109`、`规则裁决表 v0.3`（索引见 [spec-source.json](../../spec-source.json)）及 P01–P10，不改变最终功能范围。机器校验入口为 [protection-plan.schema.json](schemas/protection-plan.schema.json)，对应状态、事务及传输分别见[状态机](state-machines.md)、[数据模型](data-model.md)、[IPC](ipc-protocol.md)。需用户批准的结论集中在[业务确认表](business-decisions.md)。
 
 ## 1. 职责与三道准入
 

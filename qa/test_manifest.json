@@ -33,12 +33,19 @@
       ],
       "timeout_seconds": 180,
       "cases": [
+        "AccountConvergenceTests.test_convergence_does_not_flatten_when_actual_matches_target_during_open_fill_lag",
         "AccountConvergenceTests.test_convergence_unknown_send_reserves_capacity_without_duplicate_close",
+        "AccountConvergenceTests.test_excess_convergence_close_order_cancelled_when_excess_drops_to_zero",
         "AccountConvergenceTests.test_opposite_short_flattens_before_opening_long_on_arm",
+        "AccountConvergenceTests.test_partial_open_fill_reports_desired_and_pending_not_aligned",
         "AccountConvergenceTests.test_plastic_30_lot_external_holding_previews_disarmed_then_flattens_on_arm",
+        "AccountConvergenceTests.test_same_round_strategy_stop_loss_and_convergence_share_shfe_buckets",
         "AccountConvergenceTests.test_sdk_adapter_plan_b_startup_retains_proved_and_flattens_excess_only_on_arm",
+        "AccountConvergenceTests.test_shfe_ine_convergence_defers_instead_of_guessing_closetoday_when_buckets_unproved",
         "AccountConvergenceTests.test_standalone_ui_hides_external_banner_and_displays_account_target_delta",
-        "AccountConvergenceTests.test_unconfigured_contract_and_external_order_cancel_with_closed_session_isolation"
+        "AccountConvergenceTests.test_stopped_convergence_reconciles_cancels_and_cancels_working_conv_order",
+        "AccountConvergenceTests.test_unconfigured_contract_and_external_order_cancel_with_closed_session_isolation",
+        "AccountConvergenceTests.test_unknown_position_facts_isolate_contract_instead_of_faking_zero"
       ],
       "case_overrides": {}
     },
@@ -2589,6 +2596,35 @@
       ],
       "case_overrides": {}
     },
+    "test_maintenance_policy": {
+      "tier": "T1",
+      "domains": [
+        "runtime",
+        "trading"
+      ],
+      "risk": "P1",
+      "profiles": [
+        "FullOffline",
+        "Runtime",
+        "Trading"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": false,
+      "requirements": [],
+      "timeout_seconds": 30,
+      "cases": [
+        "MaintenancePolicyTests.test_activated_protection_position_blocks_maintenance_and_derives_draining",
+        "MaintenancePolicyTests.test_preview_only_startup_inference_position_allows_maintenance_in_monitoring",
+        "MaintenancePolicyTests.test_running_intent_unsynced_or_fault_blocks_maintenance",
+        "MaintenancePolicyTests.test_uncertain_child_and_detached_conflict_mark_unknown",
+        "MaintenancePolicyTests.test_unresolved_orders_and_convergence_cancels_block_maintenance"
+      ],
+      "case_overrides": {}
+    },
     "test_manual_workbench": {
       "tier": "T2",
       "domains": [
@@ -2623,35 +2659,6 @@
         "ManualWorkbenchTests.test_manual_sell_queue_price_is_frozen_until_terminal",
         "ManualWorkbenchTests.test_manual_short_uses_limit_and_no_automatic_opening",
         "ManualWorkbenchTests.test_reconnect_on_same_day_disarms_and_checks_new_epoch"
-      ],
-      "case_overrides": {}
-    },
-    "test_maintenance_policy": {
-      "tier": "T1",
-      "domains": [
-        "runtime",
-        "trading"
-      ],
-      "risk": "P1",
-      "profiles": [
-        "FullOffline",
-        "Runtime",
-        "Trading"
-      ],
-      "platform": [
-        "Windows",
-        "Linux"
-      ],
-      "broker_mode": "OFFLINE",
-      "legacy": false,
-      "requirements": [],
-      "timeout_seconds": 30,
-      "cases": [
-        "MaintenancePolicyTests.test_activated_protection_position_blocks_maintenance_and_derives_draining",
-        "MaintenancePolicyTests.test_preview_only_startup_inference_position_allows_maintenance_in_monitoring",
-        "MaintenancePolicyTests.test_running_intent_unsynced_or_fault_blocks_maintenance",
-        "MaintenancePolicyTests.test_uncertain_child_and_detached_conflict_mark_unknown",
-        "MaintenancePolicyTests.test_unresolved_orders_and_convergence_cancels_block_maintenance"
       ],
       "case_overrides": {}
     },
@@ -3934,42 +3941,6 @@
       ],
       "case_overrides": {}
     },
-    "test_runtime_market_continuity": {
-      "tier": "T2",
-      "domains": [
-        "runtime",
-        "trading"
-      ],
-      "risk": "UNTRIAGED",
-      "profiles": [
-        "FullOffline",
-        "Runtime"
-      ],
-      "platform": [
-        "Windows",
-        "Linux"
-      ],
-      "broker_mode": "OFFLINE",
-      "legacy": null,
-      "requirements": [
-        "PySide6"
-      ],
-      "timeout_seconds": 120,
-      "cases": [
-        "MarketHealthClassificationTests.test_quiet_symbol_is_isolated_while_all_active_silence_blocks_feed",
-        "MarketHealthClassificationTests.test_zero_max_quote_age_flags_disabled_but_keeps_feed_health_gate",
-        "OwnerProjectionOffloadAndIdleSkipTests.test_control_server_skips_stream_projection_without_subscribers",
-        "OwnerProjectionOffloadAndIdleSkipTests.test_idle_round_skip_respects_open_positions_orders_timers_and_1s_cadence",
-        "OwnerProjectionOffloadAndIdleSkipTests.test_prepare_workbench_publication_defers_projection_and_formats_bars_in_background",
-        "StaleSnapshotRecheckTests.test_recheck_operations_remain_allowed_when_stale_or_synchronizing",
-        "StaleSnapshotRecheckTests.test_snapshot_age_tiers_and_symbol_quote_labels",
-        "TargetMarketDiagnosticsTests.test_diagnostics_drops_when_queue_full_without_raising",
-        "TargetMarketDiagnosticsTests.test_diagnostics_emits_summary_and_anomaly_jsonl",
-        "TqSdkUpgradeHookRegressionTests.test_pinned_sdk_version_and_wait_timeout_hook_match_installed_tqsdk",
-        "TqSdkUpgradeHookRegressionTests.test_pre_queue_send_and_cancel_refusal_hooks_match_real_tqsdk_frames"
-      ],
-      "case_overrides": {}
-    },
     "test_runtime_fault_isolation": {
       "tier": "T2",
       "domains": [
@@ -4005,6 +3976,63 @@
         "WorkbenchLifecycleIsolationTests.test_subscription_worker_detects_owner_crash_stops_dead_pipe_and_discovers_replacement",
         "WorkbenchLifecycleIsolationTests.test_subscription_worker_ignores_mismatched_boot_id_crash_file_and_reports_unresponsive",
         "WorkbenchLifecycleIsolationTests.test_workbench_clears_stale_broker_recovery_and_notifies_once_on_owner_crash"
+      ],
+      "case_overrides": {
+        "DsvFactAndRecoveryTests.test_adjusted_insert_time_within_60s_skew_accepts_subsequent_trade_and_preserves_bounds": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "DsvFactAndRecoveryTests.test_gt_60s_order_skew_and_pre_order_trade_still_fail_closed": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "DsvFactAndRecoveryTests.test_post_rollback_close_fill_reconciles_without_duplicate_close_or_reopen": {
+          "platform": [
+            "Windows"
+          ]
+        },
+        "DsvFactAndRecoveryTests.test_undercovered_position_without_fill_forbids_forged_reconcile": {
+          "platform": [
+            "Windows"
+          ]
+        }
+      }
+    },
+    "test_runtime_market_continuity": {
+      "tier": "T2",
+      "domains": [
+        "runtime",
+        "trading"
+      ],
+      "risk": "UNTRIAGED",
+      "profiles": [
+        "FullOffline",
+        "Runtime"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": null,
+      "requirements": [
+        "PySide6"
+      ],
+      "timeout_seconds": 120,
+      "cases": [
+        "MarketHealthClassificationTests.test_quiet_symbol_is_isolated_while_all_active_silence_blocks_feed",
+        "MarketHealthClassificationTests.test_zero_max_quote_age_flags_disabled_but_keeps_feed_health_gate",
+        "OwnerProjectionOffloadAndIdleSkipTests.test_control_server_skips_stream_projection_without_subscribers",
+        "OwnerProjectionOffloadAndIdleSkipTests.test_idle_round_skip_respects_open_positions_orders_timers_and_1s_cadence",
+        "OwnerProjectionOffloadAndIdleSkipTests.test_prepare_workbench_publication_defers_projection_and_formats_bars_in_background",
+        "StaleSnapshotRecheckTests.test_recheck_operations_remain_allowed_when_stale_or_synchronizing",
+        "StaleSnapshotRecheckTests.test_snapshot_age_tiers_and_symbol_quote_labels",
+        "TargetMarketDiagnosticsTests.test_diagnostics_drops_when_queue_full_without_raising",
+        "TargetMarketDiagnosticsTests.test_diagnostics_emits_summary_and_anomaly_jsonl",
+        "TqSdkUpgradeHookRegressionTests.test_pinned_sdk_version_and_wait_timeout_hook_match_installed_tqsdk",
+        "TqSdkUpgradeHookRegressionTests.test_pre_queue_send_and_cancel_refusal_hooks_match_real_tqsdk_frames"
       ],
       "case_overrides": {}
     },
@@ -4611,11 +4639,13 @@
       "requirements": [],
       "timeout_seconds": 60,
       "cases": [
+        "StartupInferencePlanBTests.test_filters_prior_day_bars_and_preserves_cross_midnight_night_session",
         "StartupInferencePlanBTests.test_flat_account_reconstructs_day_stop_from_today_trades",
         "StartupInferencePlanBTests.test_overnight_historical_position_on_force_close_contract_returns_zero",
         "StartupInferencePlanBTests.test_proved_entry_that_already_hit_stop_loss_returns_zero",
         "StartupInferencePlanBTests.test_proved_half_close_stage_narrows_target",
         "StartupInferencePlanBTests.test_proved_long_entry_and_partial_excess_flattening",
+        "StartupInferencePlanBTests.test_repriced_child_orders_count_as_one_target_and_daily_limit_does_not_flatten_proved_position",
         "StartupInferencePlanBTests.test_unproved_no_today_fill_returns_zero",
         "StartupInferencePlanBTests.test_unproved_signal_mismatch_returns_zero"
       ],
@@ -5038,6 +5068,8 @@
         "TargetOwnerExecutionReliabilityTests.test_reduction_route_unavailable_sets_explicit_block_reason_and_diagnostics_log",
         "TargetOwnerExecutionReliabilityTests.test_sdk_pre_queue_risk_refusal_returns_definitely_not_sent_without_unknown_occupation",
         "TargetOwnerExecutionReliabilityTests.test_unknown_negative_reconciliation_releases_reduce_target_and_unblocks_sync_after_complete_snapshot",
+        "TargetOwnerMaintenanceTests.test_clock_pause_preserves_strategy_intent_until_resume_or_user_stop",
+        "TargetOwnerMaintenanceTests.test_disarm_clears_strategy_intent_while_temporary_disconnect_preserves_it",
         "TargetOwnerMaintenanceTests.test_safe_stop_for_maintenance_aborts_and_projects_when_late_position_or_disconnect_occurs",
         "TargetOwnerMaintenanceTests.test_safe_stop_for_maintenance_bypasses_idle_skip_and_completes",
         "TargetOwnerPureLogicTests.test_incomplete_calendar_window_holds_current_trading_day_even_when_other_contract_is_active",
@@ -5251,6 +5283,37 @@
           ]
         }
       }
+    },
+    "test_unfilled_order_stalls": {
+      "tier": "T1",
+      "domains": [
+        "unfilled-order-stalls"
+      ],
+      "risk": "UNTRIAGED",
+      "profiles": [
+        "FullOffline"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": null,
+      "requirements": [],
+      "timeout_seconds": 30,
+      "cases": [
+        "UnfilledOrderStallTests.test_10_dual_clock_and_unconfigured_contract_sync_isolation",
+        "UnfilledOrderStallTests.test_1_unfilled_60s_on_one_contract_does_not_block_other_contracts",
+        "UnfilledOrderStallTests.test_2_cancel_without_terminal_fact_keeps_contract_in_cancel_pending_forever",
+        "UnfilledOrderStallTests.test_3_pending_child_missing_from_sync_blocks_entire_account_resync",
+        "UnfilledOrderStallTests.test_4_partial_fill_protection_and_entry_confirm_timeout_exit",
+        "UnfilledOrderStallTests.test_5_active_unfilled_order_disables_idle_skip",
+        "UnfilledOrderStallTests.test_6_sdk_port_call_hang_blocks_dispatch_synchronously",
+        "UnfilledOrderStallTests.test_7_isolated_contract_recovers_automatically_and_retains_stop_loss_protection",
+        "UnfilledOrderStallTests.test_8_sdk_adapter_reconcile_runs_when_isolated_and_runner_blocks_until_resolved",
+        "UnfilledOrderStallTests.test_9_cancel_retry_local_refusal_preserves_prior_unknown_status"
+      ],
+      "case_overrides": {}
     },
     "test_update_install": {
       "tier": "T1",
