@@ -1,123 +1,81 @@
-# OnlineTrader development
+# OnlineTrader 开发规范
 
-Independent Windows product. G0 source specifications are recorded in docs/spec-source.json.
-Preserve existing work; do not import V7, vnpy, DSV, their credentials, databases or environments.
+OnlineTrader 是独立 Windows 产品。G0 原始规格索引见 [spec-source.json](file:///e:/online-trader/docs/spec-source.json)。
+开发时必须保留既有工作成果；严禁直接导入 V7、vnpy、DSV 原版程序及其凭据、数据库或运行环境。
 
-## AI 开发导航
+---
 
-- 开始 Runtime、Workbench 或 DSV 源码任务时，先按 `docs/ai/architecture-status.yaml` 的 `path + scope` 核对当前合同，再用 `docs/ai/module-boundaries.yaml` 定位实际入口。文档、状态索引与源码冲突时报告 `CONFLICT / NEEDS_REVIEW`，不得静默采用旧结论。
-- `.agents/skills/runtime-workbench-development` 和 `.agents/skills/dsv-parity-review` 是短工作流入口；`docs/skills/online-trader.md` 仍是 OnlineTrader 业务规则的规范源。本文件中的安全、测试与打包约束始终适用，不依赖 Skill 是否触发。
+## 1. 默认运行与开发路径
 
-## 默认启动与交付路径
+未明确指定执行路径时，启动、重启、用户验收、测试候选和打包一律默认采用 **Standalone Trading Runtime**：
+- 普通用户入口：`online-trader-desktop --runtime-root <目录>`，或配置便携版直接双击 `OnlineTrader.exe`。
+- 统一入口先附着已有 Runtime，缺失时以 `DISARMED` 启动 Owner，再打开同一个 `WorkbenchWindow` / `WorkbenchLayout`。
+- `runtime run` 和 `--runtime-pipe` 仅保留为运维及高级附着入口；CLI 不提供交易命令或无人值守调度，禁止另建第二套界面。
+- 仅当用户明确要求 **Legacy 维护**、**Replacement candidate** 或 **Isolated QA** 时，才切换对应路径并在报告中标明（各路径入口与边界见 [architecture.md](file:///e:/online-trader/docs/architecture.md)）。
 
-- 未明确指定执行路径时，OnlineTrader 的启动、重启、用户验收、测试候选和打包默认采用 **Standalone Trading Runtime**。普通用户从 `online-trader-desktop --runtime-root <目录>`（配置便携版直接双击 `OnlineTrader.exe`）主动进入；统一桌面入口先附着已有 Runtime，缺失时以 `DISARMED` 启动 Owner，再打开同一个 `WorkbenchWindow` / `WorkbenchLayout`。`runtime run` 和 `--runtime-pipe` 仅保留为运维及高级附着入口；CLI 不提供交易命令或无人值守调度。不要另建或交付第二套界面。
-- 默认 Runtime 路径不授予账号连接、订单操作、测试或打包权限；这些动作仍按本次用户授权执行。用户明确要求 Legacy 维护、replacement candidate 或 isolated QA 时，才切换相应路径，并在报告中标明。
-- 默认打包目标是可实际运行的 Runtime 完整交付单元，不是仅含普通工作台的 Legacy 包。除通用便携依赖外，按接收方带齐 Runtime 账户和参数配置；不交付操作员授权、自动启动控制或执行账本，历史缓存可由期货账户重新下载。从最终 ZIP/安装器按双击 `OnlineTrader.exe` 的统一 Runtime 入口独立验收，并另外核对 `runtime run` 与 `--runtime-pipe` 运维入口。
+---
 
-## 所有软件制品必须随包交付配置
+## 2. 按任务定位文档与源码
 
-- OnlineTrader 每次出包都必须带齐本次交付所需的配置。安装器、便携包、更新 ZIP、客户专用包和测试包均适用。打包前确认目标设备或接收方使用的配置来源和文件清单。需要预配账户和交易参数时，必须随包带入已确认的 `OnlineTrader-defaults.json` 和 `OnlineTrader-parameters.json`，以及该包所需的启动和更新配置。独立 Trading Runtime 的新交付必须显式带入 `runtime.json`；`runtime-control.json` 和 `private/operators.json` 是被忽略的旧文件，不得作为新交付依赖。
-- 禁止将缺少交付配置的通用包、空配置包或占位配置包作为制品交付。客户包使用为该客户或设备确认的配置。测试包使用能完成指定场景的隔离测试配置。配置缺失、归属不明，或分发渠道无法承载经授权的配置时，停止出包或发布并说明原因。含账户口令的制品只通过获准的私有渠道交付。
-- 正式交付的安装器、便携包和更新 ZIP 允许随包配置白银，包括白银主连及上期所 `ag` 具体合约月。白银与其他品种适用相同的配置来源确认、参数有效性、目标设备适配和最终制品内容核对要求；不得仅因存在白银配置而停止交付，也不得未经确认擅自新增、删除或替换白银合约。
-- 交付前检查最终制品本身。对 ZIP 检查实际归档内容，对安装器在隔离目录安装验证，核对配置文件的路径、有效内容及其与已确认输入的一致性。使用用户实际启动入口验证配置可读取。交付记录写明版本、制品 SHA-256 和配置验证结果，省略口令等秘密。任一检查缺失或失败，该制品不能交付。
-
-## 完整制品与关键流程评审
-
-- 便携版以包含 EXE、`_internal`、必需脚本和配置的完整 ZIP 为交付单元。交付链接指向已验收的 ZIP 或安装器。承诺单文件交付时，独立测试只复制该文件到干净的目标环境，按用户实际方式验证。构建和验收记录均关联最终制品 SHA-256。发现缺依赖或配置时停止交付，替换件须复跑原接收场景。
-- 改动执行入口、订单与账本、时钟与行情判定、换机恢复或安装更新等跨模块行为时，先定位实际入口的第一处差异。实现前在现有设计中评审流程图、时序图、状态归属、兼容与回退及异常验收条件。
-- 开发时加入关联得到的诊断证据。关键行情拒绝须能追出实际失败的年龄、时段或盘口条件及其输入依据。订单链路须能区分触发、发送前中止、实际发送、回执、成交与保护。独立验收用代表性故障验证日志能还原原因。
-
-For DSV parity, start with the [current refactor index](docs/refactor/dsv-parity-20261114/README.md)
-and [the connected strategy and SDK replay](docs/refactor/dsv-parity-20261114/15-strategy-sdk-schedule.md).
-Verify the frozen archive and run the original code in isolated QA when it can be reused.
-Feed both implementations the same configuration, ticks, position snapshots and ordered facts.
-Trace the first differing round through `wait_update`, strategy target, SDK API call and outbound packet.
-Keep `online_trader.dsv_core` free of the legacy owner, SDK, UI, I/O and system clock.
-Keep the explicit controller's per-child pre-send durability and the existing cutover gates.
-
-## Select the execution path before changing it
-
-| Path | Entry points and owner | Applicable contract |
+| 任务类型 | 必读文档 | 说明 |
 | --- | --- | --- |
-| Legacy, not yet retired; explicit maintenance only | `simulation run`, `dsv run`, `simnow run`, and the ordinary workbench's existing launch route | Preserve the original Kernel owner and that route's recovery contract until approved cutover. Do not select this as the default launch or package path. |
-| Standalone Trading Runtime; default | `online-trader-desktop --runtime-root`, packaged `OnlineTrader.exe`, `runtime run`, attached status/account/history and runtime Workbench | One Windows host has at most one Runtime; other hosts are not mutually excluded, including when they use the same futures account. Each boot uses a process-owned temporary Kernel/SQLite execution store and synchronizes current facts from the broker. Qt and runtime-view are read/control-side processes. Only the same-user Workbench channel submits trading controls. Follow [the current authority design](docs/refactor/runtime-broker-authority-single-instance-20261120.md) and [manual-only contract](docs/refactor/runtime-manual-only-cleanup-20261120.md). |
-| Replacement candidate | `dsv replacement-run`, `simnow replacement-run` | `DsvSession` + `ExplicitOrderController` + `Journal` + `DsvSdkAdapter`; share the compatible account lock, not the legacy Kernel sender. See [candidate startup](docs/refactor/dsv-parity-20261114/10-sdk-startup-and-same-day-rollback.md). |
-| Isolated QA | `offline-dsv` and `qa/dsv_parity/` replay tools | DEV/OFFLINE fixtures or locally bounded SDK replay; no real account connection or order authority. |
+| 架构与模块定位 | [architecture.md](file:///e:/online-trader/docs/architecture.md) | 确认执行路径、模块入口与禁止越权边界 |
+| 执行、订单、持仓收敛、权限、时钟 | [runtime.md](file:///e:/online-trader/docs/runtime.md) | 单 Owner/Sender、临时 Journal、收敛与市场门禁 |
+| DSV 策略规则与参数 | [strategy.md](file:///e:/online-trader/docs/strategy.md) | B01–B20 基准、慢部分成交差异、纯逻辑边界 |
+| Qt 界面与工作台交互 | [workbench.md](file:///e:/online-trader/docs/workbench.md) | CommandBus、过期快照放行、柜台核对提示、托盘退出 |
+| 配置、缓存与持久化 | [storage.md](file:///e:/online-trader/docs/storage.md) | 柜台权威、临时执行库、可重建历史缓存、对账单边界 |
+| 测试与验收 | [testing.md](file:///e:/online-trader/docs/testing.md) | 编译命令、离线 Profile、独立验收记录要求 |
+| 打包与更新 | [delivery.md](file:///e:/online-trader/docs/delivery.md) | 随包配置清单、白银规则、更新载荷与交付核对 |
+| 诊断与排障 | [diagnostics.md](file:///e:/online-trader/docs/diagnostics.md) | 诊断旁路、事件模型与脱敏边界 |
 
-A shared helper or lock does not authorize two senders. Do not import legacy full-Tick-path gates,
-epoch-switching or clock-fault exceptions into the replacement merely because the legacy route
-uses them. Conversely, do not remove legacy checks while maintaining that route. Every changed
-trading condition needs DSV evidence, a scoped user-approved difference, or a stated minimum
-fact/ownership requirement. QA input injection must never become an online input port.
+> [!IMPORTANT]
+> 若发现文档合同与当前源码冲突，立即报告 `CONFLICT / NEEDS_REVIEW`，不得静默采用旧结论或通过改文档掩盖源码缺陷。
 
-For slow partial fills, honor the approved behavior in
-[the decision register](docs/refactor/dsv-parity-20261114/00-evidence-and-decisions.md#用户批准的行为差异).
-In the fixed sample, keep the 5-lot opening target when 3 lots are proved, then hold the
-5 proved lots after the remaining 2 fill. When testing an affected change within an authorized scope, include the fixed round 7 and 9 replay. This approval does not approve unrelated month-stop or restart deviations.
+---
 
-Current implementation and evidence are indexed in [README](README.md) and the
-[96-item checklist](docs/功能实现与待办清单_20261110.md). The product has separate
-TqKq and SimNow simulation paths and a pinned optional SDK environment. Use the
-current user's authorization and current session scope for account connections,
-order operations, service installation, CI or release work. B01-B20 follow the
-user-confirmed DSV reference in docs/decisions/dsv-confirmation-20261109.json.
-A saved reference or draft is NON_TRADING. Confirm unresolved DSV semantics from
-source or observation evidence.
+## 3. 交易业务与安全红线
 
-One owner controls state and one writer controls SQLite. Commit required facts before send;
-unknown sends reserve capacity and require reconciliation. GUI/strategy lifetime cannot delete
-protection. All exits share one remaining target; cancellation requests do not release quantity.
+1. **单 Owner / 单 Sender / 单 SQLite 写者**：同一台 Windows 主机最多一个 Runtime；不同主机不互斥（允许同账户多机按柜台规则运行）。每次启动创建进程所有的临时执行库，退出即删除，不跨 boot 交接。严禁把 SDK/下单/撤单/保护逻辑移出当前 Owner。
+2. **期货账户权威与 `DISARMED` 安全**：柜台为持仓、委托、成交、资金的最终权威。`DISARMED` 期间只同步事实、推算目标并预览，严禁自动发单或撤单。
+3. **`commit-before-send` 与 `UNKNOWN` 占量**：每次发单/撤单前必须先写入临时 Journal；调用结果未知（`SEND_POSSIBLE` / `UNKNOWN`）时必须保留最大剩余占量并等待核对。所有退出路径共享同一剩余目标；撤单请求未终态前不释放占量，GUI/策略生命周期不得删除保护。
+4. **控制通道隔离**：交易控制仅通过同一 Windows 交互用户的 Workbench 通道提交；CLI、公开 API、委托工具仅只读。旧 `runtime-control.json`、`private/operators.json`、watchdog 与 handoff 文件一律忽略。
+5. **参数计算与模板预览边界**：33 项模板、批量 CSV 导入导出、偏移计算器（`offset_calc`）仅返回预览结果，不得直接写入交易权限或覆盖生效配置/保护计划；计算与生效绑定数据哈希与预览哈希，不得以今日未完结 K 线作回退。
+6. **外部对账单只读边界**：对账单比较只读；仅在 `ONLINE_SIM`/开发账本且 Owner 关闭、周期全部平仓、委托终态一致时允许原子登记费用与回执，不改写成交价量或保护，且保持 `DISARMED`。
+7. **路径隔离原则**：不得因 Legacy 路径存在某些检查而将其强行引入 Replacement/Standalone，也不得在维护 Legacy 时擅自移除其原有检查；QA 注入端口严禁接入在线生产模式。
 
-For the standalone Trading Runtime, the futures account is authoritative for positions, orders,
-trades, funds and returns. Enforce one Runtime per Windows host with a machine-local lock, but do
-not use local files or locks to exclude another computer using the same account. Each boot creates
-a fresh process-owned execution ledger and synchronizes broker facts; it is deleted when that boot
-ends and is never handed off. Persist only version defaults plus user configuration overrides and a
-rebuildable broker-history/return cache. Existing old execution ledgers remain read-only historical
-artifacts and never block startup. Do not move SDK/order/protection work out of the single owner.
+---
 
-External statement comparison is read only. Reviewed fee registration is confined to the existing
-ONLINE_SIM/development ledger while the execution owner is closed, all owned cycles are flat/closed
-and orders are quantity-consistent terminal facts. It appends statement fees and a durable receipt
-in one original-writer transaction, never imports or rewrites trade prices, quantities or protection,
-and leaves entry authority DISARMED. A CSV/export/preview alone is not a registration instruction.
+## 4. 用户授权范围
 
-Tests and QA are outside the production wheel. After routine changes, run compilation only.
-Do not add, adjust, or run tests without an explicit request for testing or packaging.
-For every authorized packaging request, ask the user before testing or building whether to run
-the full test suite for that package. If the user approves full testing, independently run global
-product tests before building and independently verify the final artifact after building. If the
-user explicitly declines testing, packaging and handoff may proceed without pre-build tests or
-post-build functional/independent acceptance; clearly label the artifact as untested, list the
-omitted checks, and do not claim that testing or acceptance passed. Non-test artifact integrity,
-configuration-content and SHA-256 checks still apply. Silver main/continuous contracts and
-specific SHFE `ag` contract months are permitted when they are part of the confirmed delivery
-configuration and pass the same validation as other instruments. A prior packaging or
-testing choice does not answer this question for a later packaging request. When full source
-regression is in scope, run
-`.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v` with `PYTHONPATH=src`.
-Use `.venv\Scripts\python.exe -X utf8 -m compileall -q src tests qa` for source compilation.
-Follow the global independent-testing instructions for delivery acceptance and use the actual
-entry point with isolated fixtures. Report offline, connected and packaged evidence by scope.
-An acceptance statement must name the full candidate SHA, scenario/fixture, environment and
-PASS/FAIL/SKIP/NOT_RUN counts. Unread local reports remain reported results, not independently
-verified evidence. A documentation-only commit does not fix an open source defect.
+默认选择 Standalone 路径**不授予**以下操作权限，以下动作均须本次会话用户的明确授权：
+- 连接模拟或实盘期货账户；
+- 执行真实或模拟报撤单；
+- 新增、调整或运行测试套件；
+- 安装系统服务、执行打包构建、发布 Release 或切换生产版本。
 
-Offline parameter work also includes the DSV 33-field trade-form templates and whole-batch symbol
-CSV preview/import/export. Template application and CSV import return preview values only; they
-never write trading authority, active configuration or existing protection plans. Template edits
-require an explicit expected revision and append immutable local history outside the ledger.
-All business-parameter editing and the versioned DSV offset calculator remain preview-only.
-Use explicit offline daily-series identities and an explicit cutoff trading date; never infer
-live market completeness, use today's unfinished bars as fallback, or activate trading from a
-calculated/exported result. Calculations and applications bind the data and preview hashes.
+---
 
-Historical execution grants and evidence are archived in [the November 10–11 development record](docs/history/development-authorizations-20261110-11.md).
+## 5. 测试与交付约束
 
-When modifying the legacy startup replay, commit historical path replay separately from the quote
-used for execution. Preserve the durable observation start and validate native
-sequence, session and source epoch before extending the path. Delayed incremental
-updates use the bounded startup catch-up and the original freshness limit. These are legacy
-maintenance instructions, not a new replacement entry gate. For replacement startup, follow its
-bound SDK facts and documented synchronization contract. Reuse existing evidence when the task
-only maintains documentation, and do not relabel old results as newly executed.
+### 5.1 测试执行规范
+- **日常源码改动后只运行编译检查**：
+  ```powershell
+  .\.venv\Scripts\python.exe -X utf8 -m compileall -q src tests qa
+  ```
+- 未经明确要求测试或打包，**不得擅自新增、修改或运行测试**。
+- **每次获准打包前**，必须先向用户确认是否运行该包对应的全量测试：
+  - 若用户批准全量测试：构建前独立运行全局产品测试（`.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -v`，`PYTHONPATH=src`），构建后对最终制品做独立验收；
+  - 若用户明确拒绝测试：可跳过构建前测试与构建后功能验收，但必须在交付说明中**明确标明未测试**、列出省略项，不得宣称测试或验收通过；非测试类的制品完整性、配置内容核对与 SHA-256 校验仍须执行。
+- 每次打包/测试选择仅对当次有效，不得沿用过往授权。验收声明必须写明完整候选 SHA、场景/fixture、运行环境及 `PASS / FAIL / SKIP / NOT_RUN` 计数。
+
+### 5.2 随包配置与完整制品交付
+- **所有软件制品必须随包带齐配置**（安装器、便携包、更新 ZIP、客户包、测试包均适用）。禁止交付缺配置、空配置或占位配置包；含账户口令的制品只通过获准私有渠道交付。
+- 独立 Trading Runtime 新交付必须显式带入 `runtime.json` 及已确认的 `OnlineTrader-defaults.json`、`OnlineTrader-parameters.json`（不得依赖已废弃的 `runtime-control.json` / `private/operators.json`）。
+- **白银合约规则**：正式交付物允许随包配置白银（含白银主连及上期所 `ag` 具体合约月），适用与其它品种相同的配置校验要求；不得仅因存在白银配置而停止交付，也不得未经确认擅自增删或替换白银合约。
+- **交付前检查最终制品本身**：对 ZIP 检查归档内容，对安装器在隔离目录安装验证，使用用户实际启动入口验证配置可读取，记录版本、制品 SHA-256 与配置核对结果（省略口令等秘密）。任一检查失败则停止交付。
+
+---
+
+## 6. 文档更新要求
+
+仅当代码修改**改变了其他开发者需要遵守的架构合同、业务规则，或改变了用户需要了解的使用/测试/交付方式**时，才同步更新对应的 `docs/*.md` 文档。普通的 Bug 修复、内部辅助函数重构、性能优化、单测补充不要求修改正式文档。
