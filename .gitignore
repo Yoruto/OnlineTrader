@@ -11,3 +11,4 @@ output/
 *.db-wal
 *.db-shm
 .coverage
+.local/
