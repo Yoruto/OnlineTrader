@@ -1485,6 +1485,37 @@ class ExplicitOrderController:
             '' if tick is None else tick.get('tick_size', ''),
         ))
 
+    @staticmethod
+    def _reconcile_convergence_cancels(state, non_strategy_orders):
+        active_ext_ids = {str(item['native_order_id']) for item in (non_strategy_orders or ())}
+        cancels = state.setdefault('convergence_cancels', {})
+        for nid in [k for k in cancels if k not in active_ext_ids]:
+            cancels.pop(nid, None)
+
+    def reconcile_stopped_convergence(
+        self, state, configured_markets, unconfigured_markets, non_strategy_orders, *, wall_iso=None,
+    ):
+        """Reconcile convergence responsibilities while DISARMED (no new opens/closes/reprices)."""
+        self._reconcile_convergence_cancels(state, non_strategy_orders)
+        effects = []
+        perm_by_cid = {}
+        for cid, market in (configured_markets or {}).items():
+            perm_by_cid[cid] = market.get('market_permission') or infer_offline_market_permission(
+                market, wall_iso, clock_unverified=bool(state.get('clock_recovery_required')))
+        for market in (unconfigured_markets or ()):
+            cid = market['contract_id']
+            perm_by_cid[cid] = market.get('market_permission') or infer_offline_market_permission(
+                market, wall_iso, clock_unverified=bool(state.get('clock_recovery_required')))
+        for order in state['orders'].values():
+            if not order.get('convergence_order') or terminal(order):
+                continue
+            perm = perm_by_cid.get(order['contract_id'])
+            if perm is None or not perm.get('can_cancel', False):
+                continue
+            if req := self.cancel(order, 'USER_STOPPED'):
+                effects.append(req)
+        return effects
+
     def plan_convergence(self, state, configured_markets, unconfigured_markets, non_strategy_orders, wall_time,
                          *, wall_iso=None):
         """Plan non-blocking per-contract convergence orders and external cancellations (ARMED only)."""
@@ -1493,10 +1524,7 @@ class ExplicitOrderController:
         events = []
         if wall_iso is None and wall_time is not None:
             wall_iso = datetime.fromtimestamp(float(wall_time), tz=timezone.utc).isoformat().replace('+00:00', 'Z')
-        active_ext_ids = {str(item['native_order_id']) for item in (non_strategy_orders or ())}
-        cancels = state.setdefault('convergence_cancels', {})
-        for nid in [k for k in cancels if k not in active_ext_ids]:
-            cancels.pop(nid, None)
+        self._reconcile_convergence_cancels(state, non_strategy_orders)
 
         all_targets = []
         market_by_cid = {}
@@ -1555,10 +1583,11 @@ class ExplicitOrderController:
             excess_short = max(0, actual_short - target_short)
             deficit_long = max(0, target_long - actual_long)
             deficit_short = max(0, target_short - actual_short)
-            # Convergence only closes holdings above strategy-owned quantity;
-            # strategy-owned exits remain governed by DSV strategy rules in plan().
-            conv_excess_long = max(0, actual_long - owned_long)
-            conv_excess_short = max(0, actual_short - owned_short)
+            # Convergence only closes holdings above strategy-owned quantity and
+            # above active strategy target (e.g. when broker position snapshot
+            # leads fill facts during an in-flight open).
+            conv_excess_long = min(excess_long, max(0, actual_long - owned_long))
+            conv_excess_short = min(excess_short, max(0, actual_short - owned_short))
             conv_orders = [
                 o for o in all_orders
                 if o.get('convergence_order') and o['contract_id'] == cid and not terminal(o)
@@ -1852,8 +1881,16 @@ class ExplicitOrderController:
                         offset = 'CLOSETODAY'
                         send_qty = min(needed, free_today, max_qty)
                     else:
-                        offset = 'CLOSETODAY'
-                        send_qty = min(needed, max_qty)
+                        contract_status = 'DEFERRED_FACTS_INCOMPLETE'
+                        contract_wait_reason = 'CLOSE_BUCKET_UNPROVED'
+                        events.append({
+                            'event': 'CONVERGENCE_DEFERRED',
+                            'contract_id': cid,
+                            'side': pos_side,
+                            'reason': 'CLOSE_BUCKET_UNPROVED',
+                            'needed': needed,
+                        })
+                        continue
                 else:
                     offset = 'CLOSE'
                     send_qty = min(needed, max_qty)

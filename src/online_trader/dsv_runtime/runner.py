@@ -950,6 +950,10 @@ class DsvSession:
                 state['convergence_status'] = conv_status
                 self._emit_convergence_diagnostics(conv_status, conv_events)
             else:
+                conv_effects = self._controller.reconcile_stopped_convergence(
+                    state, observed_configured, unconfigured_observed, ext_orders,
+                    wall_iso=frame['wall_time'])
+                effects.extend(conv_effects)
                 state['convergence_status'] = self._compute_convergence_preview(
                     state, observed_configured, unconfigured_observed, ext_orders,
                     wall_iso=frame['wall_time'], clock_unverified=bool(state.get('clock_recovery_required')))

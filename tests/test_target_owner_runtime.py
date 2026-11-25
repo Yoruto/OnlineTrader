@@ -2196,6 +2196,17 @@ class TargetOwnerMaintenanceTests(unittest.TestCase):
 
                     # Now broker reconnects with a late-arriving unresolved convergence cancel / native conflict;
                     # owner must ABORT maintenance and project ABORTED immediately.
+                    env.adapter.api.get_order()['late-ext-order-1'] = SimpleNamespace(
+                        order_id='late-ext-order-1',
+                        instrument_id='DCE.p2701',
+                        exchange_id='DCE',
+                        direction='BUY',
+                        offset='OPEN',
+                        status='ALIVE',
+                        volume_orign=1,
+                        volume_left=1,
+                        limit_price=1050.0,
+                    )
                     session._state['convergence_cancels']['late-ext-order-1'] = {'cancel_status': 'UNKNOWN'}
                     owner.step(trading_day='2026-11-13', complete=True)
                     self.assertFalse(owner.stop_event.is_set())
@@ -2216,6 +2227,35 @@ class TargetOwnerMaintenanceTests(unittest.TestCase):
                     })
                     self.assertEqual(view['maintenance_completion']['state'], 'ABORTED')
                     self.assertEqual(view['maintenance_completion']['command_id'], 'maint-abort-1')
+                finally:
+                    owner.close()
+
+    def test_disarm_clears_strategy_intent_while_temporary_disconnect_preserves_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = TargetOwnerWorkbenchProjectionTests._make_hot_add_harness(self, temp_dir)
+            with RuntimeSessionStorage() as storage:
+                binding = env.make_binding(storage.boot_id)
+                session = DsvSession(
+                    storage.ledger, account_key=env.account_key, provider='TQKQ',
+                    trading_day='2026-11-13', profile=env.base, port=env.adapter,
+                    _execution_lock=binding.account_lock, _owner_binding=binding,
+                )
+                owner = StandaloneDsvOwner(
+                    session, env.adapter, env.connection, env.base, binding,
+                    configuration_revision='1',
+                )
+                try:
+                    owner.step(trading_day='2026-11-13', complete=True)
+                    owner.start_confirmed()
+                    self.assertEqual(owner.strategy_intent, 'RUNNING')
+                    # Temporary disconnect (disarm=False) keeps strategy_intent RUNNING.
+                    owner.disconnect_for_error('TEMP_NET', disarm=False)
+                    self.assertEqual(owner.strategy_intent, 'RUNNING')
+                    # Disarming disconnect clears strategy_intent so maintenance is not stuck on STRATEGY_RUNNING.
+                    owner.disconnect_for_error('FATAL_DISARM', disarm=True)
+                    self.assertEqual(owner.strategy_intent, 'STOPPED')
+                    summary = owner.responsibility_summary()
+                    self.assertNotIn('STRATEGY_RUNNING', summary['blockers'])
                 finally:
                     owner.close()
 

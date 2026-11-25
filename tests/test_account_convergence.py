@@ -798,6 +798,194 @@ class AccountConvergenceTests(unittest.TestCase):
         self.assertIn('[非配置]', grid.item(1, 0).text())
         self.assertEqual(grid.item(1, 4).text(), '待清仓 (未启动)')
 
+    def test_stopped_convergence_reconciles_cancels_and_cancels_working_conv_order(self):
+        from online_trader.runtime.maintenance_policy import evaluate_responsibility
+
+        runtime, client = self._start_runtime()
+        client.command(
+            'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'authority_policy_id': 'target-authority-current-boot',
+             'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
+            expected_config_revision='1',
+        )
+        # Round 2: external non-strategy order triggers convergence cancel.
+        runtime.submit(_offline_frame(
+            2,
+            long_qty=0,
+            non_strategy_orders=[{
+                'native_order_id': 'ext-stop-1',
+                'contract_id': CONTRACT,
+                'direction': 'BUY',
+                'native_offset': 'OPEN',
+                'volume_left': 1,
+            }],
+        ))
+        self._wait_view(
+            client,
+            lambda v: (v.get('responsibility') or {}).get('unresolved_convergence_cancels') == 1,
+        )
+
+        # User STOP while convergence_cancels still has ext-stop-1.
+        client.command(
+            'STOP_DSV_STRATEGY', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {},
+            expected_config_revision='1',
+        )
+        # Unsynchronized round must NOT clear convergence_cancels.
+        unsync_frame = _offline_frame(3, long_qty=0, non_strategy_orders=[])
+        unsync_frame['synchronized'] = False
+        runtime.submit(unsync_frame)
+        self._wait_view(client, lambda v: not v['connection']['synchronized'])
+        self.assertEqual(
+            client.workbench()['responsibility']['unresolved_convergence_cancels'], 1,
+        )
+
+        # Synchronized round without ext-stop-1 clears convergence_cancels even while DISARMED.
+        runtime.submit(_offline_frame(4, long_qty=0, non_strategy_orders=[]))
+        cleared = self._wait_view(
+            client,
+            lambda v: v['connection']['synchronized']
+            and (v.get('responsibility') or {}).get('unresolved_convergence_cancels') == 0,
+        )
+        self.assertTrue(cleared['responsibility']['maintenance_allowed'])
+
+        # Now test working convergence close order cancelled on STOP via real SDK harness.
+        t0 = int(datetime(2026, 11, 13, 1, 5, 0, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+        quotes = {
+            'DCE.p2701': SimpleNamespace(
+                instrument_id='DCE.p2701', expired=False, ins_class='FUTURE', volume_multiple=10,
+                trading_time={'day': [['09:00:00', '10:15:00']], 'night': []},
+                datetime='2026-11-13 09:10:00.000000', last_price=1062.0, highest=1065.0, lowest=1020.0,
+                bid_price1=1061.0, ask_price1=1063.0, price_tick=1.0, lower_limit=950.0, upper_limit=1150.0, margin=4000.0,
+            ),
+        }
+        positions = {
+            'DCE.p2701': SimpleNamespace(pos_long=3, pos_short=0, pos_long_today=3, pos_long_his=0, pos_short_today=0, pos_short_his=0, margin=12000.0),
+        }
+        orders = {}
+        serials = {
+            'DCE.p2701': _make_serial([
+                {'datetime': t0, 'open': 1025.0, 'high': 1030.0, 'low': 1020.0, 'close': 1028.0},
+            ]),
+        }
+        adapter, session, _prof, inserted, cancelled = self._build_real_sdk_harness(
+            quotes=quotes, positions=positions, orders=orders, trades={}, serials=serials,
+            configured_code='DCE.p2701',
+        )
+        adapter.step(session, trading_day=DAY, complete=True)
+        session.command({'id': 'cmd-start-2', 'action': 'START'})
+        quotes['DCE.p2701'].datetime = '2026-11-13 09:10:01.000000'
+        adapter.step(session, trading_day=DAY, complete=True)
+        self.assertEqual(len(inserted), 1)
+        conv_order_id = inserted[0]['order_id']
+
+        session.command({'id': 'cmd-stop-2', 'action': 'STOP'})
+        quotes['DCE.p2701'].datetime = '2026-11-13 09:10:02.000000'
+        adapter.step(session, trading_day=DAY, complete=True)
+        self.assertIn(conv_order_id, cancelled)
+        self.assertEqual(len(inserted), 1)
+        orders[conv_order_id].status = 'FINISHED'
+        orders[conv_order_id].volume_left = 3
+        quotes['DCE.p2701'].datetime = '2026-11-13 09:10:03.000000'
+        adapter.step(session, trading_day=DAY, complete=True)
+        summary = evaluate_responsibility(session.snapshot(), strategy_intent='STOPPED')
+        self.assertNotIn('UNRESOLVED_CHILDREN', summary['blockers'])
+        self.assertTrue(summary['maintenance_allowed'])
+
+    def test_shfe_ine_convergence_defers_instead_of_guessing_closetoday_when_buckets_unproved(self):
+        t0 = int(datetime(2026, 11, 13, 1, 5, 0, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+        quotes = {
+            'SHFE.ag2702': SimpleNamespace(
+                instrument_id='SHFE.ag2702', expired=False, ins_class='FUTURE', volume_multiple=15,
+                trading_time={'day': [['09:00:00', '10:15:00']], 'night': []},
+                datetime='2026-11-13 09:10:00.000000', last_price=7500.0, highest=7520.0, lowest=7480.0,
+                bid_price1=7499.0, ask_price1=7501.0, price_tick=1.0, lower_limit=7000.0, upper_limit=8000.0, margin=6000.0,
+            ),
+        }
+        positions = {
+            'SHFE.ag2702': SimpleNamespace(pos_long=2, pos_short=0, pos_long_today=1, pos_long_his=1, pos_short_today=0, pos_short_his=0, margin=12000.0),
+        }
+        serials = {
+            'SHFE.ag2702': _make_serial([
+                {'datetime': t0, 'open': 7490.0, 'high': 7510.0, 'low': 7480.0, 'close': 7500.0},
+            ]),
+        }
+        adapter, session, _prof, _inserted, _cancelled = self._build_real_sdk_harness(
+            quotes=quotes, positions=positions, orders={}, trades={}, serials=serials,
+            configured_code='SHFE.ag2702',
+        )
+        adapter.step(session, trading_day=DAY, complete=True)
+        state = session.snapshot()
+        state['symbols']['SHFE.ag2702']['position'] = {
+            'id': 'pos-shfe-1', 'target_id': 't-shfe-1', 'target_revision': 1,
+            'target_reason': 'TEST', 'target_fact_sequence': 1,
+            'contract_id': 'SHFE.ag2702', 'direction': 'LONG',
+            'quantity': 1, 'owned': 1, 'entry_filled': 1, 'legacy_owned': 0,
+            'today_owned': 1, 'historical_owned': 0,
+            'fills': [{
+                'trade_key': ['t-1'], 'contract_id': 'SHFE.ag2702', 'direction': 'LONG',
+                'effect': 'OPEN', 'trading_day': DAY, 'event_seq': '1', 'quantity': 1, 'remaining': 1,
+            }],
+            'children': ['strat-close-1'], 'timers': {},
+        }
+        state['orders']['strat-close-1'] = {
+            'child_order_id': 'strat-close-1', 'position_id': 'pos-shfe-1',
+            'contract_id': 'SHFE.ag2702', 'effect': 'REDUCE', 'direction': 'SELL',
+            'native_offset': 'CLOSE', 'original_qty': 1, 'filled_qty': 0,
+            'reported_fill_qty': 0, 'send_state': 'NATIVE_SEEN', 'broker_state': 'ALIVE',
+            'native_id': 'nat-strat-1',
+            'terminal_confirmed': False, 'cancel_status': None, 'native_trading_day': DAY,
+        }
+        market = {
+            'contract_id': 'SHFE.ag2702', 'long_qty': 2, 'short_qty': 0,
+            'long_today': 1, 'long_historical': 1, 'short_today': 0, 'short_historical': 0,
+            'position_known': True,
+            'ticks': [{'last': '7500', 'bid1': '7499', 'ask1': '7501', 'tick_size': '1',
+                       'lower_limit': '7000', 'upper_limit': '8000'}],
+            'market_permission': {
+                'market_phase': 'CONTINUOUS', 'evidence_state': 'PROVED',
+                'status_source': 'TEST', 'continuous_matching': True,
+                'can_open': True, 'can_close': True, 'can_cancel': True,
+            },
+        }
+        effects, statuses, _events = session._controller.plan_convergence(
+            state, {'SHFE.ag2702': market}, [], [], 1700000000.0, wall_iso=f'{DAY}T01:10:00Z',
+        )
+        self.assertEqual(effects, [])
+        st = statuses['SHFE.ag2702']
+        self.assertEqual(st['status'], 'DEFERRED_FACTS_INCOMPLETE')
+        self.assertEqual(st['wait_reason'], 'CLOSE_BUCKET_UNPROVED')
+
+    def test_convergence_does_not_flatten_when_actual_matches_target_during_open_fill_lag(self):
+        runtime, client = self._start_runtime()
+        client.command(
+            'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'authority_policy_id': 'target-authority-current-boot',
+             'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
+            expected_config_revision='1',
+        )
+        # Round 2: strategy opens 5 lots at 1060.
+        runtime.submit(_offline_frame(2, long_qty=0, last='1060'))
+        opening_view = self._wait_view(client, lambda v: len(v['orders']) == 1)
+        cid = opening_view['orders'][0]['child_order_id']
+        # Round 3: partial fill 2 of 5 proved locally, while broker position snapshot already shows actual_long=5.
+        runtime.submit(_offline_frame(
+            3, long_qty=5, last='1060',
+            facts=[
+                _order_fact(cid, 'nat-open-lag', CONTRACT, 'BUY', 'OPEN', 5, status='ALIVE', filled=2),
+                _trade_fact(cid, 'nat-open-lag', 'trd-open-lag', CONTRACT, 'BUY', 'OPEN', 2, '1060'),
+            ],
+        ))
+        view = self._wait_view(
+            client,
+            lambda v: (v.get('connection') or {}).get('account_positions', [{}])[0].get('actual_long') == 5,
+        )
+        acc = view['connection']['account_positions'][0]
+        self.assertEqual(acc['target_long'], 5)
+        self.assertEqual(acc['excess_long'], 0)
+        # Must NOT send a convergence close order for the 3-lot fill-fact lag.
+        self.assertEqual(len(view['orders']), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -146,7 +146,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                 window.view = view
                 window.render_view()
                 detail = window.tables['markets'].item(0,window.tables['markets'].columnCount()-1).text()
-                self.assertIn('当日行情已越过多头不追价线',detail)
+                self.assertIn('行情已越过不追价线，本次跳过开仓',detail)
                 self.assertIn('当日行情已越过多头不追价线',dashboard.status_labels[0].text())
                 dashboard.add_activity('本地连接诊断')
                 dashboard.show_details(dashboard.log_tab)

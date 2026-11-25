@@ -422,6 +422,8 @@ class StandaloneDsvOwner:
             )
         else:
             receipt = self.adapter.step(self.session, trading_day=trading_day, complete=complete)
+        if self.strategy_intent == 'RUNNING' and not bool(self.session._state.get('running')):
+            self.strategy_intent = 'STOPPED'
         if self.maintenance is not None and receipt is not None and receipt.get('type') != 'DISCONNECTED':
             self._maintenance_verified_step = True
         if receipt is not None:
@@ -452,6 +454,8 @@ class StandaloneDsvOwner:
         receipt = self.session.disconnect(reason, disarm=disarm, fault_code=fault_code)
         if disarm:
             self._authority_generation += 1
+            self.strategy_intent = 'STOPPED'
+            self.has_start_pending = False
         self._projection_seq += 1
         if self._track_commit_views:
             self._commit_views.append(self.snapshot())
