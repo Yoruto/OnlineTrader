@@ -4,6 +4,7 @@ import copy
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
+import logging
 import sqlite3
 from threading import get_ident
 import time
@@ -13,6 +14,7 @@ from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes, content_hash
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
 from online_trader.dsv_core.business_statistics import reduce_stops
+from online_trader.dsv_core.entry_rules import trigger_prices
 from online_trader.dsv_core.month_stop import observe_month_stop
 from online_trader.dsv_core.transition import continuation_entry, ordinary_entry, price_value, protect
 from online_trader.dsv_core.price_rules import scheduled_close_mode
@@ -1386,6 +1388,55 @@ class DsvSession:
             self._diag().observe_block(
                 ('session_gate', contract), active=False, contract_id=contract,
                 position_id=position_id)
+        primary = next((v for v in values if v.get('reason')), None)
+        if primary is not None:
+            reason = primary['reason']
+            tick = market.get('tick') or {}
+            candle_id = tick.get('candle_id')
+            target = primary.get('target') or {}
+            direction = primary.get('direction') or target.get('direction') or (
+                None if position is None else position.get('direction'))
+            high, low = tick.get('day_high'), tick.get('day_low')
+            lines = {}
+            if high is not None and low is not None and contract in self._symbols:
+                try:
+                    lines = trigger_prices(Decimal(str(high)), Decimal(str(low)),
+                                           Decimal(str(self._symbols[contract]['open_offset'])))
+                except (ArithmeticError, ValueError, TypeError):
+                    lines = {}
+            high_priority_reasons = {
+                'NORMAL_ENTRY', 'CONTINUATION_ENTRY', 'DAY_STOP', 'DAILY_TARGET_LIMIT',
+                'FIRST_MINUTE_JUMP_DAY_STOP', 'ENTRY_CONFIRM_TIMEOUT', 'ADVERSE_SLIPPAGE',
+                'DATA_GAP_EXIT', 'STOP_LOSS', 'TAKE_PROFIT', 'TRAILING_STOP',
+                'PROTECTED_FLOOR', 'SCHEDULED_CLOSE',
+            }
+            spec = self._symbols.get(contract) or {}
+            self._diag().emit_transition(
+                ('strategy_decision', contract),
+                (reason, direction, candle_id, bool(row.get('day_stop')), target.get('quantity')),
+                'STRATEGY_DECISION_CHANGED',
+                level=logging.INFO,
+                component='STRATEGY',
+                priority='HIGH' if reason in high_priority_reasons else 'NORMAL',
+                contract_id=contract,
+                position_id=position_id,
+                reason=reason,
+                direction=direction,
+                candle_id=candle_id,
+                last_price=tick.get('last'),
+                day_high=high,
+                day_low=low,
+                long_trigger=str(lines['LONG']) if 'LONG' in lines else None,
+                short_trigger=str(lines['SHORT']) if 'SHORT' in lines else None,
+                open_offset=spec.get('open_offset'),
+                stop_offset=spec.get('stop_offset'),
+                profit_offset=spec.get('profit_offset'),
+                quantity=target.get('quantity'),
+                theory=target.get('theory') or (None if position is None else position.get('theory')),
+                cap=target.get('cap') or (None if position is None else position.get('cap')),
+                day_stop=bool(row.get('day_stop')),
+                target_count=row.get('target_count'),
+            )
 
     def _synchronize(self, state, frame, pending):
         seen = {fact['child_order_id'] for fact in frame['native'] if fact['kind'] == 'ORDER'}
@@ -2075,6 +2126,18 @@ class DsvSession:
             if added_contracts:
                 event_payload['added_contracts'] = added_contracts
             self._journal.event('DSV_PARAMETERS_SAVED', event_payload)
+            sink = getattr(self._diag(), 'evidence_sink', None)
+            if sink is not None and hasattr(sink, 'set_configuration_revision'):
+                sink.set_configuration_revision(next_revision)
+            self._diag().emit(
+                'CONFIG_SAVED',
+                level=logging.INFO,
+                component='CONFIG',
+                priority='HIGH',
+                log_to_logger=False,
+                configuration_revision=next_revision,
+                reason='DSV_PARAMETERS_SAVED',
+            )
             return [{'reason': 'DSV_PARAMETERS_SAVED', **event_payload, 'rule_ids': ['D14']}], []
         if action == 'REDUCE_DETACHED':
             row = state['symbols'].get(command['contract_id'])

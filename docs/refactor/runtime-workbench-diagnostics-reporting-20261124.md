@@ -774,3 +774,10 @@ src/online_trader/diagnostics/
 - 500 MiB 上限下以诊断包/进程目录为单位的旧优先淘汰是否符合实际使用；
 - 诊断协议升级时 Analyzer 的最低支持窗口；
 - Windows 冻结制品中 detached Reporter 与更新切换的进程关系。
+
+### 2026-11-25 Issue #26 复审与证据补齐记录
+
+- **统一错误码与脱敏（D01/D04）**：新增 [catalog.py](../../src/online_trader/diagnostics/catalog.py)，区分 `E_*` 内部异常码、`reason_code` 与 `OT-*` 用户诊断码，并由 [contract.py](../../src/online_trader/diagnostics/contract.py) 兼容校验；[redaction.py](../../src/online_trader/diagnostics/redaction.py) 提供字段级敏感键剔除与凭据/路径/账号文本脱敏，`desktop/runtime_client/diagnostics.py` 复用公共目录。
+- **热路径隔离与关键事件保护（D02/D06/D09/D10）**：[sink.py](../../src/online_trader/diagnostics/sink.py) 将 `canonical_bytes` 编码移至后台 writer 线程，通过单队列尾部高优保留槽位保护 `HIGH`/`CRITICAL` 证据同时保持严格 `event_seq` 单调，并区分显式 `None` 上下文与默认回退、支持 `set_configuration_revision` 与 `metadata.json` 版本归属；[reporter.py](../../src/online_trader/diagnostics/reporter.py) 保护策略/执行/配置/连接/历史关键 `INFO` 事件、采集脱敏启动失败与 bootstrap  stderr 摘要，并在超额时清理超过 24 小时且非活跃的残留崩溃目录。
+- **交易行为证据与最小 Analyzer（D03/D07/D08/D11）**：`runner.py` 去重记录 `STRATEGY_DECISION_CHANGED` 与 `CONFIG_SAVED`；`controller.py` 与 `sdk_adapter.py` 记录 `ORDER_PREPARED`、`ORDER_CANCEL_REQUESTED`、`SDK_SEND_DISPATCHED`、`ORDER_NATIVE_UPDATE`、`TRADE_FILL`；`tools/diagnostics` 的 `validate_bundle.py`、`check_market.py` 与 `analyze.py` 统一校验 ZIP 边界，按 `(observed_at_utc_dt, stream_id, int(event_seq))` 排序并输出 `C01–C08` 行为核对（JSON/Markdown），禁止在缺失证据或部分包情况下误判 `OBSERVED_OK`。
+- **验证状态**：仅完成全仓 Python 编译检查；新增/修改路径的功能单元测试、A/B 性能测量、在线柜台与 Windows 冻结制品验收仍为 `NOT_RUN`。

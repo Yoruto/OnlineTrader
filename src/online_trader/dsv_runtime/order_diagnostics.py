@@ -60,12 +60,14 @@ class OrderDiagnosticTracker:
         self.boot_id = boot_id
         self.evidence_sink = evidence_sink
         self._active_blocks = {}
+        self._transitions = {}
 
     def bind_evidence_sink(self, sink):
         self.evidence_sink = sink
         return self
 
-    def emit(self, event_type, *, level=logging.WARNING, **fields):
+    def emit(self, event_type, *, level=logging.WARNING, component='ORDER', priority=None,
+             log_to_logger=True, **fields):
         payload = _compact_fields(
             at=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
             event=event_type,
@@ -73,12 +75,17 @@ class OrderDiagnosticTracker:
             runtime_boot_id=self.boot_id,
             **fields,
         )
-        _LOGGER.log(level, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        if log_to_logger:
+            _LOGGER.log(level, json.dumps(payload, ensure_ascii=False, sort_keys=True))
         if self.evidence_sink is not None:
             try:
                 correlation = {
                     key: str(fields[key])
-                    for key in ('position_id', 'child_order_id', 'effect_id')
+                    for key in (
+                        'position_id', 'child_order_id', 'effect_id',
+                        'contract_id', 'candle_id', 'native_order_id', 'native_trade_id',
+                        'command_id',
+                    )
                     if fields.get(key) is not None
                 }
                 safe = {
@@ -86,20 +93,33 @@ class OrderDiagnosticTracker:
                     for key in (
                         'contract_id', 'effect', 'reason', 'previous_reason',
                         'stage', 'category', 'broker_state', 'native_offset',
-                        'sequence', 'attempt', 'entry_stopped',
+                        'sequence', 'attempt', 'entry_stopped', 'direction',
+                        'quantity', 'filled_qty', 'original_qty', 'limit_price',
+                        'cancel_reason', 'terminal_confirmed', 'owned_after',
+                        'price', 'theory', 'cap', 'last_price', 'day_high',
+                        'day_low', 'day_stop', 'target_count', 'candle_id',
+                        'long_trigger', 'short_trigger', 'open_offset',
+                        'stop_offset', 'profit_offset', 'configuration_revision',
+                        'entry_authority', 'runtime_mode', 'strategy_intent',
                     )
                     if fields.get(key) is not None
-                    and type(fields[key]) in {str, int, bool}
+                    and type(fields[key]) in {str, int, float, bool}
                 }
                 error_code = fields.get('error_code')
                 if not isinstance(error_code, str) or not error_code.startswith('E_'):
                     error_code = None
+                reason_code = fields.get('reason')
+                if not isinstance(reason_code, str) or not reason_code:
+                    reason_code = None
+                resolved_priority = priority or (
+                    'CRITICAL' if event_type in {'EFFECT_DISPATCH_UNKNOWN', 'SDK_SEND_UNCERTAIN_EXCEPTION'}
+                    else 'HIGH'
+                )
                 self.evidence_sink.record(
-                    event_type, component='ORDER', priority='CRITICAL'
-                    if event_type in {'EFFECT_DISPATCH_UNKNOWN', 'SDK_SEND_UNCERTAIN_EXCEPTION'}
-                    else 'HIGH',
+                    event_type, component=component, priority=resolved_priority,
                     severity='ERROR' if level >= logging.ERROR or error_code else
                     'WARNING' if level >= logging.WARNING else 'INFO',
+                    reason_code=reason_code,
                     error_code=error_code,
                     correlation=correlation,
                     payload=safe,
@@ -107,6 +127,13 @@ class OrderDiagnosticTracker:
             except Exception:
                 pass
         return payload
+
+    def emit_transition(self, key, signature, event_type, **kwargs):
+        """Emit an evidence event only when ``signature`` changes for ``key``."""
+        if self._transitions.get(key) == signature:
+            return None
+        self._transitions[key] = signature
+        return self.emit(event_type, log_to_logger=False, **kwargs)
 
     def observe_block(self, key, *, active, contract_id=None, effect=None,
                       reason=None, detail=None, position_id=None, child_order_id=None,

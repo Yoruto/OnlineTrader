@@ -27,6 +27,7 @@ from online_trader.diagnostics.backend import (
     load_upload_config,
 )
 from online_trader.diagnostics.contract import utc_now
+from online_trader.diagnostics.redaction import redact_text
 
 
 REQUEST_SCHEMA = "ONLINE_TRADER_DIAGNOSTIC_REPORT_REQUEST/2"
@@ -43,7 +44,10 @@ _KEY_EVENT_RESERVE = 1 * 1024 * 1024
 _MAX_KEY_SCAN = 64 * 1024 * 1024
 _MAX_WORKBENCH_SCAN = 64 * 1024 * 1024
 _MAX_WORKBENCH_SCAN_SECONDS = 3.0
-_KEY_COMPONENTS = frozenset({"LIFECYCLE", "OWNER", "STORAGE", "ORDER", "COMMAND"})
+_KEY_COMPONENTS = frozenset({
+    "LIFECYCLE", "OWNER", "STORAGE", "ORDER", "COMMAND",
+    "STRATEGY", "EXECUTION", "POSITION", "CONFIG", "CONNECTION", "HISTORY",
+})
 _KEY_SEVERITIES = frozenset({"ERROR", "CRITICAL"})
 _KEY_EVENT_TYPES = frozenset({
     "MARKET_ANOMALY",
@@ -54,9 +58,17 @@ _KEY_EVENT_TYPES = frozenset({
     "STARTUP_TARGET_INFERENCE",
     "CONVERGENCE_ACTION",
     "CONVERGENCE_DEFERRED",
+    "STRATEGY_DECISION_CHANGED",
+    "ORDER_PREPARED",
+    "ORDER_CANCEL_REQUESTED",
+    "SDK_SEND_DISPATCHED",
+    "ORDER_NATIVE_UPDATE",
+    "TRADE_FILL",
+    "CONFIG_SAVED",
 })
 _KEY_LINE_TOKENS = (
     b'"LIFECYCLE"', b'"OWNER"', b'"STORAGE"', b'"ORDER"', b'"COMMAND"',
+    b'"STRATEGY"', b'"EXECUTION"', b'"POSITION"', b'"CONFIG"', b'"CONNECTION"', b'"HISTORY"',
     b'"ERROR"', b'"CRITICAL"',
     b'"MARKET_ANOMALY"',
     b'"WORKBENCH_CONNECTION_CHANGED"',
@@ -66,8 +78,18 @@ _KEY_LINE_TOKENS = (
     b'"STARTUP_TARGET_INFERENCE"',
     b'"CONVERGENCE_ACTION"',
     b'"CONVERGENCE_DEFERRED"',
+    b'"STRATEGY_DECISION_CHANGED"',
+    b'"ORDER_PREPARED"',
+    b'"ORDER_CANCEL_REQUESTED"',
+    b'"SDK_SEND_DISPATCHED"',
+    b'"ORDER_NATIVE_UPDATE"',
+    b'"TRADE_FILL"',
+    b'"CONFIG_SAVED"',
 )
 _MAX_LOCAL_BYTES = 500 * 1024 * 1024
+_STALE_CRASH_AGE_NS = 24 * 3600 * 1_000_000_000
+_MAX_BOOTSTRAP_FILE_BYTES = 32 * 1024
+_MAX_BOOTSTRAP_LINES = 200
 _CONTEXT_EVENTS = frozenset({
     "WORKBENCH_STARTED", "WORKBENCH_STOPPED", "WORKBENCH_CONNECTION_CHANGED",
     "QT_UNHANDLED_EXCEPTION",
@@ -531,6 +553,7 @@ def _collect_event_stream(staging, group, root, target_boot, budget, files, omis
         "stream_id": (metadata or {}).get("stream_id"),
         "process_role": (metadata or {}).get("process_role"),
         "process_instance_id": (metadata or {}).get("process_instance_id", root.name),
+        "application_version": (metadata or {}).get("application_version"),
         "runtime_boot_id": target_boot,
         "created_at_utc": (metadata or {}).get("created_at_utc"),
         "first_event_at_utc": min(observed, key=_utc_key, default=None),
@@ -605,6 +628,64 @@ def _collect_view_log(staging, runtime_root, request, coverage_start, files, omi
     return rows, workbench_expected
 
 
+def _collect_bootstrap_context(staging, runtime_root, request, files):
+    """Stage bounded, redacted early startup and failure context when available."""
+    rows = []
+    target_boot = request.get("runtime_boot_id")
+    starts = runtime_root / "desktop-starts"
+    if starts.is_dir():
+        candidates = sorted(
+            starts.glob("*/run/startup-failure.json"),
+            key=lambda p: p.stat().st_mtime_ns if p.exists() else 0,
+            reverse=True,
+        )[:4]
+        for path in candidates:
+            record = _json_snapshot(path)
+            if record is None:
+                continue
+            boot = record.get("kernel_boot_id") or record.get("runtime_boot_id")
+            if target_boot and boot and boot != target_boot:
+                continue
+            rows.append({
+                "schema_version": "ONLINE_TRADER_BOOTSTRAP_CONTEXT/1",
+                "source": "startup-failure",
+                "observed_at_utc": record.get("observed_at_utc"),
+                "runtime_boot_id": boot,
+                "error_code": record.get("error_code"),
+                "message": redact_text(record.get("message") or ""),
+            })
+    bootstrap_logs = runtime_root / "logs" / "desktop-bootstrap"
+    if bootstrap_logs.is_dir():
+        stderr_logs = sorted(
+            bootstrap_logs.glob("*.stderr.log"),
+            key=lambda p: p.stat().st_mtime_ns if p.exists() else 0,
+            reverse=True,
+        )[:2]
+        for path in stderr_logs:
+            try:
+                raw, _, _, _ = _line_snapshot(path, limit=_MAX_BOOTSTRAP_FILE_BYTES, from_end=True)
+            except OSError:
+                continue
+            lines = [
+                redact_text(line)
+                for line in raw.decode("utf-8", errors="replace").splitlines()
+                if line.strip()
+            ][-_MAX_BOOTSTRAP_LINES:]
+            if lines:
+                rows.append({
+                    "schema_version": "ONLINE_TRADER_BOOTSTRAP_CONTEXT/1",
+                    "source": f"desktop-bootstrap/{path.name}",
+                    "lines": lines,
+                })
+    if rows:
+        _stage(
+            staging,
+            "bootstrap/startup-context.jsonl",
+            b"".join(canonical_bytes(row) + b"\n" for row in rows),
+            files,
+        )
+
+
 def _collect_sources(staging: Path, runtime_root: Path, request: dict):
     diagnostics = runtime_root / "diagnostics"
     files = []
@@ -675,6 +756,7 @@ def _collect_sources(staging: Path, runtime_root: Path, request: dict):
     view_rows, workbench_expected = _collect_view_log(
         staging, runtime_root, request, coverage_start, files, omissions,
     )
+    _collect_bootstrap_context(staging, runtime_root, request, files)
     files.extend(wb_files)
     streams.extend(wb_streams)
     omissions.extend(wb_omissions)
@@ -784,23 +866,45 @@ def _finalized_directory(path: Path) -> bool:
     return bool(health and not health.get("active") and health.get("finalized_at_utc"))
 
 
-def _retention_units(diagnostics: Path, keep: Path):
+def _stale_crash_directory(path: Path, *, now_ns: int, active_ids: set[str]) -> bool:
+    if path.name in active_ids or _finalized_directory(path):
+        return False
+    try:
+        latest_mtime = path.stat().st_mtime_ns
+        for child in path.iterdir():
+            try:
+                latest_mtime = max(latest_mtime, child.stat().st_mtime_ns)
+            except OSError:
+                continue
+        return now_ns - latest_mtime >= _STALE_CRASH_AGE_NS
+    except OSError:
+        return False
+
+
+def _retention_units(diagnostics: Path, keep: Path, *, active_ids: set[str] | None = None):
     units = []
+    now_ns = time.time_ns()
+    protected = active_ids or set()
     bundles = diagnostics / "bundles"
     if bundles.is_dir():
         units.extend(path for path in bundles.glob("*.zip") if path.resolve() != keep.resolve())
     for group in ("runtime", "runtime-view", "workbench"):
         root = diagnostics / group
         if root.is_dir():
-            units.extend(path for path in root.iterdir()
-                         if path.is_dir() and _finalized_directory(path))
+            units.extend(
+                path for path in root.iterdir()
+                if path.is_dir() and (
+                    _finalized_directory(path)
+                    or _stale_crash_directory(path, now_ns=now_ns, active_ids=protected)
+                )
+            )
     return sorted(units, key=lambda path: path.stat().st_mtime_ns)
 
 
-def enforce_retention(diagnostics: Path, *, keep: Path):
+def enforce_retention(diagnostics: Path, *, keep: Path, active_ids: set[str] | None = None):
     try:
         total = sum(path.stat().st_size for path in diagnostics.rglob("*") if path.is_file())
-        for unit in _retention_units(diagnostics, keep):
+        for unit in _retention_units(diagnostics, keep, active_ids=active_ids):
             if total <= _MAX_LOCAL_BYTES:
                 break
             size = (sum(path.stat().st_size for path in unit.rglob("*") if path.is_file())
@@ -875,7 +979,8 @@ def report(runtime_root, request_path) -> int:
             "upload": result.to_record(),
         }), claimed.with_suffix(".done.json"))
         claimed.unlink(missing_ok=True)
-        enforce_retention(diagnostics, keep=bundle)
+        active_ids = {str(request["runtime_process_instance_id"])} if request.get("runtime_process_instance_id") else set()
+        enforce_retention(diagnostics, keep=bundle, active_ids=active_ids)
         return 0 if result.status in {"UPLOADED", "LOCAL_ONLY"} else 2
     except Exception as error:
         _record_failure(diagnostics, report_id=request["report_id"], stage="COMPLETE", error=error)

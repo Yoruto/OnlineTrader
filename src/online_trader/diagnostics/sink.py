@@ -2,27 +2,45 @@
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import os
 from pathlib import Path
-from queue import Empty, Full, Queue
-from threading import Event, Lock, Thread
+from threading import Condition, Event, Lock, Thread
 import time
 
+from online_trader import __version__
 from online_trader.configuration.files import publish_replace_bytes
 from online_trader.contracts.codec import canonical_bytes
-from online_trader.diagnostics.contract import diagnostic_event, utc_now
+from online_trader.diagnostics.contract import encode_diagnostic_event, utc_now, validate_event_header
 
 
 _DEFAULT_QUEUE = 2048
 _DEFAULT_SEGMENT_BYTES = 2 * 1024 * 1024
 _DEFAULT_STREAM_BYTES = 64 * 1024 * 1024
+_UNSET = object()
+_HIGH_PRIORITIES = frozenset({"HIGH", "CRITICAL"})
+
+
+def _freeze_mapping(mapping):
+    if not mapping:
+        return None
+    frozen = {}
+    for key, value in mapping.items():
+        if isinstance(value, (list, tuple)):
+            frozen[key] = tuple(value[:16])
+        else:
+            frozen[key] = value
+    return frozen
 
 
 class NullDiagnosticSink:
     """No-op fallback used whenever diagnostics cannot initialize."""
 
     process_instance_id = None
+
+    def set_configuration_revision(self, revision):
+        return None
 
     def record(self, *_, **__):
         return False
@@ -76,9 +94,12 @@ class DiagnosticSink:
         self.configuration_revision = configuration_revision
         self.stream_id = f"{stream_group}:{process_instance_id}:events"
         self.directory = self.root / stream_group / process_instance_id
-        self._queue: Queue = Queue(maxsize=max_queue)
+        self._max_queue = max_queue
+        self._reserved_priority = max(4, min(max_queue // 4, 256))
+        self._queue: deque = deque()
         self._closing = Event()
         self._lock = Lock()
+        self._condition = Condition(self._lock)
         self._sequence = 0
         self._segment_bytes = segment_bytes
         self._max_stream_bytes = max_stream_bytes
@@ -103,6 +124,7 @@ class DiagnosticSink:
         publish_replace_bytes(canonical_bytes({
             "schema_version": "ONLINE_TRADER_DIAGNOSTIC_STREAM/1",
             "diagnostic_protocol": "1",
+            "application_version": __version__,
             "stream_id": self.stream_id,
             "process_role": self.process_role,
             "process_instance_id": self.process_instance_id,
@@ -118,6 +140,10 @@ class DiagnosticSink:
         )
         self._writer.start()
 
+    def set_configuration_revision(self, revision: str | None):
+        with self._lock:
+            self.configuration_revision = revision
+
     def record(
         self,
         event_type,
@@ -129,9 +155,9 @@ class DiagnosticSink:
         error_code=None,
         correlation=None,
         payload=None,
-        runtime_boot_id=None,
-        account_pseudonym=None,
-        configuration_revision=None,
+        runtime_boot_id=_UNSET,
+        account_pseudonym=_UNSET,
+        configuration_revision=_UNSET,
     ):
         if self._closing.is_set():
             return False
@@ -139,17 +165,8 @@ class DiagnosticSink:
         if priority not in {"LOW", "NORMAL", "HIGH", "CRITICAL"}:
             priority = "NORMAL"
         try:
-            with self._lock:
-                self._sequence += 1
-                sequence = self._sequence
-            record = diagnostic_event(
-                stream_id=self.stream_id,
-                event_seq=sequence,
+            role, component_name, event_name, severity_name = validate_event_header(
                 process_role=self.process_role,
-                process_instance_id=self.process_instance_id,
-                runtime_boot_id=runtime_boot_id or self.runtime_boot_id,
-                account_pseudonym=account_pseudonym or self.account_pseudonym,
-                configuration_revision=configuration_revision or self.configuration_revision,
                 component=component,
                 event_type=event_type,
                 severity=severity,
@@ -158,18 +175,59 @@ class DiagnosticSink:
                 correlation=correlation,
                 payload=payload,
             )
-            line = canonical_bytes(record) + b"\n"
+            frozen_correlation = _freeze_mapping(correlation)
+            frozen_payload = _freeze_mapping(payload)
+            observed = utc_now()
+            mono_ns = str(time.monotonic_ns())
         except Exception:
-            self._health["write_failures"] += 1
+            with self._lock:
+                self._health["write_failures"] += 1
             return False
-        try:
-            self._queue.put_nowait((sequence, line))
+        with self._condition:
+            if self._closing.is_set():
+                return False
+            self._sequence += 1
+            sequence = self._sequence
+            limit = (
+                self._max_queue
+                if priority in _HIGH_PRIORITIES
+                else self._max_queue - self._reserved_priority
+            )
+            if len(self._queue) >= limit:
+                dropped = self._health["dropped_by_priority"]
+                dropped[priority] = dropped.get(priority, 0) + 1
+                return False
+            boot = self.runtime_boot_id if runtime_boot_id is _UNSET else runtime_boot_id
+            acct = self.account_pseudonym if account_pseudonym is _UNSET else account_pseudonym
+            cfg_rev = (
+                self.configuration_revision
+                if configuration_revision is _UNSET
+                else configuration_revision
+            )
+            self._queue.append((
+                sequence,
+                {
+                    "stream_id": self.stream_id,
+                    "event_seq": sequence,
+                    "process_role": role,
+                    "process_instance_id": self.process_instance_id,
+                    "runtime_boot_id": boot,
+                    "account_pseudonym": acct,
+                    "configuration_revision": cfg_rev,
+                    "component": component_name,
+                    "event_type": event_name,
+                    "severity": severity_name,
+                    "reason_code": reason_code,
+                    "error_code": error_code,
+                    "observed_at_utc": observed,
+                    "monotonic_ns": mono_ns,
+                    "correlation": frozen_correlation,
+                    "payload": frozen_payload,
+                },
+            ))
             self._health["enqueued"] += 1
+            self._condition.notify()
             return True
-        except Full:
-            dropped = self._health["dropped_by_priority"]
-            dropped[priority] = dropped.get(priority, 0) + 1
-            return False
 
     def _open_segment(self):
         self._segment_number += 1
@@ -261,12 +319,15 @@ class DiagnosticSink:
         return status
 
     def _write_loop(self):
-        while not self._closing.is_set() or not self._queue.empty():
+        while True:
+            with self._condition:
+                while not self._queue and not self._closing.is_set():
+                    self._condition.wait(timeout=0.1)
+                if not self._queue and self._closing.is_set():
+                    break
+                sequence, kwargs = self._queue.popleft()
             try:
-                sequence, line = self._queue.get(timeout=0.1)
-            except Empty:
-                continue
-            try:
+                line = encode_diagnostic_event(**kwargs)
                 if self._stream is None:
                     self._open_segment()
                 if self._stream_size and self._stream_size + len(line) > self._segment_bytes:
@@ -277,10 +338,12 @@ class DiagnosticSink:
                 self._stream_size += len(line)
                 self._stream_first_seq = sequence if self._stream_first_seq is None else self._stream_first_seq
                 self._stream_last_seq = sequence
-                self._health["persisted"] += 1
-                self._health["last_persisted_seq"] = str(sequence)
+                with self._lock:
+                    self._health["persisted"] += 1
+                    self._health["last_persisted_seq"] = str(sequence)
             except Exception:
-                self._health["write_failures"] += 1
+                with self._lock:
+                    self._health["write_failures"] += 1
         self._close_segment()
 
     def finalize(self, *, clean_shutdown=False, snapshot_available=False, timeout=1.0):
@@ -294,21 +357,26 @@ class DiagnosticSink:
                     "snapshot_available": bool(snapshot_available),
                 },
             )
-            self._closing.set()
+            with self._condition:
+                self._closing.set()
+                self._condition.notify_all()
             self._writer.join(timeout=max(0.0, float(timeout)))
             if self._writer.is_alive():
-                self._health["write_failures"] += 1
+                with self._lock:
+                    self._health["write_failures"] += 1
         writer_timeout = self._writer.is_alive()
         try:
-            status = self._publish_health(
-                active=writer_timeout,
-                clean_shutdown=clean_shutdown,
-                snapshot_available=snapshot_available,
-                writer_timeout=writer_timeout,
-            )
+            with self._lock:
+                status = self._publish_health(
+                    active=writer_timeout,
+                    clean_shutdown=clean_shutdown,
+                    snapshot_available=snapshot_available,
+                    writer_timeout=writer_timeout,
+                )
         except Exception:
-            status = dict(self._health)
-            status["write_failures"] += 1
+            with self._lock:
+                status = dict(self._health)
+                status["write_failures"] += 1
         return status
 
     close = finalize
