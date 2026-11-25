@@ -1,7 +1,7 @@
 {
   "source_specification": "OT-G0-1",
   "source_directory": "E:\\Futures Trading Assistant\\Futures Trading Assistant\\docs\\online_trader\\g0",
-  "repository_archive": "docs/history/g0",
+  "repository_archive": "docs/specs/g0",
   "copied_specification_resources": {
     "schema.sql": "6fab1ec7ae70e59a2e46174c91135ba5e21ed1bbe0a9f0418afee777436549d2",
     "schemas/ipc.schema.json": "def8789c02b5f55ec9207b223d18579861449293d5ff4fe5d41e6657da2feb62",

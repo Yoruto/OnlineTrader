@@ -5,7 +5,7 @@ description: Develop or review OnlineTrader DSV parity, Replacement Candidate, E
 
 # DSV Parity and Replacement Review
 
-Start with the repository `AGENTS.md`, the [canonical OnlineTrader guidance](../../../docs/skills/online-trader.md), the [current DSV index](../../../docs/refactor/dsv-parity-20261114/README.md), and the [strategy and SDK replay contract](../../../docs/refactor/dsv-parity-20261114/15-strategy-sdk-schedule.md). Read the [decision register](../../../docs/refactor/dsv-parity-20261114/00-evidence-and-decisions.md) when behavior may differ from frozen DSV.
+Start with the repository `AGENTS.md`, [strategy.md](../../../docs/strategy.md), and [dsv-confirmation-20261109.json](../../../docs/specs/dsv-confirmation-20261109.json). Read [testing.md](../../../docs/testing.md) when preparing isolated replay or parity verification.
 
 ## Current boundaries
 
