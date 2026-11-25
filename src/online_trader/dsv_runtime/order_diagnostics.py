@@ -137,7 +137,7 @@ class OrderDiagnosticTracker:
 
     def observe_block(self, key, *, active, contract_id=None, effect=None,
                       reason=None, detail=None, position_id=None, child_order_id=None,
-                      **extra):
+                      dedupe_signature=None, **extra):
         """Log state transitions into or out of a blocked order state without tick spam."""
         if not active:
             previous = self._active_blocks.pop(key, None)
@@ -147,16 +147,17 @@ class OrderDiagnosticTracker:
                     level=logging.INFO,
                     contract_id=contract_id,
                     effect=effect,
-                    previous_reason=previous[0],
-                    previous_detail=previous[1],
+                    previous_reason=previous[1],
+                    previous_detail=previous[2],
                     position_id=position_id,
                     child_order_id=child_order_id,
                 )
             return False
-        signature = (reason, detail)
-        if self._active_blocks.get(key) == signature:
+        signature = (reason, detail) if dedupe_signature is None else dedupe_signature
+        existing = self._active_blocks.get(key)
+        if existing is not None and existing[0] == signature:
             return False
-        self._active_blocks[key] = signature
+        self._active_blocks[key] = (signature, reason, detail)
         self.emit(
             'ORDER_BLOCKED',
             level=logging.WARNING,

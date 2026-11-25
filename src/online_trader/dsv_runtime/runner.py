@@ -838,10 +838,10 @@ class DsvSession:
             sync_isolated = bool((state.get('sync_pending_by_contract') or {}).get(contract))
             if sync_isolated:
                 self._diag().observe_block(
-                    ('session_gate', contract), active=True, contract_id=contract,
+                    ('sync_isolation_gate', contract), active=True, contract_id=contract,
                     reason='AWAITING_NATIVE_SYNC', detail='SYNCHRONIZE_PENDING_CHILDREN_MISSING')
             else:
-                self._diag().observe_block(('session_gate', contract), active=False, contract_id=contract)
+                self._diag().observe_block(('sync_isolation_gate', contract), active=False, contract_id=contract)
             symbol_frame = frame
             if frame.get('market_clock') and market['ticks']:
                 symbol_frame = frame | {'wall_time': market['ticks'][-1]['native_time']}
@@ -1599,14 +1599,14 @@ class DsvSession:
             if c_missing:
                 unknown_c = [child for child in c_missing if state['orders'][child]['send_state'] == 'UNKNOWN']
                 self._diag().observe_block(
-                    ('synchronize', contract),
+                    ('synchronize_orders', contract),
                     active=True,
                     contract_id=contract,
                     reason='SYNCHRONIZE_PENDING_CHILDREN_MISSING',
                     detail=f'missing={",".join(c_missing)};unknown={",".join(unknown_c)}',
                 )
             else:
-                self._diag().observe_block(('synchronize', contract), active=False, contract_id=contract)
+                self._diag().observe_block(('synchronize_orders', contract), active=False, contract_id=contract)
         if missing:
             unknown_missing = [child for child in missing if state['orders'][child]['send_state'] == 'UNKNOWN']
             self._diag().observe_block(
@@ -1632,16 +1632,18 @@ class DsvSession:
                     row.pop('ownership_conflict', None)
                 continue
             if position is not None and not self._controller.proves_position(state, position, market):
+                proof_reason = self._controller._position_proof_reason(state, position, market)
                 self._diag().observe_block(
-                    ('synchronize', market['contract_id']),
+                    ('synchronize_position', market['contract_id']),
                     active=True,
                     contract_id=market['contract_id'],
                     position_id=position['id'],
                     reason='SYNCHRONIZE_POSITION_MISMATCH',
-                    detail=self._controller._position_proof_reason(state, position, market),
+                    detail=proof_reason,
+                    dedupe_signature=('SYNCHRONIZE_POSITION_MISMATCH', (proof_reason or '').split('(', 1)[0]),
                 )
                 return
-            self._diag().observe_block(('synchronize', market['contract_id']), active=False,
+            self._diag().observe_block(('synchronize_position', market['contract_id']), active=False,
                                        contract_id=market['contract_id'])
         state['synchronized'] = True
 

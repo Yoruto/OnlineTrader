@@ -1212,7 +1212,9 @@ class ExplicitOrderController:
                 diag.observe_block(
                     block_key, active=needed > 0, contract_id=contract_id,
                     position_id=position['id'], effect=effect, reason='POSITION_CHANGED',
-                    detail=proof_reason, needed_qty=needed)
+                    detail=proof_reason,
+                    dedupe_signature=('POSITION_CHANGED', (proof_reason or '').split('(', 1)[0]),
+                    needed_qty=needed)
             elif desired is None:
                 position['execution_reason'] = 'NO_LEGAL_PRICE'
                 diag.observe_block(
@@ -1247,7 +1249,9 @@ class ExplicitOrderController:
                 diag.observe_block(
                     block_key, active=True, contract_id=contract_id,
                     position_id=position['id'], effect=effect, reason='QUANTITY_OUT_OF_RANGE',
-                    detail=f'needed={needed},min={minimum},max={maximum}', needed_qty=needed)
+                    detail=f'needed={needed},min={minimum},max={maximum}',
+                    dedupe_signature=('QUANTITY_OUT_OF_RANGE', minimum, maximum),
+                    needed_qty=needed)
                 continue
             # Reconciliation proves completion independently of the result of the cancel call.
             if previous and not outstanding and previous[-1]['filled_qty'] < previous[-1]['original_qty']:
@@ -1284,7 +1288,9 @@ class ExplicitOrderController:
                             block_key, active=True, contract_id=contract_id,
                             position_id=position['id'], child_order_id=old['child_order_id'],
                             effect=effect, reason='E_ENTRY_PRICE_CAP',
-                            detail=f'proposed={desired},cap={position["cap"]}', needed_qty=needed)
+                            detail=f'proposed={desired},cap={position["cap"]}',
+                            dedupe_signature=('E_ENTRY_PRICE_CAP', str(position['cap'])),
+                            needed_qty=needed)
                         continue
             if opening:
                 diag.observe_block(block_key, active=False, contract_id=contract_id,
@@ -1308,6 +1314,7 @@ class ExplicitOrderController:
                         block_key, active=True, contract_id=contract_id,
                         position_id=position['id'], effect=effect,
                         reason='REDUCTION_ROUTE_UNAVAILABLE', detail=route_reason or 'EMPTY_CLOSE_ROUTES',
+                        dedupe_signature=('REDUCTION_ROUTE_UNAVAILABLE', (route_reason or 'EMPTY_CLOSE_ROUTES').split('(', 1)[0]),
                         needed_qty=needed)
         return effects
 

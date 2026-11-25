@@ -662,21 +662,31 @@ def populate(grid, rows):
     updates = grid.updatesEnabled()
     blocked = grid.blockSignals(True)
     grid.setUpdatesEnabled(False)
+    model = grid.model()
     try:
         if grid.rowCount() != len(rows):
             grid.setRowCount(len(rows))
-        for i, values in enumerate(rows):
-            for j, value in enumerate(values):
-                label = str(value)
-                item = grid.item(i, j)
-                if item is None:
-                    item = QTableWidgetItem(label)
-                    item.setTextAlignment(Qt.AlignCenter)
-                    grid.setItem(i, j, item)
-                elif item.text() != label:
-                    item.setText(label)
-                if item.toolTip() != label:
-                    item.setToolTip(label)
+        model_blocked = model.blockSignals(True) if model is not None else False
+        try:
+            for i, values in enumerate(rows):
+                for j, value in enumerate(values):
+                    label = str(value)
+                    item = grid.item(i, j)
+                    if item is None:
+                        item = QTableWidgetItem(label)
+                        item.setTextAlignment(Qt.AlignCenter)
+                        grid.setItem(i, j, item)
+                    elif item.text() != label:
+                        item.setText(label)
+                    if item.toolTip() != label:
+                        item.setToolTip(label)
+        finally:
+            if model is not None:
+                model.blockSignals(model_blocked)
+        header = grid.horizontalHeader()
+        for column in range(grid.columnCount()):
+            if header.sectionResizeMode(column) == QHeaderView.ResizeToContents:
+                grid.resizeColumnToContents(column)
     finally:
         grid.setUpdatesEnabled(updates)
         grid.blockSignals(blocked)
@@ -1620,8 +1630,9 @@ class WorkbenchLayout:
         self.dashboard_markets = table(('合约', '最新价', '当前关注', '持仓', '状态'))
         self.dashboard_markets.setObjectName('dashboardGrid')
         self.dashboard_markets.verticalHeader().setDefaultSectionSize(29)
-        for column in (0, 2):
-            self.dashboard_markets.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        for column, width in ((0, 128), (2, 160)):
+            self.dashboard_markets.horizontalHeader().setSectionResizeMode(column, QHeaderView.Interactive)
+            self.dashboard_markets.setColumnWidth(column, width)
         self.dashboard_markets.setItemDelegateForColumn(4, StatusBadge(self.dashboard_markets))
         self.dashboard_markets.setSelectionMode(QAbstractItemView.SingleSelection)
         self.dashboard_market_rows = {}
@@ -1701,8 +1712,9 @@ class WorkbenchLayout:
         self.home_positions = table(('合约', '方向', '手数', '浮动盈亏', '状态', '开仓均价', '最新价'))
         self.home_positions.setObjectName('dashboardGrid')
         self.home_positions.verticalHeader().setDefaultSectionSize(31)
-        for column in (0, 3, 4, 5, 6):
-            self.home_positions.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        for column, width in ((0, 120), (3, 100), (4, 110), (5, 92), (6, 92)):
+            self.home_positions.horizontalHeader().setSectionResizeMode(column, QHeaderView.Interactive)
+            self.home_positions.setColumnWidth(column, width)
         self.home_positions.setItemDelegateForColumn(4, StatusBadge(self.home_positions))
         self.home_positions.setSelectionMode(QAbstractItemView.SingleSelection)
         positions.addWidget(self.home_positions, 1)
@@ -1814,12 +1826,18 @@ class WorkbenchLayout:
         current = grid.item(grid.currentRow(), 0)
         selected = current.data(Qt.UserRole) if current is not None else None
         blocked = grid.blockSignals(True)
+        model = grid.model()
         try:
             populate(grid, rows)
-            for index, key in enumerate(keys):
-                item = grid.item(index, 0)
-                if item.data(Qt.UserRole) != key:
-                    item.setData(Qt.UserRole, key)
+            model_blocked = model.blockSignals(True) if model is not None else False
+            try:
+                for index, key in enumerate(keys):
+                    item = grid.item(index, 0)
+                    if item.data(Qt.UserRole) != key:
+                        item.setData(Qt.UserRole, key)
+            finally:
+                if model is not None:
+                    model.blockSignals(model_blocked)
             if keys:
                 row = keys.index(selected) if selected in keys else 0
                 if grid.currentRow() != row or grid.currentColumn() != 0:
@@ -4003,8 +4021,9 @@ class WorkbenchLayout:
         self.log_records = table(('时间', '级别', '合约', '事件'))
         self.log_records.setObjectName('dashboardGrid')
         self.log_records.setSelectionMode(QAbstractItemView.SingleSelection)
-        for column in (0, 1, 2):
-            self.log_records.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        for column, width in ((0, 76), (1, 56), (2, 118)):
+            self.log_records.horizontalHeader().setSectionResizeMode(column, QHeaderView.Interactive)
+            self.log_records.setColumnWidth(column, width)
         records.addWidget(self.log_records)
         detail = QWidget()
         detail_layout = QVBoxLayout(detail)
