@@ -177,7 +177,9 @@ def projection_batch(snapshot):
             'plan_id': position.get('target_id', position['id']),
             'plan_revision': str(position.get('target_revision', 1)),
             'protection_mode': 'PROTECTED' if position.get('protected') else 'NORMAL',
-            'protection_quality': 'CONTIGUOUS' if snapshot['synchronized'] else 'UNKNOWN',
+            'protection_quality': 'CONTIGUOUS' if (
+                snapshot['synchronized'] and not row.get('sync_pending_children')
+            ) else 'UNKNOWN',
             'protection_persistence': 'DURABLE', 'takeover_state': None,
         })
     for child_id, order in snapshot['orders'].items():
@@ -449,7 +451,9 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
             'remaining_quantity': position['owned'],
             'target_remaining_quantity': position['exit_target'],
             'mode': 'PROTECTED' if position.get('protected') else 'NORMAL',
-            'quality': 'CONTIGUOUS' if snapshot['synchronized'] else 'UNKNOWN',
+            'quality': 'CONTIGUOUS' if (
+                snapshot['synchronized'] and not row.get('sync_pending_children')
+            ) else 'UNKNOWN',
             'exit_pending': exit_pending,
             'entry_price': entry_price,
             'stop_price': stop_price, 'take_profit_price': take_profit_price,
@@ -588,7 +592,7 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
                       owner_fault if owner_fault else 'RUNTIME_NOT_READY')
         elif operation == 'FLATTEN_THEN_STOP':
             flat_and_clean = not cycles and not orders and not any(
-                row.get('native_conflicts') or row.get('detached_positions')
+                row.get('native_conflicts') or row.get('detached_positions') or row.get('sync_pending_children')
                 for row in snapshot['symbols'].values()
             )
             allowed = synchronized or flat_and_clean
@@ -636,8 +640,9 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
     }
     config['config_snapshot_hash'] = content_hash(config_snapshot)
     owner_fault_detail = snapshot.get('owner_fault_detail')
+    has_sync_isolation = any(row.get('sync_pending_children') for row in snapshot['symbols'].values())
     blocks = []
-    if not synchronized:
+    if not synchronized or has_sync_isolation:
         blocks.append({'reason_code': 'BROKER_FACTS_INCOMPLETE', 'active': True})
     if clock_fault:
         blocks.append({'reason_code': 'CLOCK_FAULT', 'active': True})
@@ -656,7 +661,7 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         'execution_scope': 'ONLINE_SIMULATION', 'configuration': config,
         'connection': {'broker_connected': connected, 'synchronized': synchronized,
                        'fault': False,
-                       'recovery_required': not synchronized or bool(owner_fault),
+                       'recovery_required': not synchronized or has_sync_isolation or bool(owner_fault),
                        'owner_fault_code': owner_fault,
                        'owner_fault_detail': owner_fault_detail,
                        'storage_failed': storage_failed,

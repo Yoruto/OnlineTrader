@@ -989,7 +989,7 @@ class ExplicitOrderController:
         reducing = self.target_accounting(state, position, 'REDUCE')
         uncertain = opening.uncertain_children + reducing.uncertain_children
         cancelling = opening.cancel_pending_children + reducing.cancel_pending_children
-        if row.get('native_conflicts') or row.get('detached_positions'):
+        if row.get('native_conflicts') or row.get('detached_positions') or row.get('sync_pending_children'):
             status, reason = 'BLOCKED', 'BROKER_FACTS_INCOMPLETE'
         elif uncertain:
             status, reason = 'RECONCILING', 'SEND_RESULT_UNKNOWN'
@@ -1069,17 +1069,21 @@ class ExplicitOrderController:
                 )
                 continue
             reason = order.get('cancel_reason') or 'CANCEL_TIMEOUT_RETRY'
+            prior_status = order['cancel_status']
+            order['prior_cancel_status'] = prior_status
             order['cancel_status'] = None
             request = self.cancel(order, reason, wall_time=now)
             if request is not None:
                 effects.append(request)
             else:
-                order['cancel_status'] = 'CALL_RETURNED'
+                order.pop('prior_cancel_status', None)
+                order['cancel_status'] = prior_status
         return effects
 
     def plan_maintenance(self, state, row, market, *, wall_time=None):
         """Cancel provably owned residual orders using identity and quantity alone."""
-        allow_cancel = market.get('allow_cancel', True)
+        allow_cancel = market.get('allow_cancel', True) and (
+            market.get('market_permission') or {}).get('can_cancel', True)
         retry_effects = self._retry_stale_cancellations(
             state, market['contract_id'], allow_cancel=allow_cancel, wall_time=wall_time)
         position = row['position']
@@ -1666,11 +1670,17 @@ class ExplicitOrderController:
                 'pending_close_long': pending_summary['close_long'],
                 'pending_close_short': pending_summary['close_short'],
             }
-            if market.get('position_known') is False:
+            if market.get('position_known') is False or (
+                    is_configured and state['symbols'][cid].get('sync_pending_children')):
+                defer_reason = (
+                    'SYNCHRONIZE_PENDING_CHILDREN_MISSING'
+                    if (is_configured and state['symbols'][cid].get('sync_pending_children'))
+                    else 'POSITION_FACTS_UNAVAILABLE'
+                )
                 statuses[cid] = {
                     'configured': is_configured,
                     'status': 'DEFERRED_FACTS_INCOMPLETE',
-                    'wait_reason': 'POSITION_FACTS_UNAVAILABLE',
+                    'wait_reason': defer_reason,
                     'failure_count': 0,
                     **qty_meta,
                     **perm_meta,
@@ -1678,7 +1688,7 @@ class ExplicitOrderController:
                 events.append({
                     'event': 'CONVERGENCE_DEFERRED',
                     'contract_id': cid,
-                    'reason': 'POSITION_FACTS_UNAVAILABLE',
+                    'reason': defer_reason,
                 })
                 continue
 
@@ -2178,14 +2188,16 @@ class ExplicitOrderController:
                     )
             else:
                 if result == 'DEFINITELY_NOT_SENT':
-                    order['cancel_status'] = None
+                    prior_cancel = order.pop('prior_cancel_status', None)
+                    order['cancel_status'] = prior_cancel
                     order['local_cancel_rejection'] = {'effect_id': effect['id'], **details}
                     if details.get('error_code') == 'E_DSV_MARKET_PHASE':
-                        if not is_ext_cancel:
+                        if not is_ext_cancel and prior_cancel is None:
                             order['cancel_attempt'] = max(0, int(order.get('cancel_attempt') or 1) - 1)
                     elif is_ext_cancel:
                         order['cancel_failure_count'] = int(order.get('cancel_failure_count') or 0) + 1
                 else:
+                    order.pop('prior_cancel_status', None)
                     order['cancel_status'] = result
                 if is_ext_cancel and effect['kind'] == 'CANCEL':
                     order['native_order_id'] = effect['native_order_id']

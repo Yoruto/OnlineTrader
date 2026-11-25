@@ -763,7 +763,16 @@ class DsvSession:
             if self._sdk_port is not None:
                 state['running'] = False
         needs_sync = not state['synchronized']
-        pending = {child for child, order in state['orders'].items() if not terminal(order)} if needs_sync else set()
+        has_sync_isolation = any(row.get('sync_pending_children') for row in state['symbols'].values())
+        pending = (
+            {child for child, order in state['orders'].items() if not terminal(order)}
+            if needs_sync else {
+                child
+                for row in state['symbols'].values()
+                for child in (row.get('sync_pending_children') or ())
+                if child in state['orders'] and not terminal(state['orders'][child])
+            }
+        )
         self._controller.accept_native(state, frame['native'])
         if frame.get('absent_orders'):
             native_seen = {fact['child_order_id'] for fact in frame['native']}
@@ -773,7 +782,7 @@ class DsvSession:
                 self._controller.confirm_absent(state, child_id, frame=frame)
         if frame.get('synchronized') is False:
             self._mark_unsynchronized(state)
-        if needs_sync and frame.get('synchronized') is True:
+        if (needs_sync or has_sync_isolation) and frame.get('synchronized') is True:
             self._synchronize(state, frame, pending)
         if getattr(self, '_standalone_convergence', False) and state['synchronized']:
             if not state.get('startup_inferred'):
@@ -818,14 +827,18 @@ class DsvSession:
                 row['quote_observation'] = market.get('quote_observation')
                 row['calendar_reason'] = market.get('calendar_reason')
                 row['market_session_active'] = market.get('market_session_active')
-            if not state['synchronized'] or row.get('sync_pending_children'):
-                detail = 'SYNCHRONIZE_PENDING_CHILDREN_MISSING' if row.get('sync_pending_children') else 'NOT_SYNCHRONIZED'
+            if not state['synchronized']:
                 self._diag().observe_block(
                     ('session_gate', contract), active=True, contract_id=contract,
-                    reason='AWAITING_NATIVE_SYNC', detail=detail)
+                    reason='AWAITING_NATIVE_SYNC', detail='NOT_SYNCHRONIZED')
                 decisions.append({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:0",
                                   'reason': 'AWAITING_NATIVE_SYNC', 'rule_ids': ['I01', 'I02']})
                 continue
+            sync_isolated = bool(row.get('sync_pending_children'))
+            if sync_isolated:
+                self._diag().observe_block(
+                    ('session_gate', contract), active=True, contract_id=contract,
+                    reason='AWAITING_NATIVE_SYNC', detail='SYNCHRONIZE_PENDING_CHILDREN_MISSING')
             symbol_frame = frame
             if frame.get('market_clock') and market['ticks']:
                 symbol_frame = frame | {'wall_time': market['ticks'][-1]['native_time']}
@@ -893,6 +906,10 @@ class DsvSession:
             decisions.extend({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:{i}",
                               **value} for i, value in enumerate(values))
             if timing or frozen_plan_b:
+                continue
+            if sync_isolated:
+                decisions.append({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:sync_isolated",
+                                  'reason': 'AWAITING_NATIVE_SYNC', 'rule_ids': ['I01', 'I02']})
                 continue
             if self._in_session(symbol_frame, observed) and perm['continuous_matching']:
                 self._diag().observe_block(('exit_session_gate', contract), active=False, contract_id=contract)
@@ -2242,7 +2259,7 @@ class DsvSession:
                                   'remaining': 0, 'rule_ids': ['I01', 'I02']})
             return decisions, effects
         if action == 'RECONCILE':
-            if not state['synchronized']:
+            if not state['synchronized'] or any(row.get('sync_pending_children') for row in state['symbols'].values()):
                 raise TraderError('E_DSV_SYNC', 'Broker reconciliation is still waiting for a complete native frame')
             if any(row.get('ownership_conflict') or row.get('native_conflicts') or row.get('detached_positions')
                    for row in state['symbols'].values()):

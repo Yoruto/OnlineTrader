@@ -11,9 +11,10 @@ import unittest
 
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.dsv import DsvProfile
-from online_trader.dsv_runtime.controller import ExplicitOrderController, terminal
+from online_trader.dsv_runtime.controller import CancelNotAttempted, ExplicitOrderController, terminal
 from online_trader.dsv_runtime.runner import DsvSession
 from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter
+from online_trader.errors import TraderError
 from online_trader.online_scope import DsvSimulationGrant
 from online_trader.runtime.instance import AccountLock
 from qa.target_owner.fake_broker import FakeBroker
@@ -391,6 +392,163 @@ class UnfilledOrderStallTests(unittest.TestCase):
         controller.dispatch(state, [cancel_effect])
         elapsed_ms = (time.monotonic_ns() - t0) / 1_000_000
         self.assertGreaterEqual(elapsed_ms, 200.0)
+
+    def test_7_isolated_contract_recovers_automatically_and_retains_stop_loss_protection(self):
+        broker, port, session = self._make_session('auto-recover', contracts=('DCE.p2701', 'DCE.m2701'))
+        session.command({'id': 'cmd-start', 'action': 'START'})
+
+        f1 = broker.prepare_frame(wall_time=f'{DAY}T01:10:00Z', monotonic_ms=1000, last='1055', candle_id='bar-1')
+        session.apply_round(f1)
+        broker.acknowledge_frame(f1['id'])
+
+        f2 = broker.prepare_frame(wall_time=f'{DAY}T01:10:05Z', monotonic_ms=6000, last='1061', candle_id='bar-1')
+        _set_contract_prices(f2, {'DCE.m2701': '1055'})
+        session.apply_round(f2)
+        broker.acknowledge_frame(f2['id'])
+
+        p_child = port.orders[0]['child_order_id']
+        broker.accept_order(p_child)
+        broker.fill(p_child, 2, '1061')  # 2 of 5 filled, 3 remain ALIVE
+
+        f3 = broker.prepare_frame(wall_time=f'{DAY}T01:10:06Z', monotonic_ms=7000, last='1061', candle_id='bar-1')
+        _set_contract_prices(f3, {'DCE.m2701': '1055'})
+        session.apply_round(f3)
+        broker.acknowledge_frame(f3['id'])
+        self.assertEqual(session.snapshot()['symbols']['DCE.p2701']['position']['owned'], 2)
+
+        # Disconnect and resync while p_child is missing -> DCE.p2701 isolated, account synchronized.
+        session.disconnect(reason='SIMULATED_DISCONNECT')
+        f4 = broker.prepare_frame(wall_time=f'{DAY}T01:10:08Z', monotonic_ms=9000, last='1051', candle_id='bar-1')
+        f4['sync_orders'] = []
+        f4['native'] = []
+        orders_before = len(port.orders)
+        session.apply_round(f4)
+        broker.acknowledge_frame(f4['id'])
+
+        snap4 = session.snapshot()
+        self.assertTrue(snap4['synchronized'])
+        self.assertEqual(snap4['symbols']['DCE.p2701'].get('sync_pending_children'), [p_child])
+        # Stop-loss target (exit_target=0) WAS calculated even while isolated, without unsafe dispatch!
+        self.assertEqual(snap4['symbols']['DCE.p2701']['position']['exit_target'], 0)
+        self.assertEqual(len(port.orders), orders_before)
+
+        # Next frame: missing p_child reappears in sync_orders & native -> automatic recovery!
+        f5 = broker.prepare_frame(wall_time=f'{DAY}T01:10:10Z', monotonic_ms=11000, last='1051', candle_id='bar-1')
+        f5['native'].append({
+            'kind': 'ORDER',
+            'child_order_id': p_child,
+            'native_order_id': broker.orders[p_child]['native_order_id'],
+            'status': 'ALIVE',
+            'filled_qty': 2,
+        })
+        session.apply_round(f5)
+        broker.acknowledge_frame(f5['id'])
+
+        snap5 = session.snapshot()
+        self.assertIsNone(snap5['symbols']['DCE.p2701'].get('sync_pending_children'))
+        self.assertIn(p_child, {c['child_order_id'] for c in port.cancellations})
+        reduce_orders = [o for o in port.orders if o['contract_id'] == 'DCE.p2701' and o['native_offset'] != 'OPEN']
+        self.assertEqual(len(reduce_orders), 1)
+        self.assertEqual(reduce_orders[0]['quantity'], 2)
+
+    def test_8_sdk_adapter_reconcile_runs_when_isolated_and_runner_blocks_until_resolved(self):
+        broker, _port, session = self._make_session('adapter-reconcile', contracts=('DCE.p2701', 'DCE.m2701'))
+        session.command({'id': 'cmd-start', 'action': 'START'})
+
+        f1 = broker.prepare_frame(wall_time=f'{DAY}T01:10:00Z', monotonic_ms=1000, last='1055', candle_id='bar-1')
+        session.apply_round(f1)
+        broker.acknowledge_frame(f1['id'])
+
+        f2 = broker.prepare_frame(wall_time=f'{DAY}T01:10:05Z', monotonic_ms=6000, last='1061', candle_id='bar-1')
+        _set_contract_prices(f2, {'DCE.m2701': '1055'})
+        session.apply_round(f2)
+        broker.acknowledge_frame(f2['id'])
+        p_child = _port.orders[0]['child_order_id']
+        broker.accept_order(p_child)
+
+        session.disconnect(reason='SIMULATED_DISCONNECT')
+        f3 = broker.prepare_frame(wall_time=f'{DAY}T01:10:08Z', monotonic_ms=9000, last='1055', candle_id='bar-1')
+        f3['sync_orders'] = []
+        f3['native'] = []
+        session.apply_round(f3)
+        broker.acknowledge_frame(f3['id'])
+        self.assertTrue(session.snapshot()['synchronized'])
+
+        # Runner RECONCILE must refuse to report BROKER_FACTS_RECONCILED while DCE.p2701 is isolated.
+        with self.assertRaises(TraderError) as err:
+            session.command({'id': 'cmd-rec-1', 'action': 'RECONCILE'})
+        self.assertEqual(err.exception.code, 'E_DSV_SYNC')
+
+        # DsvSdkAdapter.command('RECONCILE') must still clear caches and invoke step() when isolated!
+        adapter = DsvSdkAdapter.__new__(DsvSdkAdapter)
+        adapter.account = 'fake-acct'
+        adapter.synchronized = True
+        adapter.connection = None
+        adapter._verified_order_facts = {'stale': 1}
+        adapter._verified_trade_facts = {'stale': 1}
+        adapter._native_fact_cache = {('ORDER', 'x', None): {}}
+        adapter._clock_resume_day = None
+        adapter._bind = lambda _s: session.snapshot()
+        adapter.prepare_added_contracts = lambda *_a, **_kw: None
+        step_calls = []
+        adapter.step = lambda _s, **_kw: step_calls.append(_kw)
+
+        with self.assertRaises(TraderError) as adapter_err:
+            adapter.command(session, {'id': 'cmd-rec-2', 'action': 'RECONCILE'})
+        self.assertEqual(adapter_err.exception.code, 'E_DSV_SYNC')
+        self.assertEqual(len(step_calls), 1)
+        self.assertEqual(adapter._verified_order_facts, {})
+        self.assertEqual(adapter._native_fact_cache, {})
+
+    def test_9_cancel_retry_local_refusal_preserves_prior_unknown_status(self):
+        from online_trader.dsv_runtime.runner import initial_state
+        from online_trader.dsv_storage.journal import Journal
+
+        scope = {'account_key': 'DEV:cancel-unknown', 'provider': 'OFFLINE', 'trading_day': DAY, 'configuration_id': 'cfg-1'}
+        journal = Journal(self.root / 'cancel-unknown-journal.sqlite', scope, initial_state(DAY, ['DCE.p2701']))
+        self.addCleanup(journal.close)
+
+        class _FailThenRefusePort:
+            def __init__(self):
+                self.calls = 0
+
+            def send(self, _req):
+                return {'ok': True}
+
+            def cancel(self, req):
+                self.calls += 1
+                if self.calls == 1:
+                    raise OSError('network timeout on first cancel')
+                return CancelNotAttempted(req['id'], req['native_order_id'], 'E_DSV_MARKET_PHASE', {'message': 'phase'})
+
+        port = _FailThenRefusePort()
+        controller = ExplicitOrderController(scope, journal, port)
+        state = journal.load()
+        order = {
+            'child_order_id': 'c-unk-1', 'intent_id': 'i1', 'attempt_id': 'c-unk-1',
+            'position_id': 'p1', 'contract_id': 'DCE.p2701', 'direction': 'BUY',
+            'native_offset': 'OPEN', 'effect': 'OPEN', 'original_qty': 5, 'filled_qty': 0,
+            'limit_price': '1060', 'send_state': 'CALL_RETURNED', 'broker_state': 'ALIVE',
+            'cancel_status': None, 'terminal_confirmed': False, 'reported_fill_qty': 0,
+            'native_id': None, 'native_trading_day': DAY, 'local_order_id': 'loc-1',
+        }
+        state['orders']['c-unk-1'] = order
+        with journal.transaction():
+            eff1 = controller.cancel(order, 'USER_STOP', wall_time=100.0)
+            journal.save(state)
+        controller.dispatch(state, [eff1])
+        self.assertEqual(order['cancel_status'], 'UNKNOWN')
+        self.assertEqual(order['cancel_attempt'], 1)
+
+        # Retry at t=106s hits local CancelNotAttempted -> MUST preserve UNKNOWN and NOT reset to None!
+        with journal.transaction():
+            effects = controller._retry_stale_cancellations(
+                state, 'DCE.p2701', allow_cancel=True, wall_time=106.0)
+            journal.save(state)
+        self.assertEqual(len(effects), 1)
+        controller.dispatch(state, effects)
+        self.assertEqual(order['cancel_status'], 'UNKNOWN')
+        self.assertEqual(order['cancel_attempt'], 2)
 
 
 if __name__ == '__main__':

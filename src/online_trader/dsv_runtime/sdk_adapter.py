@@ -441,7 +441,8 @@ class DsvSdkAdapter:
         state = self._bind(session)
         if command.get('action') in {'START', 'STOP', 'CLOCK_RECOVER'}:
             self._clock_resume_day = None
-        if command.get('action') == 'RECONCILE' and not state.get('synchronized'):
+        has_sync_isolation = any(row.get('sync_pending_children') for row in (state.get('symbols') or {}).values())
+        if command.get('action') == 'RECONCILE' and (not state.get('synchronized') or has_sync_isolation):
             for cache_attr in ('_verified_order_facts', '_verified_trade_facts'):
                 cache = getattr(self, cache_attr, None)
                 if isinstance(cache, dict):
@@ -758,7 +759,8 @@ class DsvSdkAdapter:
         details, foreign_trades, deferred = self._trade_facts(
             trades, bindings, day, accepted, needs_recovery=bool(state['orders']), day_held=day_held)
         self.metrics['native_fill_waiting_day_contracts'] = len(deferred)
-        reconcile = (not state['synchronized'] or day != state['trading_day']
+        has_sync_isolation = any(row.get('sync_pending_children') for row in (state.get('symbols') or {}).values())
+        reconcile = (not state['synchronized'] or has_sync_isolation or day != state['trading_day']
                      or state.get('clock_recovery_required') or self._health.get('reason'))
         self._record_unknown_snapshots(state)
         snapshot_complete = (bool(self.connection.broker_connected and self.connection.complete())
