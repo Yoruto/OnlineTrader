@@ -69,6 +69,7 @@ OnlineTrader 是独立 Windows 产品。G0 原始规格索引见 [spec-source.js
 - 每次打包/测试选择仅对当次有效，不得沿用过往授权。验收声明必须写明完整候选 SHA、场景/fixture、运行环境及 `PASS / FAIL / SKIP / NOT_RUN` 计数。
 
 ### 5.2 随包配置与完整制品交付
+- **本机私有账号与令牌优先从 `.local/` 查找**：极狐发布令牌、自动更新只读令牌、模拟期货账号等本地私有凭据统一放在仓库根目录被 `.gitignore` 忽略的 `.local/` 下（如 `.local/jihulab-release.json`、`.local/jihulab-release.token`、`.local/jihulab-read.token`、`.local/jihulab-owner.token`、`.local/sim-futures-accounts.txt`）；需要相关凭据时优先从 `.local/` 读取，严禁提交到 Git、严禁打印明文、严禁将 `.local/` 整体打入制品。
 - **完整交付制品必须随包带齐配置**（首次/全量安装器、便携包 `RuntimeConfigured`、客户包、测试包均适用）。禁止交付缺配置、空配置或占位配置包；含账户口令的制品只通过获准私有渠道交付。
 - **受管程序更新载荷（`ONLINE_TRADER_UPDATE_PAYLOAD/1`）例外**：仅含程序本体与 `update-payload.json`（`standalone: false, requires_managed_root: true`），严禁包含 `runtime/`、`OnlineTrader-defaults.json`、`OnlineTrader-parameters.json`、`OnlineTrader-overrides.json`、`update-source.json`、`active.json`、`OnlineTrader.ini`，以免覆盖用户既有配置；单独解压直接启动须 fail-closed 拒绝运行（详见 [delivery.md](file:///e:/online-trader/docs/delivery.md)）。
 - 独立 Trading Runtime 新交付必须显式带入 `runtime.json` 及已确认的 `OnlineTrader-defaults.json`、`OnlineTrader-parameters.json`（不得依赖已废弃的 `runtime-control.json` / `private/operators.json`）。

@@ -21,6 +21,7 @@ OnlineTrader 以包含 `EXE`、`_internal`、必需脚本与配置的**完整交
 
 ## 2. 发布与受管更新流程
 
+- **本机私有凭据与账户约定（`.local/`）**：开发/发布机上的极狐发布令牌、自动更新只读令牌及模拟期货账号等本地私有凭据，统一存放在仓库根目录已加入 `.gitignore` 的 `.local/` 目录（如 `.local/jihulab-release.json`、`.local/jihulab-release.token`、`.local/jihulab-read.token`、`.local/jihulab-owner.token`、`.local/sim-futures-accounts.txt`）。执行打包配置注入或 Release 发布时优先从 `.local/` 查找，严禁提交到 Git、严禁整体打入交付物，亦不得在日志或输出中打印明文凭据。
 - **发布源**：支持 `gitlab.com` 与中国大陆受控极狐 `jihulab.com`。使用 [publish_gitlab_update.py](file:///e:/online-trader/scripts/publish_gitlab_update.py) 校验载荷、上传资产、按客户端同款逻辑回读大小与 SHA-256 后创建 Release。`update-source.json` 中仅允许可选只读 `read_token`，严禁携带写权限令牌或跨域名跳转透传。
 - **安装根目录布局**：安装根维护 `active.json`、`update-source.json`、`OnlineTrader.ini` 与稳定的 `runtime/`；程序本体解压在 `versions/<版本>/`。
 - **更新状态与安全切换**：
