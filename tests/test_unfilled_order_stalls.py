@@ -258,8 +258,8 @@ class UnfilledOrderStallTests(unittest.TestCase):
         # Fixed behavior: only DCE.p2701 (missing child) is isolated; account sync succeeds
         # and DCE.m2701 immediately sends its 5-lot stop-loss REDUCE order!
         self.assertTrue(snap4['synchronized'])
-        self.assertEqual(snap4['symbols']['DCE.p2701'].get('sync_pending_children'), [p_child])
-        self.assertIsNone(snap4['symbols']['DCE.m2701'].get('sync_pending_children'))
+        self.assertEqual((snap4.get('sync_pending_by_contract') or {}).get('DCE.p2701'), [p_child])
+        self.assertIsNone((snap4.get('sync_pending_by_contract') or {}).get('DCE.m2701'))
         self.assertEqual(len(port.orders), orders_before + 1)
         self.assertEqual(port.orders[-1]['contract_id'], 'DCE.m2701')
         self.assertEqual(port.orders[-1]['native_offset'], 'CLOSE')
@@ -427,7 +427,7 @@ class UnfilledOrderStallTests(unittest.TestCase):
 
         snap4 = session.snapshot()
         self.assertTrue(snap4['synchronized'])
-        self.assertEqual(snap4['symbols']['DCE.p2701'].get('sync_pending_children'), [p_child])
+        self.assertEqual((snap4.get('sync_pending_by_contract') or {}).get('DCE.p2701'), [p_child])
         # Stop-loss target (exit_target=0) WAS calculated even while isolated, without unsafe dispatch!
         self.assertEqual(snap4['symbols']['DCE.p2701']['position']['exit_target'], 0)
         self.assertEqual(len(port.orders), orders_before)
@@ -445,7 +445,7 @@ class UnfilledOrderStallTests(unittest.TestCase):
         broker.acknowledge_frame(f5['id'])
 
         snap5 = session.snapshot()
-        self.assertIsNone(snap5['symbols']['DCE.p2701'].get('sync_pending_children'))
+        self.assertFalse(snap5.get('sync_pending_by_contract'))
         self.assertIn(p_child, {c['child_order_id'] for c in port.cancellations})
         reduce_orders = [o for o in port.orders if o['contract_id'] == 'DCE.p2701' and o['native_offset'] != 'OPEN']
         self.assertEqual(len(reduce_orders), 1)
@@ -549,6 +549,78 @@ class UnfilledOrderStallTests(unittest.TestCase):
         controller.dispatch(state, effects)
         self.assertEqual(order['cancel_status'], 'UNKNOWN')
         self.assertEqual(order['cancel_attempt'], 2)
+
+    def test_10_dual_clock_and_unconfigured_contract_sync_isolation(self):
+        from online_trader.dsv_runtime.runner import TIME_SEMANTICS
+        from online_trader.dsv_runtime.standalone_projection import projection_batch
+        from online_trader.scheduling.clock import ClockSample
+
+        broker, port, session = self._make_session('dual-clock-iso', contracts=('DCE.p2701', 'DCE.m2701'))
+        session.command({'id': 'cmd-start', 'action': 'START'})
+
+        def _with_paired_clock(frm, wall_iso, mono_ms):
+            sample = ClockSample(
+                now_utc=wall_iso,
+                monotonic_ns=str(mono_ms * 1_000_000),
+                clock_epoch='a' * 32,
+            )
+            frm['time_semantics_version'] = TIME_SEMANTICS
+            frm['time_sample'] = sample.paired_record()
+            frm['wall_time'] = sample.now_utc
+            frm['decision_utc'] = sample.now_utc
+            frm['authorization_time'] = sample.now_utc
+            frm['clock_health'] = {'status': 'VALID', 'reason': None, 'continuous_samples': 3, 'utc_error_ns': '0'}
+            return frm
+
+        f1 = _with_paired_clock(
+            broker.prepare_frame(wall_time=f'{DAY}T01:10:00Z', monotonic_ms=1000, last='1055', candle_id='bar-1'),
+            f'{DAY}T01:10:00Z', 1000,
+        )
+        session.apply_round(f1)
+        broker.acknowledge_frame(f1['id'])
+
+        f2 = _with_paired_clock(
+            broker.prepare_frame(wall_time=f'{DAY}T01:10:05Z', monotonic_ms=6000, last='1061', candle_id='bar-1'),
+            f'{DAY}T01:10:05Z', 6000,
+        )
+        _set_contract_prices(f2, {'DCE.m2701': '1055'})
+        session.apply_round(f2)
+        broker.acknowledge_frame(f2['id'])
+        p_child = port.orders[0]['child_order_id']
+        broker.accept_order(p_child)
+        broker.fill(p_child, 2, '1061')
+
+        f3 = _with_paired_clock(
+            broker.prepare_frame(wall_time=f'{DAY}T01:10:06Z', monotonic_ms=7000, last='1061', candle_id='bar-1'),
+            f'{DAY}T01:10:06Z', 7000,
+        )
+        _set_contract_prices(f3, {'DCE.m2701': '1055'})
+        session.apply_round(f3)
+        broker.acknowledge_frame(f3['id'])
+
+        # Disconnect + resync on dual-clock path with p_child missing and price dropping to stop-loss 1051:
+        # controller.plan_priced_effects MUST block REDUCE on DCE.p2701 even on the dual-clock path!
+        session.disconnect(reason='SIMULATED_DISCONNECT')
+        f4 = _with_paired_clock(
+            broker.prepare_frame(wall_time=f'{DAY}T01:10:08Z', monotonic_ms=9000, last='1051', candle_id='bar-1'),
+            f'{DAY}T01:10:08Z', 9000,
+        )
+        f4['sync_orders'] = []
+        f4['native'] = []
+        orders_before = len(port.orders)
+        session.apply_round(f4)
+        broker.acknowledge_frame(f4['id'])
+
+        snap4 = session.snapshot()
+        self.assertTrue(snap4['synchronized'])
+        self.assertEqual((snap4.get('sync_pending_by_contract') or {}).get('DCE.p2701'), [p_child])
+        self.assertEqual(snap4['symbols']['DCE.p2701']['position']['exit_target'], 0)
+        self.assertEqual(len(port.orders), orders_before)
+
+        # Projection must mark DCE.p2701 CYCLE protection_quality='UNKNOWN' via sync_pending_by_contract.
+        batch = projection_batch(snap4)
+        p_cycles = [r for r in batch['records'] if r['record_type'] == 'CYCLE' and r['contract_id'] == 'DCE.p2701']
+        self.assertEqual(p_cycles[0]['protection_quality'], 'UNKNOWN')
 
 
 if __name__ == '__main__':

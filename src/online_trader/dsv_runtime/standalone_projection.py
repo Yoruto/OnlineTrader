@@ -156,6 +156,7 @@ def projection_batch(snapshot):
                 'children': [o['child_order_id'] for o in pos_orders],
             }, {}))
             seen_positions.add(pos_id)
+    sync_pending_by_contract = snapshot.get('sync_pending_by_contract') or {}
     for contract, position, target in all_positions:
         cycle_state = ('EXIT_PENDING' if target.get('reduce_pending_qty') or target.get('reduce_needed_qty')
                        else 'HOLDING' if position['owned']
@@ -178,7 +179,7 @@ def projection_batch(snapshot):
             'plan_revision': str(position.get('target_revision', 1)),
             'protection_mode': 'PROTECTED' if position.get('protected') else 'NORMAL',
             'protection_quality': 'CONTIGUOUS' if (
-                snapshot['synchronized'] and not row.get('sync_pending_children')
+                snapshot['synchronized'] and not sync_pending_by_contract.get(contract)
             ) else 'UNKNOWN',
             'protection_persistence': 'DURABLE', 'takeover_state': None,
         })
@@ -452,7 +453,7 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
             'target_remaining_quantity': position['exit_target'],
             'mode': 'PROTECTED' if position.get('protected') else 'NORMAL',
             'quality': 'CONTIGUOUS' if (
-                snapshot['synchronized'] and not row.get('sync_pending_children')
+                snapshot['synchronized'] and not (snapshot.get('sync_pending_by_contract') or {}).get(contract)
             ) else 'UNKNOWN',
             'exit_pending': exit_pending,
             'entry_price': entry_price,
@@ -591,8 +592,8 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
                       'CLOCK_FAULT' if clock_fault else
                       owner_fault if owner_fault else 'RUNTIME_NOT_READY')
         elif operation == 'FLATTEN_THEN_STOP':
-            flat_and_clean = not cycles and not orders and not any(
-                row.get('native_conflicts') or row.get('detached_positions') or row.get('sync_pending_children')
+            flat_and_clean = not cycles and not orders and not (snapshot.get('sync_pending_by_contract') or {}) and not any(
+                row.get('native_conflicts') or row.get('detached_positions')
                 for row in snapshot['symbols'].values()
             )
             allowed = synchronized or flat_and_clean
@@ -640,7 +641,7 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
     }
     config['config_snapshot_hash'] = content_hash(config_snapshot)
     owner_fault_detail = snapshot.get('owner_fault_detail')
-    has_sync_isolation = any(row.get('sync_pending_children') for row in snapshot['symbols'].values())
+    has_sync_isolation = bool(snapshot.get('sync_pending_by_contract'))
     blocks = []
     if not synchronized or has_sync_isolation:
         blocks.append({'reason_code': 'BROKER_FACTS_INCOMPLETE', 'active': True})

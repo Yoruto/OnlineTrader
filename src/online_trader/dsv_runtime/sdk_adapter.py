@@ -441,7 +441,7 @@ class DsvSdkAdapter:
         state = self._bind(session)
         if command.get('action') in {'START', 'STOP', 'CLOCK_RECOVER'}:
             self._clock_resume_day = None
-        has_sync_isolation = any(row.get('sync_pending_children') for row in (state.get('symbols') or {}).values())
+        has_sync_isolation = bool(state.get('sync_pending_by_contract'))
         if command.get('action') == 'RECONCILE' and (not state.get('synchronized') or has_sync_isolation):
             for cache_attr in ('_verified_order_facts', '_verified_trade_facts'):
                 cache = getattr(self, cache_attr, None)
@@ -759,7 +759,7 @@ class DsvSdkAdapter:
         details, foreign_trades, deferred = self._trade_facts(
             trades, bindings, day, accepted, needs_recovery=bool(state['orders']), day_held=day_held)
         self.metrics['native_fill_waiting_day_contracts'] = len(deferred)
-        has_sync_isolation = any(row.get('sync_pending_children') for row in (state.get('symbols') or {}).values())
+        has_sync_isolation = bool(state.get('sync_pending_by_contract'))
         reconcile = (not state['synchronized'] or has_sync_isolation or day != state['trading_day']
                      or state.get('clock_recovery_required') or self._health.get('reason'))
         self._record_unknown_snapshots(state)
@@ -2192,11 +2192,15 @@ class DsvSdkAdapter:
                         'E_DSV_MARKET_PHASE',
                         perm['wait_reason'] or 'Market phase currently disallows order cancellation',
                     )
-            if effect.get('external_order') and getattr(self, 'owner_mode', None) == 'STANDALONE':
+            if (effect.get('external_order') or int(effect.get('cancel_seq') or 1) > 1) and getattr(
+                    self, 'owner_mode', None) == 'STANDALONE':
                 live_orders = self.api.get_order(account=self.account) or {}
                 live = live_orders.get(native)
-                if live is None or getattr(live, 'status', None) != 'ALIVE' or native_integer(getattr(live, 'volume_left', 0)) <= 0:
-                    raise TraderError('E_DSV_SDK_SCOPE', 'Non-strategy order is already absent or terminal')
+                if effect.get('external_order'):
+                    if live is None or getattr(live, 'status', None) != 'ALIVE' or native_integer(getattr(live, 'volume_left', 0)) <= 0:
+                        raise TraderError('E_DSV_SDK_SCOPE', 'Non-strategy order is already absent or terminal')
+                elif live is not None and (getattr(live, 'status', None) != 'ALIVE' or native_integer(getattr(live, 'volume_left', 0)) <= 0):
+                    raise TraderError('E_DSV_SDK_SCOPE', 'Strategy order is already terminal on broker snapshot')
         except Exception as error:
             return CancelNotAttempted(effect['id'], effect['native_order_id'],
                                       getattr(error, 'code', 'E_DSV_PRE_CANCEL'), exception_record(error))

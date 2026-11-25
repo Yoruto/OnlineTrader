@@ -989,7 +989,8 @@ class ExplicitOrderController:
         reducing = self.target_accounting(state, position, 'REDUCE')
         uncertain = opening.uncertain_children + reducing.uncertain_children
         cancelling = opening.cancel_pending_children + reducing.cancel_pending_children
-        if row.get('native_conflicts') or row.get('detached_positions') or row.get('sync_pending_children'):
+        sync_pending = (state.get('sync_pending_by_contract') or {}).get(position['contract_id'])
+        if row.get('native_conflicts') or row.get('detached_positions') or sync_pending:
             status, reason = 'BLOCKED', 'BROKER_FACTS_INCOMPLETE'
         elif uncertain:
             status, reason = 'RECONCILING', 'SEND_RESULT_UNKNOWN'
@@ -1042,11 +1043,15 @@ class ExplicitOrderController:
             return []
         now = float(wall_time)
         effects = []
+        sync_missing = set((state.get('sync_pending_by_contract') or {}).get(contract_id) or ())
         for order in state['orders'].values():
             if (order['contract_id'] != contract_id or terminal(order)
-                    or order.get('convergence_order') or order.get('terminal_conflict')):
+                    or order.get('convergence_order') or order.get('terminal_conflict')
+                    or order['child_order_id'] in sync_missing):
                 continue
             if order.get('cancel_status') not in {'CALL_RETURNED', 'UNKNOWN'}:
+                continue
+            if order.get('broker_state') != 'ALIVE':
                 continue
             requested_at = order.get('cancel_requested_at')
             if requested_at is None:
@@ -1151,19 +1156,25 @@ class ExplicitOrderController:
             contract_id = market['contract_id']
             diag = self._diag()
             block_key = ('controller', contract_id, effect)
-            if opening and not market.get('allow_new_entry', market.get('allow_new_order', True)):
+            if opening and ((state.get('sync_pending_by_contract') or {}).get(contract_id)
+                            or not market.get('allow_new_entry', market.get('allow_new_order', True))):
                 accounting = self.target_accounting(state, position, effect)
+                sync_blocked = bool((state.get('sync_pending_by_contract') or {}).get(contract_id))
                 diag.observe_block(
                     block_key, active=accounting.needed_qty > 0, contract_id=contract_id,
                     position_id=position['id'], effect=effect, reason='ENTRY_NOT_ALLOWED',
-                    detail='ALLOW_NEW_ENTRY_FALSE', needed_qty=accounting.needed_qty)
+                    detail='SYNCHRONIZE_PENDING_CHILDREN_MISSING' if sync_blocked else 'ALLOW_NEW_ENTRY_FALSE',
+                    needed_qty=accounting.needed_qty)
                 continue
-            if not opening and not market.get('allow_protective_exit', market.get('allow_new_order', True)):
+            if not opening and ((state.get('sync_pending_by_contract') or {}).get(contract_id)
+                                or not market.get('allow_protective_exit', market.get('allow_new_order', True))):
                 accounting = self.target_accounting(state, position, effect)
+                sync_blocked = bool((state.get('sync_pending_by_contract') or {}).get(contract_id))
                 diag.observe_block(
                     block_key, active=accounting.needed_qty > 0, contract_id=contract_id,
                     position_id=position['id'], effect=effect, reason='PROTECTIVE_EXIT_NOT_ALLOWED',
-                    detail='ALLOW_PROTECTIVE_EXIT_FALSE', needed_qty=accounting.needed_qty)
+                    detail='SYNCHRONIZE_PENDING_CHILDREN_MISSING' if sync_blocked else 'ALLOW_PROTECTIVE_EXIT_FALSE',
+                    needed_qty=accounting.needed_qty)
                 continue
             proven_position = self.proves_position(state, position, market, for_effect=effect)
             proof_reason = (None if proven_position else
@@ -1670,11 +1681,11 @@ class ExplicitOrderController:
                 'pending_close_long': pending_summary['close_long'],
                 'pending_close_short': pending_summary['close_short'],
             }
-            if market.get('position_known') is False or (
-                    is_configured and state['symbols'][cid].get('sync_pending_children')):
+            sync_pending = bool((state.get('sync_pending_by_contract') or {}).get(cid))
+            if market.get('position_known') is False or sync_pending:
                 defer_reason = (
                     'SYNCHRONIZE_PENDING_CHILDREN_MISSING'
-                    if (is_configured and state['symbols'][cid].get('sync_pending_children'))
+                    if sync_pending
                     else 'POSITION_FACTS_UNAVAILABLE'
                 )
                 statuses[cid] = {
