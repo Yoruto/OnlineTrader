@@ -181,6 +181,52 @@ class StartupInferencePlanBTests(unittest.TestCase):
         self.assertEqual(res['target_count'], 1)
         self.assertEqual(res['reason'], 'FLAT_DAY_STOP_RECONSTRUCTED')
 
+    def test_filters_prior_day_bars_and_preserves_cross_midnight_night_session(self):
+        spec, trade = _spec_and_trade()
+        # Mix prior trading day's day-session bar (extreme high/low 900..1500 that would break geometry_limit)
+        # with valid cross-midnight night session bars (2026-11-12 21:05 BJT = 13:05Z and 2026-11-13 00:10 BJT = 2026-11-12 16:10Z).
+        bars = [
+            {'bar_id': 'prior-day', 'time_utc': '2026-11-12T06:55:00Z', 'open': 900, 'high': 1500, 'low': 900, 'close': 1025},
+            {'bar_id': 'night-1', 'time_utc': '2026-11-12T13:05:00Z', 'open': 1025, 'high': 1030, 'low': 1020, 'close': 1028},
+            {'bar_id': 'night-2', 'time_utc': '2026-11-12T16:10:00Z', 'open': 1028, 'high': 1062, 'low': 1027, 'close': 1061},
+        ]
+        trades = [{
+            'trade_id': 't-night', 'order_id': 'o-night', 'direction': 'BUY', 'offset': 'OPEN',
+            'quantity': 5, 'price': '1060', 'timestamp_utc': '2026-11-12T16:10:15Z',
+        }]
+        res = infer_startup_symbol_state(
+            contract_id=CONTRACT, spec=spec, trade_settings=trade, trading_day=DAY,
+            market=_market(long_today=5, last='1062'), today_trades=trades, minute_bars=bars,
+        )
+        self.assertEqual(res['target_long'], 5)
+        self.assertEqual(res['reason'], 'PROVED_OPEN_MATCH')
+
+    def test_repriced_child_orders_count_as_one_target_and_daily_limit_does_not_flatten_proved_position(self):
+        spec, trade = _spec_and_trade()
+        trade = trade | {'max_daily_orders': 1}
+        bars = _bars([
+            (1025, 1030, 1020, 1028),
+            (1028, 1062, 1027, 1061),
+            (1061, 1065, 1059, 1063),
+        ])
+        # Single 5-lot strategy open target filled across 2 repriced native order_ids (2 + 3 = 5).
+        trades = [
+            {'trade_id': 't1', 'order_id': 'child-1', 'direction': 'BUY', 'offset': 'OPEN',
+             'quantity': 2, 'price': '1060', 'timestamp_utc': f'{DAY}T01:11:05Z'},
+            {'trade_id': 't2', 'order_id': 'child-2', 'direction': 'BUY', 'offset': 'OPEN',
+             'quantity': 3, 'price': '1060', 'timestamp_utc': f'{DAY}T01:11:20Z'},
+        ]
+        res = infer_startup_symbol_state(
+            contract_id=CONTRACT, spec=spec, trade_settings=trade, trading_day=DAY,
+            market=_market(long_today=5, last='1063'), today_trades=trades, minute_bars=bars,
+        )
+        self.assertEqual(res['target_count'], 1)
+        self.assertTrue(res['day_stop'])
+        self.assertEqual(res['day_stop_reason'], 'DAILY_TARGET_LIMIT')
+        # Reaching max_daily_orders=1 blocks NEW entries, but MUST NOT flatten the proved 5-lot position.
+        self.assertEqual(res['target_long'], 5)
+        self.assertEqual(res['reason'], 'PROVED_OPEN_MATCH')
+
 
 if __name__ == '__main__':
     unittest.main()

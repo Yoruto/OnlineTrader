@@ -14,7 +14,11 @@ from online_trader.dsv_core.price_rules import strategy_price
 from online_trader.dsv_core.transition import entry_price, price_value
 from online_trader.dsv_runtime.market_permissions import infer_offline_market_permission
 from online_trader.dsv_runtime.order_diagnostics import OrderDiagnosticTracker
-from online_trader.dsv_runtime.target_execution import account_target
+from online_trader.dsv_runtime.target_execution import (
+    account_target,
+    contract_pending_summary,
+    effective_position_target,
+)
 from online_trader.errors import TraderError, exception_record
 from online_trader.execution.close_routes import close_routes, replay_lots
 
@@ -706,6 +710,7 @@ class ExplicitOrderController:
         fills = ExplicitOrderController._position_fills(position, market['contract_id'])
         pending_orders = []
         target_quantity = needed
+        native_today, native_hist = today, historical
         if include_pending_orders and 'orders' in state:
             pending_orders = [
                 order | {'contract_id': market['contract_id'], 'direction': position['direction'],
@@ -716,9 +721,35 @@ class ExplicitOrderController:
             ]
             if pending_orders and position.get('exit_target') is not None:
                 target_quantity = max(needed, position['owned'] - position['exit_target'])
+            # Account for active convergence close orders on the same contract/side
+            # so strategy reductions and convergence closes never double-spend broker buckets.
+            close_dir = 'SELL' if position['direction'] == 'LONG' else 'BUY'
+            conv_today = conv_hist = 0
+            for order in state['orders'].values():
+                if (order.get('convergence_order')
+                        and order.get('contract_id') == market['contract_id']
+                        and order.get('effect') == 'REDUCE'
+                        and order.get('direction') == close_dir
+                        and not terminal(order)):
+                    rem = max(0, int(order['original_qty']) - int(order['filled_qty']))
+                    if order.get('native_offset') == 'CLOSETODAY':
+                        conv_today += rem
+                    else:
+                        conv_hist += rem
+            if conv_today or conv_hist:
+                if market['contract_id'].split('.')[0] in {'SHFE', 'INE'}:
+                    native_today = max(0, today - conv_today)
+                    native_hist = max(0, historical - conv_hist)
+                else:
+                    rem_comb = conv_today + conv_hist
+                    take_hist = min(native_hist, rem_comb)
+                    native_hist -= take_hist
+                    rem_comb -= take_hist
+                    native_today = max(0, native_today - rem_comb)
         try:
             result = close_routes(contract_id=market['contract_id'], direction=position['direction'], current_day=day,
-                                  fills=fills, native={'today': today, 'historical': historical, 'total': today + historical},
+                                  fills=fills, native={'today': native_today, 'historical': native_hist,
+                                                       'total': native_today + native_hist},
                                   orders=pending_orders, target_quantity=target_quantity,
                                   allow_external=bool(market.get('standalone_external_model')),
                                   historical_first_on_combined=True)
@@ -1508,19 +1539,31 @@ class ExplicitOrderController:
                     })
 
         separated_exchanges = {'SHFE', 'INE'}
+        all_orders = list(state['orders'].values())
         for cid, market, is_configured in all_targets:
             perm = perm_by_cid[cid]
             pos = state['symbols'][cid]['position'] if (is_configured and cid in state['symbols']) else None
+            pos_orders = self.child_orders(state, pos) if pos is not None else ()
+            target_long, target_short = effective_position_target(
+                pos, orders=pos_orders, terminal=terminal)
             owned_long = pos['owned'] if (pos is not None and pos['direction'] == 'LONG') else 0
             owned_short = pos['owned'] if (pos is not None and pos['direction'] == 'SHORT') else 0
             actual_long = int(market.get('long_qty') or 0)
             actual_short = int(market.get('short_qty') or 0)
-            excess_long = max(0, actual_long - owned_long)
-            excess_short = max(0, actual_short - owned_short)
+            # Desired-based excess/deficit for unified Account vs Desired reporting.
+            excess_long = max(0, actual_long - target_long)
+            excess_short = max(0, actual_short - target_short)
+            deficit_long = max(0, target_long - actual_long)
+            deficit_short = max(0, target_short - actual_short)
+            # Convergence only closes holdings above strategy-owned quantity;
+            # strategy-owned exits remain governed by DSV strategy rules in plan().
+            conv_excess_long = max(0, actual_long - owned_long)
+            conv_excess_short = max(0, actual_short - owned_short)
             conv_orders = [
-                o for o in state['orders'].values()
+                o for o in all_orders
                 if o.get('convergence_order') and o['contract_id'] == cid and not terminal(o)
             ]
+            pending_summary = contract_pending_summary(all_orders, cid, terminal)
             has_ext = cid in ext_by_contract
             perm_meta = {
                 'market_phase': perm.get('market_phase'),
@@ -1531,18 +1574,102 @@ class ExplicitOrderController:
                 'can_close': bool(perm.get('can_close')),
                 'can_cancel': bool(perm.get('can_cancel')),
             }
-            if excess_long == 0 and excess_short == 0 and not has_ext:
+            qty_meta = {
+                'actual_long': actual_long,
+                'actual_short': actual_short,
+                'target_long': target_long,
+                'target_short': target_short,
+                'excess_long': excess_long,
+                'excess_short': excess_short,
+                'deficit_long': deficit_long,
+                'deficit_short': deficit_short,
+                'pending_open_long': pending_summary['open_long'],
+                'pending_open_short': pending_summary['open_short'],
+                'pending_close_long': pending_summary['close_long'],
+                'pending_close_short': pending_summary['close_short'],
+            }
+            if market.get('position_known') is False:
                 statuses[cid] = {
                     'configured': is_configured,
-                    'status': 'CONVERGING_FILL_PENDING' if conv_orders else 'ALIGNED',
-                    'wait_reason': None,
+                    'status': 'DEFERRED_FACTS_INCOMPLETE',
+                    'wait_reason': 'POSITION_FACTS_UNAVAILABLE',
                     'failure_count': 0,
-                    'actual_long': actual_long,
-                    'actual_short': actual_short,
-                    'target_long': owned_long,
-                    'target_short': owned_short,
-                    'excess_long': 0,
-                    'excess_short': 0,
+                    **qty_meta,
+                    **perm_meta,
+                }
+                events.append({
+                    'event': 'CONVERGENCE_DEFERRED',
+                    'contract_id': cid,
+                    'reason': 'POSITION_FACTS_UNAVAILABLE',
+                })
+                continue
+
+            # Always check active convergence orders FIRST — even when conv_excess == 0 —
+            # so redundant working close orders are cancelled promptly before alignment.
+            excess_cancel_status = None
+            excess_cancel_wait = None
+            for pos_side, conv_excess in (('LONG', conv_excess_long), ('SHORT', conv_excess_short)):
+                side_orders = [o for o in conv_orders if o.get('convergence_side') == pos_side]
+                if not side_orders:
+                    continue
+                side_pending = sum(max(0, o['original_qty'] - o['filled_qty']) for o in side_orders)
+                if side_pending <= conv_excess:
+                    continue
+                uncertain_side = [
+                    o['child_order_id'] for o in side_orders
+                    if o['send_state'] in {'SEND_POSSIBLE', 'UNKNOWN'}
+                    or o.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}
+                ]
+                if uncertain_side:
+                    excess_cancel_status = (
+                        'SEND_RESULT_UNKNOWN'
+                        if any(o['send_state'] in {'SEND_POSSIBLE', 'UNKNOWN'} for o in side_orders)
+                        else 'CANCELLING_EXCESS_CLOSE'
+                    )
+                    continue
+                if perm.get('can_cancel', False):
+                    over = side_pending - conv_excess
+                    for order in reversed(side_orders):
+                        if req := self.cancel(order, 'TARGET_REDUCED'):
+                            effects.append(req)
+                            events.append({
+                                'event': 'CONVERGENCE_ACTION',
+                                'contract_id': cid,
+                                'action': 'CANCEL_EXCESS_CONVERGENCE_CLOSE',
+                                'side': pos_side,
+                                'child_order_id': order['child_order_id'],
+                                'native_order_id': order.get('native_id'),
+                            })
+                        over -= max(0, order['original_qty'] - order['filled_qty'])
+                        if over <= 0:
+                            break
+                    excess_cancel_status = 'CANCELLING_EXCESS_CLOSE'
+                else:
+                    excess_cancel_status = self._convergence_deferred_status(perm)
+                    excess_cancel_wait = perm.get('wait_reason')
+
+            if conv_excess_long == 0 and conv_excess_short == 0 and not has_ext:
+                if excess_cancel_status is not None:
+                    st_name = excess_cancel_status
+                    st_wait = excess_cancel_wait
+                elif conv_orders or pending_summary['close_long'] or pending_summary['close_short']:
+                    st_name = 'CONVERGING_FILL_PENDING'
+                    st_wait = None
+                elif deficit_long or deficit_short or pending_summary['open_long'] or pending_summary['open_short']:
+                    st_name = 'OPENING'
+                    st_wait = None
+                elif excess_long or excess_short:
+                    st_name = 'CONVERGING_FILL_PENDING'
+                    st_wait = None
+                else:
+                    st_name = 'ALIGNED'
+                    st_wait = None
+                statuses[cid] = {
+                    'configured': is_configured,
+                    'status': st_name,
+                    'wait_reason': st_wait,
+                    'failure_count': 0,
+                    **qty_meta,
                     **perm_meta,
                 }
                 continue
@@ -1555,12 +1682,7 @@ class ExplicitOrderController:
                         'status': defer_status,
                         'wait_reason': defer_reason,
                         'failure_count': 0,
-                        'actual_long': actual_long,
-                        'actual_short': actual_short,
-                        'target_long': owned_long,
-                        'target_short': owned_short,
-                        'excess_long': excess_long,
-                        'excess_short': excess_short,
+                        **qty_meta,
                         **perm_meta,
                     }
                     events.append({
@@ -1576,12 +1698,7 @@ class ExplicitOrderController:
                         'status': 'CANCELLING_NON_STRATEGY_ORDERS',
                         'wait_reason': 'WAITING_NON_STRATEGY_CANCEL',
                         'failure_count': 0,
-                        'actual_long': actual_long,
-                        'actual_short': actual_short,
-                        'target_long': owned_long,
-                        'target_short': owned_short,
-                        'excess_long': excess_long,
-                        'excess_short': excess_short,
+                        **qty_meta,
                         **perm_meta,
                     }
                     events.append({
@@ -1594,19 +1711,14 @@ class ExplicitOrderController:
 
             ticks = market.get('ticks') or ()
             if not perm.get('can_close', False) or not ticks:
-                defer_status = self._convergence_deferred_status(perm)
-                defer_reason = perm.get('wait_reason') or 'OUTSIDE_SESSION_OR_NO_QUOTE'
+                defer_status = excess_cancel_status or self._convergence_deferred_status(perm)
+                defer_reason = excess_cancel_wait or perm.get('wait_reason') or 'OUTSIDE_SESSION_OR_NO_QUOTE'
                 statuses[cid] = {
                     'configured': is_configured,
                     'status': defer_status,
                     'wait_reason': defer_reason,
                     'failure_count': 0,
-                    'actual_long': actual_long,
-                    'actual_short': actual_short,
-                    'target_long': owned_long,
-                    'target_short': owned_short,
-                    'excess_long': excess_long,
-                    'excess_short': excess_short,
+                    **qty_meta,
                     **perm_meta,
                 }
                 events.append({
@@ -1629,14 +1741,22 @@ class ExplicitOrderController:
                     owned_today_bucket = pos['owned']
                     owned_hist_bucket = 0
 
-            contract_status = 'CONVERGING'
-            contract_wait_reason = None
+            contract_status = excess_cancel_status or 'CONVERGING'
+            contract_wait_reason = excess_cancel_wait
             contract_failures = 0
             tick = market.get('tick') or ticks[-1]
-            for pos_side, excess_qty in (('LONG', excess_long), ('SHORT', excess_short)):
+            for pos_side, excess_qty in (('LONG', conv_excess_long), ('SHORT', conv_excess_short)):
                 if excess_qty <= 0:
                     continue
                 side_orders = [o for o in conv_orders if o.get('convergence_side') == pos_side]
+                close_dir = 'SELL' if pos_side == 'LONG' else 'BUY'
+                # Unified non-terminal close orders for this contract/side (strategy + convergence + UNKNOWN/CancelPending).
+                all_side_close = [
+                    o for o in state['orders'].values()
+                    if o.get('contract_id') == cid and o.get('effect') == 'REDUCE'
+                    and o.get('direction') == close_dir and not terminal(o)
+                ]
+                strat_side_close = [o for o in all_side_close if not o.get('convergence_order')]
                 desired, price_reason = self._convergence_close_price(market, pos_side)
                 if desired is None:
                     contract_status = price_reason
@@ -1652,22 +1772,19 @@ class ExplicitOrderController:
 
                 uncertain = [
                     o['child_order_id'] for o in side_orders
-                    if o['send_state'] == 'UNKNOWN' or o.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}
+                    if o['send_state'] in {'SEND_POSSIBLE', 'UNKNOWN'}
+                    or o.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}
                 ]
                 pending_qty = sum(max(0, o['original_qty'] - o['filled_qty']) for o in side_orders)
-                if pending_qty > excess_qty and not uncertain:
-                    if perm.get('can_cancel', False):
-                        over = pending_qty - excess_qty
-                        for order in reversed(side_orders):
-                            if req := self.cancel(order, 'TARGET_REDUCED'):
-                                effects.append(req)
-                            over -= max(0, order['original_qty'] - order['filled_qty'])
-                            if over <= 0:
-                                break
-                        contract_status = 'CANCELLING_EXCESS_CLOSE'
+                if pending_qty > excess_qty:
+                    if uncertain:
+                        contract_status = (
+                            'SEND_RESULT_UNKNOWN'
+                            if any(o['send_state'] in {'SEND_POSSIBLE', 'UNKNOWN'} for o in side_orders)
+                            else 'CANCELLING_EXCESS_CLOSE'
+                        )
                     else:
-                        contract_status = self._convergence_deferred_status(perm)
-                        contract_wait_reason = perm.get('wait_reason')
+                        contract_status = excess_cancel_status or 'CANCELLING_EXCESS_CLOSE'
                     continue
 
                 repricing = False
@@ -1692,21 +1809,34 @@ class ExplicitOrderController:
 
                 side_key = pos_side.lower()
                 actual_side_qty = actual_long if pos_side == 'LONG' else actual_short
+                owned_side_qty = owned_long if pos_side == 'LONG' else owned_short
                 m_today = int(market.get(f'{side_key}_today', actual_side_qty))
                 m_hist = int(market.get(f'{side_key}_historical', 0))
                 res_today = owned_today_bucket if (pos is not None and pos['direction'] == pos_side) else 0
                 res_hist = owned_hist_bucket if (pos is not None and pos['direction'] == pos_side) else 0
-                free_today = max(0, m_today - res_today)
-                free_hist = max(0, m_hist - res_hist)
-                for order in side_orders:
-                    rem = max(0, order['original_qty'] - order['filled_qty'])
-                    if order['native_offset'] == 'CLOSETODAY':
-                        free_today = max(0, free_today - rem)
-                    else:
-                        free_hist = max(0, free_hist - rem)
+                strat_today = sum(
+                    max(0, o['original_qty'] - o['filled_qty'])
+                    for o in strat_side_close if o.get('native_offset') == 'CLOSETODAY'
+                )
+                strat_hist = sum(
+                    max(0, o['original_qty'] - o['filled_qty'])
+                    for o in strat_side_close if o.get('native_offset') != 'CLOSETODAY'
+                )
+                all_today = sum(
+                    max(0, o['original_qty'] - o['filled_qty'])
+                    for o in all_side_close if o.get('native_offset') == 'CLOSETODAY'
+                )
+                all_hist = sum(
+                    max(0, o['original_qty'] - o['filled_qty'])
+                    for o in all_side_close if o.get('native_offset') != 'CLOSETODAY'
+                )
+                keep_today = max(0, res_today - strat_today)
+                keep_hist = max(0, res_hist - strat_hist)
+                free_today = max(0, m_today - all_today - keep_today)
+                free_hist = max(0, m_hist - all_hist - keep_hist)
                 if free_today + free_hist < needed:
-                    # Fallback to remaining broker total if buckets shifted.
-                    rem_total = max(0, m_today + m_hist - pending_qty - (owned_long if pos_side == 'LONG' else owned_short))
+                    keep_total = max(0, owned_side_qty - (strat_today + strat_hist))
+                    rem_total = max(0, m_today + m_hist - (all_today + all_hist) - keep_total)
                     needed = min(needed, rem_total) if rem_total > 0 else 0
                 if needed <= 0:
                     continue
@@ -1869,17 +1999,17 @@ class ExplicitOrderController:
                     'configured': is_configured,
                 })
 
+            post_pending = contract_pending_summary(state['orders'].values(), cid, terminal)
             statuses[cid] = {
                 'configured': is_configured,
                 'status': contract_status,
                 'wait_reason': contract_wait_reason,
                 'failure_count': contract_failures,
-                'actual_long': actual_long,
-                'actual_short': actual_short,
-                'target_long': owned_long,
-                'target_short': owned_short,
-                'excess_long': excess_long,
-                'excess_short': excess_short,
+                **qty_meta,
+                'pending_open_long': post_pending['open_long'],
+                'pending_open_short': post_pending['open_short'],
+                'pending_close_long': post_pending['close_long'],
+                'pending_close_short': post_pending['close_short'],
                 **perm_meta,
             }
         return effects, statuses, events

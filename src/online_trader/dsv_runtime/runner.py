@@ -23,6 +23,7 @@ from online_trader.dsv_runtime.market_permissions import infer_offline_market_pe
 from online_trader.dsv_runtime.order_diagnostics import OrderDiagnosticTracker
 from online_trader.dsv_runtime.owner_binding import StandaloneOwnerBinding
 from online_trader.dsv_runtime.startup_inference import infer_startup_symbol_state
+from online_trader.dsv_runtime.target_execution import contract_pending_summary, effective_position_target
 from online_trader.dsv_storage.journal import Journal
 from online_trader.dsv_storage.workbench_evidence import WorkbenchEvidence
 from online_trader.errors import TraderError
@@ -971,6 +972,7 @@ class DsvSession:
                 today_trades=facts.get('today_trades'),
                 minute_bars=facts.get('minute_bars'),
                 has_prior_day_force_close=bool(facts.get('has_prior_day_force_close', True)),
+                session_windows=facts.get('session_windows'),
             )
             inferred[contract] = {k: v for k, v in res.items() if k != 'proved_position'} | {
                 'has_proved_position': res['proved_position'] is not None,
@@ -1044,6 +1046,7 @@ class DsvSession:
 
     def _sync_disarmed_inferred_positions(self, state, frame):
         market_rows = {m['contract_id']: m for m in frame['market']}
+        inferred = state.setdefault('startup_inference', {})
         for contract, row in state['symbols'].items():
             pos = row.get('position')
             if pos is None or not pos.get('awaiting_start_arm') or pos.get('children'):
@@ -1054,7 +1057,10 @@ class DsvSession:
             if actual_own <= 0:
                 row['position'] = None
                 row.pop('ownership_conflict', None)
-            elif actual_own < pos['owned']:
+                if contract in inferred:
+                    inferred[contract] = dict(inferred[contract], target_long=0, target_short=0, has_proved_position=False)
+                continue
+            if actual_own < pos['owned']:
                 avg_px = Decimal(pos['entry_notional']) / Decimal(pos['entry_filled']) if pos.get('entry_filled') else Decimal(pos['theory'])
                 pos.update(
                     owned=actual_own,
@@ -1064,28 +1070,118 @@ class DsvSession:
                     entry_notional=decimal_text(avg_px * actual_own),
                 )
                 row.pop('ownership_conflict', None)
+            # Read-only incremental protection review during DISARMED wait so that
+            # price moves before ARM update peak/protected/half_stage/exit status
+            # without emitting any order or cancel effects.
+            ticks = market.get('ticks') or ()
+            tick = market.get('tick') or (ticks[-1] if ticks else None)
+            spec = self._symbols.get(contract)
+            if tick is not None and spec is not None and price_value(tick.get('last')) is not None:
+                sim_pos = {
+                    'direction': pos['direction'],
+                    'theory': pos['theory'],
+                    'stop': pos['stop'],
+                    'profit': pos['profit'],
+                    'owned': pos['owned'],
+                    'peak': pos.get('peak', '0'),
+                    'protected': bool(pos.get('protected', False)),
+                    'half_stage': int(pos.get('half_stage', 0)),
+                    'exit_target': None,
+                }
+                sim_pos, events = protect(sim_pos, tick, self._trade, spec)
+                pos['peak'] = sim_pos['peak']
+                pos['protected'] = bool(sim_pos['protected'])
+                pos['half_stage'] = int(sim_pos['half_stage'])
+                exited = False
+                for ev in events:
+                    if ev.get('remaining') == 0:
+                        row['position'] = None
+                        row.pop('ownership_conflict', None)
+                        reason = ev.get('reason')
+                        if (
+                            (reason == 'TAKE_PROFIT' and bool(self._trade.get('stop_day_on_profit', True)))
+                            or (reason == 'TRAILING_STOP' and bool(self._trade.get('stop_day_on_trailing')))
+                            or (reason == 'PROTECTED_FLOOR' and bool(self._trade.get('protect_stop_day')))
+                        ):
+                            row['day_stop'] = True
+                            row['day_stop_reason'] = reason
+                        if contract in inferred:
+                            inferred[contract] = dict(
+                                inferred[contract],
+                                target_long=0,
+                                target_short=0,
+                                has_proved_position=False,
+                                reason='PROVED_SHOULD_HAVE_EXITED',
+                            )
+                        exited = True
+                        break
+                    if 'remaining' in ev and int(ev['remaining']) < pos['owned']:
+                        new_qty = max(0, int(ev['remaining']))
+                        if new_qty == 0:
+                            row['position'] = None
+                            exited = True
+                            break
+                        avg_px = Decimal(pos['entry_notional']) / Decimal(pos['entry_filled']) if pos.get('entry_filled') else Decimal(pos['theory'])
+                        pos.update(
+                            owned=new_qty,
+                            legacy_owned=new_qty,
+                            quantity=new_qty,
+                            entry_filled=new_qty,
+                            entry_notional=decimal_text(avg_px * new_qty),
+                        )
+                if not exited and contract in inferred:
+                    t_long = pos['owned'] if pos['direction'] == 'LONG' else 0
+                    t_short = pos['owned'] if pos['direction'] == 'SHORT' else 0
+                    inferred[contract] = dict(
+                        inferred[contract],
+                        target_long=t_long,
+                        target_short=t_short,
+                        has_proved_position=True,
+                    )
 
     @staticmethod
     def _compute_convergence_preview(state, configured_markets, unconfigured_markets, non_strategy_orders,
                                      *, wall_iso=None, clock_unverified=False):
         ext_contracts = {o['contract_id'] for o in (non_strategy_orders or ())}
+        all_orders = list((state.get('orders') or {}).values())
         preview = {}
         for cid in sorted(configured_markets):
             m = configured_markets[cid]
             perm = m.get('market_permission') or infer_offline_market_permission(
                 m, wall_iso, clock_unverified=clock_unverified)
             pos = state['symbols'][cid]['position']
-            t_long = pos['owned'] if (pos is not None and pos['direction'] == 'LONG') else 0
-            t_short = pos['owned'] if (pos is not None and pos['direction'] == 'SHORT') else 0
+            pos_orders = (
+                [state['orders'][oid] for oid in pos.get('children', ()) if oid in state.get('orders', {})]
+                if pos is not None else ()
+            )
+            t_long, t_short = effective_position_target(pos, orders=pos_orders, terminal=terminal)
             a_long = int(m.get('long_qty') or 0)
             a_short = int(m.get('short_qty') or 0)
             ex_long = max(0, a_long - t_long)
             ex_short = max(0, a_short - t_short)
+            def_long = max(0, t_long - a_long)
+            def_short = max(0, t_short - a_short)
+            pending = contract_pending_summary(all_orders, cid, terminal)
             has_ext = cid in ext_contracts
+            if m.get('position_known') is False:
+                st_name = 'DEFERRED_FACTS_INCOMPLETE'
+                st_wait = 'POSITION_FACTS_UNAVAILABLE'
+            elif ex_long or ex_short or has_ext:
+                st_name = 'PREVIEW_NEEDS_CONVERGENCE'
+                st_wait = perm.get('wait_reason')
+            elif def_long or def_short or pending['open_long'] or pending['open_short']:
+                st_name = 'OPENING' if pending['open_long'] or pending['open_short'] else 'PREVIEW_NEEDS_CONVERGENCE'
+                st_wait = perm.get('wait_reason')
+            elif pending['close_long'] or pending['close_short']:
+                st_name = 'CONVERGING_FILL_PENDING'
+                st_wait = None
+            else:
+                st_name = 'ALIGNED'
+                st_wait = None
             preview[cid] = {
                 'configured': True,
-                'status': 'PREVIEW_NEEDS_CONVERGENCE' if (ex_long or ex_short or has_ext) else 'ALIGNED',
-                'wait_reason': perm.get('wait_reason') if (ex_long or ex_short or has_ext) else None,
+                'status': st_name,
+                'wait_reason': st_wait,
                 'failure_count': 0,
                 'actual_long': a_long,
                 'actual_short': a_short,
@@ -1093,6 +1189,12 @@ class DsvSession:
                 'target_short': t_short,
                 'excess_long': ex_long,
                 'excess_short': ex_short,
+                'deficit_long': def_long,
+                'deficit_short': def_short,
+                'pending_open_long': pending['open_long'],
+                'pending_open_short': pending['open_short'],
+                'pending_close_long': pending['close_long'],
+                'pending_close_short': pending['close_short'],
                 'market_phase': perm.get('market_phase'),
                 'evidence_state': perm.get('evidence_state'),
                 'status_source': perm.get('status_source'),
@@ -1107,11 +1209,24 @@ class DsvSession:
                 m, wall_iso, clock_unverified=clock_unverified)
             a_long = int(m.get('long_qty') or 0)
             a_short = int(m.get('short_qty') or 0)
+            pending = contract_pending_summary(all_orders, cid, terminal)
             has_ext = cid in ext_contracts
+            if m.get('position_known') is False:
+                st_name = 'DEFERRED_FACTS_INCOMPLETE'
+                st_wait = 'POSITION_FACTS_UNAVAILABLE'
+            elif a_long or a_short or has_ext:
+                st_name = 'PREVIEW_NEEDS_CONVERGENCE'
+                st_wait = perm.get('wait_reason')
+            elif pending['total_pending']:
+                st_name = 'CONVERGING_FILL_PENDING'
+                st_wait = None
+            else:
+                st_name = 'ALIGNED'
+                st_wait = None
             preview[cid] = {
                 'configured': False,
-                'status': 'PREVIEW_NEEDS_CONVERGENCE' if (a_long or a_short or has_ext) else 'ALIGNED',
-                'wait_reason': perm.get('wait_reason') if (a_long or a_short or has_ext) else None,
+                'status': st_name,
+                'wait_reason': st_wait,
                 'failure_count': 0,
                 'actual_long': a_long,
                 'actual_short': a_short,
@@ -1119,6 +1234,12 @@ class DsvSession:
                 'target_short': 0,
                 'excess_long': a_long,
                 'excess_short': a_short,
+                'deficit_long': 0,
+                'deficit_short': 0,
+                'pending_open_long': pending['open_long'],
+                'pending_open_short': pending['open_short'],
+                'pending_close_long': pending['close_long'],
+                'pending_close_short': pending['close_short'],
                 'market_phase': perm.get('market_phase'),
                 'evidence_state': perm.get('evidence_state'),
                 'status_source': perm.get('status_source'),

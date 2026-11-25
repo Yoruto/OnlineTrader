@@ -8,7 +8,7 @@ holdings resolve to target 0 so they flatten upon strategy ARM.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from online_trader.domain.values import decimal_text
@@ -65,6 +65,40 @@ def _bar_time_utc(bar):
         except (TypeError, ValueError):
             pass
     return None
+
+
+def _belongs_to_trading_day(
+    dt: datetime | None,
+    *,
+    item_trading_day: str | None,
+    trading_day: str,
+    parsed_windows: list[tuple[datetime, datetime]],
+) -> bool:
+    """Return True if ``dt`` belongs to ``trading_day`` (supporting cross-midnight night sessions)."""
+    if item_trading_day:
+        return str(item_trading_day) == str(trading_day)
+    if dt is None:
+        return True
+    if parsed_windows:
+        return any(open_dt <= dt < close_dt for open_dt, close_dt in parsed_windows)
+    try:
+        td = date.fromisoformat(str(trading_day))
+    except ValueError:
+        return True
+    civil = dt.astimezone(_BEIJING)
+    cdate = civil.date()
+    if cdate > td:
+        return False
+    if cdate == td:
+        # Same Beijing date: night tail (00:00-02:30) and day session (08:30-16:00) belong to td;
+        # evening session (>= 20:00) on td belongs to the NEXT trading day.
+        return civil.hour < 20
+    # Prior Beijing date: only evening night session (>= 20:00) on the immediately preceding
+    # business day (or Friday evening for Monday) can belong to td.
+    earliest_night_date = td - timedelta(days=3 if td.weekday() == 0 else 1)
+    if cdate < earliest_night_date:
+        return False
+    return civil.hour >= 20
 
 
 def _evaluate_side_plan_b(
@@ -248,6 +282,7 @@ def infer_startup_symbol_state(
     today_trades: list[dict] | None = None,
     minute_bars: list[dict] | None = None,
     has_prior_day_force_close: bool = True,
+    session_windows: list[dict] | None = None,
 ) -> dict:
     """Strictly infer startup target & protection baseline for one configured contract."""
     actual_long = int(market.get('long_qty') or 0)
@@ -257,6 +292,15 @@ def infer_startup_symbol_state(
     short_today = int(market.get('short_today', actual_short))
     short_hist = int(market.get('short_historical', 0))
 
+    parsed_windows: list[tuple[datetime, datetime]] = []
+    for win in (session_windows or ()):
+        if win.get('trading_day') and str(win['trading_day']) != str(trading_day):
+            continue
+        o_dt = _utc(win.get('open_utc'))
+        c_dt = _utc(win.get('close_utc'))
+        if o_dt is not None and c_dt is not None and o_dt < c_dt:
+            parsed_windows.append((o_dt, c_dt))
+
     normalized_bars = []
     for raw in (minute_bars or ()):
         t = _bar_time_utc(raw)
@@ -265,6 +309,13 @@ def infer_startup_symbol_state(
         except (KeyError, TypeError, ValueError):
             continue
         if t is None or min(o, h, l, c) <= 0 or l > h:
+            continue
+        if not _belongs_to_trading_day(
+            t,
+            item_trading_day=raw.get('trading_day'),
+            trading_day=trading_day,
+            parsed_windows=parsed_windows,
+        ):
             continue
         normalized_bars.append({'time': t, 'open': o, 'high': h, 'low': l, 'close': c,
                                 'bar_id': raw.get('bar_id')})
@@ -281,6 +332,13 @@ def infer_startup_symbol_state(
         if qty <= 0 or price_value(tr.get('price')) is None:
             continue
         t = _trade_time_utc(tr)
+        if not _belongs_to_trading_day(
+            t,
+            item_trading_day=tr.get('trading_day'),
+            trading_day=trading_day,
+            parsed_windows=parsed_windows,
+        ):
+            continue
         parsed_trades.append({
             'seq': idx,
             'trade_id': str(tr.get('trade_id') or tr.get('native_trade_id') or idx),
@@ -293,12 +351,25 @@ def infer_startup_symbol_state(
         })
     parsed_trades.sort(key=lambda r: (r['time'] or datetime.min.replace(tzinfo=timezone.utc), r['seq']))
 
+    order_vol = int(spec.get('order_volume') or 0)
+    max_vol = int(trade_settings.get('max_volume') or 0)
+    if order_vol > 0 and max_vol > 0:
+        single_target_cap = min(order_vol, max_vol)
+    elif order_vol > 0:
+        single_target_cap = order_vol
+    elif max_vol > 0:
+        single_target_cap = max_vol
+    else:
+        single_target_cap = 0
+
     open_lots: dict[str, list[dict]] = {'LONG': [], 'SHORT': []}
-    distinct_open_orders: set[str] = set()
+    active_target_qty: dict[str, int] = {'LONG': 0, 'SHORT': 0}
+    target_count = 0
     net_loss = Decimal(0)
     stop_streak = 0
     day_stop = False
     day_stop_reason = None
+    profit_day_stop = False
     last_signal_bar = None
     profit_offset = Decimal(str(spec.get('profit_offset') or 0))
     stop_offset = Decimal(str(spec.get('stop_offset') or 0))
@@ -306,7 +377,18 @@ def infer_startup_symbol_state(
     for tr in parsed_trades:
         if tr['offset'] == 'OPEN':
             side = 'LONG' if tr['direction'] == 'BUY' else 'SHORT'
-            distinct_open_orders.add(tr['order_id'])
+            # Group multiple repriced child order_ids filling into the same open target
+            # instead of counting each native order_id as a separate strategy target.
+            if not open_lots[side]:
+                target_count += 1
+                active_target_qty[side] = tr['qty']
+            else:
+                next_qty = active_target_qty[side] + tr['qty']
+                if single_target_cap > 0 and next_qty > single_target_cap:
+                    target_count += 1
+                    active_target_qty[side] = tr['qty']
+                else:
+                    active_target_qty[side] = next_qty
             open_lots[side].append({
                 'order_id': tr['order_id'],
                 'qty': tr['qty'],
@@ -335,6 +417,8 @@ def infer_startup_symbol_state(
                 head['qty'] -= take
                 if head['qty'] <= 0:
                     lots.pop(0)
+            if not lots:
+                active_target_qty[side] = 0
             if matched_qty > 0:
                 avg_move = matched_pnl / Decimal(matched_qty)
                 net_loss -= avg_move
@@ -344,9 +428,9 @@ def infer_startup_symbol_state(
                     stop_streak = 0
                 if profit_offset > 0 and avg_move >= profit_offset and trade_settings.get('stop_day_on_profit', True):
                     day_stop = True
+                    profit_day_stop = True
                     day_stop_reason = '止盈触发'
 
-    target_count = len(distinct_open_orders)
     max_daily = int(trade_settings.get('max_daily_orders') or 0)
     if max_daily > 0 and target_count >= max_daily:
         day_stop = True
@@ -376,7 +460,10 @@ def infer_startup_symbol_state(
         reason = 'FLAT_DAY_STOP_RECONSTRUCTED' if day_stop else 'FLAT_BASELINE'
         return base_summary | {'reason': reason}
 
-    if day_stop:
+    # Only a realized take-profit day stop implies no further position should be retained;
+    # reaching DAILY_TARGET_LIMIT or NET_LOSS_STOP blocks NEW entries without forcing
+    # liquidation of an already strategy-proved open position.
+    if profit_day_stop:
         return base_summary | {'reason': 'DAY_STOP_ACTIVE'}
 
     if has_prior_day_force_close and long_today == 0 and short_today == 0 and (long_hist > 0 or short_hist > 0):

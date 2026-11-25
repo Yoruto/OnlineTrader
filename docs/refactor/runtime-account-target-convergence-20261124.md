@@ -1,9 +1,9 @@
 # Standalone Runtime 全账户目标持仓收敛与启动状态推算设计
 
 > 状态：`CURRENT / IMPLEMENTED_OFFLINE_VERIFIED`  
-> 日期：2026-11-24  
+> 日期：2026-11-24（2026-11-25 按 Issue #28 修订）  
 > 适用范围：Standalone Trading Runtime 执行层（`DsvSession` / `ExplicitOrderController` / `DsvSdkAdapter`）、启动业务状态推算及 Workbench 持仓展示  
-> 验证状态：已完成工作区源码与离线回归验证（基于基线提交 `61c0dc09906aceba3ee9ec1915b0e17385590a26`：`compileall` 通过，`test_registry.py` 1998 项校验通过，`FullOffline` 1998/1998 PASS，`SimAll` 17/17 PASS，`DesktopE2E` 3/3 PASS）；实盘/仿真柜台连接（`LivePreflight`）与产品打包验收仍为 `NOT_RUN`
+> 验证状态：已完成 Issue #28 核心项（任务 A/B/C）源码修复与离线回归（基于 `930bb1c` 工作区：`compileall` 通过，`test_startup_inference` + `test_account_convergence` 19/19 PASS，受影响 convergence/market_permissions/target 测试 36/36 PASS，全量离线 `unittest discover -s tests` 2058/2059 PASS，唯一失败为既有的 `test_dsv_workbench_parity.py:149` 中文文案差异）；实盘/仿真柜台连接（`LivePreflight`）与产品打包验收仍为 `NOT_RUN`
 
 ---
 
@@ -32,6 +32,10 @@
    - **集合竞价与非连续阶段默认规则**：开盘前、集合竞价撮合（开盘前最后 1 分钟）、盘中休市、临时停牌及收盘后禁止主动开/平仓；集合竞价申报阶段（开盘前 5 分钟至前 1 分钟）禁止主动开/平仓及撤单追价，仅在权限明确允许时执行必要的非策略/多余开仓撤单；撮合期禁止撤单。市场暂不可交易时保留目标持仓差额，市场恢复连续交易后自动继续执行，无需人工重启。
    - **分层交易状态来源**：保持 `TRADING_CALENDAR/1` 持久化结构不变，在其上派生只读阶段查询。优先采用可选实时交易状态（`TqApi.get_trading_status`，按连接生命周期订阅，无商业权限或超时时自动无错降级，不阻塞 Runtime 主循环，并识别 `CONTINOUS` / `AUCTIONORDERING` / `NOTRADING`）；无实时状态权限时以完整日历 + 可信时钟 + 当前时段有效行情作为 `INFERRED` 基础路径，并结合柜台拒单回报进行阶段修正；非配置合约按需在内存中构建临时运行期时段覆盖，不得直接以“存在报价时间”视为处于连续交易。
    - **失败分类与条件恢复重试**：市场阶段限制、行情暂不可用、本地因市场权限拒绝发送/撤单（`E_DSV_MARKET_PHASE`）不计入失败次数；`TRANSIENT` 拒单采用退避重试而非永久锁死；撤单 `effect_id` 唯一序列号与真实失败次数分离计数；结构性拒单基于失败原因与执行条件指纹（可用今昨仓、挂单占用、目标手数、合法价位、市场阶段）判断是否可重新计算并恢复重试，对无交易权限等明确权限故障保持阻断报警。
+10. **Issue #28 核心可靠性修订（2026-11-25）**：
+   - **统一 `Actual / Desired / Pending` 语义**：在 `target_execution.py` 提供 `effective_position_target` 与 `contract_pending_summary`，`plan_convergence`、`_compute_convergence_preview` 与 `standalone_projection` 共用同一目标口径（区分正常开仓 `quantity`、部分成交后停止补开 `owned`、减仓/退出 `exit_target`），输出 `deficit_*` 与 `pending_*`，不再将部分成交缺口或活动委托在途状态误标为 `ALIGNED`。
+   - **统一委托占量与差额归零撤单**：`plan_convergence` 每轮先检查所有活动收敛平仓单；即使某侧 `conv_excess == 0`，多余在途收敛平仓单亦立即提交撤单（`CANCELLING_EXCESS_CLOSE`）。策略正常平仓路由（`_reduction_routes_with_reason`）与收敛平仓路由（`plan_convergence`）共同按合约、方向、今昨仓桶核算全部非终态平仓单（含 `SEND_POSSIBLE` / `UNKNOWN` / `CancelPending`）。
+   - **启动状态推算与事实完整性**：`_collect_startup_facts` 与 `infer_startup_symbol_state` 按交易日历/窗口过滤当前交易日 K 线与成交（正确保留跨自然日夜盘、剔除上一交易日日盘）；将同一开仓目标的多次撤改子单归并为 1 次策略目标；区分 `DAILY_TARGET_LIMIT`/`NET_LOSS_STOP`（禁止继续开新仓）与已实现止盈日停，不因达到每日次数上限而强平当前合法在手仓位；`DISARMED` 等待期间对 Plan B 推算持仓只读增量复核保护状态（零发单/撤单）；`position_known=False` 时单合约隔离为 `DEFERRED_FACTS_INCOMPLETE`，不依据伪造零持仓执行。
 
 ---
 

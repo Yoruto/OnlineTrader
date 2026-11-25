@@ -8,6 +8,7 @@ import re
 from online_trader.contracts.codec import canonical_bytes, content_hash
 from online_trader.domain.values import decimal_text
 from online_trader.dsv_runtime.controller import terminal
+from online_trader.dsv_runtime.target_execution import contract_pending_summary, effective_position_target
 from online_trader.dsv_core.entry_rules import trigger_prices
 from online_trader.errors import TraderError
 from online_trader.gateway.dsv_facts import native_integer
@@ -306,20 +307,40 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         fresh = bool(tick and quote.get('age_quality') == 'VALID'
                      and row.get('market_session_active') is not False)
         position = row.get('position')
+        all_snapshot_orders = list((snapshot.get('orders') or {}).values())
+        pos_orders = (
+            [snapshot['orders'][oid] for oid in position.get('children', ()) if oid in (snapshot.get('orders') or {})]
+            if position is not None else ()
+        )
         actual_long = int(market.get('long_qty', 0) or 0)
         actual_short = int(market.get('short_qty', 0) or 0)
-        target_long = position['owned'] if position is not None and position['direction'] == 'LONG' else 0
-        target_short = position['owned'] if position is not None and position['direction'] == 'SHORT' else 0
+        target_long, target_short = effective_position_target(
+            position, orders=pos_orders, terminal=terminal)
         excess_long = max(0, actual_long - target_long)
         excess_short = max(0, actual_short - target_short)
+        deficit_long = max(0, target_long - actual_long)
+        deficit_short = max(0, target_short - actual_short)
+        pending = contract_pending_summary(all_snapshot_orders, contract, terminal)
         conv = convergence_status.get(contract) or {}
         inf = startup_inference.get(contract) or {}
         perm = market.get('market_permission') or {}
-        conv_state = conv.get('status') or (
-            'ALIGNED' if (actual_long == target_long and actual_short == target_short)
-            else ('PREVIEW_NEEDS_CONVERGENCE' if not snapshot['running'] else 'CONVERGING')
+        if conv.get('status'):
+            conv_state = conv['status']
+        elif market.get('position_known') is False:
+            conv_state = 'DEFERRED_FACTS_INCOMPLETE'
+        elif actual_long == target_long and actual_short == target_short and pending['total_pending'] == 0:
+            conv_state = 'ALIGNED'
+        elif not snapshot['running']:
+            conv_state = 'PREVIEW_NEEDS_CONVERGENCE'
+        elif deficit_long or deficit_short or pending['open_long'] or pending['open_short']:
+            conv_state = 'OPENING'
+        elif pending['close_long'] or pending['close_short']:
+            conv_state = 'CONVERGING_FILL_PENDING'
+        else:
+            conv_state = 'CONVERGING'
+        conv_wait_reason = conv.get('wait_reason') or (
+            perm.get('wait_reason') if (excess_long or excess_short or deficit_long or deficit_short) else None
         )
-        conv_wait_reason = conv.get('wait_reason') or (perm.get('wait_reason') if (excess_long or excess_short) else None)
         market_phase = conv.get('market_phase') or perm.get('market_phase')
         evidence_state = conv.get('evidence_state') or perm.get('evidence_state')
         account_positions.append({
@@ -332,6 +353,12 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
             'target_short': target_short,
             'excess_long': excess_long,
             'excess_short': excess_short,
+            'deficit_long': deficit_long,
+            'deficit_short': deficit_short,
+            'pending_open_long': conv.get('pending_open_long', pending['open_long']),
+            'pending_open_short': conv.get('pending_open_short', pending['open_short']),
+            'pending_close_long': conv.get('pending_close_long', pending['close_long']),
+            'pending_close_short': conv.get('pending_close_short', pending['close_short']),
             'status': conv_state,
             'wait_reason': conv_wait_reason,
             'failure_count': int(conv.get('failure_count') or 0),

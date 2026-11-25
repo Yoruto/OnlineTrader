@@ -807,17 +807,24 @@ class DsvSdkAdapter:
                 frame['startup_account_facts'] = self._collect_startup_facts(day, trades)
         return frame, {row['contract_id']: row for row in markets}
 
-    def _safe_all_positions(self):
+    def _read_all_positions(self):
         try:
             positions = self.api.get_position(account=self.account)
         except TypeError:
-            return {}
+            # Older mock / single-contract get_position(code) signature without zero-arg support.
+            return {}, True
+        except Exception:
+            return {}, False
         if not hasattr(positions, 'items'):
-            return {}
+            return {}, False
         result = {}
         for code, pos in positions.items():
             if isinstance(code, str) and '.' in code and hasattr(pos, 'pos_long'):
                 result[code] = pos
+        return result, True
+
+    def _safe_all_positions(self):
+        result, _ = self._read_all_positions()
         return result
 
     def _collect_non_strategy_orders(self, orders, bindings):
@@ -1062,7 +1069,7 @@ class DsvSdkAdapter:
         )
 
     def _collect_unconfigured_markets(self, state, non_strategy, sample, day, funds):
-        all_positions = self._safe_all_positions()
+        all_positions, positions_ok = self._read_all_positions()
         ext_codes = {item['contract_id'] for item in non_strategy}
         conv_codes = {
             o['contract_id'] for o in state['orders'].values()
@@ -1077,11 +1084,15 @@ class DsvSdkAdapter:
         results = []
         for code in sorted(target_codes):
             pos = all_positions.get(code)
+            position_known = positions_ok
             if pos is None:
                 try:
                     pos = self.api.get_position(code, account=self.account)
+                    if pos is not None:
+                        position_known = True
                 except Exception:
                     pos = None
+                    position_known = False
             quote = self.quotes.get(code)
             if quote is None:
                 try:
@@ -1163,6 +1174,7 @@ class DsvSdkAdapter:
                 'long_historical': 0 if pos is None else native_integer(getattr(pos, 'pos_long_his', 0)),
                 'short_today': 0 if pos is None else native_integer(getattr(pos, 'pos_short_today', 0)),
                 'short_historical': 0 if pos is None else native_integer(getattr(pos, 'pos_short_his', 0)),
+                'position_known': bool(position_known),
             }
             if observation is not None:
                 entry['quote_observation'] = observation
@@ -1180,13 +1192,23 @@ class DsvSdkAdapter:
         return results
 
     def _collect_startup_facts(self, day, trades):
-        facts = {code: {'today_trades': [], 'minute_bars': [], 'has_prior_day_force_close': True}
+        facts = {code: {'today_trades': [], 'minute_bars': [], 'has_prior_day_force_close': True, 'session_windows': []}
                  for code in self.contracts}
         for code in self.contracts:
             periods = self.periods.get(code)
             if periods:
+                day_periods = [p for p in periods if p.get('trading_day') == day]
                 facts[code]['has_prior_day_force_close'] = any(
-                    bool(p.get('force_close_at_end')) for p in periods if p.get('trading_day') == day)
+                    bool(p.get('force_close_at_end')) for p in day_periods)
+                facts[code]['session_windows'] = [
+                    {
+                        'trading_day': p.get('trading_day'),
+                        'open_utc': p.get('open_utc'),
+                        'close_utc': p.get('close_utc'),
+                    }
+                    for p in day_periods
+                    if p.get('open_utc') and p.get('close_utc')
+                ]
             serial = self.minutes.get(code)
             if serial is not None:
                 ready = getattr(self.api, 'is_serial_ready', None)
@@ -1198,11 +1220,19 @@ class DsvSdkAdapter:
                         for r in rows:
                             if not r or not r[0]:
                                 continue
+                            bar_ns = int(r[0])
+                            if self.calendar is not None:
+                                try:
+                                    if native_day(self.calendar, code, str(bar_ns))['trading_day'] != day:
+                                        continue
+                                except TraderError:
+                                    continue
                             ohlc = [number(v) for v in r[1:5]]
                             if len(ohlc) != 4 or any(v is None for v in ohlc):
                                 continue
                             formatted_bars.append({
-                                'datetime_ns': str(int(r[0])),
+                                'datetime_ns': str(bar_ns),
+                                'trading_day': day,
                                 'open': ohlc[0],
                                 'high': ohlc[1],
                                 'low': ohlc[2],

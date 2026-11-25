@@ -555,21 +555,180 @@ class AccountConvergenceTests(unittest.TestCase):
         self.assertEqual(snap['convergence_status']['SHFE.ag2702']['excess_long'], 3)
         self.assertEqual(snap['convergence_status']['SHFE.ag2702']['excess_short'], 2)
 
-        # Even if quote jumps while still DISARMED, ZERO exits or closes fire before START.
+        # Even if quote drops through stop loss while still DISARMED, ZERO exits or closes fire before START,
+        # but read-only protection review updates the inferred target to 0 before ARM.
         quotes['SHFE.ag2702'].datetime = '2026-11-13 09:10:01.000000'
         quotes['SHFE.ag2702'].last_price = 7505.0
         quotes['SHFE.ag2702'].bid_price1 = 7504.0
         adapter.step(session, trading_day=DAY, complete=True)
         self.assertEqual(inserted, [])
+        snap_after_drop = session.snapshot()
+        self.assertIsNone(snap_after_drop['symbols']['SHFE.ag2702']['position'])
+        self.assertEqual(snap_after_drop['startup_inference']['SHFE.ag2702']['target_long'], 0)
+        self.assertEqual(snap_after_drop['startup_inference']['SHFE.ag2702']['reason'], 'PROVED_SHOULD_HAVE_EXITED')
 
-        # User clicks START -> flattens 3 excess LONG (CLOSETODAY) and 2 opposite SHORT (CLOSETODAY), AND stops out the 5 retained lots at 7505!
+        # User clicks START -> flattens all 8 LONG (CLOSETODAY) and 2 opposite SHORT (CLOSETODAY).
         session.command({'id': 'cmd-start', 'action': 'START'})
         quotes['SHFE.ag2702'].datetime = '2026-11-13 09:10:02.000000'
         adapter.step(session, trading_day=DAY, complete=True)
-        # Expect: 1 strategy STOP_LOSS exit for 5 + 1 convergence excess close for 3 + 1 convergence opposite SHORT close for 2
-        self.assertTrue(any(o['offset'] == 'CLOSETODAY' and o['direction'] == 'SELL' and o['volume'] == 3 for o in inserted))
+        self.assertTrue(any(o['offset'] == 'CLOSETODAY' and o['direction'] == 'SELL' and o['volume'] == 8 for o in inserted))
         self.assertTrue(any(o['offset'] == 'CLOSETODAY' and o['direction'] == 'BUY' and o['volume'] == 2 for o in inserted))
-        self.assertTrue(any(o['offset'] == 'CLOSETODAY' and o['direction'] == 'SELL' and o['volume'] == 5 for o in inserted))
+
+    def test_excess_convergence_close_order_cancelled_when_excess_drops_to_zero(self):
+        # Issue 28 Task B: actual LONG 10, target LONG 5, working convergence close 5;
+        # when external fill reduces actual LONG to 5 (excess == 0), working close MUST be cancelled.
+        t0 = int(datetime(2026, 11, 13, 1, 5, 0, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+        t_fill = int(datetime(2026, 11, 13, 1, 8, 10, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+        quotes = {
+            'DCE.p2701': SimpleNamespace(
+                instrument_id='DCE.p2701', expired=False, ins_class='FUTURE', volume_multiple=10,
+                trading_time={'day': [['09:00:00', '10:15:00']], 'night': []},
+                datetime='2026-11-13 09:10:00.000000', last_price=1062.0, highest=1065.0, lowest=1020.0,
+                bid_price1=1061.0, ask_price1=1063.0, price_tick=1.0, lower_limit=950.0, upper_limit=1150.0, margin=4000.0,
+            ),
+        }
+        positions = {
+            'DCE.p2701': SimpleNamespace(pos_long=10, pos_short=0, pos_long_today=10, pos_long_his=0, pos_short_today=0, pos_short_his=0, margin=40000.0),
+        }
+        orders = {}
+        trades = {
+            'hist-t1': SimpleNamespace(
+                trade_id='hist-t1', order_id='hist-o1', exchange_id='DCE', instrument_id='p2701',
+                direction='BUY', offset='OPEN', volume=5, price=1060.0, trade_date_time=t_fill,
+            ),
+        }
+        serials = {
+            'DCE.p2701': _make_serial([
+                {'datetime': t0, 'open': 1025.0, 'high': 1030.0, 'low': 1020.0, 'close': 1028.0},
+                {'datetime': t0 + 180_000_000_000, 'open': 1028.0, 'high': 1062.0, 'low': 1027.0, 'close': 1061.0},
+            ]),
+        }
+        adapter, session, _prof, inserted, cancelled = self._build_real_sdk_harness(
+            quotes=quotes, positions=positions, orders=orders, trades=trades, serials=serials,
+            configured_code='DCE.p2701',
+        )
+        adapter.step(session, trading_day=DAY, complete=True)
+        session.command({'id': 'cmd-start', 'action': 'START'})
+        quotes['DCE.p2701'].datetime = '2026-11-13 09:10:01.000000'
+        adapter.step(session, trading_day=DAY, complete=True)
+        self.assertEqual(len(inserted), 1)
+        self.assertEqual(inserted[0]['volume'], 5)
+        conv_order_id = inserted[0]['order_id']
+
+        # Next round: broker reports the convergence order ALIVE, AND external activity reduced actual LONG from 10 to 5.
+        positions['DCE.p2701'].pos_long = 5
+        positions['DCE.p2701'].pos_long_today = 5
+        quotes['DCE.p2701'].datetime = '2026-11-13 09:10:02.000000'
+        adapter.step(session, trading_day=DAY, complete=True)
+        self.assertIn(conv_order_id, cancelled)
+        self.assertEqual(len(inserted), 1)
+
+    def test_partial_open_fill_reports_desired_and_pending_not_aligned(self):
+        # Issue 28 Task A: target open 5, filled 3, pending 2 -> Desired=5, Actual=3, NOT ALIGNED.
+        runtime, client = self._start_runtime()
+        client.command(
+            'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'authority_policy_id': 'target-authority-current-boot',
+             'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
+            expected_config_revision='1',
+        )
+        runtime.submit(_offline_frame(2, long_qty=0, last='1060'))
+        opening_view = self._wait_view(client, lambda v: len(v['orders']) == 1)
+        cid = opening_view['orders'][0]['child_order_id']
+        # Partial fill 3 of 5, order still ALIVE with 2 remaining.
+        runtime.submit(_offline_frame(
+            3, long_qty=3, last='1060',
+            facts=[
+                _order_fact(cid, 'nat-open-1', CONTRACT, 'BUY', 'OPEN', 5, status='ALIVE', filled=3),
+                _trade_fact(cid, 'nat-open-1', 'trd-open-1', CONTRACT, 'BUY', 'OPEN', 3, '1060'),
+            ],
+        ))
+        partial_view = self._wait_view(
+            client,
+            lambda v: (v.get('connection') or {}).get('account_positions', [{}])[0].get('actual_long') == 3,
+        )
+        acc = partial_view['connection']['account_positions'][0]
+        self.assertEqual(acc['actual_long'], 3)
+        self.assertEqual(acc['target_long'], 5)
+        self.assertEqual(acc['deficit_long'], 2)
+        self.assertEqual(acc['pending_open_long'], 2)
+        self.assertNotEqual(acc['status'], 'ALIGNED')
+        self.assertEqual(len(runtime.adapter.orders), 1)
+
+    def test_same_round_strategy_stop_loss_and_convergence_share_shfe_buckets(self):
+        # Issue 28 Task B: SHFE strategy holds 5 today + external 3 historical;
+        # on same round stop loss closes 5 CLOSETODAY and convergence closes 3 CLOSE (historical) without double-counting.
+        t0 = int(datetime(2026, 11, 13, 1, 5, 0, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+        t_fill = int(datetime(2026, 11, 13, 1, 8, 10, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+        quotes = {
+            'SHFE.ag2702': SimpleNamespace(
+                instrument_id='SHFE.ag2702', expired=False, ins_class='FUTURE', volume_multiple=15,
+                trading_time={'day': [['09:00:00', '10:15:00']], 'night': []},
+                datetime='2026-11-13 09:10:00.000000', last_price=7550.0, highest=7560.0, lowest=7500.0,
+                bid_price1=7549.0, ask_price1=7551.0, price_tick=1.0, lower_limit=7000.0, upper_limit=8000.0, margin=6000.0,
+            ),
+        }
+        positions = {
+            'SHFE.ag2702': SimpleNamespace(pos_long=8, pos_short=0, pos_long_today=5, pos_long_his=3, pos_short_today=0, pos_short_his=0, margin=60000.0),
+        }
+        orders = {}
+        trades = {
+            'hist-t1': SimpleNamespace(
+                trade_id='hist-t1', order_id='hist-o1', exchange_id='SHFE', instrument_id='ag2702',
+                direction='BUY', offset='OPEN', volume=5, price=7540.0, trade_date_time=t_fill,
+            ),
+        }
+        serials = {
+            'SHFE.ag2702': _make_serial([
+                {'datetime': t0, 'open': 7505.0, 'high': 7520.0, 'low': 7500.0, 'close': 7515.0},
+                {'datetime': t0 + 180_000_000_000, 'open': 7515.0, 'high': 7544.0, 'low': 7512.0, 'close': 7542.0},
+            ]),
+        }
+        adapter, session, _prof, inserted, _cancelled = self._build_real_sdk_harness(
+            quotes=quotes, positions=positions, orders=orders, trades=trades, serials=serials,
+            configured_code='SHFE.ag2702',
+        )
+        adapter.step(session, trading_day=DAY, complete=True)
+        # ARM while price is still safe (7550), then drop through stop loss (7505) on the same ARMED round!
+        session.command({'id': 'cmd-start', 'action': 'START'})
+        quotes['SHFE.ag2702'].datetime = '2026-11-13 09:10:01.000000'
+        quotes['SHFE.ag2702'].last_price = 7505.0
+        quotes['SHFE.ag2702'].bid_price1 = 7504.0
+        adapter.step(session, trading_day=DAY, complete=True)
+        today_closes = [o for o in inserted if o['direction'] == 'SELL' and o['offset'] == 'CLOSETODAY']
+        hist_closes = [o for o in inserted if o['direction'] == 'SELL' and o['offset'] == 'CLOSE']
+        self.assertEqual(sum(o['volume'] for o in today_closes), 5)
+        self.assertEqual(sum(o['volume'] for o in hist_closes), 3)
+
+    def test_unknown_position_facts_isolate_contract_instead_of_faking_zero(self):
+        # Issue 28 Task C: position_known=False must defer contract instead of acting on fabricated zero.
+        runtime, client = self._start_runtime()
+        client.command(
+            'ARM_ENTRIES', {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            {'authority_policy_id': 'target-authority-current-boot',
+             'rule_set_id': 'DSV_TARGET_EXECUTION', 'config_revision': '1'},
+            expected_config_revision='1',
+        )
+        frame = _offline_frame(
+            2, long_qty=0, last='1050',
+            unconfigured_markets=[{
+                'contract_id': 'SHFE.cu2701',
+                'long_qty': 0, 'short_qty': 0,
+                'long_today': 0, 'long_historical': 0,
+                'short_today': 0, 'short_historical': 0,
+                'position_known': False,
+                'ticks': [],
+                'market_session_active': True,
+            }],
+        )
+        runtime.submit(frame)
+        view = self._wait_view(
+            client,
+            lambda v: any(a['contract_id'] == 'SHFE.cu2701' for a in (v.get('connection') or {}).get('account_positions', [])),
+        )
+        cu = next(a for a in view['connection']['account_positions'] if a['contract_id'] == 'SHFE.cu2701')
+        self.assertEqual(cu['status'], 'DEFERRED_FACTS_INCOMPLETE')
+        self.assertEqual(runtime.adapter.orders, [])
 
     def test_standalone_ui_hides_external_banner_and_displays_account_target_delta(self):
         app = QApplication.instance() or QApplication([])

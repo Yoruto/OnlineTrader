@@ -71,3 +71,95 @@ def account_target(*, confirmed_qty, target_qty, orders, terminal):
         uncertain_children=uncertain,
         cancel_pending_children=cancelling,
     )
+
+
+def effective_target_qty(position, *, orders=None, terminal=None) -> int:
+    """Return the effective strategy desired quantity for ``position``.
+
+    Covers normal opening (``quantity``), partial fill with stopped entry
+    (``owned``/``entry_filled``), stop with preserved open orders, and active
+    reduction/exit (``exit_target``).
+    """
+    if position is None:
+        return 0
+    exit_target = position.get('exit_target')
+    if exit_target is not None:
+        return max(0, min(int(position['owned']), int(exit_target)))
+    if position.get('entry_stopped'):
+        if position.get('preserve_open_on_stop') and orders is not None and terminal is not None:
+            pending_open = sum(
+                _remaining(o) for o in orders
+                if o.get('effect') == 'OPEN' and not terminal(o)
+            )
+            return max(0, min(int(position['quantity']), int(position['entry_filled']) + pending_open))
+        return max(0, int(position['owned']))
+    return max(0, int(position['quantity']))
+
+
+def effective_position_target(position, *, orders=None, terminal=None) -> tuple[int, int]:
+    """Return ``(target_long, target_short)`` using unified effective-target rules."""
+    qty = effective_target_qty(position, orders=orders, terminal=terminal)
+    if position is None or qty <= 0:
+        return 0, 0
+    if position.get('direction') == 'LONG':
+        return qty, 0
+    if position.get('direction') == 'SHORT':
+        return 0, qty
+    return 0, 0
+
+
+def contract_pending_summary(orders, contract_id: str, terminal) -> dict[str, int]:
+    """Aggregate all non-terminal orders for ``contract_id`` across strategy and convergence.
+
+    Includes ``SEND_POSSIBLE``, ``UNKNOWN``, and ``CancelPending`` orders until
+    ``terminal(order)`` observes an admissible terminal fact.
+    """
+    summary = {
+        'open_long': 0,
+        'open_short': 0,
+        'close_long': 0,
+        'close_short': 0,
+        'strategy_close_long': 0,
+        'strategy_close_short': 0,
+        'convergence_close_long': 0,
+        'convergence_close_short': 0,
+        'close_long_today': 0,
+        'close_long_hist': 0,
+        'close_short_today': 0,
+        'close_short_hist': 0,
+        'uncertain_open_long': 0,
+        'uncertain_open_short': 0,
+        'uncertain_close_long': 0,
+        'uncertain_close_short': 0,
+        'total_pending': 0,
+    }
+    for order in orders:
+        if order.get('contract_id') != contract_id or terminal(order):
+            continue
+        rem = _remaining(order)
+        if rem <= 0:
+            continue
+        summary['total_pending'] += rem
+        effect = order.get('effect')
+        direction = order.get('direction')
+        is_uncertain = (
+            order.get('send_state') in {'SEND_POSSIBLE', 'UNKNOWN'}
+            or order.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}
+        )
+        if effect == 'OPEN':
+            side_key = 'long' if direction == 'BUY' else 'short'
+            summary[f'open_{side_key}'] += rem
+            if is_uncertain:
+                summary[f'uncertain_open_{side_key}'] += rem
+        elif effect == 'REDUCE':
+            side_key = 'long' if direction == 'SELL' else 'short'
+            summary[f'close_{side_key}'] += rem
+            if order.get('convergence_order'):
+                summary[f'convergence_close_{side_key}'] += rem
+            else:
+                summary[f'strategy_close_{side_key}'] += rem
+            bucket_key = 'today' if order.get('native_offset') == 'CLOSETODAY' else 'hist'
+            summary[f'close_{side_key}_{bucket_key}'] += rem
+            if is_uncertain:
+                summary[f'uncertain_close_{side_key}'] += rem
+    return summary
