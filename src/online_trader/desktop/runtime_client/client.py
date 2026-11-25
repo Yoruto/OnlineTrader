@@ -2,28 +2,221 @@
 
 from contextlib import closing
 from dataclasses import replace
+from pathlib import Path
 from queue import Empty, Full, Queue
+import time
 from uuid import uuid4
 
 from PySide6.QtCore import QObject, QThread, Signal
 
 from online_trader.contracts.codec import content_hash
 from online_trader.errors import TraderError
+from online_trader.runtime.instance import runtime_owner_exists
+from online_trader.runtime.instance_registry import read_runtime_instance
 from online_trader.runtime.operator_api import RuntimeWorkbenchClient
 from online_trader.transport.runtime_account import RuntimeAccountClient
 from online_trader.transport.runtime_view import RuntimeViewClient, ViewReplica
 from online_trader.desktop.runtime_client.pending_registry import PendingCommandRegistry
 from online_trader.desktop.runtime_client.state import PendingCommandState, PendingCommandStatus
+from online_trader.desktop.runtime_logs import read_record, supplied_run_directory
 
 
 class RuntimeSubscriptionWorker(QThread):
     state_received = Signal(object, object, object)
     publication_observed = Signal(object)
     connection_changed = Signal(str, str)
+    lifecycle_changed = Signal(object)
+
+    _PROBE_INTERVAL_NS = 1_500_000_000
 
     def __init__(self, pipe, parent=None):
         super().__init__(parent)
+        self.pipe = pipe
         self.client = RuntimeViewClient(pipe)
+        self._last_account_key = None
+        self._last_boot_id = None
+        self._last_run_dir = None
+        self._initial_instance_id = None
+        self._last_lifecycle = None
+        self._last_lifecycle_key = None
+        self._last_probe_ns = 0
+        try:
+            inst = read_runtime_instance()
+            if isinstance(inst, dict) and inst.get('pipe') == pipe:
+                self._initial_instance_id = inst.get('instance_id')
+                self._last_account_key = inst.get('account_key')
+                rt_root = inst.get('runtime_root')
+                if isinstance(rt_root, str) and rt_root and isinstance(self._last_account_key, str) and self._last_account_key:
+                    self._last_run_dir = Path(rt_root) / self._last_account_key / 'run'
+        except Exception:
+            pass
+
+    def _capture_identity(self, state):
+        if not isinstance(state, dict):
+            return
+        view = state.get('view') if isinstance(state.get('view'), dict) else state
+        acct = view.get('account_key')
+        if isinstance(acct, str) and acct:
+            self._last_account_key = acct
+        if isinstance(view.get('configuration'), dict):
+            run_dir = supplied_run_directory(view)
+            if run_dir is not None:
+                self._last_run_dir = run_dir
+        boot_id = view.get('runtime_boot_id')
+        if not boot_id and self._last_run_dir is not None:
+            status_rec = read_record(self._last_run_dir / 'target-owner-status.json')
+            if isinstance(status_rec, dict) and isinstance(status_rec.get('runtime_boot_id'), str):
+                boot_id = status_rec['runtime_boot_id']
+        if not boot_id:
+            boot_id = view.get('kernel_boot_id')
+        if isinstance(boot_id, str) and boot_id:
+            self._last_boot_id = boot_id
+
+    def _read_matched_record(self, path, *, require_boot_match=True):
+        if path is None or not path.exists():
+            return None
+        record = read_record(path)
+        if not isinstance(record, dict):
+            return None
+        if self._last_account_key and record.get('account_key') not in (None, self._last_account_key):
+            return None
+        if self._last_boot_id:
+            rec_boot = record.get('runtime_boot_id')
+            if require_boot_match:
+                if rec_boot != self._last_boot_id:
+                    return None
+            elif rec_boot not in (None, self._last_boot_id):
+                return None
+        return record
+
+    def _emit_lifecycle(self, payload, *, force=False):
+        key = (
+            payload.get('state'),
+            payload.get('error_code'),
+            payload.get('runtime_boot_id'),
+            payload.get('pipe'),
+        )
+        self._last_lifecycle = payload
+        if force or key != self._last_lifecycle_key:
+            self._last_lifecycle_key = key
+            self.lifecycle_changed.emit(dict(payload))
+
+    def _probe_lifecycle(self, *, pipe_connected):
+        now_ns = time.monotonic_ns()
+        if not force_probe_needed(self._last_probe_ns, now_ns, self._PROBE_INTERVAL_NS) and self._last_lifecycle is not None:
+            return self._last_lifecycle
+        self._last_probe_ns = now_ns
+        try:
+            reg = read_runtime_instance()
+        except Exception:
+            reg = None
+        try:
+            owner_locked = runtime_owner_exists()
+        except Exception:
+            owner_locked = False
+        if isinstance(reg, dict):
+            reg_pipe = reg.get('pipe')
+            reg_instance = reg.get('instance_id')
+            if self._last_run_dir is None and isinstance(reg.get('runtime_root'), str) and isinstance(reg.get('account_key'), str):
+                self._last_run_dir = Path(reg['runtime_root']) / reg['account_key'] / 'run'
+            if owner_locked and (
+                (isinstance(reg_pipe, str) and reg_pipe and reg_pipe != self.pipe)
+                or (self._initial_instance_id and isinstance(reg_instance, str) and reg_instance != self._initial_instance_id)
+            ):
+                return {
+                    'state': 'OWNER_REPLACED',
+                    'owner_locked': True,
+                    'pipe': reg_pipe,
+                    'instance_id': reg_instance,
+                    'account_key': reg.get('account_key'),
+                    'runtime_root': reg.get('runtime_root'),
+                }
+        if owner_locked:
+            if pipe_connected:
+                return {
+                    'state': 'OWNER_UNRESPONSIVE',
+                    'owner_locked': True,
+                    'runtime_boot_id': self._last_boot_id,
+                    'account_key': self._last_account_key,
+                    'detail': 'Runtime 进程锁仍被持有，但视图快照未按期更新（无法确认主循环健康状态）',
+                }
+            return {
+                'state': 'VIEW_RECONNECTING',
+                'owner_locked': True,
+                'runtime_boot_id': self._last_boot_id,
+                'account_key': self._last_account_key,
+                'detail': 'Runtime 进程锁仍被持有，正在重连视图通道（尚无法确认主循环状态）',
+            }
+        run_dir = self._last_run_dir
+        runtime_failure = self._read_matched_record(run_dir / 'runtime-failure.json') if run_dir is not None else None
+        if runtime_failure is not None:
+            return {
+                'state': 'OWNER_CRASHED',
+                'owner_locked': False,
+                'runtime_boot_id': runtime_failure.get('runtime_boot_id') or self._last_boot_id,
+                'account_key': runtime_failure.get('account_key') or self._last_account_key,
+                'error_code': runtime_failure.get('error_code') or 'E_RUNTIME_OWNER_EXITED',
+                'detail': runtime_failure.get('detail') or runtime_failure.get('message') or '',
+                'observed_at_utc': runtime_failure.get('observed_at_utc'),
+            }
+        status_rec = self._read_matched_record(run_dir / 'target-owner-status.json') if run_dir is not None else None
+        if status_rec is not None:
+            phase = status_rec.get('phase')
+            if phase == 'STOPPED':
+                return {
+                    'state': 'OWNER_STOPPED',
+                    'owner_locked': False,
+                    'runtime_boot_id': status_rec.get('runtime_boot_id') or self._last_boot_id,
+                    'account_key': status_rec.get('account_key') or self._last_account_key,
+                    'observed_at_utc': status_rec.get('observed_at_utc'),
+                }
+            if phase == 'NEEDS_REVIEW':
+                return {
+                    'state': 'OWNER_CRASHED',
+                    'owner_locked': False,
+                    'runtime_boot_id': status_rec.get('runtime_boot_id') or self._last_boot_id,
+                    'account_key': status_rec.get('account_key') or self._last_account_key,
+                    'error_code': status_rec.get('error_code') or 'E_RUNTIME_OWNER_EXITED',
+                    'detail': status_rec.get('detail') or '',
+                    'observed_at_utc': status_rec.get('observed_at_utc'),
+                }
+        startup_failure = (
+            self._read_matched_record(run_dir / 'startup-failure.json', require_boot_match=self._last_boot_id is not None)
+            if run_dir is not None else None
+        )
+        if startup_failure is not None:
+            return {
+                'state': 'OWNER_CRASHED',
+                'owner_locked': False,
+                'runtime_boot_id': startup_failure.get('runtime_boot_id') or self._last_boot_id,
+                'account_key': startup_failure.get('account_key') or self._last_account_key,
+                'error_code': startup_failure.get('error_code') or 'E_RUNTIME_OWNER_EXITED',
+                'detail': startup_failure.get('detail') or startup_failure.get('message') or '',
+                'observed_at_utc': startup_failure.get('observed_at_utc'),
+            }
+        return {
+            'state': 'OWNER_CRASHED',
+            'owner_locked': False,
+            'runtime_boot_id': self._last_boot_id,
+            'account_key': self._last_account_key,
+            'error_code': 'E_RUNTIME_OWNER_EXITED',
+            'detail': '未检测到 Runtime 进程锁，也未找到正常停机状态记录',
+        }
+
+    def _watch_for_new_runtime(self):
+        while not self.isInterruptionRequested():
+            for _ in range(4):
+                if self.isInterruptionRequested():
+                    return None
+                self.msleep(500)
+            try:
+                owner_locked = runtime_owner_exists()
+                reg = read_runtime_instance() if owner_locked else None
+            except Exception:
+                continue
+            if owner_locked and isinstance(reg, dict) and isinstance(reg.get('pipe'), str) and reg['pipe']:
+                return reg
+        return None
 
     def run(self):
         replica = ViewReplica()
@@ -37,8 +230,19 @@ class RuntimeSubscriptionWorker(QThread):
                             return
                         if message['kind'] == 'UNAVAILABLE':
                             self.connection_changed.emit('STALE', 'E_RUNTIME_VIEW_UNAVAILABLE')
+                            verdict = self._probe_lifecycle(pipe_connected=True)
+                            self._emit_lifecycle(verdict)
+                            if verdict['state'] == 'OWNER_REPLACED':
+                                return
                             continue
                         if replica.apply(message):
+                            self._capture_identity(replica.state)
+                            if self._last_lifecycle_key is not None and self._last_lifecycle_key[0] != 'HEALTHY':
+                                self._emit_lifecycle({
+                                    'state': 'HEALTHY',
+                                    'runtime_boot_id': self._last_boot_id,
+                                    'account_key': self._last_account_key,
+                                })
                             self.state_received.emit(replica.state, replica.cursor, int(message['published_ns']))
                         else:
                             self.publication_observed.emit(int(message['published_ns']))
@@ -51,13 +255,53 @@ class RuntimeSubscriptionWorker(QThread):
             except (OSError, KeyError, TypeError, ValueError):
                 if self.isInterruptionRequested():
                     return
+                self._last_probe_ns = 0
+                verdict = self._probe_lifecycle(pipe_connected=False)
+                if verdict['state'] == 'OWNER_REPLACED':
+                    self._emit_lifecycle(verdict, force=True)
+                    return
+                if verdict['state'] in {'OWNER_CRASHED', 'OWNER_STOPPED'}:
+                    self.connection_changed.emit(
+                        'RESYNC_REQUIRED',
+                        verdict.get('error_code') or 'E_RUNTIME_OWNER_EXITED',
+                    )
+                    self._emit_lifecycle(verdict, force=True)
+                    replica = ViewReplica()
+                    replacement = self._watch_for_new_runtime()
+                    if replacement is None:
+                        return
+                    if replacement['pipe'] != self.pipe:
+                        self._emit_lifecycle({
+                            'state': 'OWNER_REPLACED',
+                            'owner_locked': True,
+                            'pipe': replacement['pipe'],
+                            'instance_id': replacement.get('instance_id'),
+                            'account_key': replacement.get('account_key'),
+                            'runtime_root': replacement.get('runtime_root'),
+                        }, force=True)
+                        return
+                    self._initial_instance_id = replacement.get('instance_id')
+                    self._last_boot_id = None
+                    self._last_lifecycle_key = None
+                    self._emit_lifecycle({
+                        'state': 'VIEW_RECONNECTING',
+                        'owner_locked': True,
+                        'account_key': replacement.get('account_key'),
+                        'detail': '检测到新启动的 Runtime 实例，正在重新连接',
+                    }, force=True)
+                    continue
                 self.connection_changed.emit('STALE', 'E_RUNTIME_VIEW')
+                self._emit_lifecycle(verdict)
                 replica = ViewReplica()
             self.msleep(300)
 
     def shutdown(self):
         self.requestInterruption()
         self.client.close()
+
+
+def force_probe_needed(last_probe_ns, now_ns, interval_ns):
+    return last_probe_ns == 0 or now_ns - last_probe_ns >= interval_ns
 
 
 class RuntimeCommandWorker(QThread):
@@ -160,6 +404,7 @@ class RuntimeClientCoordinator(QObject):
     query_result = Signal(object)
     query_failed = Signal(object)
     publication_observed = Signal(object)
+    lifecycle_changed = Signal(object)
 
     def __init__(self, pipe, store, parent=None):
         super().__init__(parent)
@@ -170,6 +415,7 @@ class RuntimeClientCoordinator(QObject):
         self.subscription.state_received.connect(store.apply)
         self.subscription.publication_observed.connect(self.publication_observed)
         self.subscription.connection_changed.connect(store.set_connection)
+        self.subscription.lifecycle_changed.connect(self.lifecycle_changed)
         self.commands.result.connect(self.command_result)
         self.commands.failed.connect(self.command_failed)
         self.queries.result.connect(self.query_result)

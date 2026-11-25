@@ -59,18 +59,12 @@ def publish_new_bytes(raw, path):
             except FileNotFoundError:pass
 
 
-def publish_replace_bytes(raw, path):
-    """Atomically replace one validated local configuration file.
-
-    Runtime defaults and user overrides are configuration, not trading facts.
-    The temporary file is flushed on the target volume before replacement so a
-    crash leaves either the old or the complete new document.
-    """
+def _atomic_replace_bytes(raw, path, *, prefix, error_code, error_message):
     target = Path(path)
     temporary = None
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(mode="wb", prefix=".online-trader-config-", suffix=".tmp",
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=prefix, suffix=".tmp",
                                          dir=target.parent, delete=False) as stream:
             temporary = Path(stream.name)
             stream.write(raw)
@@ -80,8 +74,43 @@ def publish_replace_bytes(raw, path):
         temporary = None
         return target
     except OSError as error:
-        raise TraderError("E_CONFIG_FILE", "Cannot replace the local configuration file") from error
+        raise TraderError(error_code, error_message) from error
     finally:
         if temporary is not None:
-            try:temporary.unlink()
-            except FileNotFoundError:pass
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def publish_replace_bytes(raw, path):
+    """Atomically replace one validated local configuration file.
+
+    Runtime defaults and user overrides are configuration, not trading facts.
+    The temporary file is flushed on the target volume before replacement so a
+    crash leaves either the old or the complete new document.
+    """
+    return _atomic_replace_bytes(
+        raw,
+        path,
+        prefix=".online-trader-config-",
+        error_code="E_CONFIG_FILE",
+        error_message="Cannot replace the local configuration file",
+    )
+
+
+def publish_runtime_file_bytes(
+    raw,
+    path,
+    *,
+    error_code="E_RUNTIME_STATUS_WRITE",
+    error_message="Cannot replace the runtime auxiliary file",
+):
+    """Atomically replace a non-authoritative runtime status or diagnostic file."""
+    return _atomic_replace_bytes(
+        raw,
+        path,
+        prefix=".online-trader-runtime-",
+        error_code=error_code,
+        error_message=error_message,
+    )

@@ -264,6 +264,8 @@ class WorkbenchWindow(StatusWindow):
         self._connection_retry_deadline_ns = 0
         self._connection_retry_pending = False
         self._connection_retry_timed_out = False
+        self._owner_lifecycle = None
+        self._owner_crash_notified_boot = None
         self._finished_run = None
         self._startup_in_progress = False
         self._guard_launch = autostart
@@ -364,6 +366,8 @@ class WorkbenchWindow(StatusWindow):
         self._detach_runtime_client()
         self.pipe_name = pipe_name
         self._runtime_shutdown_verified = False
+        self._owner_lifecycle = None
+        self._owner_crash_notified_boot = None
         client_store = ClientStateStore(self)
         coordinator = RuntimeClientCoordinator(pipe_name, client_store, self)
         command_bus = CommandBus(coordinator, client_store, self)
@@ -371,6 +375,7 @@ class WorkbenchWindow(StatusWindow):
         client_store.runtime_changed.connect(self._runtime_client_state_changed)
         client_store.connection_changed.connect(self._runtime_client_connection_changed)
         coordinator.publication_observed.connect(self._runtime_observed)
+        coordinator.lifecycle_changed.connect(self._runtime_lifecycle_changed)
         coordinator.query_result.connect(self._runtime_query_result)
         coordinator.query_failed.connect(self._runtime_query_failed)
         command_bus.command_changed.connect(self._runtime_command_changed)
@@ -471,12 +476,17 @@ class WorkbenchWindow(StatusWindow):
     def _enable_commands(self,enabled):
         for button in self.command_buttons.values():button.setEnabled(enabled)
         runtime_store = self._runtime_client_store
+        lifecycle_state = (self._owner_lifecycle or {}).get('state')
+        lifecycle_dead = lifecycle_state in {'OWNER_CRASHED', 'OWNER_STOPPED'}
         runtime_recheck_ok = (
-            runtime_store is None
-            or runtime_store.connection_state.value in {'READY', 'STALE', 'SYNCHRONIZING'}
+            not lifecycle_dead
+            and (
+                runtime_store is None
+                or runtime_store.connection_state.value in {'READY', 'STALE', 'SYNCHRONIZING'}
+            )
         )
         owner_controls = (
-            not self._closing and self._worker is None and self.view is not None
+            not self._closing and not lifecycle_dead and self._worker is None and self.view is not None
             and (self._runtime_command_bus is None or enabled or runtime_recheck_ok)
         )
         for name in ('close', 'flatten', 'cancel', 'cancel_entries', 'reconcile'):
@@ -648,6 +658,8 @@ class WorkbenchWindow(StatusWindow):
             )
             self._diagnostic_connection_signature = signature
         if self._closing or state == 'READY':
+            if state == 'READY':
+                self._owner_lifecycle = None
             return
         self._runtime_unavailable(reason or state)
 
@@ -766,6 +778,8 @@ class WorkbenchWindow(StatusWindow):
             return
         became_stale = not self._stale
         self._stale = True
+        if self.connection_recovery_source == 'broker':
+            self._observe_connection_recovery(None)
         if became_stale and self._diagnostic_sink is not None:
             self._diagnostic_sink.record(
                 'WORKBENCH_SNAPSHOT_EXPIRED', component='PROJECTION',
@@ -775,11 +789,59 @@ class WorkbenchWindow(StatusWindow):
                 payload={'snapshot_age_seconds': self.published_snapshot_age()},
             )
         self._enable_commands(False)
-        self.show_home_feedback(f'工作台未收到最新投影，正在等待 Runtime 同步 · {code}')
+        lifecycle_state = (self._owner_lifecycle or {}).get('state')
+        if lifecycle_state not in {'OWNER_CRASHED', 'OWNER_STOPPED'}:
+            self.show_home_feedback(f'工作台未收到最新投影，正在确认后台 Runtime 状态 · {code}')
         # A stale client projection is a Workbench/view condition, not a market
         # quote verdict.  Repaint immediately so the last owner quote cannot
         # remain labelled as current or be mistaken for an owner-side entry
         # refusal while the subscription reconnects.
+        if self.view is not None:
+            self.render_view()
+
+    def _runtime_lifecycle_changed(self, lifecycle):
+        if self._closing or not isinstance(lifecycle, dict):
+            return
+        state = lifecycle.get('state')
+        if state == 'OWNER_REPLACED':
+            pipe = lifecycle.get('pipe')
+            if isinstance(pipe, str) and pipe:
+                self._owner_lifecycle = None
+                self._stale = True
+                self._observe_connection_recovery(None)
+                self.show_home_feedback('检测到新启动的 Runtime 实例，正在连接...')
+                QTimer.singleShot(0, lambda p=pipe: self._attach_runtime_pipe(p))
+            return
+        if state == 'HEALTHY':
+            self._owner_lifecycle = None
+            return
+        self._owner_lifecycle = dict(lifecycle)
+        if state in {'OWNER_CRASHED', 'OWNER_STOPPED'}:
+            self._observe_connection_recovery(None)
+            self.connection_retry_timer.stop()
+            self._stale = True
+            self._enable_commands(False)
+            if state == 'OWNER_CRASHED':
+                code = str(lifecycle.get('error_code') or 'E_RUNTIME_OWNER_EXITED')
+                boot_key = str(lifecycle.get('runtime_boot_id') or code)
+                self._tray.set_status('error')
+                if boot_key != self._owner_crash_notified_boot:
+                    self._owner_crash_notified_boot = boot_key
+                    self._sounds.observe_request_error()
+                    if self._tray.icon is not None:
+                        self._tray.icon.showMessage(
+                            'OnlineTrader · Runtime 异常退出',
+                            f'后台交易服务已异常退出（{code}），请立即核对期货账户实际持仓与委托。',
+                        )
+                self.show_home_feedback(f'Runtime 后台服务已异常退出 · {code}')
+            else:
+                self._tray.set_status('idle')
+                self.show_home_feedback('Runtime 后台服务已停止。')
+        elif state in {'OWNER_UNRESPONSIVE', 'VIEW_RECONNECTING'}:
+            if self.connection_recovery_source == 'broker':
+                self._observe_connection_recovery(None)
+            self._stale = True
+            self._enable_commands(False)
         if self.view is not None:
             self.render_view()
 
@@ -933,7 +995,13 @@ class WorkbenchWindow(StatusWindow):
         self.refresh()
 
     def _update_connection_recovery(self):
-        if self._closing or self.connection_recovery_source is None:
+        lifecycle_state = (self._owner_lifecycle or {}).get('state')
+        if (
+            self._closing
+            or self.connection_recovery_source is None
+            or lifecycle_state in {'OWNER_CRASHED', 'OWNER_STOPPED'}
+            or (self.pipe_name is not None and self._stale)
+        ):
             self.dashboard.show_connection_recovery('')
             return
         now = time.monotonic_ns()

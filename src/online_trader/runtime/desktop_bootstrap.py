@@ -60,7 +60,16 @@ ERROR_MESSAGES = {
     'E_DEPENDENCY': '模拟运行组件不可用，请检查已安装的程序环境。',
     'E_CLOCK': '无法取得应用授时，请检查授时网络连接。',
     'E_RUNTIME_CONFIG': 'Runtime 配置不完整或格式无效，请核对运行目录。',
+    'E_CONFIG_FILE': '本地配置文件读取或保存失败，请检查配置目录权限或文件占用。',
+    'E_RUNTIME_STATUS_WRITE': 'Runtime 辅助状态文件写入失败。',
+    'E_RUNTIME_DIAGNOSTICS_WRITE': 'Runtime 诊断文件写入失败。',
     'E_STORAGE': '本次 Runtime 的临时存储不可用；Runtime 未启动。',
+    'E_DSV_STORE': '本次运行临时交易账本写入失败，Runtime 已安全停止。',
+    'E_DSV_OWNER': 'Runtime 执行核心所有权或配置一致性异常，服务已安全停止。',
+    'E_DSV_SDK_OWNER': 'SDK 执行线程或端口绑定异常，服务已安全停止。',
+    'E_DSV_NATIVE_FACT': '柜台返回的持仓、委托或成交事实与本地账本冲突，需要核对。',
+    'E_DSV_SDK_FACT': '柜台返回的委托或成交字段异常，需要核对。',
+    'E_DSV_OWNERSHIP': '持仓或委托归属与柜台事实不一致，需要核对。',
 }
 
 
@@ -456,17 +465,27 @@ def run_confirmed_start(request_path, output, *, now=None, configured_store=None
                 _execution_lock=lease, **({'_reference': clock} if clock is not None else {}), **runtime_options)
     except Exception as error:
         code = error.code if isinstance(error, TraderError) else 'E_DESKTOP_START'
-        failure = {'status': 'STARTUP_FAILED', 'error_code': code, 'entry_authority': 'DISARMED',
-            'observed_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-            'exception': exception_record(error),
-            'message': ERROR_MESSAGES.get(code, '启动未完成，请检查网络与模拟连接状态后重试。')}
-        path = directory / 'startup-failure.json'
-        if not path.exists():
-            publish_new_bytes(canonical_bytes(failure), path)
+        runtime_failure = directory / 'runtime-failure.json'
+        if not runtime_failure.is_file():
+            failure = {'status': 'STARTUP_FAILED', 'error_code': code, 'entry_authority': 'DISARMED',
+                'observed_at_utc': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+                'exception': exception_record(error),
+                'message': ERROR_MESSAGES.get(code, '启动未完成，请检查程序日志与运行状态后重试。')}
+            path = directory / 'startup-failure.json'
+            if not path.exists():
+                try:
+                    publish_new_bytes(canonical_bytes(failure), path)
+                except (OSError, TraderError):
+                    pass
         if diagnostic_sink is not None:
-            diagnostic_sink.record(
-                'STARTUP_FAILED', component='STARTUP', severity='ERROR', priority='CRITICAL',
-                error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_DESKTOP_START',
-                payload={'entry_authority': 'DISARMED'},
-            )
+            try:
+                diagnostic_sink.record(
+                    'STARTUP_FAILED' if not runtime_failure.is_file() else 'RUNTIME_SESSION_FAILED',
+                    component='STARTUP' if not runtime_failure.is_file() else 'LIFECYCLE',
+                    severity='ERROR', priority='CRITICAL',
+                    error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_DESKTOP_START',
+                    payload={'entry_authority': 'DISARMED'},
+                )
+            except Exception:
+                pass
         return 2

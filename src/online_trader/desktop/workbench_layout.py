@@ -55,6 +55,44 @@ CONVERGENCE_WAIT_MESSAGES = {
 }
 
 
+def _describe_owner_risk(view):
+    """Build honest last-known account risk lines without inferring from strategy targets."""
+    if not isinstance(view, Mapping):
+        return ['尚未收到可用账户快照，请在期货交易软件确认实际持仓与委托']
+    connection = view.get('connection') or {}
+    synchronized = bool(connection.get('synchronized'))
+    account_positions = connection.get('account_positions') or ()
+    actual_total = sum(
+        int(p.get('actual_long') or 0) + int(p.get('actual_short') or 0)
+        for p in account_positions
+        if isinstance(p, Mapping)
+    )
+    cycles_total = sum(
+        int(c.get('remaining_quantity') or 0)
+        for c in (view.get('cycles') or ())
+        if isinstance(c, Mapping) and int(c.get('remaining_quantity') or 0) > 0
+    )
+    unknown_orders = [
+        row for row in (view.get('orders') or ())
+        if isinstance(row, Mapping)
+        and (row.get('send_state') == 'UNKNOWN' or row.get('cancel_status') == 'UNKNOWN')
+    ]
+    external = view.get('external_positions') or ()
+    facts = [f'最后已知实仓 {actual_total} 手']
+    if cycles_total:
+        facts.append(f'本地策略归属 {cycles_total} 手')
+    if unknown_orders:
+        facts.append(f'未确认委托 {len(unknown_orders)} 笔')
+    if external:
+        facts.append(f'外部持仓 {len(external)} 项')
+    fact_summary = '，'.join(facts)
+    if not synchronized:
+        return [f'{fact_summary}，且最后已知交易事实同步不完整；无法确认实际持仓与成交结果，请立即在期货交易软件核对！']
+    if actual_total > 0 or cycles_total > 0 or unknown_orders or external:
+        return [f'{fact_summary}；后台停止或未知期间不会继续执行自动平仓或保护，请立即在期货交易软件核对并人工接管！']
+    return [f'{fact_summary}（策略目标不等同于实际持仓）；由于状态已滞后，仍请在期货交易软件确认无残余委托。']
+
+
 def _convergence_status_label(conv_state, wait_reason, *, configured=True):
     code = conv_state or wait_reason
     if code == 'DEFERRED_AUCTION_ORDERING' or wait_reason == 'DEFERRED_AUCTION_ORDERING':
@@ -1369,6 +1407,9 @@ class WorkbenchLayout:
         elif self._home_detail_target == 'markets':
             self.tabs.setCurrentWidget(self.home_tab)
             self.home_sections.setCurrentWidget(self.market_tab)
+        elif self._home_detail_target == 'logs':
+            self.tabs.setCurrentWidget(self.diagnostic_sections.parentWidget())
+            self.diagnostic_sections.setCurrentWidget(self.log_tab)
 
     def home_attention_summary(self, view, pending, *, stale, truncated):
         if view is None:
@@ -1396,8 +1437,50 @@ class WorkbenchLayout:
 
         result = {'title': '', 'items': [], 'reconcile': False,
                   'detail_target': None, 'detail_text': '查看详情'}
-        if stale:
-            result.update(title='界面重连中', items=['Runtime 仍独立运行；正在重新取得最新状态，无需重复操作'])
+        owner_lifecycle = getattr(self.window, '_owner_lifecycle', None) or {}
+        owner_state = owner_lifecycle.get('state')
+        if owner_state in {'OWNER_CRASHED', 'OWNER_STOPPED', 'OWNER_UNRESPONSIVE', 'VIEW_RECONNECTING'}:
+            risk_items = _describe_owner_risk(view)
+            if owner_state == 'OWNER_CRASHED':
+                code = str(owner_lifecycle.get('error_code') or 'E_RUNTIME_OWNER_EXITED')
+                detail = str(owner_lifecycle.get('detail') or '').strip()
+                first = f'后台交易服务已异常退出（{code}）' + (f'：{detail}' if detail else '；保护与自动交易已停止')
+                result.update(
+                    title='Runtime 后台服务已异常退出',
+                    items=[first, *risk_items],
+                    detail_target='logs',
+                    detail_text='查看日志与诊断',
+                )
+            elif owner_state == 'OWNER_STOPPED':
+                result.update(
+                    title='Runtime 后台服务已停止',
+                    items=['后台交易服务已正常停止；如需继续监控或交易请重新启动 Runtime', *risk_items],
+                    detail_target='logs',
+                    detail_text='查看日志与诊断',
+                )
+            elif owner_state == 'OWNER_UNRESPONSIVE':
+                age = self.window.published_snapshot_age()
+                age_text = f'（快照已 {age} 秒未更新）' if age is not None else ''
+                result.update(
+                    title='无法确认后台 Runtime 状态',
+                    items=[f'Runtime 进程锁仍被持有，但主循环状态未知{age_text}；不能确认自动保护是否正常运行', *risk_items],
+                    detail_target='logs',
+                    detail_text='查看日志与诊断',
+                )
+            else:
+                result.update(
+                    title='工作台正在重连后台视图',
+                    items=['Runtime 进程锁仍被持有，正在重连视图通道；在恢复最新快照前无法确认主循环健康状态', *risk_items],
+                    detail_target='logs',
+                    detail_text='查看日志与诊断',
+                )
+        elif stale:
+            result.update(
+                title='无法确认后台 Runtime 状态',
+                items=['工作台尚未收到最新状态快照，正在核对后台进程存活情况，暂无法确认执行状态', *_describe_owner_risk(view)],
+                detail_target='logs',
+                detail_text='查看日志与诊断',
+            )
         elif truncated:
             result.update(title='状态数据不完整', items=['请查看“日志与诊断”，不要依据当前省略的数据重复操作'])
         elif connection.get('storage_failed'):
@@ -2277,13 +2360,24 @@ class WorkbenchLayout:
 
         cycles = [cycle for cycle in (view or {}).get('cycles', []) if cycle['remaining_quantity'] > 0]
         quantity = sum(cycle['remaining_quantity'] for cycle in cycles)
-        if w.connection_recovery_source == 'owner':
+        owner_lifecycle = getattr(w, '_owner_lifecycle', None) or {}
+        owner_state = owner_lifecycle.get('state')
+        if owner_state == 'OWNER_CRASHED':
+            code = str(owner_lifecycle.get('error_code') or 'E_RUNTIME_OWNER_EXITED')
+            state, description = '后台已异常退出', f'Runtime 进程已退出（{code}）；保护与策略已停止，请核对柜台账户'
+        elif owner_state == 'OWNER_STOPPED':
+            state, description = '后台已停止', 'Runtime 后台服务已正常停止'
+        elif owner_state == 'OWNER_UNRESPONSIVE':
+            state, description = '后台状态未知', 'Runtime 进程锁仍被持有，但快照未按期更新；无法确认主循环是否正常'
+        elif owner_state == 'VIEW_RECONNECTING':
+            state, description = '视图重连中', 'Runtime 进程锁仍被持有，正在重连视图通道；尚无法确认主循环状态'
+        elif w.connection_recovery_source == 'owner':
             state, description = '工作台重连中', '正在恢复原执行器的状态查询'
         elif w.connection_recovery_source == 'broker':
             state, description = '柜台重连中', '等待原执行器完成柜台同步'
         elif stale or fault or truncated:
             state = '状态待核对'
-            description = ('工作台未收到最新投影；Runtime 交易与持仓保护独立运行，正在重连'
+            description = ('工作台未收到最新投影；正在核对后台进程与最新状态'
                            if stale else '柜台或执行器状态待核对')
             if truncated:
                 description = '状态数据不完整，请在日志与诊断中核对'
@@ -2322,14 +2416,21 @@ class WorkbenchLayout:
         clock_diagnostic = config.get('strategy_diagnostics', {}).get('ntp')
         clock = ('异常' if connection.get('clock_fault') or clock_diagnostic == 'NTP_SKEW'
                  else '待核对' if not available or clock_diagnostic == 'NTP_UNAVAILABLE' else '无已知异常')
-        health = ('重连中' if w.connection_recovery_source else
+        health = ('已退出' if owner_state == 'OWNER_CRASHED' else
+                  '已停止' if owner_state == 'OWNER_STOPPED' else
+                  '状态未知' if owner_state in {'OWNER_UNRESPONSIVE', 'VIEW_RECONNECTING'} else
+                  '重连中' if w.connection_recovery_source else
                   '待核对' if stale or fault or truncated else '已连接' if connected else '未连接')
         quotes = {item['contract_id']: item for item in (view or {}).get('markets', ())}
         quote_states = market_quote_states(quotes, quotes, config.get('strategy_monitor') or {}).values()
         lagging = sum(state == '行情已滞后' for state in quote_states)
         backlogged = sum(state == '本机处理积压' for state in quote_states)
         snapshot_age = w.published_snapshot_age() if view else None
-        if stale and snapshot_age is not None:
+        if owner_state == 'OWNER_CRASHED' and snapshot_age is not None:
+            market_health = f'后台已退出 · 快照滞后 {snapshot_age} 秒'
+        elif owner_state == 'OWNER_STOPPED':
+            market_health = '后台已停止'
+        elif stale and snapshot_age is not None:
             market_health = f'界面未更新 {snapshot_age} 秒'
         elif not available or not quotes:
             market_health = '待同步'
@@ -2344,14 +2445,18 @@ class WorkbenchLayout:
         else:
             market_health = '已更新'
         for (dot, label), (title, value, good, alert) in zip(self.toolbar_status, (
-            ('行情', market_health, market_health == '已更新', market_health.endswith('个合约滞后')),
-            ('交易', health, health == '已连接', health in {'重连中', '待核对'}),
-            ('策略', state, armed and available, state in {'状态待核对', '正在核对'} or bool(w.connection_recovery_source)),
+            ('行情', market_health, market_health == '已更新', market_health.endswith('个合约滞后') or owner_state in {'OWNER_UNRESPONSIVE', 'VIEW_RECONNECTING'}),
+            ('交易', health, health == '已连接', health in {'重连中', '待核对', '状态未知'}),
+            ('策略', state, armed and available, state in {'状态待核对', '正在核对', '后台状态未知', '视图重连中'} or bool(w.connection_recovery_source)),
             ('校时', clock, clock == '无已知异常', clock == '异常'),
         )):
             label.setText(f'{title} {value}')
             label.setToolTip(description if title == '策略' else label.text())
-            color = '#14a163' if good else '#eea124' if alert else '#a1afc1'
+            critical = (
+                owner_state == 'OWNER_CRASHED'
+                and title in {'行情', '交易', '策略'}
+            )
+            color = '#d9483b' if critical else '#14a163' if good else '#eea124' if alert else '#a1afc1'
             style = f'background:{color}; border-radius:4px;'
             if dot.styleSheet() != style:
                 dot.setStyleSheet(style)
@@ -4044,11 +4149,28 @@ class WorkbenchLayout:
             error_code = record.get('error_code')
             if isinstance(error_code, str):
                 parts.append(error_code)
+            detail = record.get('detail')
+            if isinstance(detail, str) and detail.strip():
+                parts.append(detail.strip())
             exception = record.get('exception')
             if isinstance(exception, dict) and exception.get('exception_id'):
                 parts.append(exception['exception_id'])
             category = 'error' if (error_code or phase == 'NEEDS_REVIEW') else None
             phases.append(WorkbenchLogLine(f'[{at}] [执行器] {" · ".join(parts)}', category, stamp))
+        runtime_failure = run / 'runtime-failure.json'
+        for record in self.log_tail(runtime_failure).read(runtime_failure):
+            if run_identity is not None and any(
+                    record.get(key) not in (None, expected)
+                    for key, expected in zip(('account_key', 'runtime_boot_id'), run_identity)):
+                continue
+            at, stamp = log_time(record.get('observed_at_utc'))
+            parts = [str(record.get('error_code') or 'E_RUNTIME_OWNER_EXITED')]
+            if isinstance(record.get('detail'), str) and record['detail'].strip():
+                parts.append(record['detail'].strip())
+            exception = record.get('exception')
+            if isinstance(exception, dict) and exception.get('exception_id'):
+                parts.append(exception['exception_id'])
+            phases.append(WorkbenchLogLine(f'[{at}] [执行器] 运行异常退出 · {" · ".join(parts)}', 'error', stamp))
         target_diagnostics = run / 'target-owner-diagnostics.json'
         for record in self.log_tail(target_diagnostics).read(target_diagnostics):
             if run_identity is not None and any(
@@ -4057,10 +4179,14 @@ class WorkbenchLayout:
                 continue
             at, stamp = log_time(record.get('observed_at_utc'))
             parts = [str(record.get('diagnostic') or 'TARGET_DIAGNOSTIC')]
+            if record.get('error_code'):
+                parts.append(str(record['error_code']))
             if record.get('authority_effect'):
                 parts.append(str(record['authority_effect']))
             if record.get('error_category'):
                 parts.append(str(record['error_category']))
+            if isinstance(record.get('detail'), str) and record['detail'].strip():
+                parts.append(record['detail'].strip())
             exception = record.get('exception')
             if isinstance(exception, dict) and exception.get('exception_id'):
                 parts.append(exception['exception_id'])

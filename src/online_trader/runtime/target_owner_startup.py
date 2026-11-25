@@ -11,7 +11,7 @@ import sqlite3
 import time
 
 from online_trader.contracts.codec import canonical_bytes
-from online_trader.configuration.files import publish_new_bytes, publish_replace_bytes
+from online_trader.configuration.files import publish_new_bytes, publish_runtime_file_bytes
 from online_trader.dsv_runtime.order_diagnostics import attach_order_blocking_log
 from online_trader.dsv_runtime.standalone_owner import create_standalone_owner
 from online_trader.dsv_runtime.target_diagnostics import TargetMarketDiagnostics
@@ -176,7 +176,7 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                 _, grant, profile = restored
             else:
                 preparation, grant, profile = prepare_connected(grant, profile, connection)
-                publish_replace_bytes(canonical_bytes({
+                publish_runtime_file_bytes(canonical_bytes({
                     'status': 'CALCULATED_BEFORE_TARGET_OWNER',
                     'preparation_hash': preparation['preparation_hash'],
                     'effective_profile_hash': profile.content_hash,
@@ -272,20 +272,26 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
         else:
             owner.run_directory = str(output)
         def history_error(error):
-            publish_replace_bytes(canonical_bytes({
-                'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
-                'execution_core': 'DSV_TARGET_EXECUTION', 'authority_effect': 'NONE',
-                'diagnostic': getattr(error, 'code', 'E_HISTORY_CACHE_WRITE'),
-                'observed_at_utc': _utc_now(),
-            }), diagnostics)
             if diagnostic_sink is not None:
                 code = getattr(error, 'code', 'E_HISTORY_CACHE_WRITE')
-                diagnostic_sink.record(
-                    'HISTORY_CACHE_WRITE_FAILED', component='HISTORY', severity='WARNING',
-                    priority='HIGH',
-                    error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_HISTORY_CACHE_WRITE',
-                    payload={'authority_effect': 'NONE', 'exception_type': type(error).__name__},
-                )
+                try:
+                    diagnostic_sink.record(
+                        'HISTORY_CACHE_WRITE_FAILED', component='HISTORY', severity='WARNING',
+                        priority='HIGH',
+                        error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_HISTORY_CACHE_WRITE',
+                        payload={'authority_effect': 'NONE', 'exception_type': type(error).__name__},
+                    )
+                except Exception:
+                    pass
+            try:
+                publish_runtime_file_bytes(canonical_bytes({
+                    'runtime_boot_id': binding.boot_id, 'account_key': binding.account_key,
+                    'execution_core': 'DSV_TARGET_EXECUTION', 'authority_effect': 'NONE',
+                    'diagnostic': getattr(error, 'code', 'E_HISTORY_CACHE_WRITE'),
+                    'observed_at_utc': _utc_now(),
+                }), diagnostics)
+            except (OSError, TraderError):
+                pass
 
         try:
             history_writer = BrokerHistoryWriter(
@@ -302,7 +308,7 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                     error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_HISTORY_CACHE_INIT',
                     payload={'authority_effect': 'NONE', 'exception_type': type(error).__name__},
                 )
-        publish_replace_bytes(canonical_bytes({
+        publish_runtime_file_bytes(canonical_bytes({
             'phase': 'WAITING_FOR_NATIVE_SYNC', 'runtime_boot_id': binding.boot_id,
             'account_key': binding.account_key, 'entry_authority': 'DISARMED',
             'execution_core': 'DSV_TARGET_EXECUTION',
@@ -372,13 +378,14 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                         payload={'exception_type': type(error).__name__},
                     )
 
+        entered_runtime_loop = True
         with attach_order_blocking_log(output), market_diagnostics:
             server.serve(stop_event=owner.stop_event, owner_tick=tick, publish_workbench=True)
         shutdown = owner.session.prepare_shutdown()
         maintenance_completion = getattr(owner, 'maintenance_completion', None)
         if maintenance_completion is not None:
             try:
-                publish_replace_bytes(
+                publish_runtime_file_bytes(
                     canonical_bytes(maintenance_completion),
                     output / 'maintenance-completion.json',
                 )
@@ -411,7 +418,10 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
         }
         if maintenance_completion is not None:
             stopped_payload['maintenance_completion'] = maintenance_completion
-        publish_replace_bytes(canonical_bytes(stopped_payload), status)
+        try:
+            publish_runtime_file_bytes(canonical_bytes(stopped_payload), status)
+        except (OSError, TraderError):
+            pass
         if diagnostic_sink is not None:
             diagnostic_sink.record(
                 'OWNER_STOPPED', component='LIFECYCLE', priority='CRITICAL',
@@ -419,21 +429,46 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             )
         return 0
     except Exception as error:
-        publish_replace_bytes(canonical_bytes({
-            'phase': 'NEEDS_REVIEW', 'account_key': grant.account_key,
-            'runtime_boot_id': binding.boot_id,
-            'entry_authority': 'DISARMED', 'execution_core': 'DSV_TARGET_EXECUTION',
-            'error_code': getattr(error, 'code', 'E_DSV_SDK_RUNTIME'),
-            'observed_at_utc': _utc_now(),
-            'exception': exception_record(error),
-        }), status)
+        error_code = getattr(error, 'code', 'E_DSV_SDK_RUNTIME')
+        if not isinstance(error_code, str) or not error_code.startswith('E_'):
+            error_code = 'E_DSV_SDK_RUNTIME'
+        detail = getattr(error, 'detail', '') or str(error)
         if diagnostic_sink is not None:
-            code = getattr(error, 'code', 'E_DSV_SDK_RUNTIME')
-            diagnostic_sink.record(
-                'OWNER_FAILED', component='LIFECYCLE', severity='ERROR', priority='CRITICAL',
-                error_code=code if isinstance(code, str) and code.startswith('E_') else 'E_DSV_SDK_RUNTIME',
-                payload={'entry_authority': 'DISARMED', 'exception_type': type(error).__name__},
-            )
+            try:
+                diagnostic_sink.record(
+                    'OWNER_FAILED', component='LIFECYCLE', severity='ERROR', priority='CRITICAL',
+                    error_code=error_code,
+                    payload={'entry_authority': 'DISARMED', 'exception_type': type(error).__name__, 'detail': detail},
+                )
+            except Exception:
+                pass
+        try:
+            publish_runtime_file_bytes(canonical_bytes({
+                'phase': 'NEEDS_REVIEW', 'account_key': grant.account_key,
+                'runtime_boot_id': binding.boot_id,
+                'entry_authority': 'DISARMED', 'execution_core': 'DSV_TARGET_EXECUTION',
+                'error_code': error_code,
+                'detail': detail,
+                'observed_at_utc': _utc_now(),
+                'exception': exception_record(error),
+            }), status)
+        except (OSError, TraderError):
+            pass
+        if locals().get('entered_runtime_loop'):
+            try:
+                publish_runtime_file_bytes(canonical_bytes({
+                    'schema_version': 'DSV_RUNTIME_FAILURE/1',
+                    'status': 'RUNTIME_FAILED',
+                    'runtime_boot_id': binding.boot_id,
+                    'account_key': grant.account_key,
+                    'error_code': error_code,
+                    'detail': detail,
+                    'observed_at_utc': _utc_now(),
+                    'exception': exception_record(error),
+                    'entry_authority': 'DISARMED',
+                }), output / 'runtime-failure.json')
+            except (OSError, TraderError):
+                pass
         raise
     finally:
         if history_writer is not None:

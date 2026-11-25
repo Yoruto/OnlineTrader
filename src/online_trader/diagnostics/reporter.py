@@ -635,7 +635,7 @@ def _collect_bootstrap_context(staging, runtime_root, request, files):
     starts = runtime_root / "desktop-starts"
     if starts.is_dir():
         candidates = sorted(
-            starts.glob("*/run/startup-failure.json"),
+            [*starts.glob("*/run/startup-failure.json"), *starts.glob("*/run/runtime-failure.json")],
             key=lambda p: p.stat().st_mtime_ns if p.exists() else 0,
             reverse=True,
         )[:4]
@@ -648,11 +648,11 @@ def _collect_bootstrap_context(staging, runtime_root, request, files):
                 continue
             rows.append({
                 "schema_version": "ONLINE_TRADER_BOOTSTRAP_CONTEXT/1",
-                "source": "startup-failure",
+                "source": "runtime-failure" if path.name == "runtime-failure.json" else "startup-failure",
                 "observed_at_utc": record.get("observed_at_utc"),
                 "runtime_boot_id": boot,
                 "error_code": record.get("error_code"),
-                "message": redact_text(record.get("message") or ""),
+                "message": redact_text(record.get("detail") or record.get("message") or ""),
             })
     bootstrap_logs = runtime_root / "logs" / "desktop-bootstrap"
     if bootstrap_logs.is_dir():

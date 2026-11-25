@@ -220,6 +220,7 @@ class ExplicitOrderController:
                                 'E_DSV_NATIVE_FACT',
                                 f'Original native order timestamp changed ({order["contract_id"]} {native_id}: {prior_stamp} -> {stamp})',
                             )
+                        order['native_order_adjusted_time_ns'] = stamp
                         self.journal.event('NATIVE_ORDER_CLOCK_SKEW', {
                             'child_order_id': child_id,
                             'native_order_id': native_id,
@@ -340,14 +341,24 @@ class ExplicitOrderController:
             raise TraderError('E_DSV_SCOPE', 'Late trade requires the original fill day')
         if 'source_time_ns' in fact and 'native_order_time_ns' in order:
             skew_limit_ns = 5_000_000_000 if order_day == fill_day else 0
-            if int(fact['source_time_ns']) + skew_limit_ns < int(order['native_order_time_ns']):
-                raise TraderError('E_DSV_NATIVE_FACT', 'Native trade precedes its original order timestamp')
-            if int(fact['source_time_ns']) < int(order['native_order_time_ns']):
+            anchor_time_ns = int(order['native_order_time_ns'])
+            adjusted_time_ns = int(order.get('native_order_adjusted_time_ns', anchor_time_ns))
+            # Match sdk_adapter's latest accepted OnRtnOrder timestamp when CTP/SimNow
+            # adjusted InsertTime earlier within the 60s NATIVE_ORDER_CLOCK_SKEW bound.
+            effective_order_time_ns = min(anchor_time_ns, adjusted_time_ns) if order_day == fill_day else anchor_time_ns
+            if int(fact['source_time_ns']) + skew_limit_ns < effective_order_time_ns:
+                raise TraderError(
+                    'E_DSV_NATIVE_FACT',
+                    f'Native trade precedes its original order timestamp ({order["contract_id"]} {native_id}/{trade_id}: '
+                    f'{fact["source_time_ns"]} < {effective_order_time_ns})',
+                )
+            if int(fact['source_time_ns']) < anchor_time_ns:
                 self.journal.event('NATIVE_TRADE_CLOCK_SKEW', {
                     'child_order_id': order['child_order_id'],
                     'native_order_id': native_id,
                     'native_trade_id': trade_id,
                     'order_time_ns': str(order['native_order_time_ns']),
+                    'effective_order_time_ns': str(effective_order_time_ns),
                     'trade_time_ns': str(fact['source_time_ns']),
                 })
         separated = order['contract_id'].split('.')[0] in {'SHFE', 'INE'}

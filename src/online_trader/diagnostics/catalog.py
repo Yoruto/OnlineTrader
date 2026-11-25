@@ -74,7 +74,15 @@ _CATALOG: tuple[DiagnosticCatalogEntry, ...] = (
         explanation="交易责任可能需要人工核对。",
         action="保持停开并检查 Runtime 诊断。",
         severity="ERROR",
-        internal_codes=("E_STORAGE", "E_PENDING_STORAGE", "STORAGE_COMMIT_FAILED"),
+        internal_codes=("E_STORAGE", "E_PENDING_STORAGE", "STORAGE_COMMIT_FAILED", "E_DSV_STORE"),
+    ),
+    DiagnosticCatalogEntry(
+        user_code="OT-SYS-9001",
+        title="运行状态文件写入受阻",
+        explanation="辅助状态或诊断文件暂未能更新，不影响既有交易权威与风控。",
+        action="检查目录占用或杀软拦截；核心交易状态以 Runtime 实时投影为准。",
+        severity="WARNING",
+        internal_codes=("E_RUNTIME_STATUS_WRITE", "E_RUNTIME_DIAGNOSTICS_WRITE"),
     ),
     DiagnosticCatalogEntry(
         user_code="OT-UI-7001",
