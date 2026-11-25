@@ -724,6 +724,36 @@ def native_time(value):
         return '—'
 
 
+def _time_ns(value):
+    """Parse nanosecond timestamp for descending time sort; missing values sort last."""
+    return int(value) if value is not None and str(value).isdecimal() else -1
+
+
+def sorted_orders(orders):
+    """Sort orders newest-first by broker timestamp while preserving relative order on ties."""
+    return sorted(orders, key=lambda item: _time_ns(item.get('source_time_ns')), reverse=True)
+
+
+def sorted_trades(trades):
+    """Sort trades newest-first by broker timestamp while preserving relative order on ties."""
+    return sorted(trades, key=lambda item: _time_ns(item.get('source_time_ns')), reverse=True)
+
+
+def sorted_account_history(records):
+    """Sort cached account history records newest-first by trading day and timestamp."""
+    return sorted(
+        records,
+        key=lambda item: (
+            str(item.get('trading_day') or ''),
+            _time_ns((item.get('fact') or {}).get('source_time_ns')
+                     if isinstance(item.get('fact'), dict) else None),
+            str(item.get('observed_at_utc') or ''),
+            str(item.get('record_id') or ''),
+        ),
+        reverse=True,
+    )
+
+
 def display_value(value):
     return '—' if value is None or value=='' else str(value)
 
@@ -1094,6 +1124,12 @@ class WorkbenchLayout:
         self.account_history_coverage = []
         self.account_history_pending = set()
         self.account_history_error = None
+        self._startup_history_refreshed = set()
+        self._triggered_sync_slots = set()
+        self.sync_schedule_timer = QTimer(window)
+        self.sync_schedule_timer.setInterval(15000)
+        self.sync_schedule_timer.timeout.connect(self._check_scheduled_account_sync)
+        self.sync_schedule_timer.start()
         self.parameter_save_buttons = []
         self._runtime_synced_hash = None
         self._saved_next_boot_hash = None
@@ -3345,11 +3381,66 @@ class WorkbenchLayout:
     def account_trades_page(self, layout):
         self.account_trade_history_status = QLabel('账号历史尚未读取。')
         self.account_trade_history_status.setWordWrap(True)
-        layout.addLayout(row(self.account_trade_history_status,
-                             button('刷新账号历史', lambda: self.request_account_history(force=True))))
+        self.sync_schedule_enabled = QCheckBox('定时同步')
+        self.sync_schedule_enabled.setChecked(
+            bool(self.settings.value('account_history/scheduled_sync_enabled', True, type=bool))
+        )
+        self.sync_schedule_time = QLineEdit(
+            str(self.settings.value('account_history/scheduled_sync_time', '15:00') or '15:00')
+        )
+        self.sync_schedule_time.setPlaceholderText('HH:MM（如 15:00,02:30）')
+        self.sync_schedule_time.setFixedWidth(120)
+        self.sync_schedule_enabled.toggled.connect(self._save_sync_schedule)
+        self.sync_schedule_time.editingFinished.connect(self._save_sync_schedule)
+        layout.addLayout(row(
+            self.account_trade_history_status,
+            button('立即同步当日成交', self.sync_account_trades_now),
+            button('刷新账号历史', lambda: self.request_account_history(force=True)),
+            self.sync_schedule_enabled,
+            self.sync_schedule_time,
+        ))
         self.account_history_trades = table(ACCOUNT_TRADE_HEADERS)
         self.account_history_trades.setObjectName('dashboardGrid')
         layout.addWidget(self.account_history_trades)
+
+    def _save_sync_schedule(self):
+        self.settings.setValue('account_history/scheduled_sync_enabled', self.sync_schedule_enabled.isChecked())
+        self.settings.setValue('account_history/scheduled_sync_time', self.sync_schedule_time.text().strip() or '15:00')
+
+    def _check_scheduled_account_sync(self):
+        if getattr(self.window, '_closing', False) or not getattr(self, 'sync_schedule_enabled', None):
+            return
+        if not self.sync_schedule_enabled.isChecked():
+            return
+        if not self.window._runtime_mode or self.rendered_view is None:
+            return
+        now_bj = datetime.now(BEIJING)
+        hhmm = now_bj.strftime('%H:%M')
+        targets = {
+            part.strip()
+            for part in self.sync_schedule_time.text().replace('，', ',').split(',')
+            if part.strip()
+        }
+        if hhmm not in targets:
+            return
+        slot = (now_bj.strftime('%Y-%m-%d'), hhmm)
+        if slot in self._triggered_sync_slots:
+            return
+        self._triggered_sync_slots.add(slot)
+        self.sync_account_trades_now()
+
+    def sync_account_trades_now(self):
+        if not self.window._runtime_mode or self.rendered_view is None:
+            self._set_account_history_status('尚未连接到 Runtime，无法同步当日柜台成交。')
+            return
+        self._set_account_history_status('正在同步当日柜台成交（保留本地已有记录）…')
+        try:
+            self.window.reconcile()
+        except Exception:
+            pass
+        QTimer.singleShot(800, lambda: (
+            None if getattr(self.window, '_closing', False) else self.request_account_history(force=True)
+        ))
 
     def ensure_account_history(self):
         self.request_account_history(force=False)
@@ -3427,6 +3518,12 @@ class WorkbenchLayout:
         cursor = value.get('next_cursor')
         if cursor:
             self._enqueue_account_history(section, cursor)
+        elif (section == 'trades' and not self.account_history_records['trades']
+              and self.account_history_binding not in self._startup_history_refreshed):
+            self._startup_history_refreshed.add(self.account_history_binding)
+            QTimer.singleShot(2500, lambda: (
+                None if getattr(self.window, '_closing', False) else self.request_account_history(force=True)
+            ))
         self._render_account_history()
 
     def fail_account_history(self, response):
@@ -3460,10 +3557,8 @@ class WorkbenchLayout:
         first, last = getattr(self, 'account_history_range', (None, None))
         inside = lambda item: (not first or item.get('trading_day', '') >= first) and (
             not last or item.get('trading_day', '') <= last)
-        orders = sorted(filter(inside, self.account_history_records['orders'].values()),
-                        key=lambda item: (item.get('trading_day', ''), item.get('record_id', '')), reverse=True)
-        trades = sorted(filter(inside, self.account_history_records['trades'].values()),
-                        key=lambda item: (item.get('trading_day', ''), item.get('record_id', '')), reverse=True)
+        orders = sorted_account_history(filter(inside, self.account_history_records['orders'].values()))
+        trades = sorted_account_history(filter(inside, self.account_history_records['trades'].values()))
         populate(self.account_history_orders, (account_order_cells(item) for item in orders))
         populate(self.account_history_trades, (account_trade_cells(item) for item in trades))
         self.render_equity_chart()
@@ -3552,7 +3647,7 @@ class WorkbenchLayout:
                 effect is None or item.get('effect') == effect) and (side=='全部方向' or side==native_side(item))
         active_count = 0
         historical = []
-        for index, item in enumerate(view['orders']):
+        for index, item in enumerate(sorted_orders(view['orders'])):
             terminal = item.get('terminal_confirmed', item.get('broker_state') in {'FILLED', 'CANCELLED', 'REJECTED'})
             fills_consistent = item.get('reported_fill_qty', item.get('filled_qty')) == item.get('filled_qty')
             unresolved = (item.get('send_state') in {'UNKNOWN', 'SEND_POSSIBLE'} or item.get('cancel_status') == 'UNKNOWN'
@@ -3569,7 +3664,7 @@ class WorkbenchLayout:
         self.fill_selectable(self.historical_orders, [order_cells(item) for item in historical],
                              [item.get('child_order_id') for item in historical])
         fill_count = 0
-        for index, item in enumerate(view['trades']):
+        for index, item in enumerate(sorted_trades(view['trades'])):
             keep = visible(item, 'trading_day')
             self.tables['trades'].setRowHidden(index, not keep)
             fill_count += keep
@@ -3798,8 +3893,8 @@ class WorkbenchLayout:
 
     def render_manual_tables(self, view):
         day = self.current_trading_day(view)
-        orders = [item for item in view['orders'] if day is not None and item.get('native_trading_day')==day]
-        trades = [item for item in view['trades'] if day is not None and item.get('trading_day')==day]
+        orders = [item for item in sorted_orders(view['orders']) if day is not None and item.get('native_trading_day')==day]
+        trades = [item for item in sorted_trades(view['trades']) if day is not None and item.get('trading_day')==day]
         positions = [item for item in view['cycles'] if item['remaining_quantity']>0]
         for name,items,cells,identity in (
                 ('orders',orders,order_cells,'child_order_id'),
@@ -4751,10 +4846,11 @@ class WorkbenchLayout:
         self.sync_runtime_profile(view)
         self.render_session_hours(view)
         orders = self.tables['orders']
-        populate(orders, [order_cells(item) for item in view['orders']])
-        for index, item in enumerate(view['orders']):
+        order_rows = sorted_orders(view['orders'])
+        populate(orders, [order_cells(item) for item in order_rows])
+        for index, item in enumerate(order_rows):
             orders.item(index, 0).setData(Qt.UserRole, item.get('child_order_id'))
-        populate(self.tables['trades'],[trade_cells(item) for item in view['trades']])
+        populate(self.tables['trades'],[trade_cells(item) for item in sorted_trades(view['trades'])])
         codes = ['全部品种', *dict.fromkeys([*self.names, *(item['contract_id'] for item in view['orders']),
                                           *(item['contract_id'] for item in view['markets'])])]
         if [self.order_contract.itemText(index) for index in range(self.order_contract.count())] != codes:

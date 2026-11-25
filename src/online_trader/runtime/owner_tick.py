@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import time
 
 from online_trader.configuration.files import publish_runtime_file_bytes
 from online_trader.contracts.codec import canonical_bytes
 from online_trader.errors import TraderError, exception_record
+
+
+_BEIJING_TZ = timezone(timedelta(hours=8))
+_DAILY_HISTORY_SYNC_TIMES = ("15:00", "02:30")
+
+
+def _scheduled_history_slot(loop_state):
+    """Return today's Beijing (date, HH:MM) slot if a scheduled sync time is due and unrecorded."""
+    now_bj = datetime.now(_BEIJING_TZ)
+    hhmm = now_bj.strftime("%H:%M")
+    if hhmm not in _DAILY_HISTORY_SYNC_TIMES:
+        return None
+    slot = (now_bj.strftime("%Y-%m-%d"), hhmm)
+    if slot in loop_state.setdefault("daily_history_sync_done", set()):
+        return None
+    return slot
 
 
 def _utc_now() -> str:
@@ -216,11 +232,22 @@ def execute_owner_tick(
         if callable(setter):
             setter(bool(loop_state.get("initial_start_pending")))
         now = time.monotonic()
-        if history_writer is not None and now - loop_state.get("last_history_capture", 0.0) >= 10:
+        sync_requested = (
+            callable(getattr(owner, "consume_history_sync_request", None))
+            and owner.consume_history_sync_request()
+        )
+        scheduled_slot = _scheduled_history_slot(loop_state)
+        if history_writer is not None and (
+            sync_requested
+            or scheduled_slot is not None
+            or now - loop_state.get("last_history_capture", 0.0) >= 10
+        ):
             snapshot = owner.native_account_snapshot()
             if snapshot is not None:
                 history_writer.offer(snapshot)
-            loop_state["last_history_capture"] = now
+                loop_state["last_history_capture"] = now
+                if scheduled_slot is not None:
+                    loop_state.setdefault("daily_history_sync_done", set()).add(scheduled_slot)
     except Exception as error:
         category = classify_owner_tick_error(
             error, storage_failed=bool(getattr(owner.session, "_failed", False))

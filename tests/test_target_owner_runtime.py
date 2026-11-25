@@ -2259,6 +2259,72 @@ class TargetOwnerMaintenanceTests(unittest.TestCase):
                 finally:
                     owner.close()
 
+    def test_clock_pause_preserves_strategy_intent_until_resume_or_user_stop(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = TargetOwnerWorkbenchProjectionTests._make_hot_add_harness(self, temp_dir)
+            with RuntimeSessionStorage() as storage:
+                binding = env.make_binding(storage.boot_id)
+                session = DsvSession(
+                    storage.ledger, account_key=env.account_key, provider='TQKQ',
+                    trading_day='2026-11-13', profile=env.base, port=env.adapter,
+                    _execution_lock=binding.account_lock, _owner_binding=binding,
+                )
+                owner = StandaloneDsvOwner(
+                    session, env.adapter, env.connection, env.base, binding,
+                    configuration_revision='1',
+                )
+                try:
+                    owner.step(trading_day='2026-11-13', complete=True)
+                    owner.start_confirmed()
+                    self.assertEqual(owner.strategy_intent, 'RUNNING')
+                    self.assertTrue(session._state['running'])
+
+                    # Simulate temporary clock pause: entries disabled, clock_resume_pending=True.
+                    clock_ok = {'ready': False}
+                    initial_sample = env.adapter._clock_sample()
+                    env.adapter.clock = SimpleNamespace(
+                        poll=lambda: None,
+                        capture=lambda: initial_sample,
+                        entry_ready=lambda: clock_ok['ready'],
+                        entry_stable=lambda: clock_ok['ready'],
+                        protection_ready=lambda: True,
+                        health=lambda _sample: {'reference_status': 'TRUSTED_UTC', 'reason': None},
+                    )
+                    owner.step(trading_day='2026-11-13', complete=True)
+                    self.assertFalse(session._state['running'])
+                    self.assertTrue(env.adapter.clock_resume_pending)
+                    self.assertEqual(owner.strategy_intent, 'RUNNING')
+
+                    # Clock recovers: adapter auto-resumes entries and strategy_intent stays RUNNING.
+                    clock_ok['ready'] = True
+                    owner.step(trading_day='2026-11-13', complete=True)
+                    self.assertTrue(session._state['running'])
+                    self.assertFalse(env.adapter.clock_resume_pending)
+                    self.assertEqual(owner.strategy_intent, 'RUNNING')
+
+                    # Pause again, then issue explicit user STOP: clears clock_resume_pending and intent.
+                    clock_ok['ready'] = False
+                    owner.step(trading_day='2026-11-13', complete=True)
+                    self.assertTrue(env.adapter.clock_resume_pending)
+                    self.assertEqual(owner.strategy_intent, 'RUNNING')
+
+                    owner.command({
+                        'command_id': 'cmd-stop-during-clock-pause',
+                        'operation': 'STOP_DSV_STRATEGY',
+                        'scope': {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                        'binding': {'account_key': env.account_key, 'kernel_boot_id': storage.boot_id,
+                                    'config_revision': owner.configuration_revision},
+                        'parameters': {},
+                    })
+                    self.assertEqual(owner.strategy_intent, 'STOPPED')
+                    self.assertFalse(env.adapter.clock_resume_pending)
+                    self.assertFalse(session._state['running'])
+
+                    owner.step(trading_day='2026-11-13', complete=True)
+                    self.assertEqual(owner.strategy_intent, 'STOPPED')
+                finally:
+                    owner.close()
+
 
 if __name__ == '__main__':
     unittest.main()

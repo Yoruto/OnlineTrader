@@ -18,7 +18,7 @@ from online_trader.desktop.notifications import WorkbenchSounds
 from online_trader.desktop.preferences import workbench_preferences
 from online_trader.desktop.runtime_client.state import OWNER_RECHECK_OPERATIONS
 from online_trader.desktop.tray import WorkbenchTray
-from online_trader.desktop.workbench_layout import QUOTE_TIME_MESSAGES, WorkbenchLayout, format_reason_text
+from online_trader.desktop.workbench_layout import QUOTE_TIME_MESSAGES, WorkbenchLayout, format_reason_text, sorted_orders
 from online_trader.errors import TraderError
 from online_trader.runtime.market_monitor import append_latency
 from online_trader.transport.status_client import StatusClient
@@ -1233,7 +1233,7 @@ class WorkbenchWindow(StatusWindow):
         if self.view is None:return {}
         return {
             'cycles':(self.cycles,self._base_cycle_ids),
-            'orders':(self.tables['orders'],[row['child_order_id'] for row in self.view['orders']]),
+            'orders':(self.tables['orders'],[row['child_order_id'] for row in sorted_orders(self.view['orders'])]),
             'markets':(self.tables['markets'],[row['contract_id'] for row in self.view['markets']]),
             'external_positions':(self.tables['external_positions'],[(row['contract_id'],row['direction'])
                 for row in self.view.get('external_positions',[])]),
@@ -1725,7 +1725,8 @@ class WorkbenchWindow(StatusWindow):
     def cancel_selected(self):
         table=self.tables['orders']
         rows=sorted({index.row() for index in table.selectedIndexes() if not table.isRowHidden(index.row())})
-        self.cancel_manual_children([self.view['orders'][i]['child_order_id'] for i in rows] if self.view else [])
+        ordered = sorted_orders(self.view['orders']) if self.view else []
+        self.cancel_manual_children([ordered[i]['child_order_id'] for i in rows] if rows else [])
 
     def cancel_manual_children(self, ids):
         if not ids:

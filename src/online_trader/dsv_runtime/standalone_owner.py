@@ -73,6 +73,7 @@ class StandaloneDsvOwner:
         self._maintenance_verified_step = False
         self.config_apply_pending = False
         self.config_recovery_notice = None
+        self._history_sync_requested = False
         step_fn = getattr(adapter, 'step', None)
         self._adapter_accepts_force_full_round = (
             callable(step_fn) and 'force_full_round' in inspect.signature(step_fn).parameters
@@ -238,6 +239,12 @@ class StandaloneDsvOwner:
     def positions(self, after=None):
         return workbench_positions(self.snapshot(), after)
 
+    def consume_history_sync_request(self):
+        """Return True once when a workbench reconciliation requested immediate history capture."""
+        requested = self._history_sync_requested
+        self._history_sync_requested = False
+        return requested
+
     def native_account_snapshot(self):
         """Read one complete broker observation from this owner's SDK connection.
 
@@ -305,6 +312,8 @@ class StandaloneDsvOwner:
             receipt = self._save_parameters(command)
         else:
             receipt = self.adapter.command(self.session, command)
+        if command['action'] == 'RECONCILE':
+            self._history_sync_requested = True
         if command['action'] == 'START':
             self.strategy_intent = 'RUNNING'
             self.has_start_pending = False
@@ -422,7 +431,11 @@ class StandaloneDsvOwner:
             )
         else:
             receipt = self.adapter.step(self.session, trading_day=trading_day, complete=complete)
-        if self.strategy_intent == 'RUNNING' and not bool(self.session._state.get('running')):
+        if (
+            self.strategy_intent == 'RUNNING'
+            and not bool(self.session._state.get('running'))
+            and not bool(getattr(self.adapter, 'clock_resume_pending', False))
+        ):
             self.strategy_intent = 'STOPPED'
         if self.maintenance is not None and receipt is not None and receipt.get('type') != 'DISCONNECTED':
             self._maintenance_verified_step = True
