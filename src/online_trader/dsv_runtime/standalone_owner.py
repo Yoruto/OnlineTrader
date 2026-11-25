@@ -9,6 +9,7 @@ import copy
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
+import inspect
 from threading import Event
 
 from online_trader.configuration.dsv import DsvProfile
@@ -62,7 +63,6 @@ class StandaloneDsvOwner:
         self._projection_seq = 1
         self._authority_generation = 0
         self._track_commit_views = True
-        self._commit_views = [self.snapshot()]
         self.publication_status = None
         self.stop_event = Event()
         self._shutdown_after_flatten = False
@@ -71,6 +71,13 @@ class StandaloneDsvOwner:
         self.maintenance = None
         self.maintenance_completion = None
         self._maintenance_verified_step = False
+        self.config_apply_pending = False
+        self.config_recovery_notice = None
+        step_fn = getattr(adapter, 'step', None)
+        self._adapter_accepts_force_full_round = (
+            callable(step_fn) and 'force_full_round' in inspect.signature(step_fn).parameters
+        )
+        self._commit_views = [self.snapshot()]
 
     def set_stream_tracking(self, enabled):
         self._track_commit_views = bool(enabled)
@@ -128,6 +135,10 @@ class StandaloneDsvOwner:
         state['strategy_intent'] = self.strategy_intent
         state['has_start_pending'] = self.has_start_pending
         state['maintenance'] = copy.deepcopy(self.maintenance)
+        if self.maintenance_completion is not None:
+            state['maintenance_completion'] = copy.deepcopy(self.maintenance_completion)
+        if self.config_recovery_notice is not None:
+            state['config_recovery_notice'] = copy.deepcopy(self.config_recovery_notice)
         state['responsibility_summary'] = evaluate_responsibility(
             state,
             strategy_intent=self.strategy_intent,
@@ -297,6 +308,7 @@ class StandaloneDsvOwner:
         if command['action'] == 'START':
             self.strategy_intent = 'RUNNING'
             self.has_start_pending = False
+            self.config_recovery_notice = None
         elif command['action'] in {'STOP', 'FLATTEN_STOP'}:
             self.strategy_intent = 'STOPPED'
             self.has_start_pending = False
@@ -386,6 +398,8 @@ class StandaloneDsvOwner:
         """Enable entries after the desktop request and first complete frame."""
         if self.maintenance is not None:
             raise TraderError('E_NOT_READY', '维护停机进行中，已禁止自动启动策略')
+        if self.config_apply_pending:
+            raise TraderError('E_NOT_READY', '上次参数保存曾中断，已禁止自动启动策略，请核对参数后手动启动')
         receipt = self.adapter.command(self.session, {
             'id': 'standalone-confirmed-start-' + self.boot_id,
             'action': 'START',
@@ -401,8 +415,14 @@ class StandaloneDsvOwner:
         return self.session.command_receipt(command_id)
 
     def step(self, *, trading_day, complete):
-        receipt = self.adapter.step(self.session, trading_day=trading_day, complete=complete)
-        if self.maintenance is not None:
+        verifying = self.maintenance is not None
+        if verifying and self._adapter_accepts_force_full_round:
+            receipt = self.adapter.step(
+                self.session, trading_day=trading_day, complete=complete, force_full_round=True,
+            )
+        else:
+            receipt = self.adapter.step(self.session, trading_day=trading_day, complete=complete)
+        if self.maintenance is not None and receipt is not None and receipt.get('type') != 'DISCONNECTED':
             self._maintenance_verified_step = True
         if receipt is not None:
             configured_contracts = getattr(self.adapter, 'contracts', None)
@@ -503,6 +523,9 @@ class StandaloneDsvOwner:
                     self.session.record_maintenance_event('MAINTENANCE_STOP_ABORTED', aborted)
                 except Exception:
                     pass
+                self._projection_seq += 1
+                if self._track_commit_views:
+                    self._commit_views.append(self.snapshot())
 
     def take_committed_views(self):
         views, self._commit_views = self._commit_views, []

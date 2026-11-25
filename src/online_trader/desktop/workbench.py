@@ -1884,6 +1884,14 @@ class WorkbenchWindow(StatusWindow):
             self.notice_label.setText(f'账号未切换 · {error} · {error.code}')
             self.dashboard.reload_accounts()
 
+    def _inspect_runtime_for_maintenance(self):
+        from online_trader.runtime.instance import runtime_owner_exists
+        from online_trader.runtime.shutdown import inspect_runtime_for_exit
+        view, pid, inspect_error = inspect_runtime_for_exit(self.pipe_name) if self.pipe_name else (None, None, None)
+        if view is None and (pid is not None or runtime_owner_exists()):
+            return None, pid, (inspect_error or '后台交易服务仍在运行或运行锁尚未释放，暂无法确认状态。')
+        return view, pid, None
+
     def switch_runtime_account(self, target_account_id):
         if (self._closing or self._runtime_shutdown_in_progress
                 or self._runtime_bootstrap is not None
@@ -1896,9 +1904,7 @@ class WorkbenchWindow(StatusWindow):
             return False
         from online_trader.desktop.runtime_bootstrap import BootstrapController
         from online_trader.runtime.portable_config import PortableAccountStore
-        from online_trader.runtime.shutdown import (
-            inspect_runtime_for_exit, maintenance_stop_runtime_and_wait,
-        )
+        from online_trader.runtime.shutdown import maintenance_stop_runtime_and_wait
         try:
             store = PortableAccountStore(root)
             account = store.get(target_account_id)
@@ -1912,45 +1918,44 @@ class WorkbenchWindow(StatusWindow):
             self.dashboard.reload_accounts()
             return True
 
-        if self.pipe_name:
-            view, pid, inspect_error = inspect_runtime_for_exit(self.pipe_name)
-            if view is None and pid is not None:
+        view, pid, inspect_error = self._inspect_runtime_for_maintenance()
+        if inspect_error is not None:
+            QMessageBox.warning(
+                self,
+                '未能切换账号',
+                f'{inspect_error}\n\n为确保账户安全，未切换账号。',
+            )
+            self.dashboard.reload_accounts()
+            return False
+        if view is not None:
+            resp = view.get('responsibility')
+            if isinstance(resp, Mapping) and not resp.get('maintenance_allowed'):
+                blockers = '、'.join(str(code) for code in (resp.get('blockers') or ())) or '存在未结交易责任'
                 QMessageBox.warning(
                     self,
-                    '未能切换账号',
-                    f'{inspect_error or "无法读取当前后台交易服务状态。"}\n\n为确保账户安全，未切换账号。',
+                    '当前不可切换账号',
+                    f'当前账户仍处于交易或保护收尾状态，不能安全切换（{blockers}）。\n\n'
+                    '请先停止策略并等待所有已激活持仓与在途委托结清后再试；系统不会自动强行平仓。',
                 )
                 self.dashboard.reload_accounts()
                 return False
-            if view is not None:
-                resp = view.get('responsibility')
-                if isinstance(resp, Mapping) and not resp.get('maintenance_allowed'):
-                    blockers = '、'.join(str(code) for code in (resp.get('blockers') or ())) or '存在未结交易责任'
-                    QMessageBox.warning(
-                        self,
-                        '当前不可切换账号',
-                        f'当前账户仍处于交易或保护收尾状态，不能安全切换（{blockers}）。\n\n'
-                        '请先停止策略并等待所有已激活持仓与在途委托结清后再试；系统不会自动强行平仓。',
-                    )
-                    self.dashboard.reload_accounts()
-                    return False
-                ok, stop_error = self._run_runtime_shutdown(
-                    lambda pipe, **kw: maintenance_stop_runtime_and_wait(
-                        pipe, reason='SWITCH_ACCOUNT', **kw,
-                    ),
-                    pid=pid,
-                    view=view,
-                    title='OnlineTrader · 切换交易账号',
-                    label=f"正在安全停止当前会话并切换到 {account['alias']}…",
+            ok, stop_error = self._run_runtime_shutdown(
+                lambda pipe, **kw: maintenance_stop_runtime_and_wait(
+                    pipe, reason='SWITCH_ACCOUNT', **kw,
+                ),
+                pid=pid,
+                view=view,
+                title='OnlineTrader · 切换交易账号',
+                label=f"正在安全停止当前会话并切换到 {account['alias']}…",
+            )
+            if not ok:
+                QMessageBox.critical(
+                    self,
+                    '当前会话未能安全停止',
+                    f'{stop_error or "未能确认原后台服务安全退出。"}\n\n原会话与状态保持不变。',
                 )
-                if not ok:
-                    QMessageBox.critical(
-                        self,
-                        '当前会话未能安全停止',
-                        f'{stop_error or "未能确认原后台服务安全退出。"}\n\n原会话与状态保持不变。',
-                    )
-                    self.dashboard.reload_accounts()
-                    return False
+                self.dashboard.reload_accounts()
+                return False
 
         self._detach_runtime_client()
         self.view = None
@@ -2477,26 +2482,32 @@ class WorkbenchWindow(StatusWindow):
         if self._runtime_shutdown_in_progress or self._runtime_bootstrap is not None:
             return False
         from online_trader.desktop.runtime_bootstrap import BootstrapController
-        from online_trader.runtime.shutdown import (
-            inspect_runtime_for_exit, maintenance_stop_runtime_and_wait,
-        )
+        from online_trader.runtime.shutdown import maintenance_stop_runtime_and_wait
 
-        view, pid, _ = inspect_runtime_for_exit(self.pipe_name)
-        ok, stop_error = self._run_runtime_shutdown(
-            lambda pipe, **kw: maintenance_stop_runtime_and_wait(
-                pipe, reason='RESTART_CONFIG', **kw,
-            ),
-            pid=pid, view=view or self.view,
-            title='OnlineTrader · 应用新合约配置',
-            label='正在安全停止当前后台服务并保存新合约配置…',
-        )
-        if not ok:
-            QMessageBox.critical(
+        view, pid, inspect_error = self._inspect_runtime_for_maintenance()
+        if inspect_error is not None:
+            QMessageBox.warning(
                 self,
-                '后台服务未能安全停止',
-                f'{stop_error or "未能确认原后台服务安全退出。"}\n\n为确保账户安全，原配置与监控状态保持不变。',
+                '后台服务状态待核对',
+                f'{inspect_error}\n\n为确保账户安全，原配置与监控状态保持不变。',
             )
             return False
+        if view is not None or self.pipe_name:
+            ok, stop_error = self._run_runtime_shutdown(
+                lambda pipe, **kw: maintenance_stop_runtime_and_wait(
+                    pipe, reason='RESTART_CONFIG', **kw,
+                ),
+                pid=pid, view=view or self.view,
+                title='OnlineTrader · 应用新合约配置',
+                label='正在安全停止当前后台服务并保存新合约配置…',
+            )
+            if not ok:
+                QMessageBox.critical(
+                    self,
+                    '后台服务未能安全停止',
+                    f'{stop_error or "未能确认原后台服务安全退出。"}\n\n为确保账户安全，原配置与监控状态保持不变。',
+                )
+                return False
         try:
             store.save_profile(candidate_profile)
         except (TraderError, OSError) as error:
@@ -2640,17 +2651,12 @@ class WorkbenchWindow(StatusWindow):
                 or (self._session_dialog is not None
                     and getattr(self._session_dialog, 'is_preparing', lambda: False)())):
             raise TraderError('E_ACCOUNT_BUSY', '请等待当前账户操作结束后再更新')
-        if not self._runtime_mode or not self.pipe_name:
+        if not self._runtime_mode:
             return
-        from online_trader.runtime.shutdown import (
-            inspect_runtime_for_exit, maintenance_stop_runtime_and_wait,
-        )
-        view, pid, inspect_error = inspect_runtime_for_exit(self.pipe_name)
-        if view is None and pid is not None:
-            raise TraderError(
-                'E_RUNTIME_STOP',
-                inspect_error or f'后台交易服务（PID {pid}）仍在运行，暂不能安装更新',
-            )
+        from online_trader.runtime.shutdown import maintenance_stop_runtime_and_wait
+        view, pid, inspect_error = self._inspect_runtime_for_maintenance()
+        if inspect_error is not None:
+            raise TraderError('E_RUNTIME_STOP', inspect_error)
         if view is not None:
             resp = view.get('responsibility')
             if isinstance(resp, Mapping) and not resp.get('maintenance_allowed'):

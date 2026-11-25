@@ -1410,6 +1410,8 @@ class WorkbenchLayout:
         elif self._home_detail_target == 'logs':
             self.tabs.setCurrentWidget(self.diagnostic_sections.parentWidget())
             self.diagnostic_sections.setCurrentWidget(self.log_tab)
+        elif self._home_detail_target == 'parameters':
+            self.tabs.setCurrentWidget(self.parameter_tab)
 
     def home_attention_summary(self, view, pending, *, stale, truncated):
         if view is None:
@@ -1544,6 +1546,14 @@ class WorkbenchLayout:
         elif pending:
             result.update(title='订单处理中', detail_target='orders', detail_text='查看委托',
                           items=list(pending))
+        elif isinstance(view.get('config_recovery_notice'), dict):
+            notice = view['config_recovery_notice']
+            result.update(
+                title='已自动校验策略参数（暂停自动启动）',
+                detail_target='parameters',
+                detail_text='核对策略参数',
+                items=[str(notice.get('message') or '请核对当前参数后手动启动策略。')],
+            )
         else:
             return None
 
@@ -2384,7 +2394,10 @@ class WorkbenchLayout:
         elif not connected:
             state, description = '尚未连接', '连接设置位于「账户与设置」'
         elif not synced or connection.get('recovery_required'):
-            state, description = '正在核对', '账户已连接 · 等待柜台或持仓核对'
+            if view and view.get('strategy_intent') == 'RUNNING' and connection.get('recovery_required'):
+                state, description = '策略已因异常暂停', '账户已连接 · 策略意图仍为运行，等待恢复核对（点击“重新核对”或停止策略）'
+            else:
+                state, description = '正在核对', '账户已连接 · 等待柜台或持仓核对'
         elif armed and config.get('manual_workbench'):
             state, description = '人工开仓已启用', '账户已连接'
         elif armed:

@@ -492,7 +492,7 @@ class DsvSdkAdapter:
         finally:
             self.enabled = False
 
-    def step(self, session, *, trading_day, complete):
+    def step(self, session, *, trading_day, complete, force_full_round=False):
         state = self._bind(session)
         self.enabled = False
         try:
@@ -555,7 +555,7 @@ class DsvSdkAdapter:
                 current_day = state['trading_day']
                 day_held = not self._protection_clock_ready() or bool(self._health.get('reason'))
                 trading_day = current_day if day_held else trading_day(current_day, sample.utc)
-            if self._can_skip_idle_round(
+            if not force_full_round and self._can_skip_idle_round(
                 state, sample, trading_day, updated=updated, timers=timers, day_held=day_held,
             ):
                 gap_raw = self.metrics.get('sdk_pump_gap_ns')

@@ -360,6 +360,33 @@
       ],
       "case_overrides": {}
     },
+    "test_configuration_recovery": {
+      "tier": "T1",
+      "domains": [
+        "runtime",
+        "configuration"
+      ],
+      "risk": "P1",
+      "profiles": [
+        "FullOffline",
+        "Runtime"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": false,
+      "requirements": [],
+      "timeout_seconds": 60,
+      "cases": [
+        "ConfigurationRecoveryTests.test_owner_tick_blocks_auto_arm_when_config_apply_pending_without_diagnostics",
+        "ConfigurationRecoveryTests.test_repository_evaluates_all_pending_marker_states",
+        "ConfigurationRecoveryTests.test_run_target_owner_auto_recovers_all_marker_cases_disarmed_without_diagnostics",
+        "ConfigurationRecoveryTests.test_standalone_owner_start_confirmed_refuses_when_config_apply_pending"
+      ],
+      "case_overrides": {}
+    },
     "test_contracts": {
       "tier": "T1",
       "domains": [
@@ -600,6 +627,32 @@
         "DesktopStartupTests.test_one_main_button_click_uses_latest_parameters_and_starts_without_dialog",
         "DesktopStartupTests.test_parent_account_change_refuses_old_starter_before_launch",
         "DesktopStartupTests.test_quote_reference_updates_display_without_starting_strategy"
+      ],
+      "case_overrides": {}
+    },
+    "test_diagnostics_redaction": {
+      "tier": "T2",
+      "domains": [
+        "runtime"
+      ],
+      "risk": "P2",
+      "profiles": [
+        "FullOffline",
+        "Runtime"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": false,
+      "requirements": [],
+      "timeout_seconds": 30,
+      "cases": [
+        "DiagnosticsRedactionTests.test_account_pseudonym_is_deterministic_and_hides_account_key",
+        "DiagnosticsRedactionTests.test_collect_view_log_redacts_messages",
+        "DiagnosticsRedactionTests.test_sanitize_diagnostic_mapping_drops_sensitive_keys_and_preserves_trading_fields",
+        "DiagnosticsRedactionTests.test_scrubs_passwords_tokens_urls_accounts_and_paths_while_keeping_trading_facts"
       ],
       "case_overrides": {}
     },
@@ -2573,6 +2626,35 @@
       ],
       "case_overrides": {}
     },
+    "test_maintenance_policy": {
+      "tier": "T1",
+      "domains": [
+        "runtime",
+        "trading"
+      ],
+      "risk": "P1",
+      "profiles": [
+        "FullOffline",
+        "Runtime",
+        "Trading"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": false,
+      "requirements": [],
+      "timeout_seconds": 30,
+      "cases": [
+        "MaintenancePolicyTests.test_activated_protection_position_blocks_maintenance_and_derives_draining",
+        "MaintenancePolicyTests.test_preview_only_startup_inference_position_allows_maintenance_in_monitoring",
+        "MaintenancePolicyTests.test_running_intent_unsynced_or_fault_blocks_maintenance",
+        "MaintenancePolicyTests.test_uncertain_child_and_detached_conflict_mark_unknown",
+        "MaintenancePolicyTests.test_unresolved_orders_and_convergence_cancels_block_maintenance"
+      ],
+      "case_overrides": {}
+    },
     "test_market_permissions_and_auction": {
       "tier": "T1",
       "domains": [
@@ -3888,6 +3970,44 @@
       ],
       "case_overrides": {}
     },
+    "test_runtime_fault_isolation": {
+      "tier": "T2",
+      "domains": [
+        "runtime",
+        "desktop"
+      ],
+      "risk": "P1",
+      "profiles": [
+        "FullOffline",
+        "Runtime"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": false,
+      "requirements": [
+        "PySide6"
+      ],
+      "timeout_seconds": 120,
+      "cases": [
+        "DsvFactAndRecoveryTests.test_adjusted_insert_time_within_60s_skew_accepts_subsequent_trade_and_preserves_bounds",
+        "DsvFactAndRecoveryTests.test_gt_60s_order_skew_and_pre_order_trade_still_fail_closed",
+        "DsvFactAndRecoveryTests.test_post_rollback_close_fill_reconciles_without_duplicate_close_or_reopen",
+        "DsvFactAndRecoveryTests.test_undercovered_position_without_fill_forbids_forged_reconcile",
+        "RuntimeWriteIsolationTests.test_diagnostics_write_failure_records_sink_first_and_even_sink_failure_is_isolated",
+        "RuntimeWriteIsolationTests.test_publish_runtime_file_bytes_error_code_and_cleanup_safety",
+        "RuntimeWriteIsolationTests.test_reporter_collects_both_startup_and_runtime_failure_records",
+        "RuntimeWriteIsolationTests.test_status_write_failure_does_not_exit_or_alter_authority_and_flushes_later",
+        "WorkbenchLifecycleIsolationTests.test_describe_owner_risk_does_not_infer_actual_positions_or_safe_flat_from_target",
+        "WorkbenchLifecycleIsolationTests.test_executor_log_surfaces_diagnostic_detail_and_runtime_failure",
+        "WorkbenchLifecycleIsolationTests.test_subscription_worker_detects_owner_crash_stops_dead_pipe_and_discovers_replacement",
+        "WorkbenchLifecycleIsolationTests.test_subscription_worker_ignores_mismatched_boot_id_crash_file_and_reports_unresponsive",
+        "WorkbenchLifecycleIsolationTests.test_workbench_clears_stale_broker_recovery_and_notifies_once_on_owner_crash"
+      ],
+      "case_overrides": {}
+    },
     "test_runtime_operator": {
       "tier": "T2",
       "domains": [
@@ -3988,6 +4108,35 @@
       ],
       "case_overrides": {}
     },
+    "test_runtime_shutdown": {
+      "tier": "T1",
+      "domains": [
+        "runtime"
+      ],
+      "risk": "P1",
+      "profiles": [
+        "FullOffline",
+        "Runtime"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": false,
+      "requirements": [],
+      "timeout_seconds": 30,
+      "cases": [
+        "RuntimeShutdownProofTests.test_aborted_projection_returns_immediately_without_waiting_full_timeout",
+        "RuntimeShutdownProofTests.test_allows_when_no_runtime_is_active",
+        "RuntimeShutdownProofTests.test_rejects_when_process_exits_without_completion_proof",
+        "RuntimeShutdownProofTests.test_rejects_when_submit_fails_even_if_process_dies",
+        "RuntimeShutdownProofTests.test_runtime_failure_file_aborts_wait_immediately",
+        "RuntimeShutdownProofTests.test_succeeds_only_with_matching_completed_proof_after_exit",
+        "RuntimeShutdownProofTests.test_valid_completion_proof_requires_matching_identity_and_completed_state"
+      ],
+      "case_overrides": {}
+    },
     "test_runtime_view": {
       "tier": "T2",
       "domains": [
@@ -4042,12 +4191,16 @@
         "RuntimeWorkbenchTests.test_home_attention_shows_generic_recovery_fallback_while_honoring_capability_gate",
         "RuntimeWorkbenchTests.test_hot_add_rejection_offers_next_boot_overrides_without_interrupting_runtime",
         "RuntimeWorkbenchTests.test_new_workbench_process_starts_without_legacy_pending_state",
+        "RuntimeWorkbenchTests.test_prepare_update_restart_enforces_maintenance_stop",
         "RuntimeWorkbenchTests.test_removing_contract_with_silver_while_armed_persists_next_boot_overrides_without_interrupting_runtime",
         "RuntimeWorkbenchTests.test_replacing_contract_while_disarmed_saves_overrides_and_restarts_runtime_to_monitor",
         "RuntimeWorkbenchTests.test_runtime_catalog_load_uses_portable_store_when_legacy_store_is_absent",
         "RuntimeWorkbenchTests.test_runtime_view_syncs_effective_profile_without_overwriting_unsaved_draft",
         "RuntimeWorkbenchTests.test_submit_delegates_the_current_intent_to_command_bus",
-        "RuntimeWorkbenchTests.test_submit_without_a_current_view_does_not_reach_command_bus"
+        "RuntimeWorkbenchTests.test_submit_without_a_current_view_does_not_reach_command_bus",
+        "RuntimeWorkbenchTests.test_switch_runtime_account_aborts_when_maintenance_stop_fails",
+        "RuntimeWorkbenchTests.test_switch_runtime_account_verifies_maintenance_and_boots_monitor_only",
+        "RuntimeWorkbenchTests.test_workbench_renders_config_recovery_notice_and_running_fault_intent"
       ],
       "case_overrides": {}
     },
@@ -4820,6 +4973,9 @@
         "SymbolEditorTests.test_add_alias_name_and_parameters_are_applied_atomically",
         "SymbolEditorTests.test_advanced_editor_new_form_cancel_and_accept_preserve_other_drafts",
         "SymbolEditorTests.test_cancel_add_and_edit_never_publish_partial_changes",
+        "SymbolEditorTests.test_complete_contract_input_does_not_keep_popup_open",
+        "SymbolEditorTests.test_contract_dropdown_keyboard_selection",
+        "SymbolEditorTests.test_contract_dropdown_single_click_selects_and_closes",
         "SymbolEditorTests.test_contract_dropdown_suggests_up_to_six_months_offline_and_from_catalog",
         "SymbolEditorTests.test_duplicate_and_invalid_values_stay_open_with_inline_errors",
         "SymbolEditorTests.test_edit_retains_unedited_values_and_custom_name",
@@ -4882,6 +5038,8 @@
         "TargetOwnerExecutionReliabilityTests.test_reduction_route_unavailable_sets_explicit_block_reason_and_diagnostics_log",
         "TargetOwnerExecutionReliabilityTests.test_sdk_pre_queue_risk_refusal_returns_definitely_not_sent_without_unknown_occupation",
         "TargetOwnerExecutionReliabilityTests.test_unknown_negative_reconciliation_releases_reduce_target_and_unblocks_sync_after_complete_snapshot",
+        "TargetOwnerMaintenanceTests.test_safe_stop_for_maintenance_aborts_and_projects_when_late_position_or_disconnect_occurs",
+        "TargetOwnerMaintenanceTests.test_safe_stop_for_maintenance_bypasses_idle_skip_and_completes",
         "TargetOwnerPureLogicTests.test_incomplete_calendar_window_holds_current_trading_day_even_when_other_contract_is_active",
         "TargetOwnerPureLogicTests.test_initial_auto_arm_survives_transient_error_and_confirms_once_while_persistent_disarm_cancels_it",
         "TargetOwnerPureLogicTests.test_market_break_retains_current_trading_day_until_next_session_is_active",

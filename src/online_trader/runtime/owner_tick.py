@@ -174,7 +174,10 @@ def execute_owner_tick(
     _flush_pending_runtime_files(
         status_path, diagnostics_path, loop_state, diagnostic_sink, now_mono,
     )
-    if getattr(owner, 'maintenance', None) is not None and loop_state.get('initial_start_pending'):
+    if (
+        (getattr(owner, 'maintenance', None) is not None or getattr(owner, 'config_apply_pending', False))
+        and loop_state.get('initial_start_pending')
+    ):
         loop_state['initial_start_pending'] = False
     setter = getattr(owner, 'set_initial_start_pending', None)
     if callable(setter):
@@ -200,7 +203,11 @@ def execute_owner_tick(
         state = owner.snapshot()
         if loop_state.get("initial_start_pending"):
             expected_gen = loop_state.get("initial_arm_generation", 0)
-            if getattr(owner, "authority_generation", 0) != expected_gen or getattr(owner, "maintenance", None) is not None:
+            if (
+                getattr(owner, "authority_generation", 0) != expected_gen
+                or getattr(owner, "maintenance", None) is not None
+                or getattr(owner, "config_apply_pending", False)
+            ):
                 loop_state["initial_start_pending"] = False
             elif state["synchronized"] and not state.get("owner_fault_code"):
                 owner.start_confirmed()

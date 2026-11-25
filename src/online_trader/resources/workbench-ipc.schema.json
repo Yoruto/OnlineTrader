@@ -512,6 +512,31 @@
                         "reason": {"enum": ["SWITCH_ACCOUNT", "UPDATE", "RESTART_CONFIG"]},
                         "state": {"enum": ["REQUESTED", "VERIFYING", "COMPLETED", "ABORTED"]}
                       }
+                    },
+                    "maintenance_completion": {
+                      "type": ["object", "null"],
+                      "required": ["command_id", "reason", "state", "blockers", "completed_at_utc"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "command_id": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"},
+                        "reason": {"enum": ["SWITCH_ACCOUNT", "UPDATE", "RESTART_CONFIG"]},
+                        "state": {"enum": ["COMPLETED", "ABORTED"]},
+                        "blockers": {
+                          "type": "array", "maxItems": 32,
+                          "items": {"type": "string", "maxLength": 64}
+                        },
+                        "completed_at_utc": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/utc"}
+                      }
+                    },
+                    "config_recovery_notice": {
+                      "type": ["object", "null"],
+                      "required": ["state", "message", "apply_id"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "state": {"enum": ["MATCHES_OLD", "MATCHES_NEW", "HASH_CONFLICT", "CORRUPTED"]},
+                        "message": {"type": "string", "maxLength": 512},
+                        "apply_id": {"type": ["string", "null"], "maxLength": 128}
+                      }
                     }
                   },
                   "required": [

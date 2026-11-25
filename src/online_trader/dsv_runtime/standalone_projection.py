@@ -681,6 +681,24 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
             }
             if isinstance(maintenance, dict) else None
         ),
+        'maintenance_completion': (
+            {
+                'command_id': str(completion['command_id']),
+                'reason': str(completion['reason']),
+                'state': str(completion['state']),
+                'blockers': list((completion.get('responsibility') or {}).get('blockers') or ())[:32],
+                'completed_at_utc': str(completion['completed_at_utc']),
+            }
+            if isinstance((completion := snapshot.get('maintenance_completion')), dict) else None
+        ),
+        'config_recovery_notice': (
+            {
+                'state': str(notice['state']),
+                'message': str(notice['message']),
+                'apply_id': (None if notice.get('apply_id') is None else str(notice['apply_id'])),
+            }
+            if isinstance((notice := snapshot.get('config_recovery_notice')), dict) else None
+        ),
     }
     account_snapshot = snapshot.get('account_snapshot')
     if account_snapshot is not None:

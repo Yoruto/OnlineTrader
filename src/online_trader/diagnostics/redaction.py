@@ -16,13 +16,19 @@ _KEY_BYTES = 32
 _SENSITIVE_KEY_TOKENS = (
     "password", "passwd", "secret", "token", "credential", "auth",
     "cookie", "private", "api_key", "apikey", "broker_account", "account_id",
-    "user_id", "investor", "phone", "email",
+    "account_key", "user_id", "username", "login", "masked_login",
+    "investor", "phone", "email", "deploy-token", "private-token", "job-token",
 )
 _TEXT_SCRUB_PATTERNS = (
-    (re.compile(r"(?i)(password|passwd|secret|token|private_token|deploy_token|api_key)\s*[=:]\s*\S+"), r"\1=[REDACTED]"),
-    (re.compile(r"(?i)(authorization\s*:\s*)\S+(?:\s+\S+)?"), r"\1[REDACTED]"),
-    (re.compile(r"\b(?:SIM|LIVE):[A-Z]+:[0-9A-Za-z._-]+\b"), "[ACCOUNT_REDACTED]"),
+    (re.compile(r'(?i)("?(?:password|passwd|secret|token|private[-_]token|deploy[-_]token|job[-_]token|api[-_]?key|username|login|kq_username|simnow_username|kq_password|simnow_password)"?\s*[:=]\s*)"[^"\r\n]*"'), r'\1"[REDACTED]"'),
+    (re.compile(r"(?i)('?(?:password|passwd|secret|token|private[-_]token|deploy[-_]token|job[-_]token|api[-_]?key|username|login|kq_username|simnow_username|kq_password|simnow_password)'?\s*[:=]\s*)'[^'\r\n]*'"), r"\1'[REDACTED]'"),
+    (re.compile(r"(?i)\b(password|passwd|secret|token|private[-_]token|deploy[-_]token|job[-_]token|api[-_]?key|username|login|kq_username|simnow_username|kq_password|simnow_password)\s*[=:]\s*[^\s,;\"']+"), r"\1=[REDACTED]"),
+    (re.compile(r"(?i)((?:authorization|private-token|deploy-token|job-token)\s*:\s*)(?:bearer\s+)?\S+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/-]+=*"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@"), r"\1[CREDENTIALS_REDACTED]@"),
+    (re.compile(r"\b(?:SIM|LIVE):[A-Z0-9_]+:[0-9A-Za-z._-]+\b"), "[ACCOUNT_REDACTED]"),
     (re.compile(r"[A-Za-z]:\\[^\s\"']+"), "[PATH_REDACTED]"),
+    (re.compile(r"\\\\[A-Za-z0-9._$-]+\\[^\s\"']+"), "[PATH_REDACTED]"),
 )
 _MAX_TEXT_LEN = 256
 

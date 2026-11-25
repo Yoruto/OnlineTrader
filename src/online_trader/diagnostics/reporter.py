@@ -612,7 +612,7 @@ def _collect_view_log(staging, runtime_root, request, coverage_start, files, omi
                 "occurred_at_utc": occurred,
                 "runtime_boot_id": boot,
                 "attribution": "EXACT_BOOT" if boot is not None else "UNATTRIBUTED_PROCESS_CONTEXT",
-                "message": message,
+                "message": redact_text(message),
             })
     if request["expected_sources"]["runtime_view"] and not found:
         omissions.append("runtime-view:MISSING_EXPECTED_SOURCE")

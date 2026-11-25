@@ -43,8 +43,8 @@ class RuntimeOperatorContractTests(unittest.TestCase):
             'ADOPT_EXTERNAL_POSITION', 'ARM_ENTRIES', 'CANCEL_NATIVE_ACCOUNT',
             'CANCEL_OWNED', 'CANCEL_SELECTED', 'FLATTEN_THEN_STOP', 'MANUAL_CLOSE',
             'MANUAL_CLOSE_ALL', 'MANUAL_OPEN', 'PAUSE_NEW_ENTRIES',
-            'REQUEST_RECONCILIATION', 'SAVE_DSV_PARAMETERS', 'SET_ENTRY_POLICY',
-            'STOP_DSV_STRATEGY',
+            'REQUEST_RECONCILIATION', 'SAFE_STOP_FOR_MAINTENANCE',
+            'SAVE_DSV_PARAMETERS', 'SET_ENTRY_POLICY', 'STOP_DSV_STRATEGY',
         }))
 
     def test_scheduler_capability_is_rejected_before_ledger_access(self):

@@ -447,7 +447,7 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         with (
             patch('online_trader.desktop.workbench.QMessageBox', _ClickFirstAcceptButton),
             patch('online_trader.runtime.shutdown.inspect_runtime_for_exit', return_value=(window.view, 5555, None)),
-            patch('online_trader.runtime.shutdown.shutdown_runtime_and_wait', return_value=(True, None)) as stop_call,
+            patch('online_trader.runtime.shutdown.maintenance_stop_runtime_and_wait', return_value=(True, None)) as stop_call,
             patch('online_trader.desktop.runtime_bootstrap.BootstrapController', _FakeBootstrapController),
         ):
             window.dashboard.export_parameters_preview()
@@ -577,6 +577,178 @@ class RuntimeWorkbenchTests(unittest.TestCase):
         self.assertFalse(dashboard.home_detail_button.isHidden())
         self.assertFalse(dashboard.home_reconcile_button.isHidden())
         self.assertFalse(dashboard.home_reconcile_button.isEnabled())
+
+    def test_switch_runtime_account_verifies_maintenance_and_boots_monitor_only(self):
+        base = single_contract_profile()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name) / 'runtime'
+        (root / 'private').mkdir(parents=True)
+        (root / 'runtime.json').write_text(json.dumps({
+            'schema_version': 'ONLINE_TRADER_RUNTIME/1',
+            'selected_account': 'sim1',
+            'accounts': [
+                {'id': 'sim1', 'alias': '模拟1', 'provider': 'TQKQ', 'broker': '快期模拟', 'line': '默认'},
+                {'id': 'sim2', 'alias': '模拟2', 'provider': 'TQKQ', 'broker': '快期模拟', 'line': '默认'},
+            ],
+        }), encoding='utf-8')
+        (root / 'private' / 'OnlineTrader-defaults.json').write_text(json.dumps({
+            'accounts': {
+                'sim1': {'username': 'user-one', 'password': 'secret'},
+                'sim2': {'username': 'user-two', 'password': 'secret2'},
+            },
+        }), encoding='utf-8')
+        (root / 'OnlineTrader-parameters.json').write_text(
+            json.dumps(base.to_settings(), ensure_ascii=False), encoding='utf-8',
+        )
+        store = PortableAccountStore(root)
+        acct2 = store.read()['accounts'][1]
+
+        window = WorkbenchWindow(r'\\.\pipe\runtime-boot-1', runtime_view=True, runtime_root=root)
+        self.addCleanup(lambda w=window: self._cleanup_runtime_window(w))
+        view = self._state_from_profile(base)
+        view['responsibility'] = {'maintenance_allowed': True, 'blockers': []}
+        window._runtime_client_store.apply(
+            view, {'generation': 'g1', 'sequence': '1', 'digest': 'a' * 64}, time.monotonic_ns(),
+        )
+
+        controllers = []
+
+        class _FakeBootstrapController(QObject):
+            ready = Signal(str)
+            failed = Signal(object)
+            cancelled = Signal()
+
+            def __init__(self, _root, *, account=None, attach_policy='attach-any',
+                         expected_account_key=None, parent=None):
+                super().__init__(parent)
+                self.account = account
+                self.attach_policy = attach_policy
+                self.expected_account_key = expected_account_key
+                self.started = False
+                controllers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def shutdown(self):
+                pass
+
+        with (
+            patch('online_trader.runtime.shutdown.inspect_runtime_for_exit', return_value=(window.view, 5555, None)),
+            patch('online_trader.runtime.instance.runtime_owner_exists', return_value=True),
+            patch('online_trader.runtime.shutdown.maintenance_stop_runtime_and_wait', return_value=(True, None)) as maint_stop,
+            patch('online_trader.desktop.runtime_bootstrap.BootstrapController', _FakeBootstrapController),
+        ):
+            ok = window.switch_runtime_account(acct2['account_id'])
+        self.assertTrue(ok)
+        maint_stop.assert_called_once()
+        self.assertEqual(maint_stop.call_args.kwargs['reason'], 'SWITCH_ACCOUNT')
+        self.assertEqual(len(controllers), 1)
+        self.assertEqual(controllers[0].attach_policy, 'attach-exact')
+        self.assertEqual(controllers[0].expected_account_key, acct2['account_key'])
+        self.assertTrue(controllers[0].started)
+
+        controllers[0].ready.emit(r'\\.\pipe\runtime-boot-2')
+        self.assertEqual(PortableAccountStore(root).read()['selected_id'], acct2['account_id'])
+
+    def test_switch_runtime_account_aborts_when_maintenance_stop_fails(self):
+        base = single_contract_profile()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name) / 'runtime'
+        (root / 'private').mkdir(parents=True)
+        (root / 'runtime.json').write_text(json.dumps({
+            'schema_version': 'ONLINE_TRADER_RUNTIME/1',
+            'selected_account': 'sim1',
+            'accounts': [
+                {'id': 'sim1', 'alias': '模拟1', 'provider': 'TQKQ', 'broker': '快期模拟', 'line': '默认'},
+                {'id': 'sim2', 'alias': '模拟2', 'provider': 'TQKQ', 'broker': '快期模拟', 'line': '默认'},
+            ],
+        }), encoding='utf-8')
+        (root / 'private' / 'OnlineTrader-defaults.json').write_text(json.dumps({
+            'accounts': {
+                'sim1': {'username': 'user-one', 'password': 'secret'},
+                'sim2': {'username': 'user-two', 'password': 'secret2'},
+            },
+        }), encoding='utf-8')
+        (root / 'OnlineTrader-parameters.json').write_text(
+            json.dumps(base.to_settings(), ensure_ascii=False), encoding='utf-8',
+        )
+        store = PortableAccountStore(root)
+        acct1, acct2 = store.read()['accounts']
+
+        window = WorkbenchWindow(r'\\.\pipe\runtime-boot-1', runtime_view=True, runtime_root=root)
+        self.addCleanup(lambda w=window: self._cleanup_runtime_window(w))
+        view = self._state_from_profile(base)
+        view['responsibility'] = {'maintenance_allowed': True, 'blockers': []}
+        window._runtime_client_store.apply(
+            view, {'generation': 'g1', 'sequence': '1', 'digest': 'a' * 64}, time.monotonic_ns(),
+        )
+
+        with (
+            patch('online_trader.desktop.workbench.QMessageBox.critical') as critical,
+            patch('online_trader.runtime.shutdown.inspect_runtime_for_exit', return_value=(window.view, 5555, None)),
+            patch('online_trader.runtime.instance.runtime_owner_exists', return_value=True),
+            patch('online_trader.runtime.shutdown.maintenance_stop_runtime_and_wait',
+                  return_value=(False, '未能确认无责任受控停机证明')),
+        ):
+            ok = window.switch_runtime_account(acct2['account_id'])
+        self.assertFalse(ok)
+        critical.assert_called_once()
+        self.assertEqual(window.pipe_name, r'\\.\pipe\runtime-boot-1')
+        self.assertEqual(PortableAccountStore(root).read()['selected_id'], acct1['account_id'])
+
+    def test_prepare_update_restart_enforces_maintenance_stop(self):
+        base = single_contract_profile()
+        root = self._portable_runtime_root(base)
+        window = WorkbenchWindow(r'\\.\pipe\runtime-boot-1', runtime_view=True, runtime_root=root)
+        self.addCleanup(lambda w=window: self._cleanup_runtime_window(w))
+        view = self._state_from_profile(base)
+        view['responsibility'] = {'maintenance_allowed': True, 'blockers': []}
+        window._runtime_client_store.apply(
+            view, {'generation': 'g1', 'sequence': '1', 'digest': 'a' * 64}, time.monotonic_ns(),
+        )
+        with (
+            patch('online_trader.runtime.shutdown.inspect_runtime_for_exit', return_value=(window.view, 5555, None)),
+            patch('online_trader.runtime.instance.runtime_owner_exists', return_value=True),
+            patch('online_trader.runtime.shutdown.maintenance_stop_runtime_and_wait',
+                  return_value=(False, '未能确认无责任受控停机证明')),
+        ):
+            with self.assertRaises(TraderError) as err:
+                window.prepare_update_restart()
+            self.assertEqual(err.exception.code, 'E_RUNTIME_STOP')
+
+        with (
+            patch('online_trader.runtime.shutdown.inspect_runtime_for_exit', return_value=(window.view, 5555, None)),
+            patch('online_trader.runtime.instance.runtime_owner_exists', return_value=True),
+            patch('online_trader.runtime.shutdown.maintenance_stop_runtime_and_wait',
+                  return_value=(True, None)) as maint_stop,
+        ):
+            window.prepare_update_restart()
+        maint_stop.assert_called_once()
+        self.assertEqual(maint_stop.call_args.kwargs['reason'], 'UPDATE')
+        self.assertTrue(window._update_restart_in_progress)
+
+    def test_workbench_renders_config_recovery_notice_and_running_fault_intent(self):
+        view = runtime_view()
+        view['config_recovery_notice'] = {
+            'state': 'MATCHES_NEW',
+            'message': '上次新参数已保存但运行曾中断，已自动加载新参数并保持停开，请看一眼合约和手数后手动启动策略。',
+            'apply_id': 'apply-1',
+        }
+        self.window.view = view
+        self.window.render_view()
+        self.assertFalse(self.window.dashboard.home_attention.isHidden())
+        self.assertIn('已自动校验策略参数', self.window.dashboard.home_pending.text())
+        self.assertIn('上次新参数已保存但运行曾中断', self.window.dashboard.home_pending.text())
+
+        view_fault = runtime_view()
+        view_fault['strategy_intent'] = 'RUNNING'
+        view_fault['connection']['recovery_required'] = True
+        self.window.view = view_fault
+        self.window.render_view()
+        self.assertEqual(self.window.dashboard.home_state.text(), '策略已因异常暂停')
 
 
 if __name__ == '__main__':

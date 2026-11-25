@@ -356,9 +356,11 @@ class TargetOwnerRuntimeTests(unittest.TestCase):
         self.assertEqual(view['configuration']['execution_core'], 'DSV_TARGET_EXECUTION')
         self.assertEqual(view['configuration']['rule_set_id'], 'DSV_TARGET_EXECUTION')
         self.assertEqual({row['policy_kind'] for row in view['policies']}, {'AUTHORITY', 'EXECUTION'})
-        self.assertEqual(len({row['operation'] for row in view['capabilities']['operations']}), 10)
+        ops = {row['operation'] for row in view['capabilities']['operations']}
+        self.assertEqual(len(ops), 11)
         self.assertTrue(view['configuration']['live_parameter_save'])
-        self.assertIn('SAVE_DSV_PARAMETERS', {row['operation'] for row in view['capabilities']['operations']})
+        self.assertIn('SAVE_DSV_PARAMETERS', ops)
+        self.assertIn('SAFE_STOP_FOR_MAINTENANCE', ops)
         self.assertFalse(view['truncated'])
 
     def test_new_boot_uses_a_new_ledger_and_does_not_inherit_runtime_commands(self):
@@ -2110,6 +2112,110 @@ class TargetOwnerWorkbenchProjectionTests(unittest.TestCase):
                     self.assertEqual(ctx.exception.code, 'E_DSV_SCOPE')
                     self.assertEqual(env.adapter.contracts, ('DCE.p2701',))
                     self.assertEqual([row['code'] for row in env.store.profile().to_settings()['symbols']], ['DCE.p2701'])
+                finally:
+                    owner.close()
+
+
+class TargetOwnerMaintenanceTests(unittest.TestCase):
+    """Tests for forced full-round verification and ABORTED projection during maintenance."""
+
+    def test_safe_stop_for_maintenance_bypasses_idle_skip_and_completes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = TargetOwnerWorkbenchProjectionTests._make_hot_add_harness(self, temp_dir)
+            env.adapter.clock = lambda: (datetime(2026, 11, 13, 1, 10, 0, tzinfo=timezone.utc), 1000)
+            env.connection.last_poll_updated = False
+            with RuntimeSessionStorage() as storage:
+                binding = env.make_binding(storage.boot_id)
+                session = DsvSession(
+                    storage.ledger, account_key=env.account_key, provider='TQKQ',
+                    trading_day='2026-11-13', profile=env.base, port=env.adapter,
+                    _execution_lock=binding.account_lock, _owner_binding=binding,
+                )
+                owner = StandaloneDsvOwner(
+                    session, env.adapter, env.connection, env.base, binding,
+                    configuration_revision='1',
+                )
+                try:
+                    # First step commits a round; within 1 second a normal step would hit _can_skip_idle_round.
+                    owner.step(trading_day='2026-11-13', complete=True)
+                    seq_before = owner.snapshot()['sequence']
+                    # Prove idle optimization would skip a normal step here.
+                    idle_receipt = owner.step(trading_day='2026-11-13', complete=True)
+                    self.assertIsNone(idle_receipt)
+                    self.assertEqual(owner.snapshot()['sequence'], seq_before)
+
+                    owner.command({
+                        'command_id': 'maint-complete-1',
+                        'operation': 'SAFE_STOP_FOR_MAINTENANCE',
+                        'scope': {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                        'binding': {'account_key': env.account_key, 'kernel_boot_id': storage.boot_id,
+                                    'config_revision': owner.configuration_revision},
+                        'parameters': {'reason': 'SWITCH_ACCOUNT'},
+                    })
+                    self.assertFalse(owner.stop_event.is_set())
+
+                    # Maintenance step must bypass _can_skip_idle_round and perform a full round.
+                    maint_receipt = owner.step(trading_day='2026-11-13', complete=True)
+                    self.assertIsNotNone(maint_receipt)
+                    self.assertGreater(owner.snapshot()['sequence'], seq_before)
+                    self.assertTrue(owner.stop_event.is_set())
+                    self.assertEqual(owner.maintenance_completion['command_id'], 'maint-complete-1')
+                    self.assertEqual(owner.maintenance_completion['state'], 'COMPLETED')
+                finally:
+                    owner.close()
+
+    def test_safe_stop_for_maintenance_aborts_and_projects_when_late_position_or_disconnect_occurs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = TargetOwnerWorkbenchProjectionTests._make_hot_add_harness(self, temp_dir)
+            with RuntimeSessionStorage() as storage:
+                binding = env.make_binding(storage.boot_id)
+                session = DsvSession(
+                    storage.ledger, account_key=env.account_key, provider='TQKQ',
+                    trading_day='2026-11-13', profile=env.base, port=env.adapter,
+                    _execution_lock=binding.account_lock, _owner_binding=binding,
+                )
+                owner = StandaloneDsvOwner(
+                    session, env.adapter, env.connection, env.base, binding,
+                    configuration_revision='1',
+                )
+                try:
+                    owner.step(trading_day='2026-11-13', complete=True)
+                    owner.command({
+                        'command_id': 'maint-abort-1',
+                        'operation': 'SAFE_STOP_FOR_MAINTENANCE',
+                        'scope': {'scope_type': 'ACCOUNT', 'scope_ids': []},
+                        'binding': {'account_key': env.account_key, 'kernel_boot_id': storage.boot_id,
+                                    'config_revision': owner.configuration_revision},
+                        'parameters': {'reason': 'UPDATE'},
+                    })
+                    # Disconnect during verification must NOT mark maintenance as verified.
+                    disc = owner.step(trading_day='2026-11-13', complete=False)
+                    self.assertEqual(disc['type'], 'DISCONNECTED')
+                    self.assertFalse(owner._maintenance_verified_step)
+                    self.assertFalse(owner.stop_event.is_set())
+
+                    # Now broker reconnects with a late-arriving unresolved convergence cancel / native conflict;
+                    # owner must ABORT maintenance and project ABORTED immediately.
+                    session._state['convergence_cancels']['late-ext-order-1'] = {'cancel_status': 'UNKNOWN'}
+                    owner.step(trading_day='2026-11-13', complete=True)
+                    self.assertFalse(owner.stop_event.is_set())
+                    self.assertIsNone(owner.maintenance)
+                    self.assertEqual(owner.maintenance_completion['command_id'], 'maint-abort-1')
+                    self.assertEqual(owner.maintenance_completion['state'], 'ABORTED')
+                    view = owner.workbench()
+                    validate_message({
+                        'protocol_version': '1.0',
+                        'type': 'WorkbenchSnapshot',
+                        'message_id': 'msg-maint-abort',
+                        'connection_id': 'conn-1',
+                        'correlation_id': None,
+                        'sent_at_utc': '2026-11-25T01:00:00Z',
+                        'kernel_boot_id': storage.boot_id,
+                        'account_key': env.account_key,
+                        'body': {'payload': view, 'content_hash': 'b' * 64},
+                    })
+                    self.assertEqual(view['maintenance_completion']['state'], 'ABORTED')
+                    self.assertEqual(view['maintenance_completion']['command_id'], 'maint-abort-1')
                 finally:
                     owner.close()
 

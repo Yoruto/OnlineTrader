@@ -180,3 +180,39 @@ class ParameterConfigRepository:
             self.marker_path().unlink(missing_ok=True)
         except OSError as error:
             raise TraderError('E_CONFIG_FILE', 'Cannot clear the parameter apply marker') from error
+
+    def evaluate_pending_apply_state(self, profile_hash: str) -> dict:
+        """Inspect any leftover hot-save apply marker without raising on corruption."""
+        try:
+            marker = self.read_pending_apply_marker()
+        except TraderError:
+            return {
+                'state': 'CORRUPTED',
+                'apply_id': None,
+                'old_hash': None,
+                'new_hash': None,
+                'current_hash': profile_hash,
+            }
+        if marker is None:
+            return {
+                'state': 'NONE',
+                'apply_id': None,
+                'old_hash': None,
+                'new_hash': None,
+                'current_hash': profile_hash,
+            }
+        old_hash = marker.get('old_hash')
+        new_hash = marker.get('new_hash')
+        if new_hash == profile_hash:
+            state = 'MATCHES_NEW'
+        elif old_hash == profile_hash:
+            state = 'MATCHES_OLD'
+        else:
+            state = 'HASH_CONFLICT'
+        return {
+            'state': state,
+            'apply_id': marker.get('apply_id'),
+            'old_hash': old_hash,
+            'new_hash': new_hash,
+            'current_hash': profile_hash,
+        }

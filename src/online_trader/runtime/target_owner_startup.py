@@ -25,6 +25,26 @@ from online_trader.runtime.startup_metadata import SDK_VERSION
 from online_trader.scheduling.clock import utc_text
 
 
+_CONFIG_RECOVERY_MESSAGES = {
+    'MATCHES_OLD': '上次修改参数未保存完成，已自动保留原参数并保持停开，核对无误后可直接点击启动策略。',
+    'MATCHES_NEW': '上次新参数已保存但运行曾中断，已自动加载新参数并保持停开，请看一眼合约和手数后手动启动策略。',
+    'HASH_CONFLICT': '检测到上次参数保存记录异常，已自动校验当前生效参数并暂停自动启动，请核对当前参数无误后手动启动策略。',
+    'CORRUPTED': '检测到上次参数保存记录异常，已自动校验当前生效参数并暂停自动启动，请核对当前参数无误后手动启动策略。',
+}
+
+
+def _config_recovery_notice(pending_state):
+    state = pending_state.get('state')
+    message = _CONFIG_RECOVERY_MESSAGES.get(state)
+    if not message:
+        return None
+    return {
+        'state': state,
+        'message': message,
+        'apply_id': pending_state.get('apply_id'),
+    }
+
+
 def _utc_now():
     return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
@@ -197,11 +217,14 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                 bind = getattr(tracker, 'bind_evidence_sink', None)
                 if callable(bind):
                     bind(diagnostic_sink)
+        pending_repo = None
+        pending_state = {'state': 'NONE'}
         if configured_store is not None:
             owner.on_parameters_saved = configured_store.replace_profile
             owner.on_parameters_restore = configured_store.restore_overrides
             repo = configured_store.config_repository() if hasattr(configured_store, 'config_repository') else None
             if repo is not None:
+                pending_repo = repo
                 owner.on_parameters_marker_write = (
                     lambda *, old_hash, new_hash, apply_id=None, _repo=repo: _repo.write_pending_apply_marker(
                         account_key=binding.account_key,
@@ -212,31 +235,29 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                     )
                 )
                 owner.on_parameters_marker_clear = repo.clear_pending_apply_marker
-                try:
-                    pending_marker = repo.read_pending_apply_marker()
-                except TraderError as error:
+                pending_state = repo.evaluate_pending_apply_state(profile.content_hash)
+                if pending_state['state'] != 'NONE':
+                    arm = False
+                    owner.config_apply_pending = True
+                    owner.config_recovery_notice = _config_recovery_notice(pending_state)
                     if diagnostic_sink is not None:
-                        diagnostic_sink.record(
-                            'CONFIG_APPLY_MARKER_CORRUPTED', component='CONFIG', severity='ERROR',
-                            priority='HIGH', error_code=error.code,
-                            payload={'authority_effect': 'DISARMED'},
-                        )
-                    raise
-                if pending_marker is not None and diagnostic_sink is not None:
-                    matched_state = (
-                        'NEW_HASH_PRESENT' if pending_marker.get('new_hash') == profile.content_hash
-                        else 'OLD_HASH_PRESENT' if pending_marker.get('old_hash') == profile.content_hash
-                        else 'HASH_CONFLICT'
-                    )
-                    diagnostic_sink.record(
-                        'CONFIG_APPLY_MARKER_PENDING', component='CONFIG', severity='WARNING',
-                        priority='HIGH',
-                        payload={
-                            'authority_effect': 'DISARMED',
-                            'marker_state': matched_state,
-                            'apply_id': pending_marker.get('apply_id'),
-                        },
-                    )
+                        if pending_state['state'] == 'CORRUPTED':
+                            diagnostic_sink.record(
+                                'CONFIG_APPLY_MARKER_CORRUPTED', component='CONFIG', severity='WARNING',
+                                priority='HIGH', error_code='E_CONFIG_FILE',
+                                payload={'authority_effect': 'DISARMED', 'recovery': 'AUTO_VALIDATED'},
+                            )
+                        else:
+                            diagnostic_sink.record(
+                                'CONFIG_APPLY_MARKER_PENDING', component='CONFIG', severity='WARNING',
+                                priority='HIGH',
+                                payload={
+                                    'authority_effect': 'DISARMED',
+                                    'marker_state': pending_state['state'],
+                                    'apply_id': pending_state.get('apply_id'),
+                                    'recovery': 'AUTO_VALIDATED',
+                                },
+                            )
         resolved_pid = _resolve_trusted_pid(trusted_control_pid)
         resolved_entry_point = entry_point or (
             'online-trader-desktop'
@@ -318,10 +339,20 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             owner, pipe, trusted_client_pid=trusted_control_pid,
             diagnostic_sink=diagnostic_sink,
         )
+        if pending_repo is not None and pending_state['state'] != 'NONE':
+            try:
+                pending_repo.clear_pending_apply_marker()
+            except (OSError, TraderError) as error:
+                if diagnostic_sink is not None:
+                    diagnostic_sink.record(
+                        'CONFIG_APPLY_MARKER_PENDING', component='CONFIG', severity='WARNING',
+                        priority='HIGH', error_code=getattr(error, 'code', 'E_CONFIG_FILE'),
+                        payload={'authority_effect': 'DISARMED', 'clear_failed': True},
+                    )
         loop_state = {
             'last_status': {'phase': 'WAITING_FOR_NATIVE_SYNC', 'entry_authority': 'DISARMED'},
             'last_history_capture': 0.0,
-            'initial_start_pending': bool(arm),
+            'initial_start_pending': bool(arm) and not getattr(owner, 'config_apply_pending', False),
             'initial_arm_generation': getattr(owner, 'authority_generation', 0),
             'diagnostic_reported_close_keys': set(),
             'diagnostic_close_check_monotonic': 0.0,
