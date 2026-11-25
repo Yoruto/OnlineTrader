@@ -818,10 +818,11 @@ class DsvSession:
                 row['quote_observation'] = market.get('quote_observation')
                 row['calendar_reason'] = market.get('calendar_reason')
                 row['market_session_active'] = market.get('market_session_active')
-            if not state['synchronized']:
+            if not state['synchronized'] or row.get('sync_pending_children'):
+                detail = 'SYNCHRONIZE_PENDING_CHILDREN_MISSING' if row.get('sync_pending_children') else 'NOT_SYNCHRONIZED'
                 self._diag().observe_block(
                     ('session_gate', contract), active=True, contract_id=contract,
-                    reason='AWAITING_NATIVE_SYNC', detail='NOT_SYNCHRONIZED')
+                    reason='AWAITING_NATIVE_SYNC', detail=detail)
                 decisions.append({'contract_id': contract, 'decision_id': f"{frame['id']}:{contract}:0",
                                   'reason': 'AWAITING_NATIVE_SYNC', 'rule_ids': ['I01', 'I02']})
                 continue
@@ -1569,6 +1570,23 @@ class DsvSession:
         if not claimed <= seen:
             raise TraderError('E_DSV_SYNC', 'Synchronization lists an order without an original snapshot in this round')
         missing = sorted(child for child in pending if child not in claimed and not terminal(state['orders'][child]))
+        missing_by_contract = {}
+        for child in missing:
+            missing_by_contract.setdefault(state['orders'][child]['contract_id'], []).append(child)
+        for contract, row in state['symbols'].items():
+            c_missing = missing_by_contract.get(contract)
+            if c_missing:
+                row['sync_pending_children'] = list(c_missing)
+                unknown_c = [child for child in c_missing if state['orders'][child]['send_state'] == 'UNKNOWN']
+                self._diag().observe_block(
+                    ('synchronize', contract),
+                    active=True,
+                    contract_id=contract,
+                    reason='SYNCHRONIZE_PENDING_CHILDREN_MISSING',
+                    detail=f'missing={",".join(c_missing)};unknown={",".join(unknown_c)}',
+                )
+            else:
+                row.pop('sync_pending_children', None)
         if missing:
             unknown_missing = [child for child in missing if state['orders'][child]['send_state'] == 'UNKNOWN']
             self._diag().observe_block(
@@ -1577,11 +1595,14 @@ class DsvSession:
                 reason='SYNCHRONIZE_PENDING_CHILDREN_MISSING',
                 detail=f'missing={",".join(missing)};unknown={",".join(unknown_missing)}',
             )
-            return
+            if len(missing_by_contract) >= len(state['symbols']):
+                return
+        else:
+            self._diag().observe_block(('synchronize', 'ACCOUNT'), active=False)
         for market in frame['market']:
             row = state['symbols'][market['contract_id']]
             position = row['position']
-            if row.get('detached_positions') or row.get('native_conflicts'):
+            if row.get('sync_pending_children') or row.get('detached_positions') or row.get('native_conflicts'):
                 continue
             if market.get('standalone_external_model'):
                 if position is not None and not self._controller.proves_position(
@@ -1602,7 +1623,6 @@ class DsvSession:
                 return
             self._diag().observe_block(('synchronize', market['contract_id']), active=False,
                                        contract_id=market['contract_id'])
-        self._diag().observe_block(('synchronize', 'ACCOUNT'), active=False)
         state['synchronized'] = True
 
     @staticmethod

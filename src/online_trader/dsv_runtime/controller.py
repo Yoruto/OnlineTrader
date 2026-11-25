@@ -587,7 +587,7 @@ class ExplicitOrderController:
         )
         return effect_record
 
-    def cancel(self, order, reason, *, retry_risk_refusal=False):
+    def cancel(self, order, reason, *, retry_risk_refusal=False, wall_time=None):
         identity = None
         if order['send_state'] == 'NATIVE_SEEN':
             identity = order['native_id']
@@ -601,6 +601,8 @@ class ExplicitOrderController:
         order['cancel_seq'] = order.get('cancel_seq', order.get('cancel_attempt', 0)) + 1
         order['cancel_attempt'] = order.get('cancel_attempt', 0) + 1
         order.update(cancel_status='SEND_POSSIBLE', cancel_reason=reason)
+        if wall_time is not None:
+            order['cancel_requested_at'] = str(float(wall_time))
         effect_record = self._prepare(order, 'CANCEL', native_order_id=identity, reason=reason)
         self._diag().emit(
             'ORDER_CANCEL_REQUESTED',
@@ -1032,9 +1034,54 @@ class ExplicitOrderController:
             'exit_revision': position.get('exit_revision', 0),
         }
 
-    def plan_maintenance(self, state, row, market):
+    _CANCEL_RETRY_INTERVAL_SECONDS = 5.0
+    _MAX_CANCEL_ATTEMPTS = 4
+
+    def _retry_stale_cancellations(self, state, contract_id, *, allow_cancel, wall_time):
+        if wall_time is None:
+            return []
+        now = float(wall_time)
+        effects = []
+        for order in state['orders'].values():
+            if (order['contract_id'] != contract_id or terminal(order)
+                    or order.get('convergence_order') or order.get('terminal_conflict')):
+                continue
+            if order.get('cancel_status') not in {'CALL_RETURNED', 'UNKNOWN'}:
+                continue
+            requested_at = order.get('cancel_requested_at')
+            if requested_at is None:
+                order['cancel_requested_at'] = str(now)
+                continue
+            if not allow_cancel or now - float(requested_at) < self._CANCEL_RETRY_INTERVAL_SECONDS:
+                continue
+            attempt = int(order.get('cancel_attempt') or 1)
+            if attempt >= self._MAX_CANCEL_ATTEMPTS:
+                self._diag().emit_transition(
+                    ('cancel_timeout', order['child_order_id']),
+                    attempt,
+                    'ORDER_CANCEL_TIMEOUT_EXHAUSTED',
+                    level=logging.WARNING,
+                    contract_id=contract_id,
+                    position_id=order.get('position_id'),
+                    child_order_id=order['child_order_id'],
+                    attempt=attempt,
+                    cancel_status=order.get('cancel_status'),
+                )
+                continue
+            reason = order.get('cancel_reason') or 'CANCEL_TIMEOUT_RETRY'
+            order['cancel_status'] = None
+            request = self.cancel(order, reason, wall_time=now)
+            if request is not None:
+                effects.append(request)
+            else:
+                order['cancel_status'] = 'CALL_RETURNED'
+        return effects
+
+    def plan_maintenance(self, state, row, market, *, wall_time=None):
         """Cancel provably owned residual orders using identity and quantity alone."""
         allow_cancel = market.get('allow_cancel', True)
+        retry_effects = self._retry_stale_cancellations(
+            state, market['contract_id'], allow_cancel=allow_cancel, wall_time=wall_time)
         position = row['position']
         prior = [
             order for order in state['orders'].values()
@@ -1043,31 +1090,33 @@ class ExplicitOrderController:
             and (position is None or order['position_id'] != position['id'])]
         if prior:
             if not allow_cancel:
-                return [], False
+                return retry_effects, False
             current = [] if position is None else self.child_orders(state, position)
-            return [request for order in prior + current if order['effect'] == 'OPEN' and not order.get('terminal_conflict')
-                    and (request := self.cancel(order, 'TARGET_REDUCED'))], False
+            return retry_effects + [
+                request for order in prior + current if order['effect'] == 'OPEN' and not order.get('terminal_conflict')
+                and (request := self.cancel(order, 'TARGET_REDUCED', wall_time=wall_time))
+            ], False
         if row.get('detached_positions') or row.get('native_conflicts'):
             if not allow_cancel:
-                return [], False
+                return retry_effects, False
             owners = [state['retired_positions'][identity] for identity in row.get('detached_positions', [])]
             if position is not None:
                 owners.append(position)
             opening = [order for owner in owners for order in self.child_orders(state, owner, 'OPEN')
                        if not terminal(order)]
-            return [request for order in opening if not order.get('terminal_conflict')
-                    and (request := self.cancel(order, 'TARGET_REDUCED'))], not opening and not row.get('native_conflicts')
+            return retry_effects + [request for order in opening if not order.get('terminal_conflict')
+                    and (request := self.cancel(order, 'TARGET_REDUCED', wall_time=wall_time))], not opening and not row.get('native_conflicts')
         if position is None:
-            return [], False
+            return retry_effects, False
         children = self.child_orders(state, position)
         if any(order['native_trading_day'] != state['trading_day'] and not terminal(order) for order in children):
-            return [], False
+            return retry_effects, False
         if any(order.get('terminal_conflict') and not terminal(order) for order in children):
             if not allow_cancel:
-                return [], False
-            return [request for order in children if not order.get('terminal_conflict')
-                    and (request := self.cancel(order, 'TARGET_REDUCED'))], False
-        effects = []
+                return retry_effects, False
+            return retry_effects + [request for order in children if not order.get('terminal_conflict')
+                    and (request := self.cancel(order, 'TARGET_REDUCED', wall_time=wall_time))], False
+        effects = list(retry_effects)
         for effect in ('OPEN', 'REDUCE'):
             accounting = self.target_accounting(state, position, effect)
             excess = accounting.excess_pending_qty
@@ -1080,7 +1129,7 @@ class ExplicitOrderController:
             for order in reversed(self.child_orders(state, position, effect)):
                 if terminal(order):
                     continue
-                if request := self.cancel(order, 'TARGET_REDUCED'):
+                if request := self.cancel(order, 'TARGET_REDUCED', wall_time=wall_time):
                     effects.append(request)
                     position['execution_reason'] = 'TARGET_REDUCED'
                 excess -= max(0, order['original_qty'] - order['filled_qty'])
@@ -1250,7 +1299,7 @@ class ExplicitOrderController:
     def plan(self, state, row, market, wall_time):
         if row.get('position') is not None:
             row['position'].pop('execution_reason', None)
-        maintenance, can_price = self.plan_maintenance(state, row, market)
+        maintenance, can_price = self.plan_maintenance(state, row, market, wall_time=wall_time)
         contract_id = market['contract_id']
         diag = self._diag()
         pos = row.get('position')
