@@ -228,9 +228,30 @@ class ExplicitOrderController:
                         })
                     else:
                         order['native_order_time_ns'] = stamp
+                prior_state = (order.get('broker_state'), order.get('filled_qty'), order.get('terminal_confirmed'))
                 self._order_update(order, fact)
                 if self.journal.record_order(child_id, native_id, order):
                     self.journal.event('NATIVE_ORDER', fact)
+                current_state = (order.get('broker_state'), order.get('filled_qty'), order.get('terminal_confirmed'))
+                if current_state != prior_state:
+                    self._diag().emit(
+                        'ORDER_NATIVE_UPDATE',
+                        level=logging.INFO,
+                        component='ORDER',
+                        priority='HIGH' if order.get('terminal_confirmed') else 'NORMAL',
+                        log_to_logger=False,
+                        contract_id=order['contract_id'],
+                        position_id=order['position_id'],
+                        child_order_id=child_id,
+                        native_order_id=native_id,
+                        effect=order['effect'],
+                        broker_state=order['broker_state'],
+                        filled_qty=order['filled_qty'],
+                        original_qty=order['original_qty'],
+                        terminal_confirmed=order['terminal_confirmed'],
+                        category=order.get('broker_rejection_category'),
+                        reason=order.get('broker_rejection_detail'),
+                    )
             else:
                 self._trade_update(state, order, native_id, fact)
                 self.journal.record_order(child_id, native_id, order)
@@ -285,6 +306,25 @@ class ExplicitOrderController:
             order['broker_rejection_detail'] = fact['rejection_detail']
         if order.get('terminal_conflict') and terminal(order):
             order.pop('terminal_conflict')
+
+    def _emit_trade_fill(self, order, native_id, trade_id, qty, price, owned_after=None):
+        self._diag().emit(
+            'TRADE_FILL',
+            level=logging.INFO,
+            component='EXECUTION',
+            priority='HIGH',
+            log_to_logger=False,
+            contract_id=order['contract_id'],
+            position_id=order['position_id'],
+            child_order_id=order['child_order_id'],
+            native_order_id=native_id,
+            native_trade_id=trade_id,
+            effect=order['effect'],
+            direction=order['direction'],
+            quantity=qty,
+            price=str(price),
+            owned_after=owned_after,
+        )
 
     def _trade_update(self, state, order, native_id, fact):
         trade_id = _native_id(fact['native_trade_id'])
@@ -343,6 +383,7 @@ class ExplicitOrderController:
             if order.get('terminal_conflict') and terminal(order):
                 order.pop('terminal_conflict')
             self.journal.event('NATIVE_TRADE', fact)
+            self._emit_trade_fill(order, native_id, trade_id, qty, fact['price'])
             return
         row = state['symbols'][order['contract_id']]
         position = row['position']
@@ -377,6 +418,7 @@ class ExplicitOrderController:
         if order.get('terminal_conflict') and terminal(order):
             order.pop('terminal_conflict')
         self.journal.event('NATIVE_TRADE', fact)
+        self._emit_trade_fill(order, native_id, trade_id, qty, fact['price'], owned_after=position['owned'])
 
     def _review_late_reduce(self, state, row, order, qty, fact, fill_day):
         original = state['retired_positions'].get(order['position_id'])
@@ -510,7 +552,25 @@ class ExplicitOrderController:
             order['quote_at'] = tick['native_time']
         state['orders'][child_id] = order
         position['children'].append(child_id)
-        return self._prepare(order, 'SEND', quantity=qty, limit_price=price, native_offset=offset, direction=side)
+        effect_record = self._prepare(order, 'SEND', quantity=qty, limit_price=price, native_offset=offset, direction=side)
+        self._diag().emit(
+            'ORDER_PREPARED',
+            level=logging.INFO,
+            component='ORDER',
+            priority='HIGH',
+            log_to_logger=False,
+            contract_id=contract,
+            position_id=position['id'],
+            child_order_id=child_id,
+            effect_id=effect_record['id'],
+            effect=effect,
+            direction=side,
+            quantity=qty,
+            limit_price=str(price),
+            native_offset=offset,
+            sequence=state.get('sequence'),
+        )
+        return effect_record
 
     def cancel(self, order, reason, *, retry_risk_refusal=False):
         identity = None
@@ -526,7 +586,24 @@ class ExplicitOrderController:
         order['cancel_seq'] = order.get('cancel_seq', order.get('cancel_attempt', 0)) + 1
         order['cancel_attempt'] = order.get('cancel_attempt', 0) + 1
         order.update(cancel_status='SEND_POSSIBLE', cancel_reason=reason)
-        return self._prepare(order, 'CANCEL', native_order_id=identity, reason=reason)
+        effect_record = self._prepare(order, 'CANCEL', native_order_id=identity, reason=reason)
+        self._diag().emit(
+            'ORDER_CANCEL_REQUESTED',
+            level=logging.INFO,
+            component='ORDER',
+            priority='HIGH',
+            log_to_logger=False,
+            contract_id=order['contract_id'],
+            position_id=order['position_id'],
+            child_order_id=order['child_order_id'],
+            effect_id=effect_record['id'],
+            native_order_id=identity,
+            effect=order['effect'],
+            reason=reason,
+            cancel_reason=reason,
+            attempt=order['cancel_attempt'],
+        )
+        return effect_record
 
     def _prepare(self, order, kind, **parameters):
         effect_id = order['child_order_id'] + '-' + kind.lower()

@@ -468,6 +468,50 @@
                         "owned_quantity": {"type": "integer", "minimum": 0},
                         "active_orders": {"type": "integer", "minimum": 0}
                       }
+                    },
+                    "runtime_mode": {
+                      "enum": ["MONITORING", "TRADING", "DRAINING"]
+                    },
+                    "strategy_intent": {
+                      "enum": ["STOPPED", "RUNNING"]
+                    },
+                    "responsibility": {
+                      "type": "object",
+                      "required": [
+                        "state", "protected_lots_total", "unresolved_children",
+                        "unresolved_convergence_cancels", "conflict_contracts",
+                        "preview_only_contracts", "blockers", "maintenance_allowed"
+                      ],
+                      "additionalProperties": false,
+                      "properties": {
+                        "state": {"enum": ["NONE", "ACTIVE", "DRAINING", "UNKNOWN"]},
+                        "protected_lots_total": {"type": "integer", "minimum": 0},
+                        "unresolved_children": {"type": "integer", "minimum": 0},
+                        "unresolved_convergence_cancels": {"type": "integer", "minimum": 0},
+                        "conflict_contracts": {
+                          "type": "array", "maxItems": 64,
+                          "items": {"type": "string", "maxLength": 128}
+                        },
+                        "preview_only_contracts": {
+                          "type": "array", "maxItems": 64,
+                          "items": {"type": "string", "maxLength": 128}
+                        },
+                        "blockers": {
+                          "type": "array", "maxItems": 32,
+                          "items": {"type": "string", "maxLength": 64}
+                        },
+                        "maintenance_allowed": {"type": "boolean"}
+                      }
+                    },
+                    "maintenance": {
+                      "type": ["object", "null"],
+                      "required": ["command_id", "reason", "state"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "command_id": {"$ref": "https://schemas.onlinetrader.invalid/g0/ipc.schema.json#/$defs/id"},
+                        "reason": {"enum": ["SWITCH_ACCOUNT", "UPDATE", "RESTART_CONFIG"]},
+                        "state": {"enum": ["REQUESTED", "VERIFYING", "COMPLETED", "ABORTED"]}
+                      }
                     }
                   },
                   "required": [

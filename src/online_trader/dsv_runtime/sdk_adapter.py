@@ -3,6 +3,7 @@
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR, localcontext
 from hashlib import sha256
+import logging
 from threading import get_ident
 import time
 from uuid import uuid4
@@ -2086,6 +2087,20 @@ class DsvSdkAdapter:
             )
             raise
         self._local_returns.add(effect['child_order_id'])
+        self._diag().emit(
+            'SDK_SEND_DISPATCHED',
+            level=logging.INFO,
+            component='EXECUTION',
+            priority='HIGH',
+            log_to_logger=False,
+            contract_id=effect['contract_id'],
+            child_order_id=effect['child_order_id'],
+            effect_id=effect['id'],
+            native_offset=effect.get('native_offset'),
+            direction=effect.get('direction'),
+            quantity=effect.get('quantity'),
+            limit_price=str(effect.get('limit_price')) if effect.get('limit_price') is not None else None,
+        )
         return None
 
     def _sdk_send_refused_before_queue(self, error):

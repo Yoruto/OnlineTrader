@@ -10,6 +10,7 @@ from zipfile import BadZipFile, ZipFile
 
 
 MAX_MEMBER_BYTES = 16 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
 MAX_MEMBERS = 4096
 
 
@@ -20,19 +21,29 @@ def _json(archive: ZipFile, name: str):
     return json.loads(raw.decode("utf-8"))
 
 
+def _check_archive_bounds(archive: ZipFile) -> list[str]:
+    names = archive.namelist()
+    if len(names) > MAX_MEMBERS or len(names) != len(set(names)):
+        raise ValueError("invalid diagnostic member set")
+    total_size = 0
+    for name in names:
+        member = PurePosixPath(name)
+        info = archive.getinfo(name)
+        if member.is_absolute() or ".." in member.parts or info.file_size > MAX_MEMBER_BYTES:
+            raise ValueError(f"unsafe diagnostic member: {name}")
+        total_size += info.file_size
+        if total_size > MAX_TOTAL_UNCOMPRESSED_BYTES:
+            raise ValueError("diagnostic archive uncompressed size exceeds limit")
+    return names
+
+
 def validate(path):
     errors = []
     gaps = []
     selection_gaps = []
     streams = {}
     with ZipFile(path) as archive:
-        names = archive.namelist()
-        if len(names) > MAX_MEMBERS or len(names) != len(set(names)):
-            raise ValueError("invalid diagnostic member set")
-        for name in names:
-            member = PurePosixPath(name)
-            if member.is_absolute() or ".." in member.parts or archive.getinfo(name).file_size > MAX_MEMBER_BYTES:
-                raise ValueError(f"unsafe diagnostic member: {name}")
+        names = _check_archive_bounds(archive)
         manifest = _json(archive, "manifest.json")
         if manifest.get("schema_version") != "ONLINE_TRADER_DIAGNOSTIC_MANIFEST/1":
             errors.append("UNSUPPORTED_MANIFEST")
@@ -89,6 +100,29 @@ def validate(path):
             "selection_gaps": selection_gaps,
             "streams": streams,
         }
+
+
+def load_validated_bundle(path):
+    """Validate and parse bounded events, runtime-view rows, and bootstrap context."""
+    validation = validate(path)
+    if validation["result"] != "VALID":
+        return validation, {}, [], [], []
+    events = []
+    view_logs = []
+    bootstrap_rows = []
+    with ZipFile(path) as archive:
+        manifest = _json(archive, "manifest.json")
+        for name in archive.namelist():
+            if name.endswith(".ndjson"):
+                for line in archive.read(name).splitlines():
+                    events.append(json.loads(line))
+            elif name == "runtime-view/runtime-view-selected.jsonl":
+                for line in archive.read(name).splitlines():
+                    view_logs.append(json.loads(line))
+            elif name == "bootstrap/startup-context.jsonl":
+                for line in archive.read(name).splitlines():
+                    bootstrap_rows.append(json.loads(line))
+    return validation, manifest, events, view_logs, bootstrap_rows
 
 
 def main(argv=None):

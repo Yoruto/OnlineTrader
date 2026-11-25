@@ -239,8 +239,7 @@ class ManagedUpdateController(QObject):
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            with quiescent_installation(self.root):
-                self.request_restart()
+            self.request_restart()
         except (UpdateError, OSError, ValueError, KeyError, TypeError, TraderError) as error:
             message = str(error) if isinstance(error, (UpdateError, TraderError)) else '无法核对更新前的账户状态'
             self._set_state('DEFERRED', message, candidate=candidate.version, persist=True)

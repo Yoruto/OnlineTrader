@@ -3,10 +3,10 @@
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import re
 import sqlite3
-from threading import Thread
+from threading import Event, Thread
 
 from online_trader.contracts.codec import canonical_bytes, content_hash, strict_loads
 from online_trader.domain.values import identifier, sequence
@@ -65,6 +65,14 @@ def initialize_cache(path, account_key, provider):
             );
             CREATE INDEX IF NOT EXISTS broker_snapshots_day
                 ON broker_snapshots(trading_day, snapshot_seq);
+            CREATE TABLE IF NOT EXISTS history_coverage(
+                trading_day TEXT NOT NULL,
+                category TEXT NOT NULL,
+                coverage_state TEXT NOT NULL,
+                source_epoch INTEGER NOT NULL,
+                updated_at_utc TEXT NOT NULL,
+                PRIMARY KEY (trading_day, category)
+            );
         ''')
         scope = db.execute('SELECT schema_version,account_key,environment,provider FROM broker_history_scope').fetchall()
         expected = (SCHEMA, account_key, 'ONLINE_SIM', provider)
@@ -101,17 +109,25 @@ class BrokerHistoryWriter:
         self.path = initialize_cache(path, account_key, provider)
         self.account_key = account_key
         self.on_error = on_error
+        self._closed = Event()
+        self.close_completed = None
         self.queue = Queue(maxsize=1)
         self.thread = Thread(target=self._run, name='broker-history-cache', daemon=True)
         self.thread.start()
 
     def offer(self, snapshot, observed_at_utc=None):
+        if self._closed.is_set():
+            return
         item = (snapshot, observed_at_utc or _utc_now())
         try:
             self.queue.put_nowait(item)
         except Exception:
+            if self._closed.is_set():
+                return
             try:self.queue.get_nowait()
             except Empty:pass
+            if self._closed.is_set():
+                return
             try:self.queue.put_nowait(item)
             except Exception:pass
 
@@ -123,6 +139,7 @@ class BrokerHistoryWriter:
             snapshot, observed = item
             try:
                 raw = _validate_snapshot(snapshot, self.account_key)
+                coverage = 'COMPLETE' if snapshot['complete'] else 'PARTIAL'
                 with closing(_open(self.path)) as db:
                     db.execute('PRAGMA synchronous=NORMAL')
                     db.execute('''INSERT OR IGNORE INTO broker_snapshots
@@ -131,16 +148,49 @@ class BrokerHistoryWriter:
                         snapshot['snapshot_id'], snapshot['trading_day'], snapshot['gateway_identity'],
                         snapshot['source_epoch'], observed, int(snapshot['complete']), raw.decode('utf-8'),
                         content_hash(snapshot)))
+                    db.execute('''INSERT INTO history_coverage
+                        (trading_day,category,coverage_state,source_epoch,updated_at_utc)
+                        VALUES(?,?,?,?,?)
+                        ON CONFLICT(trading_day,category) DO UPDATE SET
+                            coverage_state=CASE
+                                WHEN history_coverage.coverage_state='COMPLETE' THEN 'COMPLETE'
+                                ELSE excluded.coverage_state
+                            END,
+                            source_epoch=excluded.source_epoch,
+                            updated_at_utc=excluded.updated_at_utc''', (
+                        snapshot['trading_day'], 'ACCOUNT_SNAPSHOT', coverage,
+                        snapshot['source_epoch'], observed))
                     db.commit()
             except Exception as error:
                 if self.on_error is not None:
                     try:self.on_error(error)
                     except Exception:pass
 
-    def close(self):
-        try:self.queue.put(None, timeout=1)
-        except Exception:return
-        self.thread.join(timeout=3)
+    def close(self, timeout=3.0):
+        self._closed.set()
+        enqueued = False
+        try:
+            self.queue.put_nowait(None)
+            enqueued = True
+        except Full:
+            try:
+                self.queue.get_nowait()
+            except Empty:
+                pass
+            try:
+                self.queue.put_nowait(None)
+                enqueued = True
+            except Full:
+                try:
+                    self.queue.put(None, timeout=0.5)
+                    enqueued = True
+                except Exception:
+                    enqueued = False
+        if enqueued:
+            self.thread.join(timeout=timeout)
+        completed = not self.thread.is_alive()
+        self.close_completed = completed
+        return completed
 
 
 def _scope(db, account_key):

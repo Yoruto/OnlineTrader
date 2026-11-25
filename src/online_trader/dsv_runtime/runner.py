@@ -4,6 +4,7 @@ import copy
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
+import logging
 import sqlite3
 from threading import get_ident
 import time
@@ -13,6 +14,7 @@ from online_trader.configuration.dsv import DsvProfile
 from online_trader.contracts.codec import canonical_bytes, content_hash
 from online_trader.domain.values import decimal_text, decimal_value, identifier, quantity
 from online_trader.dsv_core.business_statistics import reduce_stops
+from online_trader.dsv_core.entry_rules import trigger_prices
 from online_trader.dsv_core.month_stop import observe_month_stop
 from online_trader.dsv_core.transition import continuation_entry, ordinary_entry, price_value, protect
 from online_trader.dsv_core.price_rules import scheduled_close_mode
@@ -234,6 +236,16 @@ class DsvSession:
                 row['min_days_to_expiry'] = self._trade['min_days_to_expiry']
         return {'history_status': result['history_status'], 'activity': activity, 'fills': fills}
 
+    def record_maintenance_event(self, kind, payload):
+        """Record a non-order maintenance lifecycle event in the current boot Journal."""
+        self._check_owner()
+        try:
+            with self._journal.transaction():
+                self._journal.event(kind, payload)
+        except sqlite3.Error as error:
+            self._failed = True
+            raise TraderError('E_DSV_STORE', 'Maintenance lifecycle journal write failed') from error
+
     def command_receipt(self, command_id):
         self._check_owner()
         return self._journal.command_receipt(identifier(command_id))
@@ -378,20 +390,45 @@ class DsvSession:
                 row['quote_observation'] = None
 
     def prepare_shutdown(self):
-        """Report unresolved child identities and owned lots without issuing commands."""
+        """Report unresolved child identities and activated owned lots without issuing commands."""
         self._check_owner()
         orders = [order['child_order_id'] for order in self._state['orders'].values() if not terminal(order)]
-        conflicts = [code for code, row in self._state['symbols'].items() if row.get('native_conflicts')]
-        positions = {key: row['position']['owned'] for key, row in self._state['symbols'].items()
-                     if row['position'] is not None and row['position']['owned']}
+        conv_cancels = [
+            str(nid) for nid, rec in (self._state.get('convergence_cancels') or {}).items()
+            if isinstance(rec, dict) and rec.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}
+        ]
+        conflicts = [
+            code for code, row in self._state['symbols'].items()
+            if row.get('native_conflicts') or row.get('detached_positions') or row.get('ownership_conflict')
+        ]
+        positions = {}
+        preview_only = []
+        for key, row in self._state['symbols'].items():
+            pos = row.get('position')
+            if pos is None:
+                continue
+            if pos.get('awaiting_start_arm') and not pos.get('activated_in_boot') and not pos.get('children'):
+                preview_only.append(key)
+                continue
+            if pos.get('owned'):
+                positions[key] = pos['owned']
         for contract, row in self._state['symbols'].items():
             if detached := row.get('detached_positions'):
                 positions[contract] = positions.get(contract, 0) + sum(
                     self._state['retired_positions'][key]['owned'] for key in detached)
-        result = {'ready': not orders and not positions and not conflicts, 'unresolved_children': orders,
-                  'owned_lots': positions}
+        synchronized = bool(self._state.get('synchronized', False))
+        result = {
+            'ready': not orders and not conv_cancels and not positions and not conflicts,
+            'unresolved_children': orders,
+            'owned_lots': positions,
+        }
+        if preview_only:
+            result['preview_only_contracts'] = sorted(preview_only)
+        if conv_cancels:
+            result['unresolved_convergence_cancels'] = sorted(conv_cancels)
         if conflicts:
             result['allocation_conflicts'] = conflicts
+        result['synchronized'] = synchronized
         return result
 
     def active_timers(self):
@@ -1351,6 +1388,55 @@ class DsvSession:
             self._diag().observe_block(
                 ('session_gate', contract), active=False, contract_id=contract,
                 position_id=position_id)
+        primary = next((v for v in values if v.get('reason')), None)
+        if primary is not None:
+            reason = primary['reason']
+            tick = market.get('tick') or {}
+            candle_id = tick.get('candle_id')
+            target = primary.get('target') or {}
+            direction = primary.get('direction') or target.get('direction') or (
+                None if position is None else position.get('direction'))
+            high, low = tick.get('day_high'), tick.get('day_low')
+            lines = {}
+            if high is not None and low is not None and contract in self._symbols:
+                try:
+                    lines = trigger_prices(Decimal(str(high)), Decimal(str(low)),
+                                           Decimal(str(self._symbols[contract]['open_offset'])))
+                except (ArithmeticError, ValueError, TypeError):
+                    lines = {}
+            high_priority_reasons = {
+                'NORMAL_ENTRY', 'CONTINUATION_ENTRY', 'DAY_STOP', 'DAILY_TARGET_LIMIT',
+                'FIRST_MINUTE_JUMP_DAY_STOP', 'ENTRY_CONFIRM_TIMEOUT', 'ADVERSE_SLIPPAGE',
+                'DATA_GAP_EXIT', 'STOP_LOSS', 'TAKE_PROFIT', 'TRAILING_STOP',
+                'PROTECTED_FLOOR', 'SCHEDULED_CLOSE',
+            }
+            spec = self._symbols.get(contract) or {}
+            self._diag().emit_transition(
+                ('strategy_decision', contract),
+                (reason, direction, candle_id, bool(row.get('day_stop')), target.get('quantity')),
+                'STRATEGY_DECISION_CHANGED',
+                level=logging.INFO,
+                component='STRATEGY',
+                priority='HIGH' if reason in high_priority_reasons else 'NORMAL',
+                contract_id=contract,
+                position_id=position_id,
+                reason=reason,
+                direction=direction,
+                candle_id=candle_id,
+                last_price=tick.get('last'),
+                day_high=high,
+                day_low=low,
+                long_trigger=str(lines['LONG']) if 'LONG' in lines else None,
+                short_trigger=str(lines['SHORT']) if 'SHORT' in lines else None,
+                open_offset=spec.get('open_offset'),
+                stop_offset=spec.get('stop_offset'),
+                profit_offset=spec.get('profit_offset'),
+                quantity=target.get('quantity'),
+                theory=target.get('theory') or (None if position is None else position.get('theory')),
+                cap=target.get('cap') or (None if position is None else position.get('cap')),
+                day_stop=bool(row.get('day_stop')),
+                target_count=row.get('target_count'),
+            )
 
     def _synchronize(self, state, frame, pending):
         seen = {fact['child_order_id'] for fact in frame['native'] if fact['kind'] == 'ORDER'}
@@ -1880,6 +1966,7 @@ class DsvSession:
                 for row in state['symbols'].values():
                     if row['position'] is not None:
                         row['position'].pop('awaiting_start_arm', None)
+                        row['position']['activated_in_boot'] = True
             effects = []
             if action == 'STOP':
                 for row in state['symbols'].values():
@@ -1945,6 +2032,8 @@ class DsvSession:
                 position.get('calendar_exit') is not None
                 or (prior_exit == 0 and position.get('rollback_exit', {}).get('reason') not in {None, 'MANUAL_EXIT'}))
             tighten_target(position, target, new_request=True)
+            position.pop('awaiting_start_arm', None)
+            position['activated_in_boot'] = True
             position['target_reason'] = 'USER_REDUCE'
             if command.get('price_mode') is not None and not (urgent_auto_exit and command['price_mode'] == '排队价'):
                 position['manual_close_mode'] = command['price_mode']
@@ -1987,6 +2076,8 @@ class DsvSession:
                              if state.get('time_sample') and state['time_sample'].get('now_utc') else None)
             for position_id in requested:
                 position = current[position_id]
+                position.pop('awaiting_start_arm', None)
+                position['activated_in_boot'] = True
                 urgent_auto_exit = (
                     position.get('calendar_exit') is not None
                     or (position['exit_target'] == 0
@@ -2035,6 +2126,18 @@ class DsvSession:
             if added_contracts:
                 event_payload['added_contracts'] = added_contracts
             self._journal.event('DSV_PARAMETERS_SAVED', event_payload)
+            sink = getattr(self._diag(), 'evidence_sink', None)
+            if sink is not None and hasattr(sink, 'set_configuration_revision'):
+                sink.set_configuration_revision(next_revision)
+            self._diag().emit(
+                'CONFIG_SAVED',
+                level=logging.INFO,
+                component='CONFIG',
+                priority='HIGH',
+                log_to_logger=False,
+                configuration_revision=next_revision,
+                reason='DSV_PARAMETERS_SAVED',
+            )
             return [{'reason': 'DSV_PARAMETERS_SAVED', **event_payload, 'rule_ids': ['D14']}], []
         if action == 'REDUCE_DETACHED':
             row = state['symbols'].get(command['contract_id'])

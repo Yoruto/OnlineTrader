@@ -117,8 +117,12 @@ def main(argv=None):
                 runtime_update_root = (update_root if update_root is not None
                                        and resolved_runtime_root.is_relative_to(update_root.resolve()) else None)
 
-                def runtime_ready(pipe):
-                    window = None
+                def _ensure_window(pipe=None):
+                    if windows:
+                        window = windows[0]
+                        if pipe:
+                            window._attach_runtime_pipe(pipe)
+                        return window
 
                     def request_restart():
                         nonlocal restart_for_update
@@ -136,12 +140,19 @@ def main(argv=None):
                     window.destroyed.connect(app.quit)
                     windows.append(window)
                     window.show()
+                    return window
+
+                def runtime_ready(pipe):
+                    window = _ensure_window(pipe)
                     QTimer.singleShot(0, window.refresh)
 
                 def runtime_failed(error):
-                    QMessageBox.critical(None, 'Trading Runtime 未启动',
-                                         f'{error}\n\n错误代码：{error.code}')
-                    app.exit(2)
+                    window = _ensure_window(None)
+                    code = getattr(error, 'code', 'E_RUNTIME_START')
+                    window.home_issue = f'{error}\n\n错误代码：{code}'
+                    window.show_home_feedback(f'Runtime 未连接（{code}）；可切换账号、修改配置或查看诊断。')
+                    window.dashboard.render_home()
+                    window.dashboard.reload_accounts()
 
                 def activate_workbench():
                     if windows:

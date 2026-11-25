@@ -141,11 +141,12 @@ documents:
       tests: SOURCE_COMPILE_PASS_FUNCTIONAL_NOT_RUN
       product_acceptance: NOT_RUN
     notes: Implements a non-authoritative, best-effort Runtime and Workbench evidence system with
+      OT-*/E_* catalog compatibility, field-level redaction, writer-thread encoding with priority-reserved
+      sequence-ordered queue, explicit None context attribution, strategy/order/fill/config evidence,
       process-local market-close triggering, event-level boot selection, safe active-file prefixes,
-      honest PARTIAL/FAILED coverage, finalized-directory retention, bounded per-stream pruning,
-      parsed runtime-view logs and explicit upload auth kinds. Legacy /1 private-token configuration
-      remains readable; new /2 delivery prefers a project deploy token. Product, connected upload,
-      functional tests and artifact acceptance remain NOT_RUN.
+      honest PARTIAL/FAILED coverage, finalized and stale-crash retention, bounded per-stream pruning,
+      parsed runtime-view logs, bootstrap failure context, explicit upload auth kinds, and C01-C08
+      bundle analyzer. Product, connected upload, functional tests and artifact acceptance remain NOT_RUN.
 
   - path: docs/refactor/desktop-lifecycle-user-flow-20261120.md
     scope: standalone/desktop-exit-and-tray-lifecycle

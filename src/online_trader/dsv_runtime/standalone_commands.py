@@ -154,6 +154,12 @@ def translate_workbench_command(body, snapshot, *, runtime_boot_id, configuratio
         return common | {'action': 'FLATTEN_STOP' if operation == 'FLATTEN_THEN_STOP' else 'REDUCE_ALL',
                          'position_ids': list(current), 'price_mode': _price_mode(parameters),
                          **(({'expected_target_revisions': current_revisions}) if operation == 'MANUAL_CLOSE_ALL' else {})}
+    if operation == 'SAFE_STOP_FOR_MAINTENANCE':
+        _account_scope(scope)
+        reason = parameters.get('reason')
+        if set(parameters) != {'reason'} or reason not in {'SWITCH_ACCOUNT', 'UPDATE', 'RESTART_CONFIG'}:
+            raise TraderError('E_SCHEMA', 'Maintenance stop requires a valid reason')
+        return common | {'action': 'SAFE_STOP_FOR_MAINTENANCE', 'reason': reason}
     if operation == 'SAVE_DSV_PARAMETERS':
         _account_scope(scope)
         if set(parameters) != {'profile'} or type(parameters['profile']) is not dict:

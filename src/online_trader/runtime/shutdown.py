@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
+from pathlib import Path
 import sys
 import time
 from uuid import uuid4
@@ -105,6 +107,32 @@ def inspect_runtime_for_exit(pipe_name: str) -> tuple[dict | None, int | None, s
     return view, pid, None
 
 
+def _wait_runtime_exit(pipe_name: str, *, pid: int | None = None, timeout: float = 20.0) -> tuple[bool, str | None]:
+    deadline = time.monotonic() + max(1.0, timeout)
+    if pid is not None:
+        remaining = max(0.5, deadline - time.monotonic())
+        if not wait_pid_exit(pid, timeout=remaining):
+            return False, f'后台交易服务（PID {pid}）在 {int(timeout)} 秒内仍未退出（可能仍在等待平仓或撤单确认）。'
+
+    while time.monotonic() < deadline:
+        live = matching_runtime_instance(pipe_name)
+        live_pid = live.get('pid') if live is not None else None
+        if (live is None or not pid_alive(live_pid)) and not runtime_owner_exists():
+            return True, None
+        try:
+            response = RuntimeViewClient(pipe_name).read()
+            if response.get('kind') == 'UNAVAILABLE' and not runtime_owner_exists():
+                return True, None
+        except (OSError, TraderError):
+            if not runtime_owner_exists():
+                return True, None
+        time.sleep(0.15)
+
+    if runtime_owner_exists():
+        return False, '后台交易服务或视图进程仍在运行，请确认所有持仓与撤单已结清。'
+    return True, None
+
+
 def shutdown_runtime_and_wait(
     pipe_name: str,
     *,
@@ -148,26 +176,75 @@ def shutdown_runtime_and_wait(
         code = getattr(error, 'code', 'E_RUNTIME_STOP')
         return False, f'安全停机请求被拒绝或超时：{error}（{code}）'
 
-    deadline = time.monotonic() + max(1.0, timeout)
-    if pid is not None:
-        remaining = max(0.5, deadline - time.monotonic())
-        if not wait_pid_exit(pid, timeout=remaining):
-            return False, f'后台交易服务（PID {pid}）在 {int(timeout)} 秒内仍未退出（可能仍在等待平仓或撤单确认）。'
+    return _wait_runtime_exit(pipe_name, pid=pid, timeout=timeout)
 
-    while time.monotonic() < deadline:
-        live = matching_runtime_instance(pipe_name)
-        live_pid = live.get('pid') if live is not None else None
-        if (live is None or not pid_alive(live_pid)) and not runtime_owner_exists():
+
+def _read_maintenance_completion(run_dir: str | None) -> dict | None:
+    if not isinstance(run_dir, str) or not run_dir:
+        return None
+    path = Path(run_dir) / 'maintenance-completion.json'
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def maintenance_stop_runtime_and_wait(
+    pipe_name: str,
+    *,
+    reason: str,
+    pid: int | None = None,
+    view: dict | None = None,
+    timeout: float = 20.0,
+) -> tuple[bool, str | None]:
+    """Request non-flattening SAFE_STOP_FOR_MAINTENANCE and verify controlled exit."""
+    if reason not in {'SWITCH_ACCOUNT', 'UPDATE', 'RESTART_CONFIG'}:
+        return False, '维护停机原因无效。'
+    record = matching_runtime_instance(pipe_name)
+    if pid is None and record is not None:
+        pid = record.get('pid')
+    if view is None:
+        view, detected_pid, error = inspect_runtime_for_exit(pipe_name)
+        if pid is None:
+            pid = detected_pid
+        if view is None:
+            if pid is None:
+                return True, None
+            return False, error or f'后台交易服务（PID {pid}）仍在运行。'
+
+    config = view.get('configuration') or {}
+    run_dir = config.get('run_directory')
+    command_id = 'maint-' + uuid4().hex
+    binding = {
+        'account_key': view['account_key'],
+        'kernel_boot_id': view['kernel_boot_id'],
+        'config_revision': str(config['config_revision']),
+    }
+    try:
+        RuntimeWorkbenchClient(pipe_name).request('submit', {
+            'command_id': command_id,
+            'operation': 'SAFE_STOP_FOR_MAINTENANCE',
+            'scope': {'scope_type': 'ACCOUNT', 'scope_ids': []},
+            'parameters': {'reason': reason},
+            'binding': binding,
+        })
+    except (OSError, TraderError) as error:
+        if (pid is None or not pid_alive(pid)) and not runtime_owner_exists():
             return True, None
-        try:
-            response = RuntimeViewClient(pipe_name).read()
-            if response.get('kind') == 'UNAVAILABLE' and not runtime_owner_exists():
-                return True, None
-        except (OSError, TraderError):
-            if not runtime_owner_exists():
-                return True, None
-        time.sleep(0.15)
+        code = getattr(error, 'code', 'E_RUNTIME_MAINTENANCE')
+        return False, f'无法进入维护停机：{error}（{code}）'
 
-    if runtime_owner_exists():
-        return False, '后台交易服务或视图进程仍在运行，请确认所有持仓与撤单已结清。'
+    ok, wait_error = _wait_runtime_exit(pipe_name, pid=pid, timeout=timeout)
+    if not ok:
+        completion = _read_maintenance_completion(run_dir)
+        if completion and completion.get('command_id') == command_id and completion.get('state') == 'ABORTED':
+            return False, '维护停机期间检测到晚到成交或状态变化，已中止停机并继续保持当前账户保护。'
+        return False, wait_error
+    completion = _read_maintenance_completion(run_dir)
+    if completion is not None and completion.get('command_id') == command_id:
+        if completion.get('state') != 'COMPLETED':
+            return False, '未能确认无责任受控停机证明，已阻止继续切换或更新。'
     return True, None
