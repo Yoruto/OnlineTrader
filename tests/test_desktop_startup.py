@@ -1,8 +1,10 @@
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import tempfile
 from threading import Event
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -38,6 +40,15 @@ class DesktopStartupTests(unittest.TestCase):
             'kq_username': 'offline-market', 'kq_password': 'synthetic-market-secret'})
         self.account_id = state['selected_id']
         self.profile = load_confirmed_baseline()[0]
+        clock_patch = patch(
+            'online_trader.scheduling.reference.CalibratedClock',
+            side_effect=lambda **_kwargs: SimpleNamespace(
+                now=lambda: datetime.now(timezone.utc),
+                entry_ready=lambda: True,
+            ),
+        )
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
 
     def idle(self, starter, *, completed=None):
         deadline = time.monotonic() + 5

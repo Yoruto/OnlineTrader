@@ -216,8 +216,11 @@ class DsvClockInputChainTests(unittest.TestCase):
         self.assertEqual(self.step()['effects'], [])
         self.assertEqual(self.session.snapshot()['clock_recovery_required'], 'WALL_CLOCK_DISCONTINUITY')
         self.assertEqual(self.step(2000)['effects'], [])
+        self.assertFalse(self.session.snapshot()['symbols'][CONTRACT]['position']['entry_stopped'])
         late = self.step(1)
-        self.assertEqual([effect['kind'] for effect in late['effects']], ['CANCEL'])
+        self.assertIn('ENTRY_CONFIRM_TIMEOUT', [d['reason'] for d in late['decisions']])
+        self.assertTrue(self.session.snapshot()['symbols'][CONTRACT]['position']['entry_stopped'])
+        self.assertEqual(late['effects'], [])
         self.assertFalse(self.session.snapshot()['running'])
 
     def test_close_without_quote_is_durable_without_a_nominal_price_and_stays_closed(self):
