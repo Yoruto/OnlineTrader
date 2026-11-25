@@ -5287,11 +5287,15 @@
     "test_unfilled_order_stalls": {
       "tier": "T1",
       "domains": [
-        "unfilled-order-stalls"
+        "trading",
+        "runtime",
+        "recovery"
       ],
       "risk": "UNTRIAGED",
       "profiles": [
-        "FullOffline"
+        "FullOffline",
+        "Trading",
+        "Runtime"
       ],
       "platform": [
         "Windows",

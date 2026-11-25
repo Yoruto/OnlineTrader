@@ -36,7 +36,7 @@ $env:PYTHONPATH = 'src'
 
 ## 3. 测试注册表与静态架构守卫
 
-- 新增、重命名或删除 `unittest` 用例时，必须同步更新 [qa/test_manifest.json](file:///e:/online-trader/qa/test_manifest.json) 并运行 `.\.venv\Scripts\python.exe -X utf8 qa\test_registry.py` 校验一致性。
+- 新增、重命名或删除 `unittest` 用例时，必须同步更新 [qa/test_manifest.json](file:///e:/online-trader/qa/test_manifest.json)（可运行 `.\.venv\Scripts\python.exe -X utf8 qa\test_registry.py --refresh` 增量同步用例与新增模块），并运行 `.\.venv\Scripts\python.exe -X utf8 qa\test_registry.py` 校验一致性。
 - [qa/check.py](file:///e:/online-trader/qa/check.py) 负责检查模块依赖边界（如 `dsv_core` 纯净性）以及 [spec-source.json](file:///e:/online-trader/docs/spec-source.json) / `docs/spec-extension-*.json` 与 `src/online_trader/resources/` 之间的 SHA-256 一致性。
 
 ---

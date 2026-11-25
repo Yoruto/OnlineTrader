@@ -451,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
                 for problem in problems:
                     print(f"registry error: {problem}", file=sys.stderr)
                 return 2
-            if changes:
+            if refreshed != manifest:
                 args.manifest.write_text(
                     json.dumps(refreshed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
                 )
