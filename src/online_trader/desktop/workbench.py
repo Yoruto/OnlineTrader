@@ -18,7 +18,7 @@ from online_trader.desktop.notifications import WorkbenchSounds
 from online_trader.desktop.preferences import workbench_preferences
 from online_trader.desktop.runtime_client.state import OWNER_RECHECK_OPERATIONS
 from online_trader.desktop.tray import WorkbenchTray
-from online_trader.desktop.workbench_layout import ACTIVATION_MESSAGES,WorkbenchLayout
+from online_trader.desktop.workbench_layout import QUOTE_TIME_MESSAGES, WorkbenchLayout, format_reason_text
 from online_trader.errors import TraderError
 from online_trader.runtime.market_monitor import append_latency
 from online_trader.transport.status_client import StatusClient
@@ -157,24 +157,32 @@ DISPLAY={'LONG':'多','SHORT':'空','OPEN':'开仓','REDUCE':'减仓','NORMAL':'
     'CONTIGUOUS':'连续','DATA_GAP':'断流','UNKNOWN':'未知','NOT_TRIGGERED':'未触发','DONE':'完成','ACTIVE':'生效',
     'OFF':'关闭','WAITING_FILL':'等待成交','WAITING_ENTRY_TERMINAL':'等待开仓终态','SUPPRESSED_PROTECTED':'利润保护优先',
     'MANAGED':'原内核管理','TAKEN_OVER':'已交接','TAKEOVER_PENDING':'交接待确认','NONE':'无',
-    'EXIT_REDUCTION_TERMINAL_UNFILLED':'平仓已终态，剩余目标待核对'}
+    'EXIT_REDUCTION_TERMINAL_UNFILLED':'平仓已终态，剩余目标待核对',
+    'CLOSETODAY':'平今','CLOSEYESTERDAY':'平昨','CLOSE':'平仓',
+    'STRATEGY':'策略','PROTECTION':'保护','CONVERGENCE':'自动收敛','MANUAL':'手动',
+    'HOLDING':'持仓中','ENTRY_PENDING':'开仓待成','EXIT_PENDING':'平仓待成','CLOSED':'已平仓',
+    'ALIVE':'挂单','ACKED':'已报','WORKING':'挂单中','PARTIALLY_FILLED':'部分成交',
+    'FILLED':'全部成交','CANCELLED':'已撤单','REJECTED':'已拒绝','FINISHED':'已结束','NOT_SEEN':'等待回报',
+    'NATIVE_SEEN':'柜台已见','CONFIRMED':'已确认','DEFINITELY_NOT_SENT':'确认未发单',
+    'SEND_POSSIBLE':'请求发送中','CALL_RETURNED':'已调用接口',
+    'SUCCEEDED':'成功','FAILED':'失败','READY':'就绪','RECONCILING':'核对中',
+    'ARMED':'已启动','DISARMED':'未启动'}
 
 
 def display_cell(key,value):
     if key=='source_age_raw_ns' and value is not None:
         return f'{int(value)/1_000_000:+.3f}'
     if key=='quote_time_reason':
-        return {'CALENDAR_COVERAGE_UNKNOWN':'当前时段无完整日历', 'QUOTE_OUTSIDE_CURRENT_SESSION':'当前休市',
-                'QUOTE_TIMESTAMP_INVALID':'报价时间格式无效', 'QUOTE_UNAVAILABLE':'尚无当前报价',
-                'QUOTE_SESSION_MISMATCH':'报价属于其他交易时段', 'QUOTE_LEADS_LOCAL_UTC':'源报价时间领先应用 UTC',
-                'QUOTE_STALE':'当前报价已过时'}.get(value, value or '—')
+        return QUOTE_TIME_MESSAGES.get(value, value or '—')
     if key=='close_route_review' and isinstance(value,dict):
         if value.get('status')=='BLOCKED':return '待核对 · '+value['error_code']
         if value.get('status')=='NO_OWNED_QUANTITY':return '无自有持仓'
         routes=' / '.join(('平今' if r['native_offset']=='CLOSETODAY' else '平仓')+' '+str(r['quantity'])+'手' for r in value.get('routes',[]))
         return f"今{value['owned_today']} / 昨{value['owned_historical']} · {routes or '已预占'}（核对预览）"
     if key=='entry_reasons' and isinstance(value,list):
-        return ' / '.join(ACTIVATION_MESSAGES.get(reason,reason) for reason in value) if value else '无新增原因'
+        return ' / '.join(format_reason_text(reason) for reason in value) if value else '无新增原因'
+    if key in {'reason','reason_code'} and isinstance(value,str):
+        return DISPLAY[value] if value in DISPLAY else format_reason_text(value)
     if value is None:return '原周期' if key=='management_state' else '未知'
     if type(value) is bool:return '是' if value else '否'
     return DISPLAY.get(str(value),str(value))

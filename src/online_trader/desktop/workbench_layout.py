@@ -79,7 +79,24 @@ def _convergence_status_label(conv_state, wait_reason, *, configured=True):
         return '撤销委托中'
     return '收敛平仓中' if configured else '清仓收敛中'
 BEIJING = timezone(timedelta(hours=8))
+QUOTE_TIME_MESSAGES = {
+    'CALENDAR_COVERAGE_UNKNOWN': '当前时段无完整日历',
+    'QUOTE_OUTSIDE_CURRENT_SESSION': '当前休市',
+    'AUCTION_QUOTE': '当前处于集合竞价阶段',
+    'QUOTE_UNAVAILABLE': '尚无当前报价',
+    'QUOTE_TIMESTAMP_INVALID': '报价时间格式无效',
+    'QUOTE_SESSION_UNKNOWN': '报价所属交易时段无法确认',
+    'QUOTE_SESSION_MISMATCH': '报价属于其他交易时段',
+    'QUOTE_TIME_REGRESSION': '报价源时间发生倒退',
+    'QUOTE_LEADS_LOCAL_UTC': '源报价时间领先应用 UTC',
+    'QUOTE_REFERENCE_CONFLICT': '报价时间与独立参考冲突',
+    'QUOTE_STALE': '当前报价已过时',
+    'CABINET_DAY_UNPROVED': '柜台交易日待核对',
+    'CLOCK_PROTECTION_WINDOW_EXPIRED': '参考时钟保护窗口已过',
+}
 ENTRY_MESSAGES = {
+    'NORMAL_ENTRY': '普通开仓信号成立',
+    'CONTINUATION_ENTRY': '延续开仓信号成立',
     'GEOMETRY_BLOCK': '日内振幅超出开仓上限',
     'WAITING_FRESH_QUOTE': '等待行情',
     'MARKET_PATH_INCOMPLETE': '行情路径待补齐',
@@ -87,17 +104,150 @@ ENTRY_MESSAGES = {
     'AUCTION_DISABLED': '集合竞价期间暂停普通开仓',
     'MARKET_HALTED': '市场当前暂停交易或延迟开市',
     'CLOSE_SESSION_NO_OPEN': '收盘前禁开',
+    'CLOSE_ENTRY_WINDOW': '临近收盘，停止新增开仓',
+    'OUTSIDE_SESSION': '当前不在交易时段',
     'RECONCILIATION_REQUIRED': '柜台待核对',
     'CONTROL_BARRIER': '开仓权限受限',
     'OBSERVATION_ONLY_BACKLOG': '正在补齐行情',
     'DSV_QUOTE_AGE_EXCEEDED': '行情已滞后，暂停开新仓',
     'QUOTE_AGE': '报价年龄超过配置上限，暂停开新仓',
     'FEED_HEALTH_BLOCK': '全局行情或连接异常，暂停开新仓（持仓保护维持）',
+    'QUOTE_UNAVAILABLE': '缺少有效行情',
+    'MINUTE_BAR_UNAVAILABLE': '缺少分钟 K 线',
+    'OFFSETS_UNAVAILABLE': '开仓、止损或止盈偏移无效',
     'TAKE_PROFIT_OUTSIDE_PRICE_LIMIT': '理论止盈超过涨跌停',
+    'TAKE_PROFIT_OUTSIDE_LIMIT': '理论止盈价超出涨跌停范围',
     'LAST_NEAR_PRICE_LIMIT': '最新价接近涨跌停',
+    'QUOTE_NEAR_LIMIT': '报价接近涨跌停，暂停开仓',
     'SAME_DIRECTION_WITHIN_ONE_SECOND': '同方向报单间隔不足 1 秒',
+    'ENTRY_THROTTLED': '同向开仓触发间隔过短',
+    'BAR_CONSUMED': '当前分钟的开仓机会已使用',
+    'CHASE_CAP_EXCEEDED': '报单价超出追价上限',
+    'NO_CHASE_AFTER_ACT': '行情已越过不追价线，本次跳过开仓',
+    'TRIGGER_NOT_REACHED': '价格尚未达到触发位',
+    'POSITION_OR_ENTRY_PENDING': '已有策略持仓或开仓委托待确认',
+    'POSITION_WAITING_FOR_MARKET': '已有持仓等待有效行情或交易时段',
+    'USER_STOPPED': '用户已停止开仓',
+    'DAY_STOP': '当日已停止开仓',
+    'DAY_STOP_ACTIVE': '当日停开生效中',
+    'MONTH_STOP': '当月已停止开仓',
+    'MONTH_STOP_ACTIVE': '当月停开生效中',
+    'PROTECTION_DAY_STOP': '触发保护后当日停开',
+    'DSV_PERSISTED_DAY_OR_MONTH_STOP': '历史记录显示当日或当月已停开',
+    'DAILY_TARGET_LIMIT': '已达当日开仓目标次数上限，当日停开',
+    'NET_LOSS_STOP': '当日净亏达到停开上限',
+    'NET_LOSS_LIMIT': '净亏已达上限，暂停开新仓',
+    'PROTECT_EXIT': '启动前已触发保护退出',
+    'FUNDS_UNAVAILABLE': '资金或保证金字段不足，无法计算手数',
+    'ORDER_QUANTITY_UNSUPPORTED': '下单手数不符合合约委托要求',
+    'QUANTITY_OUT_OF_RANGE': '下单手数超出合约允许范围',
+    'BELOW_MIN_ORDER_QTY': '委托数量低于合约最小下单手数',
+    'AWAITING_NATIVE_SYNC': '等待柜台委托、成交及仓位核对',
+    'LATE_FILL_OWNERSHIP_REVIEW': '存在迟到成交，待核对持仓归属',
+    'UNRESOLVED_PRIOR_CHILD': '原委托或成交尚未核齐',
+    'UNOWNED_POSITION': '存在未归属持仓或外部委托',
+    'EXTERNAL_POSITION_PRESENT': '存在未归属持仓',
     'CONVERGENCE_FLATTEN_PENDING': '正在将账号持仓与委托收敛至策略目标',
     'STARTUP_PROVED_AWAITING_START': '启动前已识别策略持仓，等待点击启动',
+    'ENTRY_CONFIRM_TIMEOUT': '开仓委托确认超时，已停止继续开仓',
+    'ADVERSE_SLIPPAGE': '开仓滑点过大，触发保护退出',
+    'DATA_GAP_EXIT': '行情断流，触发保护退出',
+    'DATA_GAP_EXIT_PENDING': '断流保护退出等待行情或成交',
+    'GAP_WAIT_FRESH_TICK': '断流后等待同盘次新鲜行情',
+    'STOP_LOSS': '触发止损',
+    'TAKE_PROFIT': '触发止盈',
+    'TRAILING_STOP': '触发移动止盈',
+    'PROTECTED_FLOOR': '触发 80% 利润保护留利线',
+    'PROTECTION_ACTIVATED': '利润保护已激活',
+    'PARTIAL_STAGE_1': '触发第一档减仓',
+    'PARTIAL_STAGE_2': '触发第二档减仓',
+    'SCHEDULED_CLOSE': '到达收盘平仓窗口',
+    'SCHEDULED_CLOSE_PENDING': '收盘平仓待完成',
+    'SESSION_CLOSE': '收盘平仓',
+    'MANUAL_EXIT': '手动平仓',
+    'PROTECTION_EXIT_AWAITING_SYNC': '保护退出等待柜台持仓核对',
+    'PROTECTION_EXIT_SYNCHRONIZED': '保护退出已完成策略同步',
+    'SCOPE_OPENING_WINDOW_CLOSED': '超出账户开仓授权时段',
+    'SCOPE_TARGET_LIMIT': '已达账户授权开仓次数上限',
+    'SCOPE_RISK_UNPROVED': '缺少授权风控所需数据',
+    'SCOPE_QUANTITY_LIMIT': '授权剩余手数低于合约最小手数',
+    'SCOPE_CONTRACTS_LIMIT': '合约不在授权范围内',
+    'SCOPE_DAY_CLOSED': '不在授权交易日内',
+    'ENTRY_NOT_ALLOWED': '当前盘段或权限禁止开仓',
+    'PROTECTIVE_EXIT_NOT_ALLOWED': '当前盘段或权限禁止保护性平仓',
+    'POSITION_CHANGED': '柜台持仓与策略目标暂不一致，等待核对',
+    'NO_LEGAL_PRICE': '当前缺少符合最小价位或涨跌停的合法委托价',
+    'SEND_RESULT_UNKNOWN': '报单结果待柜台确认',
+    'PRICE_REPRICE_REQUIRED': '策略参考价已变动，正在撤旧改价',
+    'CANCEL_PENDING': '撤单请求已发出，等待柜台确认',
+    'TARGET_REDUCED': '策略目标手数已收紧',
+    'OPEN_NOT_RETRYABLE': '前序开仓子单终态不可自动重报',
+    'EXIT_RETRY_BLOCKED': '平仓重报受阻，等待核对',
+    'REDUCTION_ROUTE_UNAVAILABLE': '今昨仓路由不可用，无法计算平仓方向',
+    'MAINTENANCE_GATE_BLOCKED': '存在未终结子单、跨日或归属冲突，暂不可报单',
+    'ORDER_POLICY_DISALLOWED': '当前时段或风控策略禁止新发委托',
+    'EXIT_WAITING_FOR_SESSION': '退出已登记，等待交易时段',
+    'EXIT_WAITING_FOR_PRICE': '退出已登记，等待有效报价',
+    'EXIT_WAITING_FOR_CLOCK_REVIEW': '退出已登记，等待时钟核对',
+    'EXIT_WAITING_FOR_UTC_REFERENCE': '退出已登记，等待 UTC 参考时钟恢复',
+    'EXIT_MANUAL_TAKEOVER_REQUIRED': '平仓连续受阻或拒单，需要人工接管核对',
+    'EXIT_TRANSIENT_RETRY_BACKOFF': '平仓遇到临时拒单或撤单，正在退避重报',
+    'EXIT_WAIT_FRESH_QUOTE': '平仓重报前等待同盘次新鲜报价',
+    'OFFSET_ROUTE_CHANGED': '平今平昨路由已切换',
+    'SYNCHRONIZE_PENDING_CHILDREN_MISSING': '柜台快照尚缺在途子单，继续同步',
+    'SYNCHRONIZE_POSITION_MISMATCH': '柜台持仓与策略记录暂不一致，继续同步',
+    'USER_CANCEL': '用户手动撤单',
+    'CANCEL_AWAITING_NATIVE_RESULT': '撤单结果待柜台返回',
+    'CANCEL_UNAVAILABLE': '当前委托状态暂不可撤',
+    'USER_REDUCE': '用户手动减仓',
+    'USER_FLATTEN': '用户手动全平',
+    'USER_REDUCE_DETACHED': '用户手动平去遗留持仓',
+    'NO_OWNED_ORDERS': '当前无可控策略委托',
+    'NO_OWNED_TARGETS': '当前无策略目标持仓',
+    'BROKER_FACTS_RECONCILED': '柜台事实已重新核清',
+    'BROKER_NEGATIVE_RECONCILED': '柜台快照已证实该笔未知委托未发出',
+    'CLOCK_RECOVERED': '时钟已恢复，需重新启动策略',
+    'DSV_PARAMETERS_SAVED': '策略参数已热更新',
+    'PARAMETERS_UNCHANGED': '策略参数未发生变化',
+    'START': '策略已启动开仓',
+    'STOP': '策略已停止开仓',
+    'QUOTE_OR_PRICE_SCOPE': '缺少有效报价、存在外部委托或限价不合规',
+    'ACCOUNT_SCOPE_OR_WINDOW': '合约、交易日或开仓时段超出账户授权',
+    'PRE_SEND_VALIDATION': '发送前校验失败',
+    'INSERT_ORDER_EXCEPTION_UNKNOWN': '报单接口异常，结果待核对',
+    'BROKER_AUCTION_MATCH_REJECTED': '集合竞价撮合期柜台拒单',
+    'BROKER_AUCTION_REJECTED': '集合竞价期间柜台拒单',
+    'BROKER_HALTED_REJECTED': '停牌或暂停交易期间柜台拒单',
+    'BROKER_NON_CONTINUOUS_REJECTED': '非连续交易时段柜台拒单',
+    'CONVERGENCE_CANCEL_NON_STRATEGY': '收敛阶段自动撤销非策略活动挂单',
+    'NO_TRADING_PERMISSION': '账号缺少该合约交易权限',
+    'FOREIGN_ACTIVE_ORDER': '存在非本策略活动委托',
+    'FLAT_BASELINE': '启动空仓基线（无持仓、无停开）',
+    'FLAT_DAY_STOP_RECONSTRUCTED': '启动空仓基线，已按当日成交恢复当日停开',
+    'FLAT_SIDE': '该方向无持仓',
+    'PROVED_OPEN_MATCH': '启动持仓已按当日策略信号核实匹配',
+    'PROVED_PARTIAL_RETAIN': '启动持仓部分匹配策略信号，其余将自动平仓收敛',
+    'PROVED_ONE_SIDE_OPPOSITE_TO_FLATTEN': '仅单边匹配策略信号，对向持仓将自动平仓收敛',
+    'PROVED_SHOULD_HAVE_EXITED': '启动持仓按历史行情本应触发平仓，启动后将自动平仓收敛',
+    'UNPROVED_OVERNIGHT_POSITION': '存在隔夜或昨仓，无法由当日策略信号证实，启动后将自动平仓收敛',
+    'UNPROVED_TWO_SIDED_POSITION': '存在双向持仓，无法作为单边策略周期证实，启动后将自动平仓收敛',
+    'UNPROVED_NO_TODAY_FILL': '缺少当日开仓成交明细，无法证实策略归属',
+    'UNPROVED_OFFSETS_UNAVAILABLE': '合约开仓、止损或止盈偏移无效，无法证实历史信号',
+    'UNPROVED_MISSING_FILL_TIME': '成交记录缺少时间，无法证实开仓信号',
+    'UNPROVED_OUTSIDE_ENTRY_WINDOW': '开仓时间不在策略允许窗口内，启动后将自动平仓收敛',
+    'UNPROVED_NO_KLINE_EVIDENCE': '缺少对应分钟 K 线证据，无法证实历史信号',
+    'UNPROVED_SIGNAL_MISMATCH': '成交价或当时价格不符合策略触发条件',
+    'UNPROVED_QUANTITY_ZERO': '无法证出有效的策略开仓手数',
+    'CLOCK_UNVERIFIED': '系统时钟未核对',
+    'MONOTONIC_DISCONTINUITY': '单调时钟发生跳变',
+    'WALL_CLOCK_DISCONTINUITY': '系统挂钟时间发生跳变',
+    'OWNER_SCHEDULING_GAP': '后台调度出现较长间隔',
+    'APPLICATION_UTC_UNAVAILABLE': '应用 UTC 参考时钟暂不可用',
+    'APPLICATION_UTC_RECOVERED': '应用 UTC 参考时钟已恢复',
+    'FEED_DISCONNECTED': '行情或交易连接已断开',
+    'SOURCE_ANOMALY': '行情源时间异常',
+    'RUNTIME_OWNER_CLOSED': '后台执行器已关闭',
+    'MAINTENANCE_STOP_REQUESTED': '维护停止流程进行中',
 }
 ACTIVATION_MESSAGES = {
     'LONG:NO_CHASE_AFTER_ACT': '当日行情已越过多头不追价线',
@@ -164,6 +314,64 @@ OWNER_RECOVERY_MESSAGES = {
     'E_DSV_NIGHT_BOUNDARY': '夜盘交易日边界无法确认',
     'E_CLOCK_INPUT': '本机时间输入无法用于安全交易',
 }
+
+DIAGNOSTIC_EVENT_MESSAGES = {
+    'ORDER_BLOCKED': '触发阻挡（ORDER_BLOCKED）',
+    'ORDER_UNBLOCKED': '解除阻挡',
+    'STARTUP_TARGET_INFERENCE': '启动持仓推演',
+    'CONVERGENCE_ACTION': '持仓收敛执行',
+    'CONVERGENCE_DEFERRED': '持仓收敛延后',
+    'UNKNOWN_NEGATIVE_RECONCILED': '未知委托否定核清',
+    'EXIT_FAILURE_CLASSIFIED': '平仓受阻分类',
+    'PRE_SEND_VALIDATION_REFUSED': '发单前校验拦截',
+    'SDK_SEND_REFUSED_BEFORE_QUEUE': '入队前被柜台接口拒绝',
+    'SDK_SEND_UNCERTAIN_EXCEPTION': '发单异常，结果待核对',
+    'EFFECT_DISPATCH_DEFINITELY_NOT_SENT': '确认未发单',
+    'EFFECT_DISPATCH_UNKNOWN': '发单结果未知，待核对',
+}
+
+DIAGNOSTIC_DETAIL_MESSAGES = {
+    'NO_TICK': '尚无实时行情',
+    'NOT_SYNCHRONIZED': '柜台数据尚未同步',
+    'ALLOW_NEW_ENTRY_FALSE': '当前盘段或权限禁止开仓',
+    'ALLOW_PROTECTIVE_EXIT_FALSE': '当前盘段或权限禁止平仓',
+    'ALLOW_NEW_ORDER_FALSE': '当前禁止新发委托',
+    'TICK_MISSING': '缺少实时报价',
+    'TICK_OR_LIMIT_INVALID': '盘口价格或涨跌停字段无效',
+    'PRIOR_OR_CONFLICT_OR_DAY_ROLLOVER': '存在未终结前序子单、跨日或归属冲突',
+    'STALE_AFTER_GAP': '断流后尚无新行情',
+    'EMPTY_CLOSE_ROUTES': '无可用平今/平昨仓位路由',
+    'MISSING_TODAY_HIS_BUCKETS': '缺少今仓/昨仓明细',
+    'EXTERNAL_ACTIVE_ORDERS': '存在非本策略活动委托',
+    'EXTERNAL_ORDERS': '存在外部委托',
+    'REDUCTION_ROUTES_EMPTY': '平仓路由为空',
+}
+
+_ASCII_CODE_RE = re.compile(r'[A-Z0-9_.:-]+\Z')
+
+
+def format_reason_text(reason):
+    """Translate an internal strategy, quote, blocking, or recovery code into Chinese."""
+    if not isinstance(reason, str) or not reason:
+        return '—'
+    code = reason.rsplit(':', 1)[-1]
+    translated = (
+        ENTRY_MESSAGES.get(reason)
+        or ENTRY_MESSAGES.get(code)
+        or ACTIVATION_MESSAGES.get(reason)
+        or QUOTE_TIME_MESSAGES.get(code)
+        or BLOCK_MESSAGES.get(code)
+        or ENTRY_FILTERS.get(code, (None, None))[1]
+        or CONVERGENCE_WAIT_MESSAGES.get(code)
+        or CLOCK_PROTECTION_REASONS.get(code)
+        or OWNER_RECOVERY_MESSAGES.get(code)
+        or DIAGNOSTIC_DETAIL_MESSAGES.get(code)
+    )
+    if translated:
+        return translated
+    if not _ASCII_CODE_RE.fullmatch(code):
+        return reason
+    return f'策略条件待核对（{code}）'
 
 
 class WorkbenchLogLine(NamedTuple):
@@ -551,11 +759,14 @@ def native_side(item):
 def order_cells(item):
     offset = {'CLOSETODAY':'平今','CLOSE':'平仓','CLOSEYESTERDAY':'平昨','OPEN':'开仓'}
     state = {'FILLED':'全部成交','CANCELLED':'已撤单','REJECTED':'已拒绝',
-             'NOT_SEEN':'等待回报','ALIVE':'挂单','ACKED':'已报'}
+             'NOT_SEEN':'等待回报','ALIVE':'挂单','ACKED':'已报',
+             'WORKING':'挂单中','PARTIALLY_FILLED':'部分成交','FINISHED':'已结束'}
     native_offset = offset.get(item.get('native_offset'),'开仓' if item['effect']=='OPEN' else '平仓')
     status = state.get(item.get('broker_state'),item.get('broker_state'))
     if item.get('send_state')=='UNKNOWN':
         status = '待核对'
+    elif item.get('send_state') == 'DEFINITELY_NOT_SENT' and item.get('broker_state') in {None, 'NOT_SEEN'}:
+        status = '确认未发单'
     quantity, filled = item.get('original_qty'), item.get('filled_qty')
     return [display_value(value) for value in (
         item.get('native_order_id'),item['contract_id'],native_side(item),native_offset,
@@ -575,10 +786,12 @@ def trade_cells(item):
 def account_order_cells(record):
     fact = record.get('fact')
     if not isinstance(fact, dict):
+        status = {'CONFLICT': '核对冲突'}.get(record.get('status', 'CONFLICT'), record.get('status', '核对冲突'))
         return [record.get('trading_day', '—'), record.get('record_id', '—'), *(['—'] * 9),
-                record.get('status', 'CONFLICT')]
+                status]
     offset = {'OPEN':'开仓','CLOSE':'平仓','CLOSETODAY':'平今','CLOSEYESTERDAY':'平昨'}
-    state = {'FINISHED':'已结束','ALIVE':'挂单','FILLED':'全部成交','CANCELLED':'已撤单','REJECTED':'已拒绝'}
+    state = {'FINISHED':'已结束','ALIVE':'挂单','FILLED':'全部成交','CANCELLED':'已撤单','REJECTED':'已拒绝',
+             'WORKING':'挂单中','PARTIALLY_FILLED':'部分成交'}
     quantity, remaining = fact.get('quantity'), fact.get('remaining')
     return [display_value(value) for value in (
         record.get('trading_day'), fact.get('order_id') or record.get('record_id'), fact.get('contract_id'),
@@ -1576,16 +1789,7 @@ class WorkbenchLayout:
             explanation = [self.entry_reason_text(reason) for reason in reasons
                            if reason != 'DUPLICATE_MARKET_EVENT']
             if self.market_view_current(view):
-                time_reason = {
-                    'CALENDAR_COVERAGE_UNKNOWN': '当前时段无完整日历',
-                    'QUOTE_OUTSIDE_CURRENT_SESSION': '当前休市',
-                    'AUCTION_QUOTE': '当前处于集合竞价阶段',
-                    'QUOTE_UNAVAILABLE': '尚无当前报价',
-                    'QUOTE_TIMESTAMP_INVALID': '报价时间格式无效',
-                    'QUOTE_SESSION_MISMATCH': '报价属于其他交易时段',
-                    'QUOTE_LEADS_LOCAL_UTC': '源报价时间领先应用 UTC',
-                    'QUOTE_STALE': '当前报价已过时',
-                }.get(quote.get('quote_time_reason'))
+                time_reason = QUOTE_TIME_MESSAGES.get(quote.get('quote_time_reason'))
                 if time_reason:
                     explanation.append(time_reason)
                 if is_standalone and acc:
@@ -1631,7 +1835,9 @@ class WorkbenchLayout:
                 status = '已停用'
             elif quote.get('day_stop_reason') or report.get('state') == 'STOPPED':
                 status = '当日停开'
-                explanation.insert(0, quote.get('day_stop_reason') or report.get('status') or status)
+                day_stop_text = (self.entry_reason_text(quote['day_stop_reason'])
+                                 if quote.get('day_stop_reason') else None)
+                explanation.insert(0, day_stop_text or report.get('status') or status)
             elif quote_state != '新鲜':
                 status = '行情滞后' if quote_state == '行情已滞后' else quote_state
             elif owned:
@@ -1700,12 +1906,7 @@ class WorkbenchLayout:
 
     @staticmethod
     def entry_reason_text(reason):
-        code = reason.rsplit(':', 1)[-1]
-        if code == 'TRIGGER_NOT_REACHED':
-            return '价格尚未达到触发位'
-        return (ENTRY_MESSAGES.get(reason) or ACTIVATION_MESSAGES.get(reason)
-                or BLOCK_MESSAGES.get(code) or ENTRY_FILTERS.get(code, (None, None))[1]
-                or f'策略条件待核对（{code}）')
+        return format_reason_text(reason)
 
     @staticmethod
     def market_time(stamp):
@@ -3197,7 +3398,8 @@ class WorkbenchLayout:
                          for trade in fills)
             lines.append(f'当前柜台回报    {cells[7]}')
             if order.get('cancel_status'):
-                states = {'SEND_POSSIBLE': '撤单已请求', 'CALL_RETURNED': '等待柜台结果', 'UNKNOWN': '撤单结果待核对'}
+                states = {'SEND_POSSIBLE': '撤单已请求', 'CALL_RETURNED': '等待柜台结果', 'UNKNOWN': '撤单结果待核对',
+                          'CONFIRMED': '已确认撤单', 'CANCELLED': '已撤单', 'DEFINITELY_NOT_SENT': '撤单未发出'}
                 status = order['cancel_status']
                 lines.append('撤单回报    ' + states.get(status, status))
             if order.get('native_message'):
@@ -3896,19 +4098,28 @@ class WorkbenchLayout:
             event = record.get('event')
             contract = record.get('contract_id')
             reason = record.get('reason') or record.get('previous_reason')
-            detail = record.get('detail')
-            parts = [item for item in (contract, event) if isinstance(item, str) and item]
+            detail = record.get('detail') or record.get('previous_detail')
+            event_label = DIAGNOSTIC_EVENT_MESSAGES.get(event, event) if isinstance(event, str) else None
+            parts = [item for item in (contract, event_label) if isinstance(item, str) and item]
             if isinstance(reason, str) and reason:
                 parts.append(self.entry_reason_text(reason))
             if isinstance(detail, str) and detail and detail != reason:
-                parts.append(detail)
+                detail_text = (DIAGNOSTIC_DETAIL_MESSAGES.get(detail)
+                               or QUOTE_TIME_MESSAGES.get(detail)
+                               or (self.entry_reason_text(detail) if _ASCII_CODE_RE.fullmatch(detail) else detail))
+                parts.append(detail_text)
             if record.get('error_code'):
-                parts.append(str(record['error_code']))
+                error_code = str(record['error_code'])
+                parts.append(OWNER_RECOVERY_MESSAGES.get(error_code, error_code))
             category = ('error' if event == 'EFFECT_DISPATCH_UNKNOWN' or reason == 'EXIT_MANUAL_TAKEOVER_REQUIRED'
-                        else None if event == 'ORDER_UNBLOCKED'
+                        else None if event in {'ORDER_UNBLOCKED', 'STARTUP_TARGET_INFERENCE', 'UNKNOWN_NEGATIVE_RECONCILED'}
                         else 'warning' if event in {'ORDER_BLOCKED', 'EFFECT_DISPATCH_DEFINITELY_NOT_SENT'}
                         else None)
-            tag = '解除' if event == 'ORDER_UNBLOCKED' else '阻挡'
+            tag = ('解除' if event == 'ORDER_UNBLOCKED'
+                   else '推演' if event == 'STARTUP_TARGET_INFERENCE'
+                   else '核对' if event == 'UNKNOWN_NEGATIVE_RECONCILED'
+                   else '收敛' if event == 'CONVERGENCE_ACTION'
+                   else '阻挡')
             phases.append(WorkbenchLogLine(f'[{at}] [{tag}] {" · ".join(parts)}', category, moment))
         return phases
 
@@ -4472,15 +4683,10 @@ class WorkbenchLayout:
             if activity_reasons != self.last_reasons.get(code):
                 self.last_reasons[code] = activity_reasons
                 if activity_reasons:
-                    messages = ENTRY_MESSAGES | ACTIVATION_MESSAGES | {
-                        'NET_LOSS_LIMIT':'净亏已达上限，暂停开新仓',
-                        'ACCOUNT_VALUES_UNKNOWN':'柜台账户字段待同步',
-                        'ENTRY_AUTHORITY_DISARMED':'策略未启用开仓',
-                    }
-                    self.add_activity(f'{code} · {" / ".join(messages.get(reason,reason) for reason in activity_reasons)}')
+                    self.add_activity(f'{code} · {" / ".join(self.entry_reason_text(reason) for reason in activity_reasons)}')
             stop_reason = market.get('day_stop_reason')
             if stop_reason:
-                blocked.append(f'● {name}  {stop_reason}')
+                blocked.append(f'● {name}  {self.entry_reason_text(stop_reason)}')
             else:
                 if market.get('enabled') is False:
                     status = '品种已手动停用'
