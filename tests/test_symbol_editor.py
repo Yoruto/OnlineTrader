@@ -6,7 +6,8 @@ import unittest
 from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-from PySide6.QtCore import QPoint
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog
 
 from online_trader.configuration.baseline import load_confirmed_baseline
@@ -155,22 +156,87 @@ class SymbolEditorTests(unittest.TestCase):
             ['SHFE.ag2612', 'SHFE.ag2701', 'SHFE.ag2702', 'SHFE.ag2703', 'SHFE.ag2704', 'SHFE.ag2705'],
         )
         dialog = self.dialog()
-        dialog.fields['code'].textEdited.emit('ag')
-        dialog.fields['code'].setText('ag')
+        dialog.show()
+        self.app.processEvents()
+        dialog.fields['code'].setFocus()
+        QTest.keyClicks(dialog.fields['code'], 'ag')
         self.assertEqual(dialog._catalog_completer.maxVisibleItems(), 6)
         self.assertEqual(len(dialog._catalog_model.stringList()), 6)
         self.assertTrue(all(item.startswith('SHFE.ag') for item in dialog._catalog_model.stringList()))
 
         catalog = [f'SHFE.ag2612', *(f'SHFE.ag270{m}' for m in range(1, 9)), 'SHFE.cu2701']
         dialog.set_contract_catalog(catalog)
-        dialog.fields['code'].setText('ag')
         self.assertEqual(
             dialog._catalog_model.stringList(),
             ['SHFE.ag2612', 'SHFE.ag2701', 'SHFE.ag2702', 'SHFE.ag2703', 'SHFE.ag2704', 'SHFE.ag2705'],
         )
-        dialog._on_suggestion_activated('SHFE.ag2701')
-        self.assertEqual(dialog.fields['code'].text(), 'SHFE.ag2701')
+
+    def test_contract_dropdown_single_click_selects_and_closes(self):
+        dialog = self.dialog()
+        catalog = ['SHFE.ag2612', 'SHFE.ag2701', 'SHFE.ag2702']
+        dialog.set_contract_catalog(catalog)
+        dialog.show()
+        self.app.processEvents()
+        code = dialog.fields['code']
+        code.setFocus()
+        QTest.keyClicks(code, 'ag')
+        self.app.processEvents()
+
+        popup = dialog._catalog_completer.popup()
+        self.assertTrue(popup.isVisible())
+        index = popup.model().index(1, 0)
+        self.assertEqual(index.data(), 'SHFE.ag2701')
+        activated = []
+        dialog._catalog_completer.activated[str].connect(activated.append)
+        QTest.mouseClick(popup.viewport(), Qt.LeftButton, pos=popup.visualRect(index).center())
+        self.app.processEvents()
+
+        self.assertEqual(activated, ['SHFE.ag2701'])
+        self.assertEqual(code.text(), 'SHFE.ag2701')
         self.assertEqual(dialog.fields['name'].text(), '白银')
+        self.assertFalse(popup.isVisible())
+        self.assertIsNone(dialog.result_profile)  # Still requires form confirmation.
+        dialog.set_contract_catalog(catalog + ['SHFE.ag2703'])
+        self.app.processEvents()
+        self.assertFalse(popup.isVisible())
+        self.assertEqual(code.text(), 'SHFE.ag2701')
+        dialog.fields['stop_offset'].setText('12')
+        self.assertEqual(code.text(), 'SHFE.ag2701')
+
+    def test_contract_dropdown_keyboard_selection(self):
+        dialog = self.dialog()
+        dialog.set_contract_catalog(['SHFE.ag2612', 'SHFE.ag2701', 'SHFE.ag2702'])
+        dialog.show()
+        self.app.processEvents()
+        code = dialog.fields['code']
+        code.setFocus()
+        QTest.keyClicks(code, 'ag')
+        self.app.processEvents()
+        popup = dialog._catalog_completer.popup()
+        self.assertTrue(popup.isVisible())
+        QTest.keyClick(popup, Qt.Key_Down)
+        index = popup.currentIndex()
+        self.assertTrue(index.isValid())
+        expected = index.data()
+        QTest.keyClick(popup, Qt.Key_Return)
+        self.app.processEvents()
+        self.assertEqual(code.text(), expected)
+        self.assertEqual(dialog.fields['name'].text(), '白银')
+        self.assertFalse(popup.isVisible())
+        self.assertIsNone(dialog.result_profile)
+
+    def test_complete_contract_input_does_not_keep_popup_open(self):
+        dialog = self.dialog()
+        dialog.set_contract_catalog(['SHFE.ag2612', 'SHFE.ag2701', 'SHFE.ag2702'])
+        dialog.show()
+        self.app.processEvents()
+        code = dialog.fields['code']
+        code.setFocus()
+        QTest.keyClicks(code, 'ag2701')
+        self.app.processEvents()
+        self.assertEqual(code.text(), 'ag2701')
+        self.assertEqual(dialog.fields['name'].text(), '白银')
+        self.assertFalse(dialog._catalog_completer.popup().isVisible())
 
     def test_runtime_symbol_limit_enforces_eleven_contracts(self):
         settings = self.profile.to_settings()
