@@ -637,6 +637,37 @@
       ],
       "case_overrides": {}
     },
+    "test_diagnostics_and_log_freeze": {
+      "tier": "T2",
+      "domains": [
+        "runtime",
+        "workbench"
+      ],
+      "risk": "P1",
+      "profiles": [
+        "FullOffline",
+        "Runtime",
+        "Trading"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": false,
+      "requirements": [
+        "PySide6"
+      ],
+      "timeout_seconds": 60,
+      "cases": [
+        "OrderDiagnosticsDedupeTests.test_dedupe_signature_suppresses_dynamic_detail_spam",
+        "OrderDiagnosticsDedupeTests.test_default_observe_block_still_tracks_detail_changes",
+        "RunnerDiagnosticKeyIsolationTests.test_disarmed_ticks_do_not_oscillate_session_gate",
+        "RunnerDiagnosticKeyIsolationTests.test_synchronize_uses_separate_keys_for_orders_and_positions",
+        "WorkbenchTableBatchPerformanceTests.test_populate_and_fill_selectable_with_resize_to_contents_stay_fast"
+      ],
+      "case_overrides": {}
+    },
     "test_diagnostics_redaction": {
       "tier": "T2",
       "domains": [
