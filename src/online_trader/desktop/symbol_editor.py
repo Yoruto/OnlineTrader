@@ -151,40 +151,50 @@ class SymbolEditorDialog(QDialog):
         except TraderError:
             matches, _ = suggest_contracts(text, self._contract_catalog, limit=MAX_CONTRACT_SUGGESTIONS)
             if matches:
-                self._catalog_model.setStringList(matches)
+                if matches != self._catalog_model.stringList():
+                    self._catalog_model.setStringList(matches)
                 self.contract_hint.setText(f'目录暂不可用（{code}），已生成 {len(matches)} 个常用月份供选择。')
             else:
                 self.contract_hint.setText(f'合约目录加载失败（{code}），仍可输入简称后从下拉选择或手动填写完整代码。')
 
     def _on_code_changed(self, text):
-        resolved = self._sync_contract()
-        self._refresh_contract_suggestions(text, popup=False, resolved=resolved)
+        # QCompleter also changes the line edit during activation. Do not reset
+        # its model or reopen its popup while Qt is processing that selection.
+        self._sync_contract()
 
     def _on_suggestion_activated(self, text):
         self.fields['code'].setText(text)
         self._sync_contract()
+        self._catalog_completer.popup().hide()
 
-    def _refresh_contract_suggestions(self, text, *, popup=False, resolved=None):
+    def _refresh_contract_suggestions(self, text, *, popup=False):
+        try:
+            resolve_contract(text.strip())
+        except TraderError:
+            pass
+        else:
+            self._catalog_completer.popup().hide()
+            if self._catalog_model.stringList():
+                self._catalog_model.setStringList([])
+            return
+
         matches, from_catalog = suggest_contracts(text, self._contract_catalog, limit=MAX_CONTRACT_SUGGESTIONS)
-        self._catalog_model.setStringList(matches)
-        if resolved is None:
-            try:
-                resolved = resolve_contract(text.strip())
-            except TraderError:
-                resolved = None
+        if matches != self._catalog_model.stringList():
+            self._catalog_model.setStringList(matches)
         if matches:
-            if resolved is None:
-                if from_catalog:
-                    self.contract_hint.setText(f'找到 {len(matches)} 个可选合约，可用上下键选择并按 Enter 确认。')
-                else:
-                    self.contract_hint.setText(f'已匹配 {len(matches)} 个常用月份，可用上下键或点击下拉选择。')
-            if popup or (self.fields['code'].hasFocus() and resolved is None):
+            if from_catalog:
+                self.contract_hint.setText(f'找到 {len(matches)} 个可选合约，可用上下键选择并按 Enter 确认。')
+            else:
+                self.contract_hint.setText(f'已匹配 {len(matches)} 个常用月份，可用上下键或点击下拉选择。')
+            if popup or self.fields['code'].hasFocus():
                 self._catalog_completer.setCompletionPrefix('')
                 self._catalog_completer.complete()
-        elif resolved is None and text.strip() and self._contract_catalog:
-            self.contract_hint.setText('当前目录没有匹配合约；可继续输入或手动填写完整代码。')
-        elif resolved is None and text.strip() and self._catalog_loading:
-            self.contract_hint.setText('正在加载可选期货合约；也可以直接输入完整合约代码。')
+        else:
+            self._catalog_completer.popup().hide()
+            if text.strip() and self._contract_catalog:
+                self.contract_hint.setText('当前目录没有匹配合约；可继续输入或手动填写完整代码。')
+            elif text.strip() and self._catalog_loading:
+                self.contract_hint.setText('正在加载可选期货合约；也可以直接输入完整合约代码。')
 
     def _sync_contract(self):
         try: code = resolve_contract(self.fields['code'].text().strip())
