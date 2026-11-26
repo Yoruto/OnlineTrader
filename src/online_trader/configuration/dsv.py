@@ -71,7 +71,7 @@ _DSV_DEFAULT_TRADE = {
     "live_daily_loss_limit": 5000, "live_first_one_lot": False, "half_close_ratio": 0.5,
     "manual_tp_drop_ratio": 0.1, "month_stop_days": 4, "night_session_close": "23:00",
     "holidays": [], "entry_slip_ratio": 0.03, "chase_window_minutes": 1, "no_chase_tolerance": 1,
-    "no_open_before_close_minutes": 10, "no_open_after_open": True, "no_open_after_open_minutes": 5,
+    "no_open_before_close_minutes": 10, "no_open_after_open": False, "no_open_after_open_minutes": 5,
     "open_jump_block_ratio": 0.8, "hysteresis_points": 0, "half_stage2": False,
     "half_stage2_trigger_ratio": 0.6, "half_breakeven": False, "total_margin_cap": 0.7,
     "position_sync_seconds": 2, "participate_auction": False, "close_price_mode": "对手价",
@@ -293,8 +293,6 @@ def _dsv_saved_settings(source):
     chase = trade.get("chase_slip_ratio")
     if type(chase) in {int, float, Decimal} and abs(Decimal(str(chase)) - Decimal("0.03")) < Decimal("1e-9") and not chase_migrated:
         trade["chase_slip_ratio"] = 0.05
-    if trade.get("no_open_after_open") is False and not trade.pop("no_open_migrated", False):
-        trade["no_open_after_open"] = True
     trade.pop("no_open_migrated", None)
     if trade.get("half_pullback_close") is True and not trade.pop("half_pullback_migrated", False):
         trade["half_pullback_close"] = False

@@ -19,6 +19,10 @@
 - **固定样本行为**：在固定回放样本中，第 7 轮锁定原 5 手开仓目标，当已证实成交 3 手时继续按剩余 2 手补开；第 9 轮在剩余 2 手成交后保留 5 手实际仓位，不产生额外反向平仓。
 - **范围限制**：该批准仅适用于慢部分成交核对，**不自动批准**其他未确认的月停跨日或重启偏差。
 
+### 集合竞价过滤不拦截连续交易首分钟与默认关闭开盘后禁开
+- **批准依据**：2026-11-26 用户确认移除 `participate_auction=False` 对连续交易首分钟（`09:00:00–09:00:59` 与 `21:00:00–21:00:59`）的 `AUCTION_DISABLED` 拦截，使其仅作用于集合竞价窗口（`08:55–08:59` / `20:55–20:59` 及物理 `AUCTION_ORDERING`/`AUCTION_MATCH` 阶段）；同时将默认配置中的 `no_open_after_open`（开盘后禁开）改为默认关闭（`False`），不再在导入旧配置时强制改回 `True`。
+- **同步范围**：Standalone 运行时策略判定（`dsv_core/transition.py`）、启动目标推断（`dsv_runtime/startup_inference.py`）与默认配置（`configuration/dsv.py`）保持一致；历史冻结基准文件（`resources/dsv-baseline-20261109.json`）、开盘首分钟跳空日停、首分钟滞回与物理市场权限门禁保持不变；Legacy 路径不作改动。打包交付时随包 `OnlineTrader-parameters.json` 应同步保持 `no_open_after_open: false`。
+
 ---
 
 ## 3. 核心策略规则摘要

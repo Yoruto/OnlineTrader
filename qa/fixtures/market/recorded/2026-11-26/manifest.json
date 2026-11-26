@@ -1,0 +1,1096 @@
+{
+  "schema_version": "MARKET_REPLAY_FIXTURE/1",
+  "dataset_id": "ot-market-2026-11-26-6contracts-recorded",
+  "trading_day": "2026-11-26",
+  "contracts": [
+    "CZCE.OI701",
+    "DCE.l2701",
+    "DCE.p2701",
+    "SHFE.ag2612",
+    "SHFE.ag2702",
+    "SHFE.bu2701"
+  ],
+  "database_file": "market_fixture.sqlite3",
+  "database_size_bytes": 35274752,
+  "database_sha256": "53c29e04f298bd44a6ac6a6897ad8fc48c8d72d047ff28890e6ab24510bb5f0d",
+  "source": {
+    "provider": "TqSdk live recorder (user desktop data)",
+    "method": "import_recording",
+    "raw_tick_count": 147945,
+    "kept_tick_count": 147936,
+    "dropped_duplicate": 0,
+    "dropped_out_of_window": 9,
+    "dropped_unknown_symbol": 0,
+    "input_files": [
+      {
+        "file": "2026-11-26.meta.jsonl",
+        "size_bytes": 100309346,
+        "sha256": "5d7973c9fb519383e5a293617da644340cbaebe0f9a0615da4525f0dbb9d8f81",
+        "line_count": 342874
+      },
+      {
+        "file": "2026-11-26.ticks.jsonl",
+        "size_bytes": 102409766,
+        "sha256": "db3dbb1971325c775362e3158219615cf2696578923f9a1aaa0b298ef839408d",
+        "raw_tick_count": 147945
+      },
+      {
+        "file": "2026-11-26.quotes.jsonl",
+        "size_bytes": 114555639,
+        "sha256": "edd187f3f81cb3f366bf436b292aa763723ad44c81b6e0f4c260cd124df1e103",
+        "imported": false
+      }
+    ]
+  },
+  "coverage_scope": "PARTIAL_LIVE_CAPTURE",
+  "time_semantics": {
+    "source_timestamp_ns": "UTC epoch nanoseconds from exchange/TqSdk tick",
+    "received_at_ns": "Client UTC epoch nanoseconds recorded on live tick receipt",
+    "tie_break_order": "(source_timestamp_ns, source_sequence, symbol, input_order)"
+  },
+  "known_gaps": [
+    "Quote snapshot files (*.quotes.jsonl) are not part of MARKET_REPLAY_FIXTURE/1 and were not imported.",
+    "Partial live capture for 2026-11-26: last kept tick precedes final session close by more than 120s."
+  ],
+  "license_notice": "QA-only live recorded market fixture; contains zero user credentials, orders, or account ledgers.",
+  "table_counts": {
+    "market_ticks": 147936,
+    "market_klines": 4713,
+    "instruments": 6,
+    "trading_sessions": 24
+  },
+  "kline_counts": {
+    "CZCE.OI701": {
+      "60": 594,
+      "86400": 121
+    },
+    "DCE.l2701": {
+      "60": 595,
+      "86400": 121
+    },
+    "DCE.p2701": {
+      "60": 595,
+      "86400": 121
+    },
+    "SHFE.ag2612": {
+      "60": 805,
+      "86400": 121
+    },
+    "SHFE.ag2702": {
+      "60": 805,
+      "86400": 121
+    },
+    "SHFE.bu2701": {
+      "60": 593,
+      "86400": 121
+    }
+  },
+  "depth_report": {
+    "CZCE.OI701": {
+      "row_count": 15814,
+      "depth_capability": "ONE_LEVEL_ONLY",
+      "sides": {
+        "bid": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 15741,
+            "valid_volume_count": 15741,
+            "valid_pair_count": 15741,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 73,
+            "valid_pair_ratio": 0.995384,
+            "classification": "PARTIAL"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 15814,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 15814,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 15814,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 15814,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          }
+        },
+        "ask": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 15741,
+            "valid_volume_count": 15741,
+            "valid_pair_count": 15741,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 73,
+            "valid_pair_ratio": 0.995384,
+            "classification": "PARTIAL"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 15814,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 15814,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 15814,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 15814,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          }
+        }
+      }
+    },
+    "DCE.l2701": {
+      "row_count": 16616,
+      "depth_capability": "ONE_LEVEL_ONLY",
+      "sides": {
+        "bid": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 16616,
+            "valid_volume_count": 16616,
+            "valid_pair_count": 16616,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16616,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16616,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16616,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16616,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          }
+        },
+        "ask": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 16616,
+            "valid_volume_count": 16616,
+            "valid_pair_count": 16616,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16616,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16616,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16616,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16616,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          }
+        }
+      }
+    },
+    "DCE.p2701": {
+      "row_count": 16514,
+      "depth_capability": "ONE_LEVEL_ONLY",
+      "sides": {
+        "bid": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 16514,
+            "valid_volume_count": 16514,
+            "valid_pair_count": 16514,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16514,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16514,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16514,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16514,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          }
+        },
+        "ask": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 16514,
+            "valid_volume_count": 16514,
+            "valid_pair_count": 16514,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16514,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16514,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16514,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 0,
+            "valid_volume_count": 0,
+            "valid_pair_count": 0,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 16514,
+            "valid_pair_ratio": 0.0,
+            "classification": "NOT_PROVIDED_OR_EMPTY"
+          }
+        }
+      }
+    },
+    "SHFE.ag2612": {
+      "row_count": 40505,
+      "depth_capability": "FIVE_LEVEL",
+      "sides": {
+        "bid": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 40505,
+            "valid_volume_count": 40505,
+            "valid_pair_count": 40505,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 40505,
+            "valid_volume_count": 40505,
+            "valid_pair_count": 40505,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 40505,
+            "valid_volume_count": 40505,
+            "valid_pair_count": 40505,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 40505,
+            "valid_volume_count": 40505,
+            "valid_pair_count": 40505,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 40505,
+            "valid_volume_count": 40505,
+            "valid_pair_count": 40505,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          }
+        },
+        "ask": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 40505,
+            "valid_volume_count": 40505,
+            "valid_pair_count": 40505,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 40505,
+            "valid_volume_count": 40505,
+            "valid_pair_count": 40505,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 40505,
+            "valid_volume_count": 40505,
+            "valid_pair_count": 40505,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 40505,
+            "valid_volume_count": 40505,
+            "valid_pair_count": 40505,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 40505,
+            "valid_volume_count": 40505,
+            "valid_pair_count": 40505,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          }
+        }
+      }
+    },
+    "SHFE.ag2702": {
+      "row_count": 41856,
+      "depth_capability": "FIVE_LEVEL",
+      "sides": {
+        "bid": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 41856,
+            "valid_volume_count": 41856,
+            "valid_pair_count": 41856,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 41856,
+            "valid_volume_count": 41856,
+            "valid_pair_count": 41856,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 41856,
+            "valid_volume_count": 41856,
+            "valid_pair_count": 41856,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 41856,
+            "valid_volume_count": 41856,
+            "valid_pair_count": 41856,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 41856,
+            "valid_volume_count": 41856,
+            "valid_pair_count": 41856,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          }
+        },
+        "ask": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 41856,
+            "valid_volume_count": 41856,
+            "valid_pair_count": 41856,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 41856,
+            "valid_volume_count": 41856,
+            "valid_pair_count": 41856,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 41856,
+            "valid_volume_count": 41856,
+            "valid_pair_count": 41856,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 41856,
+            "valid_volume_count": 41856,
+            "valid_pair_count": 41856,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 41856,
+            "valid_volume_count": 41856,
+            "valid_pair_count": 41856,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          }
+        }
+      }
+    },
+    "SHFE.bu2701": {
+      "row_count": 16631,
+      "depth_capability": "FIVE_LEVEL",
+      "sides": {
+        "bid": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 16631,
+            "valid_volume_count": 16631,
+            "valid_pair_count": 16631,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 16631,
+            "valid_volume_count": 16631,
+            "valid_pair_count": 16631,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 16631,
+            "valid_volume_count": 16631,
+            "valid_pair_count": 16631,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 16631,
+            "valid_volume_count": 16631,
+            "valid_pair_count": 16631,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 16631,
+            "valid_volume_count": 16631,
+            "valid_pair_count": 16631,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          }
+        },
+        "ask": {
+          "L1": {
+            "field_exists": true,
+            "valid_price_count": 16631,
+            "valid_volume_count": 16631,
+            "valid_pair_count": 16631,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L2": {
+            "field_exists": true,
+            "valid_price_count": 16631,
+            "valid_volume_count": 16631,
+            "valid_pair_count": 16631,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L3": {
+            "field_exists": true,
+            "valid_price_count": 16631,
+            "valid_volume_count": 16631,
+            "valid_pair_count": 16631,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L4": {
+            "field_exists": true,
+            "valid_price_count": 16631,
+            "valid_volume_count": 16631,
+            "valid_pair_count": 16631,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          },
+          "L5": {
+            "field_exists": true,
+            "valid_price_count": 16631,
+            "valid_volume_count": 16631,
+            "valid_pair_count": 16631,
+            "zero_volume_with_price_count": 0,
+            "missing_count": 0,
+            "valid_pair_ratio": 1.0,
+            "classification": "COMPLETE"
+          }
+        }
+      }
+    }
+  },
+  "integrity_report": {
+    "CZCE.OI701": {
+      "row_count": 15814,
+      "first_utc": "2026-11-25T12:55:01Z",
+      "last_utc": "2026-11-26T01:18:46.000001Z",
+      "first_cst": "2026-11-25T20:55:01+08:00",
+      "last_cst": "2026-11-26T09:18:46.000001+08:00",
+      "duplicate_source_timestamps": 0,
+      "out_of_order_source_timestamps": 0,
+      "volume_regressions": 0,
+      "price_tick_errors": 0,
+      "crossed_l1_quotes": 0,
+      "outside_session_ticks": 74,
+      "in_session_gaps_over_threshold": [],
+      "sessions": {
+        "2026-11-26-night-0": {
+          "session_kind": "night",
+          "open_utc": "2026-11-25T13:00:00Z",
+          "close_utc": "2026-11-25T15:00:00Z",
+          "row_count": 13542,
+          "first_utc": "2026-11-25T13:00:00.000001Z",
+          "last_utc": "2026-11-25T14:59:59.000002Z",
+          "first_cst": "2026-11-25T21:00:00.000001+08:00",
+          "last_cst": "2026-11-25T22:59:59.000002+08:00"
+        },
+        "2026-11-26-day-1": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T01:00:00Z",
+          "close_utc": "2026-11-26T02:15:00Z",
+          "row_count": 2198,
+          "first_utc": "2026-11-26T01:00:00Z",
+          "last_utc": "2026-11-26T01:18:46.000001Z",
+          "first_cst": "2026-11-26T09:00:00+08:00",
+          "last_cst": "2026-11-26T09:18:46.000001+08:00"
+        },
+        "2026-11-26-day-2": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T02:30:00Z",
+          "close_utc": "2026-11-26T03:30:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        },
+        "2026-11-26-day-3": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T05:30:00Z",
+          "close_utc": "2026-11-26T07:00:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        }
+      }
+    },
+    "DCE.l2701": {
+      "row_count": 16616,
+      "first_utc": "2026-11-25T12:59:00.027000Z",
+      "last_utc": "2026-11-26T01:18:46.691000Z",
+      "first_cst": "2026-11-25T20:59:00.027000+08:00",
+      "last_cst": "2026-11-26T09:18:46.691000+08:00",
+      "duplicate_source_timestamps": 0,
+      "out_of_order_source_timestamps": 0,
+      "volume_regressions": 0,
+      "price_tick_errors": 0,
+      "crossed_l1_quotes": 0,
+      "outside_session_ticks": 2,
+      "in_session_gaps_over_threshold": [],
+      "sessions": {
+        "2026-11-26-night-0": {
+          "session_kind": "night",
+          "open_utc": "2026-11-25T13:00:00Z",
+          "close_utc": "2026-11-25T15:00:00Z",
+          "row_count": 14360,
+          "first_utc": "2026-11-25T13:00:00.327008Z",
+          "last_utc": "2026-11-25T14:59:59.975001Z",
+          "first_cst": "2026-11-25T21:00:00.327008+08:00",
+          "last_cst": "2026-11-25T22:59:59.975001+08:00"
+        },
+        "2026-11-26-day-1": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T01:00:00Z",
+          "close_utc": "2026-11-26T02:15:00Z",
+          "row_count": 2254,
+          "first_utc": "2026-11-26T01:00:00.168003Z",
+          "last_utc": "2026-11-26T01:18:46.691000Z",
+          "first_cst": "2026-11-26T09:00:00.168003+08:00",
+          "last_cst": "2026-11-26T09:18:46.691000+08:00"
+        },
+        "2026-11-26-day-2": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T02:30:00Z",
+          "close_utc": "2026-11-26T03:30:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        },
+        "2026-11-26-day-3": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T05:30:00Z",
+          "close_utc": "2026-11-26T07:00:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        }
+      }
+    },
+    "DCE.p2701": {
+      "row_count": 16514,
+      "first_utc": "2026-11-25T12:59:00.027000Z",
+      "last_utc": "2026-11-26T01:18:46.691000Z",
+      "first_cst": "2026-11-25T20:59:00.027000+08:00",
+      "last_cst": "2026-11-26T09:18:46.691000+08:00",
+      "duplicate_source_timestamps": 0,
+      "out_of_order_source_timestamps": 0,
+      "volume_regressions": 0,
+      "price_tick_errors": 0,
+      "crossed_l1_quotes": 0,
+      "outside_session_ticks": 2,
+      "in_session_gaps_over_threshold": [],
+      "sessions": {
+        "2026-11-26-night-0": {
+          "session_kind": "night",
+          "open_utc": "2026-11-25T13:00:00Z",
+          "close_utc": "2026-11-25T15:00:00Z",
+          "row_count": 14264,
+          "first_utc": "2026-11-25T13:00:00.327012Z",
+          "last_utc": "2026-11-25T14:59:59.975001Z",
+          "first_cst": "2026-11-25T21:00:00.327012+08:00",
+          "last_cst": "2026-11-25T22:59:59.975001+08:00"
+        },
+        "2026-11-26-day-1": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T01:00:00Z",
+          "close_utc": "2026-11-26T02:15:00Z",
+          "row_count": 2248,
+          "first_utc": "2026-11-26T01:00:00.168003Z",
+          "last_utc": "2026-11-26T01:18:46.691000Z",
+          "first_cst": "2026-11-26T09:00:00.168003+08:00",
+          "last_cst": "2026-11-26T09:18:46.691000+08:00"
+        },
+        "2026-11-26-day-2": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T02:30:00Z",
+          "close_utc": "2026-11-26T03:30:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        },
+        "2026-11-26-day-3": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T05:30:00Z",
+          "close_utc": "2026-11-26T07:00:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        }
+      }
+    },
+    "SHFE.ag2612": {
+      "row_count": 40505,
+      "first_utc": "2026-11-25T12:59:00.500000Z",
+      "last_utc": "2026-11-26T01:18:46.500000Z",
+      "first_cst": "2026-11-25T20:59:00.500000+08:00",
+      "last_cst": "2026-11-26T09:18:46.500000+08:00",
+      "duplicate_source_timestamps": 0,
+      "out_of_order_source_timestamps": 0,
+      "volume_regressions": 0,
+      "price_tick_errors": 0,
+      "crossed_l1_quotes": 0,
+      "outside_session_ticks": 2,
+      "in_session_gaps_over_threshold": [],
+      "sessions": {
+        "2026-11-26-night-0": {
+          "session_kind": "night",
+          "open_utc": "2026-11-25T13:00:00Z",
+          "close_utc": "2026-11-25T18:30:00Z",
+          "row_count": 38251,
+          "first_utc": "2026-11-25T13:00:00.500000Z",
+          "last_utc": "2026-11-25T18:29:59.500002Z",
+          "first_cst": "2026-11-25T21:00:00.500000+08:00",
+          "last_cst": "2026-11-26T02:29:59.500002+08:00"
+        },
+        "2026-11-26-day-1": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T01:00:00Z",
+          "close_utc": "2026-11-26T02:15:00Z",
+          "row_count": 2252,
+          "first_utc": "2026-11-26T01:00:00.500000Z",
+          "last_utc": "2026-11-26T01:18:46.500000Z",
+          "first_cst": "2026-11-26T09:00:00.500000+08:00",
+          "last_cst": "2026-11-26T09:18:46.500000+08:00"
+        },
+        "2026-11-26-day-2": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T02:30:00Z",
+          "close_utc": "2026-11-26T03:30:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        },
+        "2026-11-26-day-3": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T05:30:00Z",
+          "close_utc": "2026-11-26T07:00:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        }
+      }
+    },
+    "SHFE.ag2702": {
+      "row_count": 41856,
+      "first_utc": "2026-11-25T12:59:00.500000Z",
+      "last_utc": "2026-11-26T01:18:46.500000Z",
+      "first_cst": "2026-11-25T20:59:00.500000+08:00",
+      "last_cst": "2026-11-26T09:18:46.500000+08:00",
+      "duplicate_source_timestamps": 0,
+      "out_of_order_source_timestamps": 0,
+      "volume_regressions": 0,
+      "price_tick_errors": 0,
+      "crossed_l1_quotes": 0,
+      "outside_session_ticks": 2,
+      "in_session_gaps_over_threshold": [],
+      "sessions": {
+        "2026-11-26-night-0": {
+          "session_kind": "night",
+          "open_utc": "2026-11-25T13:00:00Z",
+          "close_utc": "2026-11-25T18:30:00Z",
+          "row_count": 39601,
+          "first_utc": "2026-11-25T13:00:00.500001Z",
+          "last_utc": "2026-11-25T18:29:59.500002Z",
+          "first_cst": "2026-11-25T21:00:00.500001+08:00",
+          "last_cst": "2026-11-26T02:29:59.500002+08:00"
+        },
+        "2026-11-26-day-1": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T01:00:00Z",
+          "close_utc": "2026-11-26T02:15:00Z",
+          "row_count": 2253,
+          "first_utc": "2026-11-26T01:00:00.500000Z",
+          "last_utc": "2026-11-26T01:18:46.500000Z",
+          "first_cst": "2026-11-26T09:00:00.500000+08:00",
+          "last_cst": "2026-11-26T09:18:46.500000+08:00"
+        },
+        "2026-11-26-day-2": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T02:30:00Z",
+          "close_utc": "2026-11-26T03:30:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        },
+        "2026-11-26-day-3": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T05:30:00Z",
+          "close_utc": "2026-11-26T07:00:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        }
+      }
+    },
+    "SHFE.bu2701": {
+      "row_count": 16631,
+      "first_utc": "2026-11-25T12:59:00.500000Z",
+      "last_utc": "2026-11-26T01:18:46.500000Z",
+      "first_cst": "2026-11-25T20:59:00.500000+08:00",
+      "last_cst": "2026-11-26T09:18:46.500000+08:00",
+      "duplicate_source_timestamps": 0,
+      "out_of_order_source_timestamps": 0,
+      "volume_regressions": 0,
+      "price_tick_errors": 0,
+      "crossed_l1_quotes": 0,
+      "outside_session_ticks": 2,
+      "in_session_gaps_over_threshold": [],
+      "sessions": {
+        "2026-11-26-night-0": {
+          "session_kind": "night",
+          "open_utc": "2026-11-25T13:00:00Z",
+          "close_utc": "2026-11-25T15:00:00Z",
+          "row_count": 14376,
+          "first_utc": "2026-11-25T13:00:00.500005Z",
+          "last_utc": "2026-11-25T14:59:59.500002Z",
+          "first_cst": "2026-11-25T21:00:00.500005+08:00",
+          "last_cst": "2026-11-25T22:59:59.500002+08:00"
+        },
+        "2026-11-26-day-1": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T01:00:00Z",
+          "close_utc": "2026-11-26T02:15:00Z",
+          "row_count": 2253,
+          "first_utc": "2026-11-26T01:00:00.500000Z",
+          "last_utc": "2026-11-26T01:18:46.500000Z",
+          "first_cst": "2026-11-26T09:00:00.500000+08:00",
+          "last_cst": "2026-11-26T09:18:46.500000+08:00"
+        },
+        "2026-11-26-day-2": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T02:30:00Z",
+          "close_utc": "2026-11-26T03:30:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        },
+        "2026-11-26-day-3": {
+          "session_kind": "day",
+          "open_utc": "2026-11-26T05:30:00Z",
+          "close_utc": "2026-11-26T07:00:00Z",
+          "row_count": 0,
+          "first_utc": null,
+          "last_utc": null,
+          "first_cst": null,
+          "last_cst": null
+        }
+      }
+    }
+  },
+  "warnings": [
+    "CZCE.OI701: 74 ticks outside configured trading_sessions",
+    "DCE.l2701: 2 ticks outside configured trading_sessions",
+    "DCE.p2701: 2 ticks outside configured trading_sessions",
+    "SHFE.ag2612: 2 ticks outside configured trading_sessions",
+    "SHFE.ag2702: 2 ticks outside configured trading_sessions",
+    "SHFE.bu2701: 2 ticks outside configured trading_sessions"
+  ]
+}

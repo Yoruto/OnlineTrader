@@ -622,6 +622,175 @@ class UnfilledOrderStallTests(unittest.TestCase):
         p_cycles = [r for r in batch['records'] if r['record_type'] == 'CYCLE' and r['contract_id'] == 'DCE.p2701']
         self.assertEqual(p_cycles[0]['protection_quality'], 'UNKNOWN')
 
+    def test_11_cancel_exhausted_long_period_recovery_probe(self):
+        broker, port, session = self._make_session(
+            'cancel-long-recover', contracts=('DCE.p2701',), entry_confirm_timeout=10
+        )
+        session.command({'id': 'cmd-start', 'action': 'START'})
+
+        f1 = broker.prepare_frame(wall_time=f'{DAY}T01:10:00Z', monotonic_ms=1000, last='1055', candle_id='bar-1')
+        session.apply_round(f1)
+        broker.acknowledge_frame(f1['id'])
+
+        f2 = broker.prepare_frame(wall_time=f'{DAY}T01:10:05Z', monotonic_ms=6000, last='1061', candle_id='bar-1')
+        session.apply_round(f2)
+        broker.acknowledge_frame(f2['id'])
+        p_child = port.orders[0]['child_order_id']
+        broker.accept_order(p_child)
+
+        # Exhaust initial 4 rapid cancel retries within 25s.
+        base_dt = datetime.fromisoformat(f'{DAY}T01:10:20+00:00')
+        for i in range(6):
+            fk = broker.prepare_frame(
+                wall_time=(base_dt + timedelta(seconds=i * 6)).isoformat().replace('+00:00', 'Z'),
+                monotonic_ms=21000 + i * 6000,
+                last='1061',
+                candle_id='bar-1',
+            )
+            session.apply_round(fk)
+            broker.acknowledge_frame(fk['id'])
+        self.assertEqual(len(port.cancellations), 4)
+        self.assertEqual(session.snapshot()['orders'][p_child]['cancel_status'], 'CALL_RETURNED')
+
+        # 10 minutes later, connection is healthy and order is still ALIVE -> slow recovery probe fires (5th cancel).
+        later_dt = base_dt + timedelta(minutes=10)
+        f_recover = broker.prepare_frame(
+            wall_time=later_dt.isoformat().replace('+00:00', 'Z'),
+            monotonic_ms=21000 + 600_000,
+            last='1061',
+            candle_id='bar-1',
+        )
+        session.apply_round(f_recover)
+        broker.acknowledge_frame(f_recover['id'])
+        self.assertEqual(len(port.cancellations), 5)
+        self.assertEqual(session.snapshot()['orders'][p_child]['cancel_attempt'], 5)
+        self.assertEqual(session.snapshot()['orders'][p_child]['cancel_status'], 'CALL_RETURNED')
+
+        # Broker now confirms cancellation -> order terminates cleanly.
+        f_done = broker.prepare_frame(
+            wall_time=(later_dt + timedelta(seconds=2)).isoformat().replace('+00:00', 'Z'),
+            monotonic_ms=21000 + 602_000,
+            last='1061',
+            candle_id='bar-1',
+        )
+        f_done['native'].append({
+            'kind': 'ORDER',
+            'child_order_id': p_child,
+            'native_order_id': broker.orders[p_child]['native_order_id'],
+            'status': 'CANCELLED',
+            'filled_qty': 0,
+        })
+        session.apply_round(f_done)
+        broker.acknowledge_frame(f_done['id'])
+        self.assertTrue(session.snapshot()['orders'][p_child]['terminal_confirmed'])
+
+    def test_12_limit_locked_main_exit_queues_without_reprice_churn(self):
+        broker, port, session = self._make_session('limit-lock-exit', contracts=('DCE.p2701',))
+        session.command({'id': 'cmd-start', 'action': 'START'})
+
+        f1 = broker.prepare_frame(wall_time=f'{DAY}T01:10:00Z', monotonic_ms=1000, last='1055', candle_id='bar-1')
+        session.apply_round(f1)
+        broker.acknowledge_frame(f1['id'])
+
+        f2 = broker.prepare_frame(wall_time=f'{DAY}T01:10:05Z', monotonic_ms=6000, last='1061', candle_id='bar-1')
+        session.apply_round(f2)
+        broker.acknowledge_frame(f2['id'])
+        p_child = port.orders[0]['child_order_id']
+        broker.accept_order(p_child)
+        broker.fill(p_child, 5, '1061')
+
+        f3 = broker.prepare_frame(wall_time=f'{DAY}T01:10:06Z', monotonic_ms=7000, last='1061', candle_id='bar-1')
+        session.apply_round(f3)
+        broker.acknowledge_frame(f3['id'])
+        self.assertEqual(session.snapshot()['symbols']['DCE.p2701']['position']['owned'], 5)
+
+        # Price crashes to limit-down (900) with bid1=None -> stop-loss queues 1 SELL order at 900.
+        def _limit_down_frame(sec, mono_ms):
+            frm = broker.prepare_frame(
+                wall_time=f'{DAY}T01:11:{sec:02d}Z', monotonic_ms=mono_ms, last='900', candle_id='bar-2'
+            )
+            for mkt in frm['market']:
+                for tick in mkt['ticks']:
+                    tick['last'] = '900'
+                    tick['bid1'] = None
+                    tick['ask1'] = '900'
+                    tick['lower_limit'] = '900'
+                    tick['upper_limit'] = '1200'
+            return frm
+
+        f4 = _limit_down_frame(0, 60000)
+        session.apply_round(f4)
+        broker.acknowledge_frame(f4['id'])
+        reduce_orders = [o for o in port.orders if o['native_offset'] != 'OPEN']
+        self.assertEqual(len(reduce_orders), 1)
+        self.assertEqual(reduce_orders[0]['limit_price'], '900')
+        exit_child = reduce_orders[0]['child_order_id']
+        broker.accept_order(exit_child)
+
+        # 20 consecutive limit-down frames: MUST NOT cancel/reprice or send duplicate exit orders.
+        for i in range(1, 21):
+            fk = _limit_down_frame(i, 60000 + i * 1000)
+            session.apply_round(fk)
+            broker.acknowledge_frame(fk['id'])
+        self.assertEqual(len([o for o in port.orders if o['native_offset'] != 'OPEN']), 1)
+        self.assertEqual(len(port.cancellations), 0)
+        self.assertEqual(session.snapshot()['symbols']['DCE.p2701']['position']['exit_target'], 0)
+
+        # Limit-down opens and queued exit fills -> position closes cleanly.
+        broker.fill(exit_child, 5, '900')
+        f_open = broker.prepare_frame(wall_time=f'{DAY}T01:12:00Z', monotonic_ms=120000, last='905', candle_id='bar-2')
+        session.apply_round(f_open)
+        broker.acknowledge_frame(f_open['id'])
+        self.assertIsNone(session.snapshot()['symbols']['DCE.p2701']['position'])
+
+    def test_13_unknown_send_disconnect_and_stop_preserves_capacity_without_duplicate(self):
+        broker, port, session = self._make_session('unknown-stop-combo', contracts=('DCE.p2701', 'DCE.m2701'))
+        session.command({'id': 'cmd-start', 'action': 'START'})
+
+        f1 = broker.prepare_frame(wall_time=f'{DAY}T01:10:00Z', monotonic_ms=1000, last='1055', candle_id='bar-1')
+        session.apply_round(f1)
+        broker.acknowledge_frame(f1['id'])
+
+        # Simulate UNKNOWN send result on DCE.p2701 while DCE.m2701 sends normally.
+        orig_send = port.send
+
+        def _flaky_send(req):
+            if req['contract_id'] == 'DCE.p2701':
+                orig_send(req)
+                raise OSError('network drop during send')
+            return orig_send(req)
+
+        port.send = _flaky_send
+        f2 = broker.prepare_frame(wall_time=f'{DAY}T01:10:05Z', monotonic_ms=6000, last='1061', candle_id='bar-1')
+        session.apply_round(f2)
+        broker.acknowledge_frame(f2['id'])
+        port.send = orig_send
+
+        by_contract = {o['contract_id']: o['child_order_id'] for o in port.orders}
+        p_child, m_child = by_contract['DCE.p2701'], by_contract['DCE.m2701']
+        self.assertEqual(session.snapshot()['orders'][p_child]['send_state'], 'UNKNOWN')
+
+        # Disconnect + operator clicks STOP while send result is UNKNOWN.
+        session.disconnect(reason='NETWORK_OUTAGE')
+        session.command({'id': 'cmd-stop', 'action': 'STOP'})
+        self.assertFalse(session.snapshot()['running'])
+        self.assertEqual(len(port.orders), 2)
+
+        # Network recovers with burst of fills for both contracts -> reconciled without duplicate orders!
+        broker.accept_order(p_child)
+        broker.fill(p_child, 5, '1061')
+        broker.accept_order(m_child)
+        broker.fill(m_child, 5, '1061')
+        f3 = broker.prepare_frame(wall_time=f'{DAY}T01:10:15Z', monotonic_ms=16000, last='1061', candle_id='bar-1')
+        session.apply_round(f3)
+        broker.acknowledge_frame(f3['id'])
+
+        snap3 = session.snapshot()
+        self.assertTrue(snap3['synchronized'])
+        self.assertEqual(len(port.orders), 2)
+        self.assertEqual(snap3['symbols']['DCE.p2701']['position']['owned'], 5)
+        self.assertEqual(snap3['symbols']['DCE.m2701']['position']['owned'], 5)
+
 
 if __name__ == '__main__':
     unittest.main()

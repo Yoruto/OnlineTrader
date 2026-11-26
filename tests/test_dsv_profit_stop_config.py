@@ -9,8 +9,8 @@ from online_trader.contracts.codec import canonical_bytes
 from online_trader.errors import TraderError
 
 
-# Captured from 426ac0f before changing either the parser or the runner.
-EMPTY_SYMBOLS_BASELINE_HASH = '247857e6afee4c4b5d9d43102a94b07c71d161534bfc78209f90068281e4183a'
+# Captured for the current default trade settings (no_open_after_open=False).
+EMPTY_SYMBOLS_BASELINE_HASH = '1f0a68f9ba7ef23736f889eaf55a0fb1d5e2ae862d6bd95b4c6d1470fdf18431'
 
 
 def original(**trade):

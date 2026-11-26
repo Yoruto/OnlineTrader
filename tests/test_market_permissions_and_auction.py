@@ -724,7 +724,7 @@ class SdkAdapterAuctionAndPermissionsTests(unittest.TestCase):
         self.assertEqual({item['symbol'] for item in inserted}, {CONTRACT, 'SHFE.rb2701'})
         self.assertTrue(all(item['offset'] == 'CLOSE' for item in inserted))
 
-        # Fill both closes; Round 5 at 21:00:06 still inside AUCTION_DISABLED / OPENING_WAIT -> no ordinary OPEN!
+        # Fill both closes; Round 5 at 21:00:06 is continuous trading: OPENING_WAIT blocks entry, not AUCTION_DISABLED.
         positions[CONTRACT].pos_long = 0
         positions[CONTRACT].pos_long_his = 0
         positions['SHFE.rb2701'].pos_long = 0
@@ -747,7 +747,57 @@ class SdkAdapterAuctionAndPermissionsTests(unittest.TestCase):
         receipt = advance_step(datetime(2026, 11, 12, 13, 0, 6, tzinfo=timezone.utc))
         self.assertEqual(len(inserted), 2)
         reasons = [d['reason'] for d in receipt['decisions'] if d.get('contract_id') == CONTRACT]
-        self.assertIn('AUCTION_DISABLED', reasons)
+        self.assertIn('OPENING_WAIT', reasons)
+        self.assertNotIn('AUCTION_DISABLED', reasons)
+
+    def test_first_minute_continuous_entry_allowed_when_opening_wait_disabled(self):
+        t_2059 = datetime(2026, 11, 12, 12, 59, 30, tzinfo=timezone.utc)
+        t_2100 = datetime(2026, 11, 12, 13, 0, 5, tzinfo=timezone.utc)
+        bar_ns = int(t_2100.timestamp()) * 1_000_000_000
+        quotes = {
+            CONTRACT: SimpleNamespace(
+                instrument_id=CONTRACT, expired=False, ins_class='FUTURE', volume_multiple=10,
+                trading_time={'day': [['09:00:00', '10:15:00']], 'night': [['21:00:00', '23:00:00']]},
+                datetime='2026-11-12 20:59:30.000000', last_price=1062.0, highest=1062.0, lowest=1020.0,
+                bid_price1=1061.0, ask_price1=1062.0, price_tick=1.0, lower_limit=950.0, upper_limit=1150.0, margin=4000.0,
+            ),
+        }
+        positions = {
+            CONTRACT: SimpleNamespace(pos_long=0, pos_short=0, pos_long_today=0, pos_long_his=0, pos_short_today=0, pos_short_his=0, margin=0.0),
+        }
+        orders, trades = {}, {}
+        serials = {
+            CONTRACT: _make_serial([{'datetime': bar_ns, 'open': 1050.0, 'high': 1062.0, 'low': 1020.0, 'close': 1062.0}]),
+        }
+        clock_state = [t_2059, 1000]
+
+        adapter, session, inserted, _cancelled, _orig_cal_hash = self._harness(
+            quotes=quotes, positions=positions, orders=orders, trades=trades, serials=serials,
+            clock_times=[t_2059],
+            participate_auction=False, no_open_after_open=False,
+            get_trading_status=None,
+            clock_fn=lambda: (clock_state[0], clock_state[1]),
+        )
+        adapter.step(session, trading_day=DAY, complete=True)
+        session.command({'id': 'cmd-arm-first-min-open', 'action': 'START'})
+        # Still in auction at 20:59:30 -> blocked
+        adapter.step(session, trading_day=DAY, complete=True)
+        self.assertEqual(inserted, [])
+
+        # Advance cleanly without triggering OWNER_SCHEDULING_GAP into continuous trading at 21:00:05
+        while clock_state[0] < t_2100:
+            delta_s = min(10, int((t_2100 - clock_state[0]).total_seconds()))
+            clock_state[0] = clock_state[0] + timedelta(seconds=delta_s)
+            clock_state[1] += delta_s * 1000
+            if clock_state[0] < t_2100:
+                adapter.step(session, trading_day=DAY, complete=True)
+        quotes[CONTRACT].datetime = '2026-11-12 21:00:05.000000'
+        receipt = adapter.step(session, trading_day=DAY, complete=True)
+        reasons = [d['reason'] for d in receipt['decisions'] if d.get('contract_id') == CONTRACT]
+        self.assertNotIn('AUCTION_DISABLED', reasons)
+        self.assertEqual(len(inserted), 1)
+        self.assertEqual(inserted[0]['offset'], 'OPEN')
+        self.assertEqual(inserted[0]['direction'], 'BUY')
 
     def test_presend_and_precancel_market_phase_guard_never_consumes_cancel_budget(self):
         t_2056 = datetime(2026, 11, 12, 12, 56, 0, tzinfo=timezone.utc)
@@ -1051,3 +1101,86 @@ class NativeFactDeadlockAndToleranceTests(unittest.TestCase):
         self.assertIsNone(snap_after['owner_fault_code'])
         self.assertIsNone(snap_after['owner_fault_detail'])
         self.assertFalse(snap_after['running'])
+
+    def test_broker_phase_rejection_backoff_ignores_tick_churn_and_preserves_exit_retry_budget(self):
+        from online_trader.dsv_runtime.controller import ExplicitOrderController
+        from online_trader.dsv_runtime.order_diagnostics import classify_broker_rejection
+        from online_trader.dsv_runtime.sdk_adapter import DsvSdkAdapter, NS_PER_SECOND
+
+        # 1) Halt / non-continuous broker rejections classify as TRANSIENT / BROKER_MARKET_PHASE.
+        for msg in ('交易所暂停交易', '当前合约已停牌', '非连续交易时段禁止报单', 'Market halted'):
+            self.assertEqual(classify_broker_rejection(msg), ('TRANSIENT', 'BROKER_MARKET_PHASE'))
+
+        # 2) Progressive backoff (5s -> 15s -> 30s -> 60s) ignores tick timestamp churn during halt.
+        adapter = DsvSdkAdapter.__new__(DsvSdkAdapter)
+        adapter.quotes = {CONTRACT: SimpleNamespace(datetime='2026-11-12 21:05:00.000000')}
+        adapter._record_broker_phase_rejection(CONTRACT, '交易所暂停交易')
+        first_override = adapter._broker_phase_overrides[CONTRACT]
+        self.assertEqual(first_override['backoff_seconds'], 5)
+        t0 = first_override['recorded_mono_ns']
+        cal_cont = {'market_phase': 'CONTINUOUS', 'complete': True, 'is_trading': True}
+
+        # Tick timestamp changes 1s later -> override MUST stay active (no immediate retry storm).
+        adapter.quotes[CONTRACT] = SimpleNamespace(datetime='2026-11-12 21:05:01.000000')
+        active_1s = adapter._active_broker_phase_override(
+            CONTRACT, cal_cont, None, True, SimpleNamespace(monotonic=t0 + 1 * NS_PER_SECOND),
+        )
+        self.assertIsNotNone(active_1s)
+        self.assertEqual(active_1s['phase'], 'HALTED')
+
+        # After 5s backoff expires -> cleared for a single probe.
+        cleared_5s = adapter._active_broker_phase_override(
+            CONTRACT, cal_cont, None, True, SimpleNamespace(monotonic=t0 + 5 * NS_PER_SECOND),
+        )
+        self.assertIsNone(cleared_5s)
+
+        # Second consecutive rejection extends backoff to 15s.
+        adapter._record_broker_phase_rejection(CONTRACT, '交易所暂停交易')
+        second_override = adapter._broker_phase_overrides[CONTRACT]
+        self.assertEqual(second_override['backoff_seconds'], 15)
+        t1 = second_override['recorded_mono_ns']
+        self.assertIsNotNone(adapter._active_broker_phase_override(
+            CONTRACT, cal_cont, None, True, SimpleNamespace(monotonic=t1 + 10 * NS_PER_SECOND),
+        ))
+        # Explicit live_status == 'CONTINUOUS' clears immediately and resets backoff count.
+        self.assertIsNone(adapter._active_broker_phase_override(
+            CONTRACT, cal_cont, 'CONTINUOUS', True, SimpleNamespace(monotonic=t1 + 1 * NS_PER_SECOND),
+        ))
+        self.assertNotIn(CONTRACT, adapter._broker_phase_reject_counts)
+
+        # 3) Repeated BROKER_MARKET_PHASE exit rejections MUST NOT exhaust retry budget into manual takeover.
+        controller = ExplicitOrderController.__new__(ExplicitOrderController)
+        controller._diagnostics = None
+        position = {'id': 'pos-halt-1', 'consecutive_exit_rejections': 0}
+        market = {'tick': {
+            'native_time': '2026-11-12T13:05:10+00:00',
+            'bid1': '1050',
+            'ask1': '1051',
+            'last': '1050',
+        }}
+        for idx in range(25):
+            order = {
+                'contract_id': CONTRACT,
+                'child_order_id': f'c-halt-{idx}',
+                'effect': 'REDUCE',
+                'direction': 'SELL',
+                'send_state': 'CALL_RETURNED',
+                'terminal_confirmed': True,
+                'reported_fill_qty': 0,
+                'filled_qty': 0,
+                'broker_state': 'REJECTED',
+                'broker_rejection_category': 'TRANSIENT',
+                'broker_rejection_detail': 'BROKER_MARKET_PHASE',
+                'quote_at': '2026-11-12T13:05:00+00:00',
+            }
+            # First call records exit_failure_at and backs off for 5s.
+            self.assertFalse(controller._retry_broker_exit_failure(
+                position, order, market, newer_target=False, wall_time=1000.0 + idx * 10,
+            ))
+            self.assertEqual(position['consecutive_exit_rejections'], 0)
+            self.assertFalse(position.get('exit_manual_takeover'))
+            # After 5s with fresh quote, retry is allowed without tripping manual takeover.
+            self.assertTrue(controller._retry_broker_exit_failure(
+                position, order, market, newer_target=False, wall_time=1006.0 + idx * 10,
+            ))
+            self.assertFalse(position.get('exit_manual_takeover'))

@@ -1,0 +1,133 @@
+{
+  "trading_day": "2026-11-25",
+  "fixture_db": "E:\\online-trader\\qa\\fixtures\\market\\recorded\\2026-11-25\\market_fixture.sqlite3",
+  "window_utc": [
+    "2026-11-25T01:00:00Z",
+    "2026-11-25T03:30:00Z"
+  ],
+  "bucket_seconds": 5,
+  "rounds_replayed": 1620,
+  "contracts": [
+    "DCE.p2701",
+    "SHFE.ag2702",
+    "SHFE.bu2701"
+  ],
+  "offsets_by_contract": {
+    "DCE.p2701": {
+      "range_ticks": 144,
+      "open_offset": 95,
+      "stop_offset": 43,
+      "profit_offset": 86
+    },
+    "SHFE.ag2702": {
+      "range_ticks": 624,
+      "open_offset": 407,
+      "stop_offset": 187,
+      "profit_offset": 374
+    },
+    "SHFE.bu2701": {
+      "range_ticks": 136,
+      "open_offset": 90,
+      "stop_offset": 41,
+      "profit_offset": 82
+    }
+  },
+  "entry_count_by_contract": {
+    "DCE.p2701": 1,
+    "SHFE.ag2702": 0,
+    "SHFE.bu2701": 2
+  },
+  "close_count_by_contract": {
+    "DCE.p2701": 1,
+    "SHFE.ag2702": 0,
+    "SHFE.bu2701": 1
+  },
+  "total_opens": 3,
+  "total_closes": 2,
+  "realized_pnl_by_contract": {
+    "DCE.p2701": "820",
+    "SHFE.ag2702": "0",
+    "SHFE.bu2701": "-450"
+  },
+  "total_realized_pnl": "370",
+  "final_positions": {
+    "DCE.p2701": {
+      "long_today": 0,
+      "long_historical": 0,
+      "short_today": 0,
+      "short_historical": 0,
+      "long_qty": 0,
+      "short_qty": 0
+    },
+    "SHFE.ag2702": {
+      "long_today": 0,
+      "long_historical": 0,
+      "short_today": 0,
+      "short_historical": 0,
+      "long_qty": 0,
+      "short_qty": 0
+    },
+    "SHFE.bu2701": {
+      "long_today": 0,
+      "long_historical": 0,
+      "short_today": 1,
+      "short_historical": 0,
+      "long_qty": 0,
+      "short_qty": 1
+    }
+  },
+  "trades": [
+    {
+      "round_seq": 25,
+      "wall_time": "2026-11-25T01:02:05Z",
+      "contract_id": "DCE.p2701",
+      "action": "OPEN",
+      "direction": "SHORT",
+      "quantity": 1,
+      "price": "8351",
+      "reason": "ENTRY_TRIGGER"
+    },
+    {
+      "round_seq": 156,
+      "wall_time": "2026-11-25T01:13:00Z",
+      "contract_id": "SHFE.bu2701",
+      "action": "OPEN",
+      "direction": "LONG",
+      "quantity": 1,
+      "price": "4226",
+      "reason": "ENTRY_TRIGGER"
+    },
+    {
+      "round_seq": 549,
+      "wall_time": "2026-11-25T01:45:45Z",
+      "contract_id": "DCE.p2701",
+      "action": "CLOSE",
+      "direction": "SHORT",
+      "quantity": 1,
+      "price": "8269",
+      "reason": "TAKE_PROFIT",
+      "realized_pnl": "820"
+    },
+    {
+      "round_seq": 730,
+      "wall_time": "2026-11-25T02:00:50Z",
+      "contract_id": "SHFE.bu2701",
+      "action": "CLOSE",
+      "direction": "LONG",
+      "quantity": 1,
+      "price": "4181",
+      "reason": "STOP_LOSS",
+      "realized_pnl": "-450"
+    },
+    {
+      "round_seq": 744,
+      "wall_time": "2026-11-25T02:02:00Z",
+      "contract_id": "SHFE.bu2701",
+      "action": "OPEN",
+      "direction": "SHORT",
+      "quantity": 1,
+      "price": "4181",
+      "reason": "ENTRY_TRIGGER"
+    }
+  ]
+}

@@ -9,12 +9,15 @@ from pathlib import Path
 _LOGGER = logging.getLogger('online_trader.order_diagnostics')
 
 _TRANSIENT_RULES = (
+    (('集合竞价', '非连续交易', '撮合', '未开盘', '未开市', '休市', '停牌', '暂停交易',
+      '当前状态禁止', '当前时间禁止', 'non-continuous', 'auction', 'not trading',
+      'market closed', 'halted'), 'BROKER_MARKET_PHASE'),
     (('流控', '频率', '超速', 'throttle', 'rate limit', 'frequency'), 'BROKER_RATE_LIMITED'),
     (('繁忙', '排队', 'busy'), 'BROKER_BUSY'),
     (('未就绪', '尚未就绪', '未初始化', '正在初始化', 'not ready', 'initializing'), 'BROKER_NOT_READY'),
     (('断开', '断线', '未连接', 'disconnect', 'reconnect', '通信', '通讯', '网络'), 'BROKER_DISCONNECTED'),
     (('超时', 'timeout'), 'BROKER_TIMEOUT'),
-    (('集合竞价', '非连续交易', '暂停', 'temporar', 'try again', '重试', '稍后'), 'BROKER_TEMP_STATE'),
+    (('暂停', 'temporar', 'try again', '重试', '稍后'), 'BROKER_TEMP_STATE'),
 )
 
 _STRUCTURAL_RULES = (

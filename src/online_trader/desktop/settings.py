@@ -338,6 +338,18 @@ class SettingsDialog(QDialog):
         self.error_label.clear(); self._render()
         self.notice_label.setText("已恢复已确认DSV基准预览；运行参数与持仓计划未改变。")
 
+    def set_preview_profile(self, profile, *, emit_signal=True):
+        self._profile = profile
+        self.error_label.clear()
+        if emit_signal:
+            self._render()
+        else:
+            blocked = self.blockSignals(True)
+            try:
+                self._render()
+            finally:
+                self.blockSignals(blocked)
+
     def apply_edited_preview(self, candidate, *, expected_hash):
         from online_trader.configuration.dsv import DsvProfile
         if self._profile.content_hash != expected_hash: return self._failure("E_CONFIG_CONFLICT")

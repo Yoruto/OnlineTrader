@@ -1007,6 +1007,8 @@ class DsvSdkAdapter:
         failed_at.pop(code, None)
         return cal
 
+    _BROKER_PHASE_BACKOFF_SECONDS = (5, 15, 30, 60)
+
     def _record_broker_phase_rejection(self, code, last_msg):
         override = classify_market_phase_rejection(last_msg)
         if override is None:
@@ -1020,9 +1022,24 @@ class DsvSdkAdapter:
             mono = time.monotonic_ns()
         except Exception:
             mono = 0
+        history = getattr(self, '_broker_phase_reject_counts', None)
+        if history is None:
+            history = {}
+            self._broker_phase_reject_counts = history
+        prev_count, prev_mono = history.get(code, (0, 0))
+        if prev_mono and mono >= prev_mono and (mono - prev_mono) <= 180 * NS_PER_SECOND:
+            count = prev_count + 1
+        else:
+            count = 1
+        history[code] = (count, mono)
+        backoff_s = self._BROKER_PHASE_BACKOFF_SECONDS[
+            min(max(0, count - 1), len(self._BROKER_PHASE_BACKOFF_SECONDS) - 1)
+        ]
         overrides[code] = override | {
             'quote_stamp': None if quote is None else getattr(quote, 'datetime', None),
             'recorded_mono_ns': mono,
+            'consecutive_rejects': count,
+            'backoff_seconds': backoff_s,
         }
 
     def _active_broker_phase_override(self, code, cal_phase, live_status, has_valid_quote, sample):
@@ -1032,15 +1049,15 @@ class DsvSdkAdapter:
             return None
         if live_status == 'CONTINUOUS':
             overrides.pop(code, None)
+            history = getattr(self, '_broker_phase_reject_counts', None)
+            if history is not None:
+                history.pop(code, None)
             return None
         phase_name = (cal_phase or {}).get('market_phase')
         if phase_name == 'CONTINUOUS' and has_valid_quote:
-            quote = (getattr(self, 'quotes', None) or {}).get(code)
-            cur_stamp = None if quote is None else getattr(quote, 'datetime', None)
-            if cur_stamp and cur_stamp != override.get('quote_stamp'):
-                overrides.pop(code, None)
-                return None
-            if (sample.monotonic - int(override.get('recorded_mono_ns') or 0)) >= 5 * NS_PER_SECOND:
+            backoff_s = int(override.get('backoff_seconds') or 5)
+            elapsed_ns = sample.monotonic - int(override.get('recorded_mono_ns') or 0)
+            if elapsed_ns >= backoff_s * NS_PER_SECOND:
                 overrides.pop(code, None)
                 return None
         return override

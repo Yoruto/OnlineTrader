@@ -115,6 +115,8 @@ class JsonLogTail:
         self.offset = 0
         self.anchor = b''
         self.discard_fragment = False
+        self.version = 0
+        self._last_mtime_ns = None
 
     def _position(self, stream, end):
         self.offset = max(0, end - self.limit)
@@ -130,6 +132,8 @@ class JsonLogTail:
             stream.seek(self.offset - len(self.anchor))
             valid = stream.read(len(self.anchor)) == self.anchor
         if not valid:
+            if self.records:
+                self.version += 1
             self.records.clear()
             self.identity = identity
             self._position(stream, stat.st_size)
@@ -143,9 +147,18 @@ class JsonLogTail:
 
     def read(self, path):
         try:
+            stat = os.stat(path)
+            identity = (stat.st_dev, stat.st_ino)
+            if (self.identity == identity and stat.st_size == self.offset
+                    and (not self.document or self._last_mtime_ns == stat.st_mtime_ns)):
+                return self.records
             with path.open('rb') as stream:
-                end = self._current(stream, os.fstat(stream.fileno()))
+                fstat = os.fstat(stream.fileno())
+                end = self._current(stream, fstat)
+                self._last_mtime_ns = fstat.st_mtime_ns
                 if end - self.offset > 2 * self.limit:
+                    if self.records:
+                        self.version += 1
                     self.records.clear()
                     self._position(stream, end)
                 stream.seek(self.offset)
@@ -160,6 +173,7 @@ class JsonLogTail:
                     if value is not None and self.offset == 0:
                         if isinstance(value, dict):
                             self.records.append(value)
+                            self.version += 1
                         self._remember(stream, end)
                     return self.records
                 if self.discard_fragment:
@@ -175,6 +189,7 @@ class JsonLogTail:
                     self.discard_fragment = True
                     self._remember(stream, self.offset + len(raw))
                     return self.records
+                appended = False
                 for line in raw[:complete].splitlines():
                     if not line.startswith(b'{'):
                         continue
@@ -184,21 +199,32 @@ class JsonLogTail:
                         continue
                     if isinstance(value, dict):
                         self.records.append(value)
+                        appended = True
                         if len(self.records) > 5_000:
                             for _ in range(2_001):
                                 self.records.popleft()
+                if appended:
+                    self.version += 1
                 self._remember(stream, self.offset + complete)
         except OSError:
+            if self.records:
+                self.version += 1
             self.records.clear()
             self.identity = None
+            self._last_mtime_ns = None
         return self.records
 
     def clear(self, path):
+        if self.records:
+            self.version += 1
         self.records.clear()
         try:
             with path.open('rb') as stream:
-                end = self._current(stream, os.fstat(stream.fileno()))
+                fstat = os.fstat(stream.fileno())
+                end = self._current(stream, fstat)
+                self._last_mtime_ns = fstat.st_mtime_ns
                 self._remember(stream, end)
                 self.discard_fragment = bool(end and not self.anchor.endswith(b'\n'))
         except OSError:
             self.identity = None
+            self._last_mtime_ns = None

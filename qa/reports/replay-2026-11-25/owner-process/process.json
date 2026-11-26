@@ -1,0 +1,16 @@
+{
+  "protocol": "TARGET_OWNER_QA_PROCESS/1",
+  "run_id": "qa-process-fd974dfa361b4cc9a64ccca67512932e",
+  "parent_pid": 12068,
+  "owner_pid": 27440,
+  "runtime_boot_id": "runtime-7465c3bdf83044488b09a42126a16379",
+  "configuration_revision": "1",
+  "profile_hash": "904de756887fc1ba29acfe995f92aba44f50175d3a6980c5b54be043ab2ec578",
+  "trading_day": "2026-11-25",
+  "source": "QA_OFFLINE_FACT_ADAPTER",
+  "product_pipe": "online-trader-target-process-qa-0b6194c572454b069283a6c60bd9f007",
+  "platform": "nt",
+  "runtime_root": "PER_RUN_TEMPORARY",
+  "real_broker_connection": false,
+  "real_order_submission": false
+}

@@ -1232,6 +1232,10 @@ class WorkbenchLayout:
         self.log_timer.setInterval(400)
         self.log_timer.timeout.connect(self.update_logs)
         self.log_timer.timeout.connect(self.update_workspace_clock)
+        from online_trader.desktop.ui_hang_monitor import UiHangMonitor
+        self.hang_monitor = UiHangMonitor(log_dir_getter=lambda: self.log_directory)
+        self.log_timer.timeout.connect(self.hang_monitor.heartbeat)
+        self.hang_monitor.start()
         self.log_timer.start()
         for grid in (*self.tables.values(), window.cycles):
             configure_table(grid)
@@ -1381,6 +1385,12 @@ class WorkbenchLayout:
 
     def save_parameter_template(self):
         dialog = self.parameter_dialog()
+        panel = getattr(self, 'trade_params_panel', None)
+        if panel is not None:
+            candidate = panel.try_build_profile(dialog.profile)
+            if candidate is None:
+                return
+            dialog.set_preview_profile(candidate, emit_signal=False)
         if not dialog.template_save_button.isEnabled() and not self.choose_template_store(dialog):
             return
         name, accepted = QInputDialog.getText(self.window,'保存为模板','模板名称')
@@ -1784,6 +1794,9 @@ class WorkbenchLayout:
             label.setStyleSheet('color: #b42318; font-weight: 600;' if error
                                 else 'color: #08764d; font-weight: 600;' if message else '')
             label.setVisible(bool(message))
+        panel = getattr(self, 'trade_params_panel', None)
+        if panel is not None:
+            panel.set_feedback(message, error=error)
 
     def mark_next_boot_saved(self, profile):
         self._saved_next_boot_hash = profile.content_hash
@@ -1809,7 +1822,11 @@ class WorkbenchLayout:
         self._runtime_synced_hash = remote.content_hash
         self.profile_source = '当前 Runtime 运行配置'
         dialog = self.window._settings_dialog
-        dirty = dialog is not None and dialog.profile.content_hash != self.profile.content_hash
+        panel = getattr(self, 'trade_params_panel', None)
+        dirty = (
+            (dialog is not None and dialog.profile.content_hash != self.profile.content_hash)
+            or (panel is not None and panel.has_unsaved_changes())
+        )
         self.profile = remote
         self.symbols = remote.to_record()['settings']['symbols']
         self.names = {item['code']: item['name'] for item in self.symbols}
@@ -1819,6 +1836,9 @@ class WorkbenchLayout:
             dialog.set_runtime_baseline(remote, self.profile_source, preserve_draft=True)
         elif not dirty:
             self.render_parameters(remote)
+        elif panel is not None:
+            panel._active_profile = remote
+            panel._refresh_dirty_state()
         self.update_runtime_capabilities()
 
     @staticmethod
@@ -2336,6 +2356,8 @@ class WorkbenchLayout:
         self.dashboard_alert_owner = None
         if not preserve_logs:
             self.activity.clear()
+            self._activity_version = getattr(self, '_activity_version', 0) + 1
+            self._last_log_update_signature = None
             self.log_binding = None
             self.log_directory = None
             self.log_comparison = None
@@ -2750,55 +2772,67 @@ class WorkbenchLayout:
         return list(dict.fromkeys(pending)), rows
 
     def strategy_page(self, layout):
-        templates = group('参数模板', layout)
-        self.template_picker = QComboBox()
-        self.template_picker.setPlaceholderText('选择模板')
-        self.template_picker.setMinimumWidth(200)
-        templates.addLayout(row(QLabel('参数模板：'), self.template_picker,
-                                button('应用', self.apply_selected_template),
-                                button('保存为模板', self.save_parameter_template),
-                                button('删除模板', self.delete_selected_template)))
-        settings = self.profile.to_record()['settings']
-        fields = group('交易参数', layout)
-        self.parameter_state = QLabel(self.profile_source)
-        fields.addLayout(row(self.parameter_state,button('编辑交易参数',lambda:self.parameter_dialog().edit_preview())))
-        self.parameter_fields = {}
-        grid = QGridLayout()
-        for index, (key, label) in enumerate(TRADE_FIELDS):
-            field = self.read_value(settings['trade'][key])
-            self.parameter_fields[key] = field
-            grid.addLayout(row(QLabel(label),field), index//6, index%6)
-        fields.addLayout(grid)
-        switches = QGridLayout()
-        self.parameter_switches = {}
-        for index, (key, label) in enumerate(TRADE_SWITCHES):
-            if self.window._runtime_mode and key == 'auto_start_on_launch':
-                continue
-            check = QCheckBox(label)
-            check.setChecked(settings['trade'][key])
-            check.setAttribute(Qt.WA_TransparentForMouseEvents)
-            check.setFocusPolicy(Qt.NoFocus)
-            self.parameter_switches[key] = check
-            switches.addWidget(check, index//4, index%4)
-        fields.addLayout(switches)
+        from online_trader.desktop.trade_parameters_panel import TradeParametersPanel
+        panel = TradeParametersPanel(
+            runtime_mode=self.window._runtime_mode,
+            show_timed_start=bool(self.window.store is not None and self.paired is None),
+        )
+        self.trade_params_panel = panel
+        self.template_picker = panel.template_picker
+        self.parameter_state = panel.parameter_state
+        self.parameter_fields = panel.parameter_fields
+        self.parameter_switches = panel.parameter_switches
         self.schedule_enabled = None
-        self.schedule_fields = {}
-        self.timed_start_button = None
-        if not self.window._runtime_mode:
-            schedule = group('DSV 定时参数', fields)
-            data = settings['schedule']
-            self.schedule_enabled = QLabel('启用' if data['enabled'] else '关闭')
-            self.schedule_fields = {key:self.read_value(data[key]) for key in ('night_start_time','day_start_time','catch_up_minutes')}
-            schedule.addLayout(row(self.schedule_enabled,QLabel('夜盘'),self.schedule_fields['night_start_time'],
-                QLabel('日盘'),self.schedule_fields['day_start_time'],QLabel('补启动分钟'),self.schedule_fields['catch_up_minutes']))
-            self.timed_start_button = button('安排定时启动', self.window.arrange_timed_start)
-            if self.window.store is not None and self.paired is None:
-                schedule.addWidget(self.timed_start_button)
+        self.schedule_fields = panel.schedule_fields
+        self.timed_start_button = panel.timed_start_button
+        self.parameter_save_buttons.append(panel.save_button)
 
-        strategy_save = button('保存参数', self.export_parameters_preview)
-        self.parameter_save_buttons.append(strategy_save)
-        fields.addLayout(row(button('参数中心', self.open_parameters), strategy_save))
-        layout.addStretch()
+        panel.save_requested.connect(self.export_parameters_preview)
+        panel.revert_requested.connect(self.revert_trade_parameters)
+        panel.apply_template_requested.connect(self.apply_selected_template)
+        panel.save_template_requested.connect(self.save_parameter_template)
+        panel.delete_template_requested.connect(self.delete_selected_template)
+        panel.open_center_requested.connect(self.open_parameters)
+        panel.import_dsv_requested.connect(self.import_dsv_into_parameters)
+        panel.export_file_requested.connect(self.export_parameters_to_file)
+        panel.timed_start_requested.connect(self.window.arrange_timed_start)
+
+        panel.load_profile(self.profile, active_profile=self.profile, profile_source=self.profile_source)
+        layout.addWidget(panel, 1)
+
+    def revert_trade_parameters(self):
+        dialog = self.window._settings_dialog
+        if dialog is not None:
+            dialog.set_preview_profile(self.profile, emit_signal=False)
+        self.render_parameters(self.profile)
+        self.set_parameter_feedback('已撤销未保存修改，恢复为当前运行配置。')
+
+    def import_dsv_into_parameters(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self.window, '导入原版 DSV 配置文件', str(self.dsv_config or ''), 'JSON (*.json)'
+        )
+        if not path:
+            return
+        dialog = self.parameter_dialog()
+        if not dialog.import_file(path, source_kind='dsv'):
+            QMessageBox.warning(self.window, '导入原版 DSV 配置', dialog.error_label.text())
+            return
+        self.set_parameter_feedback('已导入到编辑区（尚未生效），核对后请点击「保存并生效」。')
+
+    def export_parameters_to_file(self):
+        dialog = self.parameter_dialog()
+        panel = getattr(self, 'trade_params_panel', None)
+        if panel is not None:
+            candidate = panel.try_build_profile(dialog.profile)
+            if candidate is None:
+                return
+            dialog.set_preview_profile(candidate, emit_signal=False)
+        path, _ = QFileDialog.getSaveFileName(self.window, '导出业务参数', 'dsv-business-settings.json', 'JSON (*.json)')
+        if path:
+            if not dialog.export_file(path):
+                QMessageBox.warning(self.window, '导出业务参数', dialog.error_label.text())
+            else:
+                self.set_parameter_feedback('已导出业务参数到：' + Path(path).name)
 
     def symbols_page(self, layout):
         contracts = group('品种列表', layout, stretch=1)
@@ -2872,14 +2906,16 @@ class WorkbenchLayout:
             self.symbol_preview_state.setToolTip(str(self.dsv_config))
         self.symbol_preview_state.setText(self.parameter_state.text())
         self.update_runtime_capabilities()
-        for key,field in self.parameter_fields.items():
-            field.setText(str(settings['trade'][key]))
-        for key,check in self.parameter_switches.items():
-            check.setChecked(settings['trade'][key])
-        if self.schedule_enabled is not None:
-            self.schedule_enabled.setText('启用' if settings['schedule']['enabled'] else '关闭')
-        for key,field in self.schedule_fields.items():
-            field.setText(str(settings['schedule'][key]))
+        live = bool((self.window.view or {}).get('configuration', {}).get('live_parameter_save') or self.window._runtime_mode)
+        panel = getattr(self, 'trade_params_panel', None)
+        if panel is not None:
+            panel.load_profile(
+                profile,
+                active_profile=self.profile,
+                profile_source=self.profile_source,
+                saved_next_boot_hash=self._saved_next_boot_hash,
+                live_save=live,
+            )
         populate(self.symbol_grid,[[s['name'],s['code'],'—','到期日未取到（可不换月）',s.get('code_new') or '—',s['open_offset'],s['stop_offset'],
             s['profit_offset'],s['order_volume'] or '自动',s['half_close_ratio'],s['hysteresis_points'],'—']
             for s in settings['symbols']])
@@ -3197,11 +3233,20 @@ class WorkbenchLayout:
 
     def export_parameters_preview(self):
         dialog = self.parameter_dialog()
+        panel = getattr(self, 'trade_params_panel', None)
+        if panel is not None:
+            candidate = panel.try_build_profile(dialog.profile)
+            if candidate is None:
+                return
+            if candidate.content_hash != dialog.profile.content_hash:
+                dialog.set_preview_profile(candidate, emit_signal=False)
+        else:
+            candidate = dialog.profile
         window = self.window
         view = window.view or {}
         live = view.get('configuration', {}).get('live_parameter_save')
         if window._runtime_mode or live:
-            window.save_runtime_parameters(dialog.profile)
+            window.save_runtime_parameters(candidate)
             return
         path,_ = QFileDialog.getSaveFileName(window,'保存业务参数','dsv-business-settings.json','JSON (*.json)')
         if path:
@@ -4098,6 +4143,8 @@ class WorkbenchLayout:
             for path in self.log_paths(run):
                 self.log_tail(path).clear(path)
         self.activity.clear()
+        self._activity_version = getattr(self, '_activity_version', 0) + 1
+        self._last_log_update_signature = None
         self.update_logs()
 
     def open_daily_report(self):
@@ -4171,6 +4218,7 @@ class WorkbenchLayout:
             executor_log_path(run),
             run / 'startup-failure.json',
             run / 'target-owner-status.json',
+            run / 'runtime-failure.json',
             run / 'target-owner-diagnostics.json',
             *sorted(run.glob('phase-*.json')),
         ]
@@ -4455,23 +4503,7 @@ class WorkbenchLayout:
         mode = self.log_filter.currentIndex()
         run = self.latest_run()
         archive = self.log_comparison
-        lines = []
-        product, dsv = self.comparison_logs(run) if run and mode in (0,1,3) else ([],[])
-        if run and mode in (0,1):lines.extend(self.executor_log(run) + product)
         event_filter = self.log_event_filter.currentText()
-        if mode in (0,3):
-            if event_filter == '平仓':
-                # The original archive reload and export use close/auto.
-                dsv = [line for line in dsv if line.category in {'close', 'auto'}]
-            lines.extend(dsv)
-        if run and mode != 2 and not self.log_source_matches(run, archive):
-            self.latest_run()
-            run = None
-            lines.clear()
-        self.log_source_status.setVisible(run is None and mode != 2)
-        if mode in (0,2):lines.extend(self.activity)
-        lines.sort(key=lambda line: line.timestamp or datetime.min.replace(tzinfo=BEIJING))
-        allowed = {'warning'} if event_filter == '警告' else LOG_EVENT_FILTERS.get(event_filter)
         query = self.log_search.text().strip().casefold()
         view = self.window.view or {}
         codes = sorted(set(self.names) | {item['contract_id'] for item in view.get('markets', ())
@@ -4487,6 +4519,45 @@ class WorkbenchLayout:
             self.log_contract_filter.blockSignals(blocked)
         code_filter = self.log_contract_filter.currentText()
         minutes = (None, 15, 60)[self.log_time_filter.currentIndex()]
+        tail_versions = ()
+        if run is not None and mode != 2:
+            paths = self.log_paths(run)
+            for path in paths:
+                self.log_tail(path).read(path)
+            tail_versions = tuple((str(path), self.log_tail(path).version) for path in paths)
+        time_bucket = int(datetime.now(BEIJING).timestamp() // 15) if minutes else None
+        update_signature = (
+            mode,
+            None if run is None else str(run),
+            None if archive is None else str(archive),
+            event_filter,
+            query,
+            code_filter,
+            tuple(codes),
+            minutes,
+            time_bucket,
+            getattr(self, '_activity_version', 0) if mode in (0, 2) else None,
+            tail_versions,
+        )
+        if update_signature == getattr(self, '_last_log_update_signature', None):
+            return
+        lines = []
+        product, dsv = self.comparison_logs(run) if run and mode in (0,1,3) else ([],[])
+        if run and mode in (0,1):lines.extend(self.executor_log(run) + product)
+        if mode in (0,3):
+            if event_filter == '平仓':
+                # The original archive reload and export use close/auto.
+                dsv = [line for line in dsv if line.category in {'close', 'auto'}]
+            lines.extend(dsv)
+        if run and mode != 2 and not self.log_source_matches(run, archive):
+            self.latest_run()
+            run = None
+            lines.clear()
+            update_signature = None
+        self.log_source_status.setVisible(run is None and mode != 2)
+        if mode in (0,2):lines.extend(self.activity)
+        lines.sort(key=lambda line: line.timestamp or datetime.min.replace(tzinfo=BEIJING))
+        allowed = {'warning'} if event_filter == '警告' else LOG_EVENT_FILTERS.get(event_filter)
         since = datetime.now(BEIJING) - timedelta(minutes=minutes) if minutes else None
         visible = [line for line in lines if (allowed is None or line.category in allowed)
                    and (since is None or line.timestamp is not None and line.timestamp >= since)
@@ -4514,6 +4585,7 @@ class WorkbenchLayout:
             follow = position >= scrollbar.maximum()-4
             self.log_text.setPlainText(content)
             scrollbar.setValue(scrollbar.maximum() if follow else position)
+        self._last_log_update_signature = update_signature
 
     def instruments_page(self, layout):
         cols = QHBoxLayout()
@@ -4673,6 +4745,7 @@ class WorkbenchLayout:
     def add_activity(self, message, *, category=None):
         moment = datetime.now(BEIJING)
         self.activity.append(WorkbenchLogLine(f'[{moment:%H:%M:%S}] [工作台] {message}', category, moment))
+        self._activity_version = getattr(self, '_activity_version', 0) + 1
 
     def record_balance(self, account, view):
         now = datetime.now(BEIJING)

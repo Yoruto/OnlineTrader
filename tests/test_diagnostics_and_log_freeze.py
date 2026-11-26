@@ -223,5 +223,66 @@ class WorkbenchTableBatchPerformanceTests(unittest.TestCase):
         grid.close()
 
 
+class LogTailAndUiHangMonitorTests(unittest.TestCase):
+    def test_json_log_tail_stat_fast_path_and_version_increment(self):
+        import json
+        from online_trader.desktop.runtime_logs import JsonLogTail
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'order-blocking-log.jsonl'
+            tail = JsonLogTail(65_536)
+            self.assertEqual(tail.version, 0)
+            self.assertEqual(list(tail.read(path)), [])
+            self.assertEqual(tail.version, 0)
+
+            path.write_text(json.dumps({'event': 'ORDER_BLOCKED', 'i': 1}) + '\n', encoding='utf-8')
+            self.assertEqual(len(tail.read(path)), 1)
+            v1 = tail.version
+            self.assertGreater(v1, 0)
+
+            # Unchanged file hits stat fast-path and keeps version identical.
+            self.assertEqual(len(tail.read(path)), 1)
+            self.assertEqual(tail.version, v1)
+
+            with path.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps({'event': 'ORDER_UNBLOCKED', 'i': 2}) + '\n')
+            self.assertEqual(len(tail.read(path)), 2)
+            v2 = tail.version
+            self.assertGreater(v2, v1)
+
+            tail.clear(path)
+            self.assertGreater(tail.version, v2)
+            self.assertEqual(len(tail.read(path)), 0)
+
+    def test_ui_hang_monitor_detects_stall_and_recovery(self):
+        import json
+        from online_trader.desktop.ui_hang_monitor import UiHangMonitor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            monitor = UiHangMonitor(
+                threshold_s=0.06,
+                poll_interval_s=0.02,
+                cooldown_s=0.5,
+                log_dir_getter=lambda: run_dir,
+            )
+            monitor.start()
+            try:
+                time.sleep(0.14)
+                self.assertGreaterEqual(monitor.dump_count, 1)
+                monitor.heartbeat()
+            finally:
+                monitor.stop()
+
+            diag_file = run_dir / 'ui-hang-diagnostics.jsonl'
+            self.assertTrue(diag_file.is_file())
+            records = [json.loads(line) for line in diag_file.read_text(encoding='utf-8').splitlines() if line.strip()]
+            events = [row['event'] for row in records]
+            self.assertIn('UI_HANG_DETECTED', events)
+            self.assertIn('UI_HANG_RECOVERED', events)
+            detected = next(row for row in records if row['event'] == 'UI_HANG_DETECTED')
+            self.assertTrue(detected['stack'])
+
+
 if __name__ == '__main__':
     unittest.main()

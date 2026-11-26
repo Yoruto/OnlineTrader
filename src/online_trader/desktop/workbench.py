@@ -2615,6 +2615,8 @@ class WorkbenchWindow(StatusWindow):
         self.monitor_timer.stop()
         self.connection_retry_timer.stop()
         self.dashboard.log_timer.stop()
+        if hasattr(self.dashboard, 'hang_monitor'):
+            self.dashboard.hang_monitor.stop()
         self.timer.stop()
         self._finalize_diagnostic_sink(clean_shutdown=True)
         super().closeEvent(event)

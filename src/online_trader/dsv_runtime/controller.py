@@ -861,7 +861,8 @@ class ExplicitOrderController:
             order['exit_failure_counted'] = True
             if wall_time is not None:
                 order['exit_failure_at'] = str(wall_time)
-            position['consecutive_exit_rejections'] = position.get('consecutive_exit_rejections', 0) + 1
+            if detail != 'BROKER_MARKET_PHASE':
+                position['consecutive_exit_rejections'] = position.get('consecutive_exit_rejections', 0) + 1
             self._diag().emit(
                 'EXIT_FAILURE_CLASSIFIED',
                 contract_id=order['contract_id'],
@@ -871,13 +872,22 @@ class ExplicitOrderController:
                 broker_state=order['broker_state'],
                 category=category,
                 detail=detail,
-                attempt=position['consecutive_exit_rejections'],
+                attempt=position.get('consecutive_exit_rejections', 0),
             )
         count = position.get('consecutive_exit_rejections', 0)
         if category == 'STRUCTURAL':
             position['exit_manual_takeover'] = True
             position['execution_reason'] = 'EXIT_MANUAL_TAKEOVER_REQUIRED'
             return False
+        if detail == 'BROKER_MARKET_PHASE':
+            failed_at = order.get('exit_failure_at')
+            if wall_time is not None and failed_at is not None and float(wall_time) - float(failed_at) < 5.0:
+                position['execution_reason'] = 'EXIT_TRANSIENT_RETRY_BACKOFF'
+                return False
+            fresh = self._has_fresh_quote_for_order(order, market)
+            if not fresh:
+                position['execution_reason'] = 'EXIT_WAIT_FRESH_QUOTE'
+            return fresh
         if category == 'TRANSIENT':
             if count > 20:
                 position['exit_manual_takeover'] = True
@@ -1037,6 +1047,8 @@ class ExplicitOrderController:
 
     _CANCEL_RETRY_INTERVAL_SECONDS = 5.0
     _MAX_CANCEL_ATTEMPTS = 4
+    _CANCEL_RECOVERY_PROBE_INTERVAL_SECONDS = 120.0
+    _MAX_CANCEL_TOTAL_ATTEMPTS = 12
 
     def _retry_stale_cancellations(self, state, contract_id, *, allow_cancel, wall_time):
         if wall_time is None:
@@ -1057,7 +1069,8 @@ class ExplicitOrderController:
             if requested_at is None:
                 order['cancel_requested_at'] = str(now)
                 continue
-            if not allow_cancel or now - float(requested_at) < self._CANCEL_RETRY_INTERVAL_SECONDS:
+            elapsed = now - float(requested_at)
+            if not allow_cancel or elapsed < self._CANCEL_RETRY_INTERVAL_SECONDS:
                 continue
             attempt = int(order.get('cancel_attempt') or 1)
             if attempt >= self._MAX_CANCEL_ATTEMPTS:
@@ -1072,7 +1085,9 @@ class ExplicitOrderController:
                     attempt=attempt,
                     cancel_status=order.get('cancel_status'),
                 )
-                continue
+                if (attempt >= self._MAX_CANCEL_TOTAL_ATTEMPTS
+                        or elapsed < self._CANCEL_RECOVERY_PROBE_INTERVAL_SECONDS):
+                    continue
             reason = order.get('cancel_reason') or 'CANCEL_TIMEOUT_RETRY'
             prior_status = order['cancel_status']
             order['prior_cancel_status'] = prior_status

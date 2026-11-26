@@ -7,6 +7,7 @@
 - `market_fixture.sqlite3`：只读 SQLite 行情数据集（含 `dataset_metadata`、`instruments`、`trading_sessions`、`market_ticks`、`market_klines` 五张表）。
 - `manifest.json`：外部校验清单，记录 `dataset_id`、合约范围、`coverage_scope`、数据库 SHA-256、每合约每侧每档（L1–L5）盘口覆盖率统计、各交易时段行数与边界时间戳。
 - `dce_p2701_entry_stop_loss.jsonl`：原有人工构造短烟雾场景夹具（保留兼容）。
+- `recorded/`：由实盘录制 JSONL 转换的多日 6 合约回放夹具目录（含 `2026-11-25` 全天与 `2026-11-26` 部分录制，详见 `recorded/README.md`）。
 
 ## 当前制品范围与诚实边界
 

@@ -65,7 +65,8 @@ class DsvProfileTests(unittest.TestCase):
         trade = settings['trade']
         self.assertEqual((trade['max_volume'],trade['max_daily_orders'],trade['max_quote_age_seconds']), (30,200,0))
         self.assertEqual((trade['chase_window_minutes'],trade['entry_slip_ratio'],trade['chase_slip_ratio']), (1,.03,.05))
-        self.assertTrue(trade['no_open_after_open'])
+        self.assertFalse(trade['no_open_after_open'])
+        self.assertFalse(DsvProfile.from_dsv_json(b'{}').to_settings()['trade']['no_open_after_open'])
         self.assertFalse(trade['half_pullback_close'])
         self.assertFalse(trade['stale_close_day_stop'])
         self.assertEqual((trade['passive_wait_seconds'],trade['resume_gap_seconds']), (1.25,0))

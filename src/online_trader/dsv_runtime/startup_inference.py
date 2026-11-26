@@ -134,7 +134,7 @@ def _evaluate_side_plan_b(
     # Check entry trading window constraints.
     civil = t_open.astimezone(_BEIJING)
     if not trade_settings.get('participate_auction', True):
-        if (civil.hour in (8, 20) and civil.minute >= 55) or (civil.hour in (9, 21) and civil.minute == 0):
+        if civil.hour in (8, 20) and civil.minute >= 55:
             return 0, None, 'UNPROVED_OUTSIDE_ENTRY_WINDOW'
     sess_open = _utc(market.get('session_open'))
     sess_close = _utc(market.get('session_close'))

@@ -155,8 +155,7 @@ def ordinary_entry(state, frame, market, spec, settings, *, active_symbols, open
     if target_count >= settings['max_daily_orders']:
         return {'reason': 'DAILY_TARGET_LIMIT', 'day_stop': True}
     civil = datetime.fromisoformat(tick['native_time']).astimezone(_BEIJING)
-    if not settings['participate_auction'] and (civil.hour in (8, 20) and civil.minute >= 55
-                                                or civil.hour in (9, 21) and civil.minute == 0):
+    if not settings['participate_auction'] and civil.hour in (8, 20) and civil.minute >= 55:
         return {'reason': 'AUCTION_DISABLED'}
     local_start, local_end = map(datetime.fromisoformat, (market['session_open'], market['session_close']))
     decision_time = _clock(frame, market, 'session')
