@@ -1862,6 +1862,8 @@ class WorkbenchLayout:
             return
         if remote.content_hash == self._runtime_synced_hash and remote.content_hash == self.profile.content_hash:
             return
+        old_active_hash = self.profile.content_hash
+        remote_changed = remote.content_hash != old_active_hash
         self._runtime_synced_hash = remote.content_hash
         self.profile_source = '当前 Runtime 运行配置'
         dialog = self.window._settings_dialog
@@ -1870,7 +1872,7 @@ class WorkbenchLayout:
         if panel_dirty and dialog is not None:
             self._sync_trade_panel_draft(update_calculator=True, create_dialog=False)
         dirty = (
-            (dialog is not None and dialog.profile.content_hash != self.profile.content_hash)
+            (dialog is not None and dialog.profile.content_hash != old_active_hash)
             or panel_dirty
         )
         self.profile = remote
@@ -1895,6 +1897,11 @@ class WorkbenchLayout:
                 profile_source=self.profile_source,
                 saved_next_boot_hash=self._saved_next_boot_hash,
                 saved_next_boot_profile=self._saved_next_boot_profile,
+            )
+        if remote_changed and dirty:
+            self.set_parameter_feedback(
+                '当前 Runtime 运行配置已更新，本地仍有未保存草稿；若直接保存将覆盖新运行配置。',
+                error=True,
             )
         self.update_runtime_capabilities()
 
@@ -4755,7 +4762,11 @@ class WorkbenchLayout:
         self.offset_market_button = button('一键计算（联网）', self.calculate_market_offsets)
         layout.addLayout(row(self.offset_market_button, self.offset_preview))
         def applied():
-            self._sync_trade_panel_draft(update_calculator=False, create_dialog=True)
+            _, preserve = self._sync_trade_panel_draft(update_calculator=False, create_dialog=True)
+            if preserve:
+                calculator.error_label.setText('交易参数存在未完成的非法输入，请先修正后再应用偏移。')
+                self.offset_preview.setText('请先修正交易参数面板中的非法输入。')
+                return
             candidate = calculator.result_profile
             dialog = self.parameter_dialog()
             if candidate is not None and dialog.apply_edited_preview(candidate, expected_hash=calculator.base_hash):

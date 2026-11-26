@@ -605,6 +605,33 @@ class TradeParametersDraftAndSavedStateTests(unittest.TestCase):
         self.assertTrue(panel.has_unsaved_changes())
         self.assertIn('已修改', panel.dirty_label.text())
 
+    def test_runtime_profile_sync_conflict_prompts_user(self):
+        win = self._new_window()
+        panel = win.dashboard.trade_params_panel
+        panel.parameter_fields['max_volume'].setText('6')
+        self.assertTrue(panel.has_unsaved_changes())
+
+        remote_rec = win.dashboard.profile.to_record()
+        remote_rec['settings']['trade']['max_daily_orders'] = 22
+        win.dashboard.sync_runtime_profile({'configuration': {'strategy_profile': remote_rec}})
+        self.assertIn('Runtime 运行配置已更新', panel.feedback_label.text())
+        self.assertEqual(panel.parameter_fields['max_volume'].text(), '6')
+
+    def test_offset_apply_blocked_while_trade_panel_has_invalid_input(self):
+        win = self._new_window()
+        panel = win.dashboard.trade_params_panel
+        panel.parameter_fields['max_volume'].setText('')
+        self.assertTrue(panel.has_unsaved_changes())
+
+        calc = win.dashboard.calculator
+        cand_rec = calc.base_profile.to_record()
+        cand_rec['settings']['symbols'][0]['open_offset'] = '99'
+        calc._result_profile = DsvProfile.from_record(cand_rec)
+        calc.accepted.emit()
+
+        self.assertIn('非法输入', calc.error_label.text())
+        self.assertEqual(panel.parameter_fields['max_volume'].text(), '')
+
 
 class UiHangMonitorAsyncRecoveryTests(unittest.TestCase):
     @classmethod

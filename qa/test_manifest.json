@@ -637,6 +637,45 @@
       ],
       "case_overrides": {}
     },
+    "test_dev45_review_fixes": {
+      "tier": "T2",
+      "domains": [
+        "trading",
+        "runtime",
+        "recovery"
+      ],
+      "risk": "P0",
+      "profiles": [
+        "FullOffline",
+        "Trading",
+        "Runtime"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": null,
+      "requirements": [
+        "PySide6"
+      ],
+      "timeout_seconds": 120,
+      "cases": [
+        "BrokerPhaseStaleStatusBackoffTests.test_stale_continuous_status_preserves_progressive_backoff_until_real_transition",
+        "ConvergenceCancelRecoveryAndPhaseTests.test_convergence_broker_market_phase_does_not_penalize_failures_and_uses_5s_backoff",
+        "ConvergenceCancelRecoveryAndPhaseTests.test_convergence_order_stale_cancel_recovers_in_armed_and_disarmed",
+        "ConvergenceCancelRecoveryAndPhaseTests.test_external_order_stale_cancel_recovers_and_preserves_prior_status_on_local_refusal",
+        "MultiContractCombinationTests.test_late_fill_after_stop_updates_owned_position_without_duplicate_open",
+        "MultiContractCombinationTests.test_limit_down_on_contract_a_does_not_block_contract_b",
+        "TradeParametersDraftAndSavedStateTests.test_next_boot_saved_profile_is_distinguished_from_unsaved_edits",
+        "TradeParametersDraftAndSavedStateTests.test_offset_apply_blocked_while_trade_panel_has_invalid_input",
+        "TradeParametersDraftAndSavedStateTests.test_runtime_profile_sync_conflict_prompts_user",
+        "TradeParametersDraftAndSavedStateTests.test_trade_panel_draft_survives_symbol_edit_runtime_sync_and_invalid_mid_typing",
+        "UiHangMonitorAsyncRecoveryTests.test_heartbeat_recovery_writes_on_monitor_thread_not_caller_thread",
+        "UiHangMonitorAsyncRecoveryTests.test_workbench_hang_diagnostic_directory_falls_back_to_runtime_root"
+      ],
+      "case_overrides": {}
+    },
     "test_diagnostics_and_log_freeze": {
       "tier": "T2",
       "domains": [
@@ -660,6 +699,8 @@
       ],
       "timeout_seconds": 60,
       "cases": [
+        "LogTailAndUiHangMonitorTests.test_json_log_tail_stat_fast_path_and_version_increment",
+        "LogTailAndUiHangMonitorTests.test_ui_hang_monitor_detects_stall_and_recovery",
         "OrderDiagnosticsDedupeTests.test_dedupe_signature_suppresses_dynamic_detail_spam",
         "OrderDiagnosticsDedupeTests.test_default_observe_block_still_tracks_detail_changes",
         "RunnerDiagnosticKeyIsolationTests.test_disarmed_ticks_do_not_oscillate_session_gate",
@@ -2723,9 +2764,11 @@
         "FakeBrokerAuctionScenarioTests.test_fake_broker_auction_wait_and_recovery_flow",
         "MarketPermissionsUnitTests.test_calendar_phase_query_preserves_schema_and_identifies_auction_phases",
         "MarketPermissionsUnitTests.test_layered_permissions_handle_tqsdk_spelling_halt_fallback_and_broker_override",
+        "NativeFactDeadlockAndToleranceTests.test_broker_phase_rejection_backoff_ignores_tick_churn_and_preserves_exit_retry_budget",
         "NativeFactDeadlockAndToleranceTests.test_controller_tolerates_bounded_ctp_order_timestamp_skew_and_cancelled_to_rejected_transition",
         "NativeFactDeadlockAndToleranceTests.test_persistent_fact_hold_avoids_crash_loop_refreshes_quotes_and_reconciles",
         "SdkAdapterAuctionAndPermissionsTests.test_first_minute_2100_allows_convergence_close_while_blocking_ordinary_open_and_unsupported_status_degrades",
+        "SdkAdapterAuctionAndPermissionsTests.test_first_minute_continuous_entry_allowed_when_opening_wait_disabled",
         "SdkAdapterAuctionAndPermissionsTests.test_presend_and_precancel_market_phase_guard_never_consumes_cancel_budget"
       ],
       "case_overrides": {}
@@ -5338,6 +5381,9 @@
       "timeout_seconds": 30,
       "cases": [
         "UnfilledOrderStallTests.test_10_dual_clock_and_unconfigured_contract_sync_isolation",
+        "UnfilledOrderStallTests.test_11_cancel_exhausted_long_period_recovery_probe",
+        "UnfilledOrderStallTests.test_12_limit_locked_main_exit_queues_without_reprice_churn",
+        "UnfilledOrderStallTests.test_13_unknown_send_disconnect_and_stop_preserves_capacity_without_duplicate",
         "UnfilledOrderStallTests.test_1_unfilled_60s_on_one_contract_does_not_block_other_contracts",
         "UnfilledOrderStallTests.test_2_cancel_without_terminal_fact_keeps_contract_in_cancel_pending_forever",
         "UnfilledOrderStallTests.test_3_pending_child_missing_from_sync_blocks_entire_account_resync",

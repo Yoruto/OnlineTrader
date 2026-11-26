@@ -354,6 +354,27 @@ def _execute_e2e_scenarios(rel_paths: tuple[str, ...], e2e_work: Path) -> list[d
     return results
 
 
+def _execute_e2e_scenarios_isolated(rel_paths: tuple[str, ...], e2e_work: Path) -> list[dict[str, object]]:
+    """Run offline E2E scenarios in a clean subprocess so prior unittest imports cannot taint sys.modules."""
+    out_file = e2e_work / "_e2e_results.json"
+    script = (
+        "import json; from pathlib import Path; import qa.test_runner as tr; "
+        f"res = tr._execute_e2e_scenarios({tuple(rel_paths)!r}, Path({str(e2e_work)!r})); "
+        f"Path({str(out_file)!r}).write_text(json.dumps(res, ensure_ascii=False), encoding='utf-8')"
+    )
+    proc = subprocess.run([sys.executable, "-X", "utf8", "-c", script], cwd=str(ROOT))
+    if proc.returncode != 0 or not out_file.is_file():
+        return [{
+            "test_id": "__E2E_SUBPROCESS__",
+            "scenario": "e2e_subprocess",
+            "status": "ERROR",
+            "rounds_recorded": 0,
+            "report_path": str(out_file),
+            "detail": f"isolated E2E subprocess exited with code {proc.returncode}",
+        }]
+    return json.loads(out_file.read_text(encoding="utf-8"))
+
+
 def _execute_unittest_records(records: list[dict[str, object]], blocked_cases: dict[str, str]) -> tuple[list[dict[str, object]], bool]:
     stream = io.StringIO()
     runner = unittest.TextTestRunner(stream=stream, verbosity=2, resultclass=RecordingResult)
@@ -579,7 +600,7 @@ def _run_release_gate(args) -> int:
     test_asset_hashes = _test_asset_hashes(records)
 
     unittest_results, unittest_ok = _execute_unittest_records(records, blocked_cases)
-    e2e_results = _execute_e2e_scenarios(RELEASE_GATE_E2E_SCENARIOS, e2e_work)
+    e2e_results = _execute_e2e_scenarios_isolated(RELEASE_GATE_E2E_SCENARIOS, e2e_work)
 
     combined = unittest_results + e2e_results
     counts = Counter(row["status"] for row in combined)
