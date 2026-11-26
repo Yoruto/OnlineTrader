@@ -318,6 +318,11 @@ class QADesktopHost:
         with self._condition:
             return len(self._events)
 
+    @property
+    def pending_frame_count(self) -> int:
+        with self._condition:
+            return len(self._pending_frames)
+
     def start(self) -> "QADesktopHost":
         if self._started:
             raise OwnerProcessError("QA Desktop Host already started")
@@ -412,6 +417,37 @@ class QADesktopHost:
             after=cursor,
             predicate=lambda ev: ev.get("frame_id") == frame_id,
         )
+
+    def submit_fact_frame_async(self, frame: dict[str, object]) -> tuple[str, int]:
+        """Submit a fact frame without waiting for ACCEPTED/APPLIED (for realtime stress mode)."""
+        if not self.is_alive or self._control is None:
+            raise OwnerProcessError("QA Desktop Host is not running")
+        clean_frame = _json_copy(frame)
+        assert isinstance(clean_frame, dict)
+        frame_id = str(clean_frame["id"])
+        sequence = int(clean_frame["sequence"])  # type: ignore[arg-type]
+        sent_ns = time.monotonic_ns()
+        with self._input_lock:
+            if self._tearing_down:
+                raise OwnerProcessError("Cannot submit frame during teardown")
+            self._input_seq += 1
+            with self._condition:
+                self._pending_frames.add(frame_id)
+            self._write_jsonl(
+                self._input_log,
+                {
+                    "input_seq": self._input_seq,
+                    "event_type": "FAKE_BROKER_FACT_FRAME",
+                    "run_id": self.run_id,
+                    "frame_id": frame_id,
+                    "input_sequence": sequence,
+                    "monotonic_ns": sent_ns,
+                    "frame": clean_frame,
+                },
+            )
+            with self._send_lock:
+                self._control.send({"type": "FACT_FRAME", "frame": clean_frame})
+        return frame_id, sent_ns
 
     def set_adapter_fault(self, *, fail_send: bool = False, timeout: float = 5.0) -> dict[str, object]:
         if not self.is_alive or self._control is None:

@@ -119,6 +119,24 @@ class BrokerFacade:
         self._trace.record("BROKER_ACTION", action="REPORT_TRADE", child_order_id=child_order_id, detail=fact)
         return fact
 
+    def set_fact_delivery_hold(self, hold: bool) -> None:
+        self._broker.set_fact_delivery_hold(hold)
+        self._trace.record("BROKER_ACTION", action="SET_FACT_HOLD", detail={"hold": bool(hold)})
+
+    def hold_pending_facts(self) -> int:
+        count = self._broker.hold_pending_facts()
+        self._trace.record("BROKER_ACTION", action="HOLD_PENDING_FACTS", detail={"count": count})
+        return count
+
+    def release_held_facts(self, count: int | None = None, *, reverse_order: bool = False) -> int:
+        released = self._broker.release_held_facts(count, reverse_order=reverse_order)
+        self._trace.record(
+            "BROKER_ACTION",
+            action="RELEASE_HELD_FACTS",
+            detail={"count": released, "reverse_order": bool(reverse_order)},
+        )
+        return released
+
 
 def build_multi_contract_profile_record(
     contracts: list[str] | tuple[str, ...],
@@ -172,6 +190,7 @@ class TradingScenario:
         max_quote_age_seconds: int | float = 0,
         use_production_tick_wrapper: bool = False,
         enable_market_diagnostics: bool = False,
+        fallback_book_to_last: bool = True,
     ) -> None:
         assert_offline_qa_environment(block_tqsdk=True)
         self.root = Path(root).resolve()
@@ -206,6 +225,7 @@ class TradingScenario:
             session_close=session_close,
             day_low=day_low,
             day_high=day_high,
+            fallback_book_to_last=fallback_book_to_last,
         )
         self.oracle = ReferenceOracle()
         self.trace = TraceRecorder(self.evidence_dir, scenario_name=scenario_name, run_id=self.run_id)
@@ -389,24 +409,50 @@ class TradingScenario:
                 candle_id=spec.get("candle_id"),  # type: ignore[arg-type]
                 opening_session=spec.get("opening_session"),  # type: ignore[arg-type]
                 market_session_active=spec.get("market_session_active"),  # type: ignore[arg-type]
+                native_time=spec.get("native_time"),  # type: ignore[arg-type]
+                delivery_time=spec.get("delivery_time"),  # type: ignore[arg-type]
                 drop_tick=bool(spec.get("drop_tick", False)),
+                fallback_book_to_last=spec.get("fallback_book_to_last"),  # type: ignore[arg-type]
             )
         if ticks_by_contract:
             for code, item in ticks_by_contract.items():
-                self.market.apply_tick(
-                    wall_time=self.clock.now_utc,
-                    last=item.get("last"),
-                    contract_id=code,
-                    bid1=item.get("bid1"),
-                    ask1=item.get("ask1"),
-                    day_low=item.get("day_low"),
-                    day_high=item.get("day_high"),
-                    candle_id=item.get("candle_id"),  # type: ignore[arg-type]
-                    opening_session=item.get("opening_session"),  # type: ignore[arg-type]
-                    market_session_active=item.get("market_session_active"),  # type: ignore[arg-type]
-                    native_time=item.get("native_time"),  # type: ignore[arg-type]
-                    drop_tick=bool(item.get("drop_tick", False)),
-                )
+                batch = item.get("ticks")
+                if isinstance(batch, list) and batch:
+                    for sub in batch:
+                        self.market.apply_tick(
+                            wall_time=self.clock.now_utc,
+                            last=sub.get("last"),
+                            contract_id=code,
+                            bid1=sub.get("bid1"),
+                            ask1=sub.get("ask1"),
+                            day_low=sub.get("day_low"),
+                            day_high=sub.get("day_high"),
+                            candle_id=sub.get("candle_id"),  # type: ignore[arg-type]
+                            opening_session=sub.get("opening_session"),  # type: ignore[arg-type]
+                            market_session_active=sub.get("market_session_active"),  # type: ignore[arg-type]
+                            native_time=sub.get("native_time"),  # type: ignore[arg-type]
+                            delivery_time=sub.get("delivery_time"),  # type: ignore[arg-type]
+                            drop_tick=bool(sub.get("drop_tick", False)),
+                            fallback_book_to_last=sub.get("fallback_book_to_last"),  # type: ignore[arg-type]
+                            append_to_buffer=True,
+                        )
+                else:
+                    self.market.apply_tick(
+                        wall_time=self.clock.now_utc,
+                        last=item.get("last"),
+                        contract_id=code,
+                        bid1=item.get("bid1"),
+                        ask1=item.get("ask1"),
+                        day_low=item.get("day_low"),
+                        day_high=item.get("day_high"),
+                        candle_id=item.get("candle_id"),  # type: ignore[arg-type]
+                        opening_session=item.get("opening_session"),  # type: ignore[arg-type]
+                        market_session_active=item.get("market_session_active"),  # type: ignore[arg-type]
+                        native_time=item.get("native_time"),  # type: ignore[arg-type]
+                        delivery_time=item.get("delivery_time"),  # type: ignore[arg-type]
+                        drop_tick=bool(item.get("drop_tick", False)),
+                        fallback_book_to_last=item.get("fallback_book_to_last"),  # type: ignore[arg-type]
+                    )
 
         # 3 & 4. Snapshot pending FakeBroker facts and assemble FACT_FRAME
         frame = self.assembler.build(

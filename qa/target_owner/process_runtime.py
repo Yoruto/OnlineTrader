@@ -400,6 +400,11 @@ class OfflineTargetOwnerProcess:
         with self._condition:
             return len(self._events)
 
+    @property
+    def pending_frame_count(self) -> int:
+        with self._condition:
+            return len(self._pending_frames)
+
     def start(self) -> "OfflineTargetOwnerProcess":
         if self._started:
             raise OwnerProcessError("Harness process already started")
@@ -537,6 +542,39 @@ class OfflineTargetOwnerProcess:
                 if remaining <= 0:
                     raise OwnerProcessError(f"Timed out waiting for fact frame {frame_id}")
                 self._condition.wait(min(remaining, 0.25))
+
+    def submit_fact_frame_async(self, frame: dict[str, object]) -> tuple[str, int]:
+        """Submit a fact frame without blocking for ACCEPTED/APPLIED (for realtime stress mode)."""
+        if not self.is_alive or self._control is None:
+            raise OwnerProcessError("Owner child is not running")
+        clean_frame = _json_copy(frame)
+        if not isinstance(clean_frame, dict):
+            raise ValueError("Fact frame must be an object")
+        frame_id = clean_frame.get("id")
+        sequence = clean_frame.get("sequence")
+        if not isinstance(frame_id, str) or type(sequence) is not int:
+            raise ValueError("Fact frame requires a string id and integer sequence")
+        sent_ns = time.monotonic_ns()
+        input_record = {
+            "input_seq": self._input_seq + 1,
+            "event_type": "FAKE_BROKER_FACT_FRAME",
+            "run_id": self.run_id,
+            "frame_id": frame_id,
+            "input_sequence": sequence,
+            "monotonic_ns": sent_ns,
+            "frame": clean_frame,
+        }
+        with self._input_lock:
+            if self._tearing_down:
+                raise OwnerProcessError("Cannot submit a fact frame during teardown")
+            self._input_seq += 1
+            input_record["input_seq"] = self._input_seq
+            with self._condition:
+                self._pending_frames.add(frame_id)
+            self._write_jsonl(self._input_log, input_record)
+            with self._send_lock:
+                self._control.send({"type": "FACT_FRAME", "frame": clean_frame})
+        return frame_id, sent_ns
 
     def set_adapter_fault(
         self,

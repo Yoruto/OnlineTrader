@@ -86,6 +86,8 @@ class FakeBroker:
         }
         self._positions = self._positions_by_contract[self.contract]
         self._pending_facts: list[dict[str, object]] = []
+        self._held_facts: list[dict[str, object]] = []
+        self._hold_new_facts = False
         self._sequence = 0
         self._last_monotonic_ms = -1
         self._next_order_id = 1
@@ -127,6 +129,56 @@ class FakeBroker:
     def pending_facts(self) -> tuple[dict[str, object], ...]:
         with self._lock:
             return tuple(deepcopy(self._pending_facts))
+
+    @property
+    def held_facts(self) -> tuple[dict[str, object], ...]:
+        with self._lock:
+            return tuple(deepcopy(self._held_facts))
+
+    def set_fact_delivery_hold(self, hold: bool) -> None:
+        """When True, newly created broker facts are held instead of queued for immediate delivery."""
+        with self._lock:
+            self._hold_new_facts = bool(hold)
+            self._record("BROKER_FACT_HOLD_UPDATED", hold=self._hold_new_facts)
+
+    def hold_pending_facts(self) -> int:
+        """Move currently pending facts into the held queue to simulate delayed/interrupted broker return."""
+        with self._lock:
+            if self._inflight is not None:
+                raise FakeBrokerError("Cannot hold pending facts while a broker frame is inflight")
+            moved = len(self._pending_facts)
+            if moved:
+                self._held_facts.extend(self._pending_facts)
+                self._pending_facts.clear()
+                self._record("BROKER_FACTS_HELD", count=moved, total_held=len(self._held_facts))
+            return moved
+
+    def release_held_facts(self, count: int | None = None, *, reverse_order: bool = False) -> int:
+        """Release held broker facts into the pending delivery queue (optionally reordered)."""
+        with self._lock:
+            if count is None:
+                batch = list(self._held_facts)
+                self._held_facts.clear()
+            else:
+                if count <= 0:
+                    return 0
+                batch = list(self._held_facts[:count])
+                del self._held_facts[:count]
+            if reverse_order:
+                batch.reverse()
+            if batch:
+                self._pending_facts.extend(batch)
+                self._record(
+                    "BROKER_FACTS_RELEASED",
+                    count=len(batch),
+                    reverse_order=bool(reverse_order),
+                    remaining_held=len(self._held_facts),
+                )
+            return len(batch)
+
+    def _enqueue_fact(self, fact: dict[str, object]) -> None:
+        target = self._held_facts if self._hold_new_facts else self._pending_facts
+        target.append(deepcopy(fact))
 
     @property
     def positions(self) -> dict[str, int]:
@@ -255,7 +307,8 @@ class FakeBroker:
                 "orders": self.orders,
                 "active_children": active_children,
                 "trades": deepcopy(self._trades),
-                "pending_fact_count": len(self._pending_facts),
+                "pending_fact_count": len(self._pending_facts) + len(self._held_facts),
+                "held_fact_count": len(self._held_facts),
             }
 
     def prepare_broker_snapshot(
@@ -500,7 +553,7 @@ class FakeBroker:
                 fact["fill_day"] = fill_day
             order.traded_qty = next_total
             self._trades[trade_id] = deepcopy(fact)
-            self._pending_facts.append(deepcopy(fact))
+            self._enqueue_fact(fact)
             self._record("TRADE_FACT_CREATED", child_order_id=child_order_id,
                          native_order_id=order.native_order_id, fact=fact,
                          positions=self._position_snapshot(str(order.request["contract_id"])))
@@ -573,7 +626,7 @@ class FakeBroker:
             fact = self._trades.get(native_trade_id)
             if fact is None:
                 raise FakeBrokerError("Cannot replay an unknown native trade")
-            self._pending_facts.append(deepcopy(fact))
+            self._enqueue_fact(fact)
             self._record("TRADE_FACT_REDELIVERED", native_trade_id=native_trade_id,
                          fact=fact, positions=self._position_snapshot())
             return deepcopy(fact)
@@ -792,7 +845,7 @@ class FakeBroker:
             fact["rejection_category"] = rejection_category
         if rejection_detail is not None:
             fact["rejection_detail"] = rejection_detail
-        self._pending_facts.append(deepcopy(fact))
+        self._enqueue_fact(fact)
         return fact
 
     def _base_fact(self, order: FakeBrokerOrder) -> dict[str, object]:

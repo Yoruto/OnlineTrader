@@ -7,7 +7,7 @@ without embedding order acceptance or fill logic.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
@@ -64,6 +64,8 @@ class ContractMarketState:
     external_orders: bool = False
     age_quality_override: str | None = None
     quote_reason_override: str | None = None
+    fallback_book_to_last: bool = True
+    pending_ticks: list[dict[str, object]] = field(default_factory=list)
 
 
 class FakeMarket:
@@ -85,6 +87,7 @@ class FakeMarket:
         available: str | int | Decimal = "100000",
         margin_per_lot: str | int | Decimal = "1000",
         multiplier: str | int | Decimal = "10",
+        fallback_book_to_last: bool = True,
     ) -> None:
         ordered = tuple(dict.fromkeys([contract_id, *(contracts or ())]))
         self._contracts: dict[str, ContractMarketState] = {
@@ -101,6 +104,7 @@ class FakeMarket:
                 available=_canon_price(available),
                 margin_per_lot=_canon_price(margin_per_lot),
                 multiplier=_canon_price(multiplier),
+                fallback_book_to_last=bool(fallback_book_to_last),
             )
             for code in ordered
         }
@@ -141,6 +145,12 @@ class FakeMarket:
         if drop_tick is not None:
             state.drop_tick = bool(drop_tick)
 
+    def set_fallback_book_to_last(self, enabled: bool, *, contract_id: str | None = None) -> None:
+        """Enable or disable replacing missing bid1/ask1 with last price."""
+        targets = [self._contracts[contract_id]] if contract_id else list(self._contracts.values())
+        for state in targets:
+            state.fallback_book_to_last = bool(enabled)
+
     def apply_tick(
         self,
         *,
@@ -155,7 +165,10 @@ class FakeMarket:
         opening_session: bool | None = None,
         market_session_active: bool | None = None,
         native_time: str | None = None,
+        delivery_time: str | None = None,
         drop_tick: bool = False,
+        fallback_book_to_last: bool | None = None,
+        append_to_buffer: bool = False,
     ) -> None:
         code = contract_id or self._default_contract
         state = self._contracts.get(code)
@@ -173,6 +186,8 @@ class FakeMarket:
         if candle_id is not None:
             state.candle_id = candle_id
         if drop_tick or last is None:
+            if not append_to_buffer:
+                state.pending_ticks.clear()
             if native_time is not None:
                 state.native_time = native_time
             self._history.append({
@@ -182,19 +197,45 @@ class FakeMarket:
             })
             return
 
+        effective_fallback = (
+            state.fallback_book_to_last if fallback_book_to_last is None else bool(fallback_book_to_last)
+        )
         last_text = _canon_price(last)
-        bid_text = last_text if bid1 is None else _canon_price(bid1)
-        ask_text = last_text if ask1 is None else _canon_price(ask1)
+        if bid1 is None:
+            bid_text: str | None = last_text if effective_fallback else None
+        else:
+            bid_text = _canon_price(bid1)
+        if ask1 is None:
+            ask_text: str | None = last_text if effective_fallback else None
+        else:
+            ask_text = _canon_price(ask1)
         state.last = last_text
         state.bid1 = bid_text
         state.ask1 = ask_text
         state.native_time = native_time or wall_time
-        state.last_quote_wall_time = wall_time
+        state.last_quote_wall_time = delivery_time or wall_time
         state.age_quality_override = None
         state.quote_reason_override = None
+        tick_payload: dict[str, object] = {
+            "native_time": state.native_time,
+            "candle_id": state.candle_id,
+            "last": last_text,
+            "day_low": state.day_low,
+            "day_high": state.day_high,
+            "bid1": bid_text,
+            "ask1": ask_text,
+            "tick_size": state.tick_size,
+            "lower_limit": state.lower_limit,
+            "upper_limit": state.upper_limit,
+        }
+        if append_to_buffer:
+            state.pending_ticks.append(tick_payload)
+        else:
+            state.pending_ticks.clear()
         self._history.append({
             "contract_id": code,
             "wall_time": wall_time,
+            "delivery_time": state.last_quote_wall_time,
             "native_time": state.native_time,
             "last": last_text,
             "bid1": bid_text,
@@ -204,25 +245,34 @@ class FakeMarket:
             "candle_id": state.candle_id,
         })
 
-    def snapshot(self, *, wall_time: str | None = None) -> list[dict[str, object]]:
+    def snapshot(self, *, wall_time: str | None = None, consume_buffer: bool = True) -> list[dict[str, object]]:
         """Return market rows ready to be merged with FakeBroker position buckets."""
         now_dt = _utc_dt(wall_time) if wall_time is not None else None
         rows: list[dict[str, object]] = []
         for state in self._contracts.values():
             ticks: list[dict[str, object]] = []
-            if not state.drop_tick and state.last is not None and state.native_time is not None:
-                ticks.append({
-                    "native_time": state.native_time,
-                    "candle_id": state.candle_id,
-                    "last": state.last,
-                    "day_low": state.day_low,
-                    "day_high": state.day_high,
-                    "bid1": state.bid1 or state.last,
-                    "ask1": state.ask1 or state.last,
-                    "tick_size": state.tick_size,
-                    "lower_limit": state.lower_limit,
-                    "upper_limit": state.upper_limit,
-                })
+            if not state.drop_tick:
+                if state.pending_ticks:
+                    ticks = deepcopy(state.pending_ticks)
+                    if consume_buffer:
+                        state.pending_ticks.clear()
+                elif state.last is not None and state.native_time is not None:
+                    bid_val = state.bid1 if (state.bid1 is not None or not state.fallback_book_to_last) else state.last
+                    ask_val = state.ask1 if (state.ask1 is not None or not state.fallback_book_to_last) else state.last
+                    ticks.append({
+                        "native_time": state.native_time,
+                        "candle_id": state.candle_id,
+                        "last": state.last,
+                        "day_low": state.day_low,
+                        "day_high": state.day_high,
+                        "bid1": bid_val,
+                        "ask1": ask_val,
+                        "tick_size": state.tick_size,
+                        "lower_limit": state.lower_limit,
+                        "upper_limit": state.upper_limit,
+                    })
+            elif consume_buffer:
+                state.pending_ticks.clear()
             source_age_ns: int | None = None
             silence_ns: int | None = None
             if now_dt is not None and state.last_quote_wall_time is not None and state.native_time is not None:

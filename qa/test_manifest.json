@@ -665,10 +665,13 @@
         "ConvergenceCancelRecoveryAndPhaseTests.test_convergence_broker_market_phase_does_not_penalize_failures_and_uses_5s_backoff",
         "ConvergenceCancelRecoveryAndPhaseTests.test_convergence_order_stale_cancel_recovers_in_armed_and_disarmed",
         "ConvergenceCancelRecoveryAndPhaseTests.test_external_order_stale_cancel_recovers_and_preserves_prior_status_on_local_refusal",
+        "ConvergenceCancelRecoveryAndPhaseTests.test_first_cancel_local_rejection_does_not_consume_cancel_attempt",
         "MultiContractCombinationTests.test_late_fill_after_stop_updates_owned_position_without_duplicate_open",
         "MultiContractCombinationTests.test_limit_down_on_contract_a_does_not_block_contract_b",
+        "TradeParametersDraftAndSavedStateTests.test_arm_prompts_when_trade_parameters_have_unsaved_changes",
         "TradeParametersDraftAndSavedStateTests.test_next_boot_saved_profile_is_distinguished_from_unsaved_edits",
         "TradeParametersDraftAndSavedStateTests.test_offset_apply_blocked_while_trade_panel_has_invalid_input",
+        "TradeParametersDraftAndSavedStateTests.test_revert_trade_parameters_respects_saved_next_boot_and_cancels_cleanly",
         "TradeParametersDraftAndSavedStateTests.test_runtime_profile_sync_conflict_prompts_user",
         "TradeParametersDraftAndSavedStateTests.test_trade_panel_draft_survives_symbol_edit_runtime_sync_and_invalid_mid_typing",
         "UiHangMonitorAsyncRecoveryTests.test_heartbeat_recovery_writes_on_monitor_thread_not_caller_thread",
@@ -4401,6 +4404,34 @@
         "SchedulerScopeTests.test_manual_original_plan_without_entry_time_is_refused_without_type_error_or_mutation",
         "SchedulerScopeTests.test_recent_pre_break_quote_cannot_open_in_the_current_recess",
         "SchedulerScopeTests.test_repeated_quote_does_not_postpone_clock_tick_or_refresh_quote_age"
+      ],
+      "case_overrides": {}
+    },
+    "test_sdk_adapter_market_channel": {
+      "tier": "T1",
+      "domains": [
+        "sdk-adapter-market-channel"
+      ],
+      "risk": "UNTRIAGED",
+      "profiles": [
+        "FullOffline"
+      ],
+      "platform": [
+        "Windows",
+        "Linux"
+      ],
+      "broker_mode": "OFFLINE",
+      "legacy": null,
+      "requirements": [],
+      "timeout_seconds": 30,
+      "cases": [
+        "DsvSdkAdapterMarketChannelTests.test_cross_session_silver_night_active_while_palm_closed",
+        "DsvSdkAdapterMarketChannelTests.test_delayed_quote_reports_exact_source_age_ns",
+        "DsvSdkAdapterMarketChannelTests.test_frozen_quote_accumulates_silence_ns_without_refreshing_distinct_time",
+        "DsvSdkAdapterMarketChannelTests.test_limit_locked_nan_book_converts_to_none_and_triggers_deferred_limit_locked",
+        "DsvSdkAdapterMarketChannelTests.test_malformed_quote_timestamp_fails_closed",
+        "DsvSdkAdapterMarketChannelTests.test_market_channel_one_sided_fault_penetrates_real_sdk_adapter",
+        "DsvSdkAdapterMarketChannelTests.test_out_of_order_time_regression_flagged_as_source_anomaly"
       ],
       "case_overrides": {}
     },
