@@ -768,6 +768,70 @@ class TradeParametersDraftAndSavedStateTests(unittest.TestCase):
         self.assertIsNone(win.dashboard._saved_next_boot_hash)
         self.assertEqual(panel.parameter_fields['night_session_close'].text(), orig_night)
 
+    def test_manual_edit_back_to_active_while_next_boot_saved_is_still_unsaved(self):
+        win = self._new_window()
+        panel = win.dashboard.trade_params_panel
+        active_profile = win.dashboard.profile
+        orig_night = active_profile.to_record()['settings']['trade']['night_session_close']
+
+        # Save B (night_session_close='23:30') as pending next-boot config.
+        panel.parameter_fields['night_session_close'].setText('23:30')
+        panel.parameter_fields['night_session_close'].editingFinished.emit()
+        profile_b = panel.build_profile(active_profile)
+        win.dashboard.mark_next_boot_saved(profile_b)
+        self.assertFalse(panel.has_unsaved_changes())
+
+        # Manually edit UI back to A without saving -> disk still holds B.
+        panel.parameter_fields['night_session_close'].setText(orig_night)
+        panel.parameter_fields['night_session_close'].editingFinished.emit()
+        self.assertTrue(panel.has_unsaved_changes())
+        self.assertTrue(panel.revert_button.isEnabled())
+        self.assertIn('尚未保存覆盖待重启启动配置', panel.dirty_label.text())
+
+        # Clicking revert restores saved next-boot config B without touching disk.
+        win.dashboard.revert_trade_parameters()
+        self.assertEqual(panel.parameter_fields['night_session_close'].text(), '23:30')
+        self.assertFalse(panel.has_unsaved_changes())
+        self.assertIsNotNone(win.dashboard._saved_next_boot_profile)
+
+        # Symbol tab symmetry: when B has different symbols, reverting dialog draft back to A is still unsaved.
+        record_sym_b = active_profile.to_record()
+        record_sym_b['settings']['symbols'] = record_sym_b['settings']['symbols'][:-1]
+        profile_sym_b = type(active_profile).from_record(record_sym_b)
+        dialog = win.dashboard.parameter_dialog()
+        win.dashboard.mark_next_boot_saved(profile_sym_b)
+        self.assertFalse(win.dashboard.has_unsaved_symbol_changes())
+        dialog.set_preview_profile(active_profile, emit_signal=False)
+        self.assertTrue(win.dashboard.has_unsaved_symbol_changes())
+
+    def test_store_none_blocks_clearing_next_boot_on_revert_and_save(self):
+        from unittest.mock import patch
+
+        win = self._new_window()
+        panel = win.dashboard.trade_params_panel
+        active_profile = win.dashboard.profile
+
+        panel.parameter_fields['night_session_close'].setText('23:30')
+        panel.parameter_fields['night_session_close'].editingFinished.emit()
+        profile_b = panel.build_profile(active_profile)
+        win.dashboard.mark_next_boot_saved(profile_b)
+        win._portable_store_and_account = lambda: (None, None)
+
+        # 1) Revert while viewing B with store=None must fail closed and keep next-boot state.
+        with patch.object(QMessageBox, 'critical') as mock_crit:
+            win.dashboard.revert_trade_parameters()
+        mock_crit.assert_called_once()
+        self.assertEqual(win.dashboard._saved_next_boot_hash, profile_b.content_hash)
+        self.assertIsNotNone(win.dashboard._saved_next_boot_profile)
+
+        # 2) Saving active profile A to overwrite B with store=None must also fail closed.
+        with patch.object(QMessageBox, 'critical') as mock_crit:
+            ok = win.save_runtime_parameters(active_profile)
+        self.assertFalse(ok)
+        mock_crit.assert_called_once()
+        self.assertEqual(win.dashboard._saved_next_boot_hash, profile_b.content_hash)
+        self.assertIsNotNone(win.dashboard._saved_next_boot_profile)
+
 
 class UiHangMonitorAsyncRecoveryTests(unittest.TestCase):
     @classmethod

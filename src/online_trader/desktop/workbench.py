@@ -2382,14 +2382,18 @@ class WorkbenchWindow(StatusWindow):
             if candidate_profile.content_hash == current_profile.content_hash:
                 if self.dashboard._saved_next_boot_hash is not None:
                     store, _ = self._portable_store_and_account()
-                    if store is not None:
-                        try:
-                            store.save_profile(candidate_profile)
-                        except (TraderError, OSError) as error:
-                            message = f'未能恢复启动配置：{error}'
-                            self.dashboard.set_parameter_feedback(message, error=True)
-                            QMessageBox.critical(self, '保存配置失败', message)
-                            return False
+                    if store is None:
+                        message = '未能恢复启动配置：当前未挂载可写配置存储。'
+                        self.dashboard.set_parameter_feedback(message, error=True)
+                        QMessageBox.critical(self, '保存配置失败', message)
+                        return False
+                    try:
+                        store.save_profile(candidate_profile)
+                    except (TraderError, OSError) as error:
+                        message = f'未能恢复启动配置：{error}'
+                        self.dashboard.set_parameter_feedback(message, error=True)
+                        QMessageBox.critical(self, '保存配置失败', message)
+                        return False
                     self.dashboard.clear_next_boot_saved(candidate_profile)
                     self.dashboard.set_parameter_feedback('已将启动配置恢复为当前运行配置。')
                     return True

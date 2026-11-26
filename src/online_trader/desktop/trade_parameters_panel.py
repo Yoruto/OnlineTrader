@@ -988,30 +988,47 @@ class TradeParametersPanel(QWidget):
     def _compute_changed_keys(self) -> tuple[list[str], bool]:
         return self._diff_against_profile(self._active_profile)
 
+    def has_pending_next_boot_config(self) -> bool:
+        return self._saved_next_boot_hash is not None and self._saved_next_boot_profile is not None
+
+    def _compute_unsaved_changed_keys(self) -> tuple[list[str], bool]:
+        baseline = self._saved_next_boot_profile if self.has_pending_next_boot_config() else self._active_profile
+        return self._diff_against_profile(baseline)
+
     def _matches_saved_next_boot(self) -> bool:
-        if self._saved_next_boot_hash is None or self._saved_next_boot_profile is None:
+        if not self.has_pending_next_boot_config():
             return False
         changed, _ = self._diff_against_profile(self._saved_next_boot_profile)
         return not changed
 
     def _refresh_dirty_state(self):
-        changed, needs_restart = self._compute_changed_keys()
-        if not changed:
-            self.dirty_label.setText('当前无未保存修改')
-            self.dirty_label.setStyleSheet('color: #66778d; font-size: 12px;')
-            self.revert_button.setEnabled(False)
+        active_changed, needs_restart = self._compute_changed_keys()
+        has_pending_next_boot = self.has_pending_next_boot_config()
+        unsaved_changed, _ = self._compute_unsaved_changed_keys()
+        if not unsaved_changed:
+            if has_pending_next_boot and active_changed:
+                self.dirty_label.setText('● 已保存至启动配置（等待重启后台服务生效）')
+                self.dirty_label.setStyleSheet('color: #9a6700; font-weight: 600; font-size: 12px;')
+                self.revert_button.setEnabled(True)
+            else:
+                self.dirty_label.setText('当前无未保存修改')
+                self.dirty_label.setStyleSheet('color: #66778d; font-size: 12px;')
+                self.revert_button.setEnabled(False)
             self.save_button.setText('保存并生效' if self._live_save else '保存参数')
-        elif self._matches_saved_next_boot():
-            self.dirty_label.setText('● 已保存至启动配置（等待重启后台服务生效）')
-            self.dirty_label.setStyleSheet('color: #9a6700; font-weight: 600; font-size: 12px;')
-            self.revert_button.setEnabled(True)
-            self.save_button.setText('保存并生效' if self._live_save else '保存参数')
-        else:
-            suffix = '（含需重启生效项）' if needs_restart else ('（保存后立即热生效）' if self._live_save else '（保存后下次启动生效）')
-            self.dirty_label.setText(f'● 已修改 {len(changed)} 项{suffix}')
+        elif has_pending_next_boot and not active_changed:
+            self.dirty_label.setText('● 已改回当前运行配置（尚未保存覆盖待重启启动配置）')
             self.dirty_label.setStyleSheet('color: #075de5; font-weight: 600; font-size: 12px;')
             self.revert_button.setEnabled(True)
-            self.save_button.setText(f'保存并生效 ({len(changed)})' if self._live_save else f'保存参数 ({len(changed)})')
+            self.save_button.setText(
+                f'保存并生效 ({len(unsaved_changed)})' if self._live_save else f'保存参数 ({len(unsaved_changed)})'
+            )
+        else:
+            count = len(active_changed) or len(unsaved_changed)
+            suffix = '（含需重启生效项）' if needs_restart else ('（保存后立即热生效）' if self._live_save else '（保存后下次启动生效）')
+            self.dirty_label.setText(f'● 已修改 {count} 项{suffix}')
+            self.dirty_label.setStyleSheet('color: #075de5; font-weight: 600; font-size: 12px;')
+            self.revert_button.setEnabled(True)
+            self.save_button.setText(f'保存并生效 ({count})' if self._live_save else f'保存参数 ({count})')
 
     def set_feedback(self, message: str, *, error: bool = False):
         self.feedback_label.setText(message)
@@ -1022,5 +1039,5 @@ class TradeParametersPanel(QWidget):
         self.feedback_label.setVisible(bool(message))
 
     def has_unsaved_changes(self) -> bool:
-        changed, _ = self._compute_changed_keys()
-        return bool(changed) and not self._matches_saved_next_boot()
+        changed, _ = self._compute_unsaved_changed_keys()
+        return bool(changed)

@@ -1842,13 +1842,12 @@ class WorkbenchLayout:
     def has_unsaved_symbol_changes(self):
         dialog = self.window._settings_dialog
         current_profile = dialog.profile if dialog is not None else self.profile
-        if current_profile.content_hash == self.profile.content_hash:
-            return False
-        if self._saved_next_boot_hash == current_profile.content_hash:
+        baseline = self._saved_next_boot_profile if self._saved_next_boot_profile is not None else self.profile
+        if current_profile.content_hash == baseline.content_hash:
             return False
         current_symbols = current_profile.to_record()['settings']['symbols']
-        active_symbols = self.profile.to_record()['settings']['symbols']
-        return current_symbols != active_symbols
+        baseline_symbols = baseline.to_record()['settings']['symbols']
+        return current_symbols != baseline_symbols
 
     def set_parameter_feedback(self, message, *, error=False):
         label = getattr(self, 'symbol_feedback_label', None)
@@ -2915,14 +2914,18 @@ class WorkbenchLayout:
                 self.set_parameter_feedback('已撤销未保存修改，恢复为已保存的下次启动配置（OnlineTrader-overrides.json）。')
                 return
             store, _ = self.window._portable_store_and_account()
-            if store is not None:
-                try:
-                    store.save_profile(self.profile)
-                except (TraderError, OSError) as error:
-                    message = f'未能撤销已保存的启动配置：{error}'
-                    self.set_parameter_feedback(message, error=True)
-                    QMessageBox.critical(self.window, '撤销配置失败', message)
-                    return
+            if store is None:
+                message = '未能撤销已保存的启动配置：当前未挂载可写配置存储。'
+                self.set_parameter_feedback(message, error=True)
+                QMessageBox.critical(self.window, '撤销配置失败', message)
+                return
+            try:
+                store.save_profile(self.profile)
+            except (TraderError, OSError) as error:
+                message = f'未能撤销已保存的启动配置：{error}'
+                self.set_parameter_feedback(message, error=True)
+                QMessageBox.critical(self.window, '撤销配置失败', message)
+                return
             self.clear_next_boot_saved(self.profile)
             self.set_parameter_feedback('已撤销下次启动配置，恢复为当前运行配置。')
             return
@@ -3025,6 +3028,8 @@ class WorkbenchLayout:
                     self.parameter_state.setText(f'待保存草稿（{"；".join(parts)}）· 点击「保存参数」生效')
                 else:
                     self.parameter_state.setText('本地参数草稿 · 保存后应用到当前策略' if live else '本地参数草稿 · 用于下次启动')
+        elif self._saved_next_boot_hash is not None and self._saved_next_boot_hash != self.profile.content_hash:
+            self.parameter_state.setText('已改回当前运行配置 · 尚未保存覆盖待重启启动配置')
         if self.dsv_config is not None:
             self.parameter_state.setToolTip(str(self.dsv_config))
             self.symbol_preview_state.setToolTip(str(self.dsv_config))
