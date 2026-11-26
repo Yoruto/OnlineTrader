@@ -52,6 +52,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             window.view = view
             window.render_view()
             window.dashboard.show_details(window.dashboard.log_tab)
+            window.dashboard.log_view_tabs.setCurrentWidget(window.dashboard.log_text)
             window.dashboard.log_filter.setCurrentText('工作台')
             self.assertIn('日内振幅超出开仓上限', window.dashboard.log_text.toPlainText())
 
@@ -150,6 +151,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                 self.assertIn('当日行情已越过多头不追价线',dashboard.status_labels[0].text())
                 dashboard.add_activity('本地连接诊断')
                 dashboard.show_details(dashboard.log_tab)
+                dashboard.log_view_tabs.setCurrentWidget(dashboard.log_text)
                 dashboard.log_filter.setCurrentText('工作台')
                 self.assertIn('本地连接诊断',dashboard.log_text.toPlainText())
                 self.assertIn('柜台待核对',dashboard.log_text.toPlainText())
@@ -169,6 +171,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
                 dashboard.add_activity('SHFE.ag2702 状态刷新失败',category='error')
                 dashboard.add_activity('DCE.p2701 状态刷新失败',category='error')
                 dashboard.log_search.setText('shfe.AG2702')
+                dashboard.update_logs()
                 self.assertEqual(len(dashboard.visible_log_lines),1)
                 self.assertIn('SHFE.ag2702',dashboard.visible_log_lines[0])
                 dashboard.log_search.clear()
@@ -244,6 +247,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             window.view = view
             dashboard = window.dashboard
             dashboard.show_details(dashboard.log_tab)
+            dashboard.log_view_tabs.setCurrentWidget(dashboard.log_text)
             dashboard.log_filter.setCurrentText('执行器')
             self.assertEqual(dashboard.visible_log_lines, [])
             self.assertIsNone(dashboard.latest_run())
@@ -265,6 +269,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             window.view = view
             dashboard = window.dashboard
             dashboard.show_details(dashboard.log_tab)
+            dashboard.log_view_tabs.setCurrentWidget(dashboard.log_text)
             dashboard.log_filter.setCurrentText('执行器')
             self.assertIn('current owner log', dashboard.log_text.toPlainText())
 
@@ -305,6 +310,7 @@ class DsvWorkbenchParityTests(unittest.TestCase):
             window.view = view
             dashboard = window.dashboard
             dashboard.show_details(dashboard.log_tab)
+            dashboard.log_view_tabs.setCurrentWidget(dashboard.log_text)
             dashboard.log_filter.setCurrentText('执行器')
             self.assertIn('操作日志降级', dashboard.log_text.toPlainText())
             failure = run / 'startup-failure.json'
