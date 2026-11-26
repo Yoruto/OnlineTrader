@@ -915,7 +915,7 @@ class DsvSession:
                 now = _utc(observed.get('wall_reads', {}).get('pending', symbol_frame['wall_time'])).timestamp()
                 if tick is None:
                     if perm['can_cancel'] and callable(getattr(self._controller, 'plan_maintenance', None)):
-                        maint, _ = self._controller.plan_maintenance(state, row, observed)
+                        maint, _ = self._controller.plan_maintenance(state, row, observed, wall_time=now)
                         effects.extend(maint)
                     self._controller.settle(state, row)
                 else:
@@ -941,13 +941,14 @@ class DsvSession:
                 else:
                     self._diag().observe_block(('exit_session_gate', contract), active=False, contract_id=contract)
                 if perm['can_cancel']:
-                    maint, _ = self._controller.plan_maintenance(state, row, observed)
+                    maint_now = _utc(observed.get('wall_reads', {}).get('pending', symbol_frame['wall_time'])).timestamp()
+                    maint, _ = self._controller.plan_maintenance(state, row, observed, wall_time=maint_now)
                     effects.extend(maint)
                     if self._sdk_port is not None:
                         position = row['position']
                         if position is not None and position['entry_stopped'] and not position.get('preserve_open_on_stop'):
                             for order in self._controller.child_orders(state, position, 'OPEN'):
-                                if request := self._controller.cancel(order, 'TARGET_REDUCED'):
+                                if request := self._controller.cancel(order, 'TARGET_REDUCED', wall_time=maint_now):
                                     effects.append(request)
                 self._controller.settle(state, row)
         if getattr(self, '_standalone_convergence', False) and state['synchronized']:
@@ -969,6 +970,7 @@ class DsvSession:
             else:
                 conv_effects = self._controller.reconcile_stopped_convergence(
                     state, observed_configured, unconfigured_observed, ext_orders,
+                    wall_time=_utc(frame['wall_time']).timestamp(),
                     wall_iso=frame['wall_time'])
                 effects.extend(conv_effects)
                 state['convergence_status'] = self._compute_convergence_preview(

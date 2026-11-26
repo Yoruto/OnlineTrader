@@ -1143,6 +1143,8 @@ class WorkbenchLayout:
         self.parameter_save_buttons = []
         self._runtime_synced_hash = None
         self._saved_next_boot_hash = None
+        self._saved_next_boot_profile = None
+        self._preserving_trade_panel_widgets = False
         self.symbol_feedback_label = None
 
         original = window.takeCentralWidget()
@@ -1213,6 +1215,7 @@ class WorkbenchLayout:
         if self.settings.value('template_directory','',str):
             self.parameter_dialog()
         self.tabs.currentChanged.connect(self.page_changed)
+        self.parameter_sections.currentChanged.connect(self._on_parameter_section_changed)
         self.diagnostic_sections.currentChanged.connect(self.update_logs)
         self.render_home()
         self.workspace_clock = QLabel()
@@ -1233,7 +1236,7 @@ class WorkbenchLayout:
         self.log_timer.timeout.connect(self.update_logs)
         self.log_timer.timeout.connect(self.update_workspace_clock)
         from online_trader.desktop.ui_hang_monitor import UiHangMonitor
-        self.hang_monitor = UiHangMonitor(log_dir_getter=lambda: self.log_directory)
+        self.hang_monitor = UiHangMonitor(log_dir_getter=self._hang_diagnostic_directory)
         self.log_timer.timeout.connect(self.hang_monitor.heartbeat)
         self.hang_monitor.start()
         self.log_timer.start()
@@ -1279,7 +1282,44 @@ class WorkbenchLayout:
         tabs.addTab(page, title)
         return page
 
+    def _hang_diagnostic_directory(self):
+        if self.log_directory is not None:
+            return self.log_directory
+        runtime_root = getattr(self.window, '_runtime_root', None)
+        if isinstance(runtime_root, Path):
+            diag_dir = runtime_root / 'diagnostics'
+            if diag_dir.is_dir():
+                return diag_dir
+            if runtime_root.is_dir():
+                return runtime_root
+        store_dir = getattr(getattr(self.window, 'store', None), 'directory', None)
+        if isinstance(store_dir, Path) and store_dir.is_dir():
+            return store_dir
+        return None
+
+    def _sync_trade_panel_draft(self, *, update_calculator=False, create_dialog=False):
+        panel = getattr(self, 'trade_params_panel', None)
+        if panel is None:
+            return None, False
+        dialog = self.parameter_dialog() if create_dialog else self.window._settings_dialog
+        base = dialog.profile if dialog is not None else self.profile
+        candidate = panel.try_merge_into_profile(base)
+        if candidate is None:
+            return None, panel.has_unsaved_changes()
+        if dialog is not None and candidate.content_hash != dialog.profile.content_hash:
+            dialog.set_preview_profile(candidate, emit_signal=False)
+        panel._base_profile = candidate
+        if (update_calculator and getattr(self, 'calculator', None) is not None
+                and self.calculator.base_hash != candidate.content_hash):
+            self.calculator.set_base_profile(candidate)
+            self.offset_preview.setText('参数预览已更新，请重新计算偏移。')
+        return candidate, False
+
+    def _on_parameter_section_changed(self, _index):
+        self._sync_trade_panel_draft(update_calculator=True, create_dialog=False)
+
     def page_changed(self, _):
+        self._sync_trade_panel_draft(update_calculator=True, create_dialog=False)
         self.window.notice_label.setVisible(self.tabs.currentWidget() is not self.home_tab)
         self.update_logs()
 
@@ -1343,7 +1383,7 @@ class WorkbenchLayout:
         QMessageBox.information(self.window, '快捷键', 'F5 启动策略或打开模拟连接\nF6 停止策略')
 
     def open_parameters(self):
-        self.parameter_dialog()
+        self._sync_trade_panel_draft(update_calculator=True, create_dialog=True)
         self.window.open_settings()
 
     def parameter_dialog(self):
@@ -1800,6 +1840,9 @@ class WorkbenchLayout:
 
     def mark_next_boot_saved(self, profile):
         self._saved_next_boot_hash = profile.content_hash
+        self._saved_next_boot_profile = profile
+        if self.window._settings_dialog is not None:
+            self.window._settings_dialog.set_preview_profile(profile, emit_signal=False)
         self.set_parameter_feedback('新合约配置已保存到启动配置（OnlineTrader-overrides.json），重启后台服务后生效。')
         self.render_parameters(profile)
 
@@ -1823,22 +1866,36 @@ class WorkbenchLayout:
         self.profile_source = '当前 Runtime 运行配置'
         dialog = self.window._settings_dialog
         panel = getattr(self, 'trade_params_panel', None)
+        panel_dirty = panel is not None and panel.has_unsaved_changes()
+        if panel_dirty and dialog is not None:
+            self._sync_trade_panel_draft(update_calculator=True, create_dialog=False)
         dirty = (
             (dialog is not None and dialog.profile.content_hash != self.profile.content_hash)
-            or (panel is not None and panel.has_unsaved_changes())
+            or panel_dirty
         )
         self.profile = remote
         self.symbols = remote.to_record()['settings']['symbols']
         self.names = {item['code']: item['name'] for item in self.symbols}
         if self._saved_next_boot_hash == remote.content_hash:
             self._saved_next_boot_hash = None
+            self._saved_next_boot_profile = None
         if dialog is not None:
-            dialog.set_runtime_baseline(remote, self.profile_source, preserve_draft=True)
+            prev_preserve = self._preserving_trade_panel_widgets
+            if panel_dirty:
+                self._preserving_trade_panel_widgets = True
+            try:
+                dialog.set_runtime_baseline(remote, self.profile_source, preserve_draft=True)
+            finally:
+                self._preserving_trade_panel_widgets = prev_preserve
         elif not dirty:
             self.render_parameters(remote)
         elif panel is not None:
-            panel._active_profile = remote
-            panel._refresh_dirty_state()
+            panel.update_active_baseline(
+                remote,
+                profile_source=self.profile_source,
+                saved_next_boot_hash=self._saved_next_boot_hash,
+                saved_next_boot_profile=self._saved_next_boot_profile,
+            )
         self.update_runtime_capabilities()
 
     @staticmethod
@@ -2796,6 +2853,7 @@ class WorkbenchLayout:
         panel.import_dsv_requested.connect(self.import_dsv_into_parameters)
         panel.export_file_requested.connect(self.export_parameters_to_file)
         panel.timed_start_requested.connect(self.window.arrange_timed_start)
+        panel.draft_committed.connect(lambda: self._sync_trade_panel_draft(update_calculator=True, create_dialog=False))
 
         panel.load_profile(self.profile, active_profile=self.profile, profile_source=self.profile_source)
         layout.addWidget(panel, 1)
@@ -2909,13 +2967,24 @@ class WorkbenchLayout:
         live = bool((self.window.view or {}).get('configuration', {}).get('live_parameter_save') or self.window._runtime_mode)
         panel = getattr(self, 'trade_params_panel', None)
         if panel is not None:
-            panel.load_profile(
-                profile,
-                active_profile=self.profile,
-                profile_source=self.profile_source,
-                saved_next_boot_hash=self._saved_next_boot_hash,
-                live_save=live,
-            )
+            if self._preserving_trade_panel_widgets:
+                panel.update_active_baseline(
+                    self.profile,
+                    base_profile=profile,
+                    profile_source=self.profile_source,
+                    saved_next_boot_hash=self._saved_next_boot_hash,
+                    saved_next_boot_profile=self._saved_next_boot_profile,
+                    live_save=live,
+                )
+            else:
+                panel.load_profile(
+                    profile,
+                    active_profile=self.profile,
+                    profile_source=self.profile_source,
+                    saved_next_boot_hash=self._saved_next_boot_hash,
+                    saved_next_boot_profile=self._saved_next_boot_profile,
+                    live_save=live,
+                )
         populate(self.symbol_grid,[[s['name'],s['code'],'—','到期日未取到（可不换月）',s.get('code_new') or '—',s['open_offset'],s['stop_offset'],
             s['profit_offset'],s['order_volume'] or '自动',s['half_close_ratio'],s['hysteresis_points'],'—']
             for s in settings['symbols']])
@@ -2944,7 +3013,12 @@ class WorkbenchLayout:
             self.window.show_home_feedback('读取 DSV 配置失败，请检查文件后重试。')
             return False
         dialog = self.window._settings_dialog
-        if (dialog is not None and dialog.profile.content_hash != self.profile.content_hash
+        panel = getattr(self, 'trade_params_panel', None)
+        has_draft = (
+            (dialog is not None and dialog.profile.content_hash != self.profile.content_hash)
+            or (panel is not None and panel.has_unsaved_changes())
+        )
+        if (has_draft
                 and QMessageBox.question(self.window, '重读 DSV 参数', '用 DSV 已保存参数替换当前未导出的编辑？',
                                          QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes):
             return False
@@ -2979,8 +3053,9 @@ class WorkbenchLayout:
             item['contract_id']: item for item in (self.rendered_view or {}).get('markets', [])})
 
     def checked_start_profile(self):
+        merged, _ = self._sync_trade_panel_draft(update_calculator=False, create_dialog=False)
         dialog = self.window._settings_dialog
-        profile = dialog.profile if dialog is not None else self.profile
+        profile = dialog.profile if dialog is not None else (merged or self.profile)
         edited = profile.content_hash != self.profile.content_hash
         if self.dsv_config is not None:
             try:
@@ -3152,11 +3227,23 @@ class WorkbenchLayout:
             item.setText(f'{estimate} 手' if estimate is not None else '—')
             item.setToolTip(note)
 
+    def _run_symbol_dialog_edit(self, action):
+        _, preserve = self._sync_trade_panel_draft(update_calculator=True, create_dialog=True)
+        dialog = self.parameter_dialog()
+        prev_preserve = self._preserving_trade_panel_widgets
+        if preserve:
+            self._preserving_trade_panel_widgets = True
+        try:
+            return action(dialog)
+        finally:
+            self._preserving_trade_panel_widgets = prev_preserve
+
     def stage_selected_rollover(self):
         selected = self.symbol_grid.selectionModel().selectedRows()
         if len(selected) != 1:
             QMessageBox.information(self.window,'换月预览','请先选中一个品种。')
             return
+        _, preserve = self._sync_trade_panel_draft(update_calculator=True, create_dialog=True)
         dialog = self.parameter_dialog()
         profile = dialog.profile
         symbol = profile.to_record()['settings']['symbols'][selected[0].row()]
@@ -3185,11 +3272,19 @@ class WorkbenchLayout:
                 '保存预览后，用新参数和新合约日历审查下一次运行范围。当前执行器仍管理原合约。',
                 QMessageBox.Yes | QMessageBox.No,QMessageBox.No) != QMessageBox.Yes:
             return
-        if (not saved and live_candidate()!=target) or not dialog.apply_edited_preview(candidate,expected_hash=profile.content_hash):
+        prev_preserve = self._preserving_trade_panel_widgets
+        if preserve:
+            self._preserving_trade_panel_widgets = True
+        try:
+            applied = not (not saved and live_candidate()!=target) and dialog.apply_edited_preview(
+                candidate, expected_hash=profile.content_hash)
+        finally:
+            self._preserving_trade_panel_widgets = prev_preserve
+        if not applied:
             QMessageBox.warning(self.window,'换月预览','候选或参数预览已变化，请重新核对。')
 
     def add_symbol(self):
-        if self.parameter_dialog().edit_preview(add_symbol=True):
+        if self._run_symbol_dialog_edit(lambda dialog: dialog.edit_preview(add_symbol=True)):
             self.symbol_grid.selectRow(self.symbol_grid.rowCount() - 1)
             self.symbol_grid.scrollToBottom()
             self.set_parameter_feedback('已加入草稿列表，请点击「保存参数」使配置生效。')
@@ -3199,7 +3294,7 @@ class WorkbenchLayout:
         selected = self.symbol_grid.selectionModel().selectedRows()
         if len(selected)==1:
             index = selected[0].row()
-            if self.parameter_dialog().edit_preview(symbol_row=index):
+            if self._run_symbol_dialog_edit(lambda dialog: dialog.edit_preview(symbol_row=index)):
                 self.symbol_grid.selectRow(index)
                 self.set_parameter_feedback('品种修改已更新到草稿，请点击「保存参数」使配置生效。')
                 self.window.show_home_feedback('品种修改已保存到草稿列表。点击“保存参数”可保存并应用。')
@@ -3207,25 +3302,31 @@ class WorkbenchLayout:
             self.window.show_home_feedback('请先选中一个品种，再点击“编辑选中”；也可以双击品种。')
 
     def remove_selected_symbols(self, *, all_symbols=False):
-        dialog = self.parameter_dialog()
-        settings = dialog.profile.to_settings()
-        selected = (set(range(len(settings['symbols']))) if all_symbols else
-                    {item.row() for item in self.symbol_grid.selectionModel().selectedRows()})
-        if not selected or QMessageBox.question(self.window,'编辑品种预览',
-                f'从参数预览移除 {len(selected)} 个品种？',
-                QMessageBox.Yes | QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:
-            return
-        settings['symbols'] = [symbol for index,symbol in enumerate(settings['symbols']) if index not in selected]
-        if dialog.apply_edited_preview(DsvProfile.from_settings(settings),expected_hash=dialog.profile.content_hash):
+        def _apply(dialog):
+            settings = dialog.profile.to_settings()
+            selected = (set(range(len(settings['symbols']))) if all_symbols else
+                        {item.row() for item in self.symbol_grid.selectionModel().selectedRows()})
+            if not selected or QMessageBox.question(self.window,'编辑品种预览',
+                    f'从参数预览移除 {len(selected)} 个品种？',
+                    QMessageBox.Yes | QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:
+                return False
+            settings['symbols'] = [symbol for index,symbol in enumerate(settings['symbols']) if index not in selected]
+            return dialog.apply_edited_preview(DsvProfile.from_settings(settings),expected_hash=dialog.profile.content_hash)
+        if self._run_symbol_dialog_edit(_apply):
             self.set_parameter_feedback('品种移除已更新到草稿，请点击「保存参数」使配置生效。')
 
     def import_symbols_preview(self):
-        dialog = self.parameter_dialog()
         path,_ = QFileDialog.getOpenFileName(self.window,'导入品种预览','','品种表 (*.xlsx *.csv)')
-        if path and not dialog.import_symbols_file(path):
-            QMessageBox.warning(self.window,'导入品种',dialog.error_label.text())
+        if not path:
+            return
+        ok, error_text = self._run_symbol_dialog_edit(
+            lambda dialog: (dialog.import_symbols_file(path), dialog.error_label.text())
+        )
+        if not ok:
+            QMessageBox.warning(self.window,'导入品种',error_text)
 
     def export_symbols_preview(self):
+        self._sync_trade_panel_draft(update_calculator=True, create_dialog=True)
         dialog = self.parameter_dialog()
         path,_ = QFileDialog.getSaveFileName(self.window,'导出品种预览','品种列表.xlsx','Excel (*.xlsx);;CSV (*.csv)')
         if path and not dialog.export_symbols_file(path):
@@ -4654,6 +4755,7 @@ class WorkbenchLayout:
         self.offset_market_button = button('一键计算（联网）', self.calculate_market_offsets)
         layout.addLayout(row(self.offset_market_button, self.offset_preview))
         def applied():
+            self._sync_trade_panel_draft(update_calculator=False, create_dialog=True)
             candidate = calculator.result_profile
             dialog = self.parameter_dialog()
             if candidate is not None and dialog.apply_edited_preview(candidate, expected_hash=calculator.base_hash):

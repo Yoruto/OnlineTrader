@@ -1050,7 +1050,7 @@ class ExplicitOrderController:
     _CANCEL_RECOVERY_PROBE_INTERVAL_SECONDS = 120.0
     _MAX_CANCEL_TOTAL_ATTEMPTS = 12
 
-    def _retry_stale_cancellations(self, state, contract_id, *, allow_cancel, wall_time):
+    def _retry_stale_cancellations(self, state, contract_id, *, allow_cancel, wall_time, convergence=False):
         if wall_time is None:
             return []
         now = float(wall_time)
@@ -1058,7 +1058,8 @@ class ExplicitOrderController:
         sync_missing = set((state.get('sync_pending_by_contract') or {}).get(contract_id) or ())
         for order in state['orders'].values():
             if (order['contract_id'] != contract_id or terminal(order)
-                    or order.get('convergence_order') or order.get('terminal_conflict')
+                    or bool(order.get('convergence_order')) != bool(convergence)
+                    or order.get('terminal_conflict')
                     or order['child_order_id'] in sync_missing):
                 continue
             if order.get('cancel_status') not in {'CALL_RETURNED', 'UNKNOWN'}:
@@ -1498,22 +1499,51 @@ class ExplicitOrderController:
             direction=side, order_source='CONVERGENCE',
         )
 
-    def _cancel_non_strategy_order(self, state, ext_order, *, perm=None):
+    def _cancel_non_strategy_order(self, state, ext_order, *, perm=None, wall_time=None):
         if perm is not None and not perm.get('can_cancel', False):
             return None
         native_id = str(ext_order['native_order_id'])
         cancels = state.setdefault('convergence_cancels', {})
         rec = cancels.get(native_id)
+        prior_status = None
         if rec is not None:
-            if rec.get('cancel_status') in {'SEND_POSSIBLE', 'CALL_RETURNED', 'UNKNOWN'}:
+            if rec.get('cancel_status') == 'SEND_POSSIBLE':
                 return None
             if rec.get('local_cancel_rejection', {}).get('error_code') == 'E_DSV_SDK_CANCEL_RISK':
                 return None
-            fail_count = rec.get('cancel_failure_count', rec.get('cancel_attempt', 0))
+            fail_count = int(rec.get('cancel_failure_count') or 0)
             if fail_count >= 3:
                 return None
-        seq = (0 if rec is None else rec.get('cancel_seq', rec.get('cancel_attempt', 0))) + 1
-        fail_count = 0 if rec is None else rec.get('cancel_failure_count', rec.get('cancel_attempt', 0))
+            if rec.get('cancel_status') in {'CALL_RETURNED', 'UNKNOWN'}:
+                if wall_time is None:
+                    return None
+                now = float(wall_time)
+                requested_at = rec.get('cancel_requested_at')
+                if requested_at is None:
+                    rec['cancel_requested_at'] = str(now)
+                    return None
+                elapsed = now - float(requested_at)
+                if elapsed < self._CANCEL_RETRY_INTERVAL_SECONDS:
+                    return None
+                attempt = int(rec.get('cancel_attempt') or 1)
+                if attempt >= self._MAX_CANCEL_ATTEMPTS:
+                    self._diag().emit_transition(
+                        ('ext_cancel_timeout', native_id),
+                        attempt,
+                        'ORDER_CANCEL_TIMEOUT_EXHAUSTED',
+                        level=logging.WARNING,
+                        contract_id=ext_order['contract_id'],
+                        native_order_id=native_id,
+                        attempt=attempt,
+                        cancel_status=rec.get('cancel_status'),
+                    )
+                    if (attempt >= self._MAX_CANCEL_TOTAL_ATTEMPTS
+                            or elapsed < self._CANCEL_RECOVERY_PROBE_INTERVAL_SECONDS):
+                        return None
+                prior_status = rec['cancel_status']
+        seq = (0 if rec is None else int(rec.get('cancel_seq', rec.get('cancel_attempt', 0)))) + 1
+        fail_count = 0 if rec is None else int(rec.get('cancel_failure_count') or 0)
+        next_attempt = (0 if rec is None else int(rec.get('cancel_attempt') or 0)) + 1
         effect_id = f'conv-cancel-{native_id}-{seq}'
         effect = {
             'id': effect_id,
@@ -1526,22 +1556,32 @@ class ExplicitOrderController:
             'native_order_id': native_id,
             'external_order': True,
             'reason': 'CONVERGENCE_CANCEL_NON_STRATEGY',
-            'cancel_attempt': fail_count + 1,
+            'cancel_attempt': next_attempt,
             'cancel_seq': seq,
         }
         self.journal.prepare(effect)
-        cancels[native_id] = {
+        requested_stamp = (
+            str(float(wall_time))
+            if wall_time is not None
+            else (None if rec is None else rec.get('cancel_requested_at'))
+        )
+        new_rec = {
             'native_order_id': native_id,
             'contract_id': ext_order['contract_id'],
             'direction': ext_order.get('direction'),
             'native_offset': ext_order.get('native_offset'),
             'volume_left': ext_order.get('volume_left'),
             'cancel_status': 'SEND_POSSIBLE',
-            'cancel_attempt': fail_count + 1,
+            'cancel_attempt': next_attempt,
             'cancel_seq': seq,
             'cancel_failure_count': fail_count,
             'cancel_effect_id': effect_id,
         }
+        if requested_stamp is not None:
+            new_rec['cancel_requested_at'] = requested_stamp
+        if prior_status is not None:
+            new_rec['prior_cancel_status'] = prior_status
+        cancels[native_id] = new_rec
         return effect
 
     @staticmethod
@@ -1579,10 +1619,13 @@ class ExplicitOrderController:
             cancels.pop(nid, None)
 
     def reconcile_stopped_convergence(
-        self, state, configured_markets, unconfigured_markets, non_strategy_orders, *, wall_iso=None,
+        self, state, configured_markets, unconfigured_markets, non_strategy_orders, *,
+        wall_time=None, wall_iso=None,
     ):
         """Reconcile convergence responsibilities while DISARMED (no new opens/closes/reprices)."""
         self._reconcile_convergence_cancels(state, non_strategy_orders)
+        if wall_time is None and wall_iso is not None:
+            wall_time = datetime.fromisoformat(wall_iso.replace('Z', '+00:00')).timestamp()
         effects = []
         perm_by_cid = {}
         for cid, market in (configured_markets or {}).items():
@@ -1592,13 +1635,26 @@ class ExplicitOrderController:
             cid = market['contract_id']
             perm_by_cid[cid] = market.get('market_permission') or infer_offline_market_permission(
                 market, wall_iso, clock_unverified=bool(state.get('clock_recovery_required')))
+        active_conv_cids = {
+            order['contract_id']
+            for order in state['orders'].values()
+            if order.get('convergence_order') and not terminal(order)
+        }
+        for cid in sorted(active_conv_cids):
+            perm = perm_by_cid.get(cid)
+            if perm is None:
+                continue
+            effects.extend(self._retry_stale_cancellations(
+                state, cid, allow_cancel=bool(perm.get('can_cancel', False)),
+                wall_time=wall_time, convergence=True,
+            ))
         for order in state['orders'].values():
             if not order.get('convergence_order') or terminal(order):
                 continue
             perm = perm_by_cid.get(order['contract_id'])
             if perm is None or not perm.get('can_cancel', False):
                 continue
-            if req := self.cancel(order, 'USER_STOPPED'):
+            if req := self.cancel(order, 'USER_STOPPED', wall_time=wall_time):
                 effects.append(req)
         return effects
 
@@ -1640,7 +1696,7 @@ class ExplicitOrderController:
             if perm is None or not perm.get('can_cancel', False):
                 continue
             for ext_order in ext_by_contract[cid]:
-                req = self._cancel_non_strategy_order(state, ext_order, perm=perm)
+                req = self._cancel_non_strategy_order(state, ext_order, perm=perm, wall_time=wall_time)
                 if req is not None:
                     effects.append(req)
                     events.append({
@@ -1725,6 +1781,21 @@ class ExplicitOrderController:
                 })
                 continue
 
+            stale_conv_cancels = self._retry_stale_cancellations(
+                state, cid, allow_cancel=bool(perm.get('can_cancel', False)),
+                wall_time=wall_time, convergence=True,
+            )
+            for req in stale_conv_cancels:
+                effects.append(req)
+                events.append({
+                    'event': 'CONVERGENCE_ACTION',
+                    'contract_id': cid,
+                    'action': 'RETRY_STALE_CONVERGENCE_CANCEL',
+                    'child_order_id': req['child_order_id'],
+                    'native_order_id': req.get('native_order_id'),
+                    'cancel_attempt': req.get('cancel_attempt'),
+                })
+
             # Always check active convergence orders FIRST — even when conv_excess == 0 —
             # so redundant working close orders are cancelled promptly before alignment.
             excess_cancel_status = None
@@ -1751,7 +1822,7 @@ class ExplicitOrderController:
                 if perm.get('can_cancel', False):
                     over = side_pending - conv_excess
                     for order in reversed(side_orders):
-                        if req := self.cancel(order, 'TARGET_REDUCED'):
+                        if req := self.cancel(order, 'TARGET_REDUCED', wall_time=wall_time):
                             effects.append(req)
                             events.append({
                                 'event': 'CONVERGENCE_ACTION',
@@ -2048,13 +2119,16 @@ class ExplicitOrderController:
                         })
                         continue
 
-                    is_phase_temp = last_cat == 'TRANSIENT' and last_detail == 'BROKER_TEMP_STATE'
+                    is_phase_temp = (
+                        last_cat == 'TRANSIENT'
+                        and last_detail in {'BROKER_MARKET_PHASE', 'BROKER_TEMP_STATE'}
+                    )
                     is_transient = (
                         last_cat == 'TRANSIENT'
                         or (last_fail['broker_state'] == 'CANCELLED' and last_fail.get('cancel_reason') is None)
                     )
                     if is_transient:
-                        # Count consecutive transient failures; BROKER_TEMP_STATE (market phase) does not penalize failure count.
+                        # Count consecutive transient failures; BROKER_MARKET_PHASE / BROKER_TEMP_STATE do not penalize failure count.
                         trans_streak = 0
                         for item in reversed(recent_failures):
                             icat = item.get('broker_rejection_category')
@@ -2064,8 +2138,11 @@ class ExplicitOrderController:
                                 break
                         if not is_phase_temp:
                             contract_failures += trans_streak
-                        schedule = (0, 1, 2, 4, 8, 15, 30)
-                        delay = schedule[min(max(0, trans_streak - 1), len(schedule) - 1)]
+                        if last_detail == 'BROKER_MARKET_PHASE':
+                            delay = 5
+                        else:
+                            schedule = (0, 1, 2, 4, 8, 15, 30)
+                            delay = schedule[min(max(0, trans_streak - 1), len(schedule) - 1)]
                         fail_at = float(last_fail.get('convergence_failure_at') or wall_time)
                         if float(wall_time) - fail_at < delay:
                             contract_status = 'DEFERRED_TRANSIENT_RETRY_BACKOFF'
@@ -2225,7 +2302,7 @@ class ExplicitOrderController:
                     order['cancel_status'] = prior_cancel
                     order['local_cancel_rejection'] = {'effect_id': effect['id'], **details}
                     if details.get('error_code') == 'E_DSV_MARKET_PHASE':
-                        if not is_ext_cancel and prior_cancel is None:
+                        if prior_cancel is None:
                             order['cancel_attempt'] = max(0, int(order.get('cancel_attempt') or 1) - 1)
                     elif is_ext_cancel:
                         order['cancel_failure_count'] = int(order.get('cancel_failure_count') or 0) + 1

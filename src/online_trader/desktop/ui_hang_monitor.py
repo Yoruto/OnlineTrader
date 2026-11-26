@@ -50,7 +50,9 @@ class UiHangMonitor:
         self._hung_since: float | None = None
         self._last_dump = 0.0
         self._dump_count = 0
+        self._pending_emits: list[tuple[dict, int]] = []
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
 
     @property
@@ -63,6 +65,7 @@ class UiHangMonitor:
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stop_event.clear()
+            self._wake_event.clear()
             self._last_heartbeat = time.monotonic()
             self._hung_since = None
             thread = threading.Thread(
@@ -75,6 +78,7 @@ class UiHangMonitor:
 
     def stop(self, timeout: float = 1.0) -> None:
         self._stop_event.set()
+        self._wake_event.set()
         with self._lock:
             thread = self._thread
             self._thread = None
@@ -83,22 +87,39 @@ class UiHangMonitor:
 
     def heartbeat(self) -> None:
         now = time.monotonic()
-        recovered_ms: int | None = None
+        wake = False
         with self._lock:
             self._last_heartbeat = now
             if self._hung_since is not None:
                 recovered_ms = max(0, int((now - self._hung_since) * 1000))
                 self._hung_since = None
-        if recovered_ms is not None:
-            self._emit({
-                'at': _utc_now(),
-                'event': 'UI_HANG_RECOVERED',
-                'hung_duration_ms': recovered_ms,
-            }, level=logging.INFO)
+                self._pending_emits.append(({
+                    'at': _utc_now(),
+                    'event': 'UI_HANG_RECOVERED',
+                    'hung_duration_ms': recovered_ms,
+                }, logging.INFO))
+                wake = True
+        if wake:
+            self._wake_event.set()
+
+    def _flush_pending(self) -> None:
+        with self._lock:
+            if not self._pending_emits:
+                return
+            items = self._pending_emits
+            self._pending_emits = []
+        for payload, level in items:
+            self._emit(payload, level=level)
 
     def _run(self) -> None:
-        while not self._stop_event.wait(self.poll_interval_s):
+        while True:
+            self._wake_event.wait(self.poll_interval_s)
+            self._wake_event.clear()
+            self._flush_pending()
+            if self._stop_event.is_set():
+                break
             self._check_once()
+        self._flush_pending()
 
     def _check_once(self) -> None:
         now = time.monotonic()

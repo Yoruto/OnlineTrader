@@ -1035,11 +1035,14 @@ class DsvSdkAdapter:
         backoff_s = self._BROKER_PHASE_BACKOFF_SECONDS[
             min(max(0, count - 1), len(self._BROKER_PHASE_BACKOFF_SECONDS) - 1)
         ]
+        recorded_live_status = self._live_trading_status(code)
         overrides[code] = override | {
             'quote_stamp': None if quote is None else getattr(quote, 'datetime', None),
             'recorded_mono_ns': mono,
             'consecutive_rejects': count,
             'backoff_seconds': backoff_s,
+            'recorded_live_status': recorded_live_status,
+            'awaiting_status_transition': recorded_live_status == 'CONTINUOUS',
         }
 
     def _active_broker_phase_override(self, code, cal_phase, live_status, has_valid_quote, sample):
@@ -1047,14 +1050,16 @@ class DsvSdkAdapter:
         override = overrides.get(code)
         if override is None:
             return None
-        if live_status == 'CONTINUOUS':
+        if live_status is not None and live_status != 'CONTINUOUS':
+            override['awaiting_status_transition'] = False
+        if live_status == 'CONTINUOUS' and not override.get('awaiting_status_transition'):
             overrides.pop(code, None)
             history = getattr(self, '_broker_phase_reject_counts', None)
             if history is not None:
                 history.pop(code, None)
             return None
         phase_name = (cal_phase or {}).get('market_phase')
-        if phase_name == 'CONTINUOUS' and has_valid_quote:
+        if (phase_name == 'CONTINUOUS' or live_status == 'CONTINUOUS') and has_valid_quote:
             backoff_s = int(override.get('backoff_seconds') or 5)
             elapsed_ns = sample.monotonic - int(override.get('recorded_mono_ns') or 0)
             if elapsed_ns >= backoff_s * NS_PER_SECOND:

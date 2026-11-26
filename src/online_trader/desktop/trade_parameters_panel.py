@@ -110,6 +110,7 @@ class TradeParametersPanel(QWidget):
     import_dsv_requested = Signal()
     export_file_requested = Signal()
     timed_start_requested = Signal()
+    draft_committed = Signal()
 
     def __init__(self, *, runtime_mode: bool = True, show_timed_start: bool = False, parent=None):
         super().__init__(parent)
@@ -120,6 +121,7 @@ class TradeParametersPanel(QWidget):
         self._base_profile: DsvProfile | None = None
         self._profile_source = ''
         self._saved_next_boot_hash: str | None = None
+        self._saved_next_boot_profile: DsvProfile | None = None
         self._live_save = True
 
         self.parameter_fields: dict[str, QWidget] = {}
@@ -379,11 +381,15 @@ class TradeParametersPanel(QWidget):
             widget.addItems(_CLOSE_PRICE_MODES)
             widget.setFixedWidth(max(width, 110))
             widget.currentTextChanged.connect(lambda _text: self._on_value_changed(key))
+            widget.activated.connect(lambda _idx: self._emit_draft_committed())
+            if widget.lineEdit() is not None:
+                widget.lineEdit().editingFinished.connect(self._emit_draft_committed)
         else:
             widget = QLineEdit()
             widget.setObjectName('paramInput')
             widget.setFixedWidth(width)
             widget.textChanged.connect(lambda _text: self._on_value_changed(key))
+            widget.editingFinished.connect(self._emit_draft_committed)
         if tooltip:
             widget.setToolTip(tooltip)
         row.addWidget(widget)
@@ -461,6 +467,7 @@ class TradeParametersPanel(QWidget):
                 if sub_tip:
                     edit.setToolTip(sub_tip)
                 edit.textChanged.connect(lambda _t, k=sub_key: self._on_value_changed(k))
+                edit.editingFinished.connect(self._emit_draft_committed)
                 self.parameter_fields[sub_key] = edit
                 self._field_types[sub_key] = sub_kind
                 self._field_labels[sub_key] = sub_label or switch_label
@@ -679,7 +686,7 @@ class TradeParametersPanel(QWidget):
             sl.setSpacing(8)
             self.schedule_enabled_check = QCheckBox('启用定时启动')
             self.schedule_enabled_check.setObjectName('paramSwitch')
-            self.schedule_enabled_check.toggled.connect(lambda _: self._refresh_dirty_state())
+            self.schedule_enabled_check.toggled.connect(self._on_schedule_toggled)
             sl.addWidget(self.schedule_enabled_check)
             for key, label, width in (
                 ('night_start_time', '夜盘', 72),
@@ -690,7 +697,8 @@ class TradeParametersPanel(QWidget):
                 edit = QLineEdit()
                 edit.setObjectName('paramInput')
                 edit.setFixedWidth(width)
-                edit.textChanged.connect(lambda _t: self._refresh_dirty_state())
+                edit.textChanged.connect(lambda _t: self._on_schedule_changed())
+                edit.editingFinished.connect(self._emit_draft_committed)
                 self.schedule_fields[key] = edit
                 sl.addWidget(edit)
             if self._show_timed_start:
@@ -717,6 +725,7 @@ class TradeParametersPanel(QWidget):
         active_profile: DsvProfile | None = None,
         profile_source: str | None = None,
         saved_next_boot_hash: str | None = None,
+        saved_next_boot_profile: DsvProfile | None = None,
         live_save: bool | None = None,
     ):
         self._base_profile = profile
@@ -728,6 +737,12 @@ class TradeParametersPanel(QWidget):
             self._profile_source = profile_source
         if saved_next_boot_hash is not None or active_profile is not None:
             self._saved_next_boot_hash = saved_next_boot_hash
+        if saved_next_boot_profile is not None:
+            self._saved_next_boot_profile = saved_next_boot_profile
+        elif self._saved_next_boot_hash is None:
+            self._saved_next_boot_profile = None
+        elif profile.content_hash == self._saved_next_boot_hash:
+            self._saved_next_boot_profile = profile
         if live_save is not None:
             self._live_save = live_save
 
@@ -772,11 +787,17 @@ class TradeParametersPanel(QWidget):
             )
             self.parameter_fields['half_stage2_trigger_ratio'].setEnabled(stage2_ready)
 
+    def _emit_draft_committed(self):
+        if self._loading:
+            return
+        self.draft_committed.emit()
+
     def _on_switch_toggled(self, _key: str, _checked: bool):
         if self._loading:
             return
         self._apply_all_dependents()
         self._refresh_dirty_state()
+        self._emit_draft_committed()
 
     def _on_value_changed(self, key: str):
         if self._loading:
@@ -784,6 +805,17 @@ class TradeParametersPanel(QWidget):
         widget = self.parameter_fields.get(key)
         if isinstance(widget, QLineEdit):
             self._set_invalid(widget, False)
+        self._refresh_dirty_state()
+
+    def _on_schedule_toggled(self, _checked: bool):
+        if self._loading:
+            return
+        self._refresh_dirty_state()
+        self._emit_draft_committed()
+
+    def _on_schedule_changed(self):
+        if self._loading:
+            return
         self._refresh_dirty_state()
 
     @staticmethod
@@ -870,6 +902,35 @@ class TradeParametersPanel(QWidget):
                 record['settings']['schedule'][key] = text
         return DsvProfile.from_record(record)
 
+    def try_merge_into_profile(self, base_profile: DsvProfile | None = None) -> DsvProfile | None:
+        """Silently merge valid panel widget values onto base_profile without touching UI feedback."""
+        try:
+            return self.build_profile(base_profile)
+        except (_ValidationError, TraderError):
+            return None
+
+    def update_active_baseline(
+        self,
+        active_profile: DsvProfile,
+        *,
+        base_profile: DsvProfile | None = None,
+        profile_source: str | None = None,
+        saved_next_boot_hash: str | None = None,
+        saved_next_boot_profile: DsvProfile | None = None,
+        live_save: bool | None = None,
+    ) -> None:
+        """Update baseline references while preserving current in-progress widget edits."""
+        self._active_profile = active_profile
+        if base_profile is not None:
+            self._base_profile = base_profile
+        if profile_source is not None:
+            self._profile_source = profile_source
+        self._saved_next_boot_hash = saved_next_boot_hash
+        self._saved_next_boot_profile = saved_next_boot_profile if saved_next_boot_hash is not None else None
+        if live_save is not None:
+            self._live_save = live_save
+        self._refresh_dirty_state()
+
     def try_build_profile(self, base_profile: DsvProfile | None = None) -> DsvProfile | None:
         try:
             candidate = self.build_profile(base_profile)
@@ -892,38 +953,46 @@ class TradeParametersPanel(QWidget):
             self.set_feedback(f'参数校验未通过：{err}', error=True)
             return None
 
-    def _compute_changed_keys(self) -> tuple[list[str], bool]:
-        if self._active_profile is None:
+    def _diff_against_profile(self, target_profile: DsvProfile | None) -> tuple[list[str], bool]:
+        if target_profile is None:
             return [], False
-        active_settings = self._active_profile.to_record()['settings']
-        active_trade = active_settings['trade']
+        target_settings = target_profile.to_record()['settings']
+        target_trade = target_settings['trade']
         changed: list[str] = []
         needs_restart = False
         for key, widget in self.parameter_fields.items():
-            if key not in active_trade:
+            if key not in target_trade:
                 continue
             cur = widget.currentText().strip() if isinstance(widget, QComboBox) else widget.text().strip()
-            base_text = self._format_value(active_trade[key], self._field_types[key])
+            base_text = self._format_value(target_trade[key], self._field_types[key])
             if cur != base_text:
                 changed.append(key)
                 if key in _RESTART_TRADE_KEYS:
                     needs_restart = True
         for key, check in self.parameter_switches.items():
-            if key in active_trade and bool(check.isChecked()) != bool(active_trade[key]):
+            if key in target_trade and bool(check.isChecked()) != bool(target_trade[key]):
                 changed.append(key)
         if self.schedule_enabled_check is not None:
-            if bool(self.schedule_enabled_check.isChecked()) != bool(active_settings['schedule']['enabled']):
+            if bool(self.schedule_enabled_check.isChecked()) != bool(target_settings['schedule']['enabled']):
                 changed.append('schedule.enabled')
                 needs_restart = True
         for key, field in self.schedule_fields.items():
-            if field.text().strip() != str(active_settings['schedule'][key]):
+            if field.text().strip() != str(target_settings['schedule'][key]):
                 changed.append(f'schedule.{key}')
                 needs_restart = True
-        # Also detect symbol changes staged in the Monitor Contracts tab
         if self._base_profile is not None:
-            if self._base_profile.to_record()['settings']['symbols'] != active_settings['symbols']:
+            if self._base_profile.to_record()['settings']['symbols'] != target_settings['symbols']:
                 changed.append('symbols')
         return changed, needs_restart
+
+    def _compute_changed_keys(self) -> tuple[list[str], bool]:
+        return self._diff_against_profile(self._active_profile)
+
+    def _matches_saved_next_boot(self) -> bool:
+        if self._saved_next_boot_hash is None or self._saved_next_boot_profile is None:
+            return False
+        changed, _ = self._diff_against_profile(self._saved_next_boot_profile)
+        return not changed
 
     def _refresh_dirty_state(self):
         changed, needs_restart = self._compute_changed_keys()
@@ -931,6 +1000,11 @@ class TradeParametersPanel(QWidget):
             self.dirty_label.setText('当前无未保存修改')
             self.dirty_label.setStyleSheet('color: #66778d; font-size: 12px;')
             self.revert_button.setEnabled(False)
+            self.save_button.setText('保存并生效' if self._live_save else '保存参数')
+        elif self._matches_saved_next_boot():
+            self.dirty_label.setText('● 已保存至启动配置（等待重启后台服务生效）')
+            self.dirty_label.setStyleSheet('color: #9a6700; font-weight: 600; font-size: 12px;')
+            self.revert_button.setEnabled(True)
             self.save_button.setText('保存并生效' if self._live_save else '保存参数')
         else:
             suffix = '（含需重启生效项）' if needs_restart else ('（保存后立即热生效）' if self._live_save else '（保存后下次启动生效）')
@@ -949,4 +1023,4 @@ class TradeParametersPanel(QWidget):
 
     def has_unsaved_changes(self) -> bool:
         changed, _ = self._compute_changed_keys()
-        return bool(changed)
+        return bool(changed) and not self._matches_saved_next_boot()
