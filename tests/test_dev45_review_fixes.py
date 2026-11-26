@@ -832,6 +832,43 @@ class TradeParametersDraftAndSavedStateTests(unittest.TestCase):
         self.assertEqual(win.dashboard._saved_next_boot_hash, profile_b.content_hash)
         self.assertIsNotNone(win.dashboard._saved_next_boot_profile)
 
+    def test_portable_store_init_error_is_caught_on_revert_and_save(self):
+        from unittest.mock import patch
+        from online_trader.errors import TraderError
+
+        win = self._new_window()
+        panel = win.dashboard.trade_params_panel
+        active_profile = win.dashboard.profile
+
+        panel.parameter_fields['night_session_close'].setText('23:30')
+        panel.parameter_fields['night_session_close'].editingFinished.emit()
+        profile_b = panel.build_profile(active_profile)
+        win.dashboard.mark_next_boot_saved(profile_b)
+
+        def _broken_store():
+            raise TraderError('E_RUNTIME_CONFIG', 'corrupt runtime.json')
+
+        win._portable_store_and_account = _broken_store
+
+        # 1) Revert while viewing B catches store init TraderError and preserves next-boot state.
+        with patch.object(QMessageBox, 'critical') as mock_crit:
+            win.dashboard.revert_trade_parameters()
+        mock_crit.assert_called_once()
+        self.assertEqual(win.dashboard._saved_next_boot_hash, profile_b.content_hash)
+
+        # 2) Saving active profile A to clear B catches store init TraderError.
+        with patch.object(QMessageBox, 'critical') as mock_crit:
+            ok_restore = win.save_runtime_parameters(active_profile)
+        self.assertFalse(ok_restore)
+        mock_crit.assert_called_once()
+        self.assertEqual(win.dashboard._saved_next_boot_hash, profile_b.content_hash)
+
+        # 3) Saving startup-only profile B catches store init TraderError.
+        with patch.object(QMessageBox, 'critical') as mock_crit:
+            ok_save = win.save_runtime_parameters(profile_b)
+        self.assertFalse(ok_save)
+        mock_crit.assert_called_once()
+
 
 class UiHangMonitorAsyncRecoveryTests(unittest.TestCase):
     @classmethod

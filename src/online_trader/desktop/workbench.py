@@ -704,7 +704,13 @@ class WorkbenchWindow(StatusWindow):
                     self._pending_focus_contracts = ()
                 reason = (pending.receipt or {}).get('reason') or pending.reason or '保存未通过校验'
                 self.dashboard.set_parameter_feedback(f'参数保存未生效：{reason}', error=True)
-                store, _ = self._portable_store_and_account() if fallback is not None else (None, None)
+                store = None
+                if fallback is not None:
+                    try:
+                        store, _ = self._portable_store_and_account()
+                    except (TraderError, OSError) as error:
+                        self.dashboard.set_parameter_feedback(f'参数保存未生效：{reason}（读取启动配置存储失败：{error}）', error=True)
+                        store = None
                 if store is not None:
                     box = QMessageBox(self)
                     box.setIcon(QMessageBox.Icon.Warning)
@@ -2381,13 +2387,10 @@ class WorkbenchWindow(StatusWindow):
         if not added and not removed and not startup_only_changed:
             if candidate_profile.content_hash == current_profile.content_hash:
                 if self.dashboard._saved_next_boot_hash is not None:
-                    store, _ = self._portable_store_and_account()
-                    if store is None:
-                        message = '未能恢复启动配置：当前未挂载可写配置存储。'
-                        self.dashboard.set_parameter_feedback(message, error=True)
-                        QMessageBox.critical(self, '保存配置失败', message)
-                        return False
                     try:
+                        store, _ = self._portable_store_and_account()
+                        if store is None:
+                            raise TraderError('E_RUNTIME_CONFIG', '当前未挂载可写配置存储。')
                         store.save_profile(candidate_profile)
                     except (TraderError, OSError) as error:
                         message = f'未能恢复启动配置：{error}'
@@ -2416,7 +2419,13 @@ class WorkbenchWindow(StatusWindow):
                       {'profile': candidate_profile.to_record()})
             return True
 
-        store, _ = self._portable_store_and_account()
+        try:
+            store, _ = self._portable_store_and_account()
+        except (TraderError, OSError) as error:
+            message = f'无法读取 Runtime 配置存储：{error}'
+            self.dashboard.set_parameter_feedback(message, error=True)
+            QMessageBox.critical(self, '保存配置失败', message)
+            return False
         if store is None:
             message = '当前连接未绑定可写 Runtime 配置目录，无法保存新增合约。\n请通过带 runtime 目录的正常入口启动工作台。'
             self.dashboard.set_parameter_feedback('未绑定可写 Runtime 目录，无法持久化启动配置。', error=True)

@@ -672,6 +672,7 @@
         "TradeParametersDraftAndSavedStateTests.test_manual_edit_back_to_active_while_next_boot_saved_is_still_unsaved",
         "TradeParametersDraftAndSavedStateTests.test_next_boot_saved_profile_is_distinguished_from_unsaved_edits",
         "TradeParametersDraftAndSavedStateTests.test_offset_apply_blocked_while_trade_panel_has_invalid_input",
+        "TradeParametersDraftAndSavedStateTests.test_portable_store_init_error_is_caught_on_revert_and_save",
         "TradeParametersDraftAndSavedStateTests.test_revert_trade_parameters_respects_saved_next_boot_and_cancels_cleanly",
         "TradeParametersDraftAndSavedStateTests.test_runtime_profile_sync_conflict_prompts_user",
         "TradeParametersDraftAndSavedStateTests.test_store_none_blocks_clearing_next_boot_on_revert_and_save",

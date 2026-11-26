@@ -2913,13 +2913,10 @@ class WorkbenchLayout:
                 self.render_parameters(saved_next)
                 self.set_parameter_feedback('已撤销未保存修改，恢复为已保存的下次启动配置（OnlineTrader-overrides.json）。')
                 return
-            store, _ = self.window._portable_store_and_account()
-            if store is None:
-                message = '未能撤销已保存的启动配置：当前未挂载可写配置存储。'
-                self.set_parameter_feedback(message, error=True)
-                QMessageBox.critical(self.window, '撤销配置失败', message)
-                return
             try:
+                store, _ = self.window._portable_store_and_account()
+                if store is None:
+                    raise TraderError('E_RUNTIME_CONFIG', '当前未挂载可写配置存储。')
                 store.save_profile(self.profile)
             except (TraderError, OSError) as error:
                 message = f'未能撤销已保存的启动配置：{error}'
