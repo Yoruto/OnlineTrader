@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import unittest
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from online_trader.configuration.baseline import load_confirmed_baseline
 from online_trader.configuration.dsv import DsvProfile
@@ -360,6 +360,69 @@ class ConvergenceCancelRecoveryAndPhaseTests(unittest.TestCase):
         self.assertEqual(s2['convergence_cancels']['ext-2']['cancel_attempt'], 2)
         self.assertEqual(s2['convergence_cancels']['ext-2']['cancel_failure_count'], 0)
 
+    def test_first_cancel_local_rejection_does_not_consume_cancel_attempt(self):
+        class _LocalRejectPort:
+            def send(self, _req):
+                return {'ok': True}
+
+            def cancel(self, req):
+                return CancelNotAttempted(
+                    req['id'], req['native_order_id'], 'E_DSV_SDK_CANCEL_RISK', {'message': 'local risk'},
+                )
+
+        controller, journal, _port = self._new_controller(port=_LocalRejectPort())
+        state = journal.load()
+        order = {
+            'child_order_id': 'c-local-rej-1',
+            'intent_id': f'conv-{UNCONF_CONTRACT}-long',
+            'attempt_id': 'c-local-rej-1',
+            'position_id': f'conv-{UNCONF_CONTRACT}-long',
+            'contract_id': UNCONF_CONTRACT,
+            'direction': 'SELL',
+            'native_offset': 'CLOSE',
+            'effect': 'REDUCE',
+            'original_qty': 1,
+            'filled_qty': 0,
+            'limit_price': '5000',
+            'send_state': 'NATIVE_SEEN',
+            'broker_state': 'ALIVE',
+            'cancel_status': None,
+            'terminal_confirmed': False,
+            'reported_fill_qty': 0,
+            'native_id': 'nat-local-1',
+            'native_trading_day': DAY,
+        }
+        state['orders']['c-local-rej-1'] = order
+        with journal.transaction():
+            eff = controller.cancel(order, 'USER_STOP', wall_time=100.0)
+            journal.save(state)
+        self.assertIsNotNone(eff)
+        controller.dispatch(state, [eff])
+        self.assertIsNone(order['cancel_status'])
+        self.assertEqual(order['cancel_attempt'], 0)
+        self.assertEqual(order['cancel_seq'], 1)
+
+        # Same for external convergence cancel on first local rejection.
+        um = [self._unconf_market(long_qty=0)]
+        ext = [{
+            'native_order_id': 'ext-local-1',
+            'contract_id': UNCONF_CONTRACT,
+            'direction': 'BUY',
+            'native_offset': 'OPEN',
+            'volume_left': 1,
+            'limit_price': '5000',
+        }]
+        with journal.transaction():
+            effs, _st, _ev = controller.plan_convergence(state, {}, um, ext, 100.0)
+            journal.save(state)
+        self.assertEqual(len(effs), 1)
+        controller.dispatch(state, effs)
+        rec = state['convergence_cancels']['ext-local-1']
+        self.assertIsNone(rec['cancel_status'])
+        self.assertEqual(rec['cancel_attempt'], 0)
+        self.assertEqual(rec['cancel_seq'], 1)
+        self.assertEqual(rec['cancel_failure_count'], 1)
+
     def test_convergence_broker_market_phase_does_not_penalize_failures_and_uses_5s_backoff(self):
         controller, journal, _port = self._new_controller()
         state = journal.load()
@@ -631,6 +694,79 @@ class TradeParametersDraftAndSavedStateTests(unittest.TestCase):
 
         self.assertIn('非法输入', calc.error_label.text())
         self.assertEqual(panel.parameter_fields['max_volume'].text(), '')
+
+    def test_arm_prompts_when_trade_parameters_have_unsaved_changes(self):
+        from unittest.mock import patch
+
+        win = self._new_window()
+        win.pipe_name = 'test-pipe'
+        win._boot = 1
+        win._stale = False
+        win.view = {
+            'account_key': 'sim:test',
+            'entry_authority': 'DISARMED',
+            'policies': [{'policy_kind': 'AUTHORITY', 'policy_id': 'auth-1'}],
+            'configuration': {
+                'rule_set_id': 'dsv-v1',
+                'config_revision': 'rev-1',
+            },
+        }
+        sent = []
+        win.send = lambda action, scope, params: sent.append((action, scope, params))
+        win._action = lambda fn: fn()
+
+        panel = win.dashboard.trade_params_panel
+        panel.parameter_fields['max_volume'].setText('7')
+        self.assertTrue(panel.has_unsaved_changes())
+        self.assertFalse(win.dashboard.has_unsaved_symbol_changes())
+
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.No) as mock_q:
+            win.arm()
+        mock_q.assert_called_once()
+        self.assertEqual(sent, [])
+        self.assertIs(win.dashboard.tabs.currentWidget(), win.dashboard.parameter_tab)
+
+        with patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes) as mock_q:
+            win.arm()
+        mock_q.assert_called_once()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], 'ARM_ENTRIES')
+
+    def test_revert_trade_parameters_respects_saved_next_boot_and_cancels_cleanly(self):
+        win = self._new_window()
+        panel = win.dashboard.trade_params_panel
+        active_profile = win.dashboard.profile
+        orig_night = active_profile.to_record()['settings']['trade']['night_session_close']
+        orig_max_vol = str(active_profile.to_record()['settings']['trade']['max_volume'])
+
+        saved_profiles = []
+        fake_store = SimpleNamespace(save_profile=lambda p: saved_profiles.append(p))
+        win._portable_store_and_account = lambda: (fake_store, {'account_key': 'sim:test'})
+
+        # Step 1: Save B (night_session_close='23:30') as next-boot config.
+        panel.parameter_fields['night_session_close'].setText('23:30')
+        panel.parameter_fields['night_session_close'].editingFinished.emit()
+        profile_b = panel.build_profile(active_profile)
+        win.dashboard.mark_next_boot_saved(profile_b)
+        self.assertFalse(panel.has_unsaved_changes())
+
+        # Step 2: Edit C on top of B, then click revert -> should revert to B, NOT A.
+        panel.parameter_fields['max_volume'].setText('9')
+        self.assertTrue(panel.has_unsaved_changes())
+        win.dashboard.revert_trade_parameters()
+        self.assertEqual(panel.parameter_fields['night_session_close'].text(), '23:30')
+        self.assertEqual(panel.parameter_fields['max_volume'].text(), orig_max_vol)
+        self.assertIsNotNone(win.dashboard._saved_next_boot_profile)
+        self.assertFalse(panel.has_unsaved_changes())
+        self.assertEqual(saved_profiles, [])
+
+        # Step 3: Click revert again while viewing B -> should cancel B on disk and restore A.
+        win.dashboard.revert_trade_parameters()
+        self.assertEqual(len(saved_profiles), 1)
+        self.assertEqual(saved_profiles[0].content_hash, active_profile.content_hash)
+        self.assertIsNone(win.dashboard._saved_next_boot_profile)
+        self.assertIsNone(win.dashboard._saved_next_boot_hash)
+        self.assertEqual(panel.parameter_fields['night_session_close'].text(), orig_night)
 
 
 class UiHangMonitorAsyncRecoveryTests(unittest.TestCase):

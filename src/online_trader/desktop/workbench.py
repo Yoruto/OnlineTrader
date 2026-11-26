@@ -1118,7 +1118,7 @@ class WorkbenchWindow(StatusWindow):
     def _notification_log(self, message):
         try:
             self.dashboard.add_activity(message)
-            self.dashboard.update_logs()
+            self.dashboard._schedule_log_update()
         except RuntimeError:
             return  # A pending network result may arrive after the workbench closes.
 
@@ -1511,17 +1511,28 @@ class WorkbenchWindow(StatusWindow):
             if config.get('strategy_stop_requested'):
                 self.show_home_feedback(config.get('strategy_stop_wait') or '正在核对原策略的退出条件。')
                 return
-            if self.dashboard.has_unsaved_symbol_changes():
+            symbol_dirty = self.dashboard.has_unsaved_symbol_changes()
+            panel = getattr(self.dashboard, 'trade_params_panel', None)
+            param_dirty = panel is not None and panel.has_unsaved_changes()
+            if symbol_dirty or param_dirty:
+                title = '存在未保存的品种草稿' if symbol_dirty and not param_dirty else '存在未保存的策略参数'
+                target_desc = (
+                    '「策略参数 → 监控合约」中有尚未保存生效的品种修改'
+                    if symbol_dirty and not param_dirty
+                    else '「策略参数」中有尚未保存生效的参数修改'
+                )
                 answer = QMessageBox.question(
                     self,
-                    '存在未保存的品种草稿',
-                    '您在「策略参数 → 监控合约」中有尚未保存生效的品种修改。\n\n'
+                    title,
+                    f'您在{target_desc}。\n\n'
                     '如果直接启动策略，将按当前运行中的合约与参数执行。\n是否仍按当前运行配置启动策略？',
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
                 if answer != QMessageBox.StandardButton.Yes:
-                    self.dashboard.show_details(self.dashboard.symbol_tab)
+                    self.dashboard.show_details(
+                        self.dashboard.symbol_tab if (symbol_dirty and not param_dirty) else self.dashboard.parameter_tab
+                    )
                     return
             self.send('ARM_ENTRIES',{'scope_type':'ACCOUNT','scope_ids':[]},
                 {'authority_policy_id':policy,'rule_set_id':identity[-2],'config_revision':identity[-1]})
@@ -2369,6 +2380,19 @@ class WorkbenchWindow(StatusWindow):
 
         if not added and not removed and not startup_only_changed:
             if candidate_profile.content_hash == current_profile.content_hash:
+                if self.dashboard._saved_next_boot_hash is not None:
+                    store, _ = self._portable_store_and_account()
+                    if store is not None:
+                        try:
+                            store.save_profile(candidate_profile)
+                        except (TraderError, OSError) as error:
+                            message = f'未能恢复启动配置：{error}'
+                            self.dashboard.set_parameter_feedback(message, error=True)
+                            QMessageBox.critical(self, '保存配置失败', message)
+                            return False
+                    self.dashboard.clear_next_boot_saved(candidate_profile)
+                    self.dashboard.set_parameter_feedback('已将启动配置恢复为当前运行配置。')
+                    return True
                 self.dashboard.set_parameter_feedback('当前参数与运行中一致，无需重复保存。')
                 return True
             self.send('SAVE_DSV_PARAMETERS', {'scope_type': 'ACCOUNT', 'scope_ids': []},

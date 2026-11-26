@@ -95,6 +95,33 @@ function Get-OnlineTraderProcesses {
     })
 }
 
+function Test-SourcePythonProcess {
+    param(
+        [string]$Executable,
+        [string]$CommandLine,
+        [string[]]$SourcePythonPaths
+    )
+
+    if ($Executable -and ($Executable -in $SourcePythonPaths)) {
+        return $true
+    }
+    if (-not $CommandLine) {
+        return $false
+    }
+    $trimmed = $CommandLine.TrimStart()
+    foreach ($candidate in $SourcePythonPaths) {
+        if ($trimmed.StartsWith('"' + $candidate + '"', [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+        if ($trimmed.Equals($candidate, [StringComparison]::OrdinalIgnoreCase) -or
+            $trimmed.StartsWith($candidate + ' ', [StringComparison]::OrdinalIgnoreCase) -or
+            $trimmed.StartsWith($candidate + "`t", [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Assert-CurrentSourceProcesses {
     $sourcePython = @(
         [IO.Path]::GetFullPath($python).ToLowerInvariant(),
@@ -116,7 +143,7 @@ function Assert-CurrentSourceProcesses {
         else {
             ''
         }
-        if ($executable -notin $sourcePython) {
+        if (-not (Test-SourcePythonProcess -Executable $executable -CommandLine $process.CommandLine -SourcePythonPaths $sourcePython)) {
             throw "检测到打包版或其他环境的 OnlineTrader 仍在运行（PID $($process.ProcessId)）。请先从托盘安全退出 OnlineTrader，再双击源码启动器。"
         }
         $created = if ($process.CreationDate -is [DateTime]) {

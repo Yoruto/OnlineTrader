@@ -2301,10 +2301,9 @@ class ExplicitOrderController:
                     prior_cancel = order.pop('prior_cancel_status', None)
                     order['cancel_status'] = prior_cancel
                     order['local_cancel_rejection'] = {'effect_id': effect['id'], **details}
-                    if details.get('error_code') == 'E_DSV_MARKET_PHASE':
-                        if prior_cancel is None:
-                            order['cancel_attempt'] = max(0, int(order.get('cancel_attempt') or 1) - 1)
-                    elif is_ext_cancel:
+                    if prior_cancel is None:
+                        order['cancel_attempt'] = max(0, int(order.get('cancel_attempt') or 1) - 1)
+                    if details.get('error_code') != 'E_DSV_MARKET_PHASE' and is_ext_cancel:
                         order['cancel_failure_count'] = int(order.get('cancel_failure_count') or 0) + 1
                 else:
                     order.pop('prior_cancel_status', None)

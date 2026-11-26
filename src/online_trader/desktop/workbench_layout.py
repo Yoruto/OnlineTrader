@@ -1109,6 +1109,13 @@ class WorkbenchLayout:
         self.last_state = None
         self.last_log_text = None
         self.visible_log_lines = []
+        self._log_text_dirty = False
+        self._log_records_dirty = False
+        self._pending_log_recent = []
+        self._pending_log_codes = []
+        self._pending_log_keys = []
+        self._executor_log_cache = None
+        self._last_tab_widget = None
         self.log_tails = {}
         self.log_binding = None
         self.log_resolution_at = 0.0
@@ -1146,6 +1153,17 @@ class WorkbenchLayout:
         self._saved_next_boot_profile = None
         self._preserving_trade_panel_widgets = False
         self.symbol_feedback_label = None
+        self._log_poll_timer = QTimer(window)
+        self._log_poll_timer.setInterval(1000)
+        self._log_poll_timer.timeout.connect(self._schedule_log_update)
+        self._log_update_pending_timer = QTimer(window)
+        self._log_update_pending_timer.setSingleShot(True)
+        self._log_update_pending_timer.setInterval(0)
+        self._log_update_pending_timer.timeout.connect(self.update_logs)
+        self._log_search_timer = QTimer(window)
+        self._log_search_timer.setSingleShot(True)
+        self._log_search_timer.setInterval(200)
+        self._log_search_timer.timeout.connect(self._schedule_log_update)
 
         original = window.takeCentralWidget()
         for widget in (window.connection_label, window.account_label, window.kernel_label,
@@ -1215,8 +1233,9 @@ class WorkbenchLayout:
         if self.settings.value('template_directory','',str):
             self.parameter_dialog()
         self.tabs.currentChanged.connect(self.page_changed)
+        self._last_tab_widget = self.tabs.currentWidget()
         self.parameter_sections.currentChanged.connect(self._on_parameter_section_changed)
-        self.diagnostic_sections.currentChanged.connect(self.update_logs)
+        self.diagnostic_sections.currentChanged.connect(self._schedule_log_update)
         self.render_home()
         self.workspace_clock = QLabel()
         self.connection_recovery_label = QLabel()
@@ -1233,13 +1252,13 @@ class WorkbenchLayout:
         self.update_workspace_clock()
         self.log_timer = QTimer(window)
         self.log_timer.setInterval(400)
-        self.log_timer.timeout.connect(self.update_logs)
         self.log_timer.timeout.connect(self.update_workspace_clock)
         from online_trader.desktop.ui_hang_monitor import UiHangMonitor
         self.hang_monitor = UiHangMonitor(log_dir_getter=self._hang_diagnostic_directory)
         self.log_timer.timeout.connect(self.hang_monitor.heartbeat)
         self.hang_monitor.start()
         self.log_timer.start()
+        self._log_poll_timer.start()
         for grid in (*self.tables.values(), window.cycles):
             configure_table(grid)
 
@@ -1319,9 +1338,13 @@ class WorkbenchLayout:
         self._sync_trade_panel_draft(update_calculator=True, create_dialog=False)
 
     def page_changed(self, _):
-        self._sync_trade_panel_draft(update_calculator=True, create_dialog=False)
-        self.window.notice_label.setVisible(self.tabs.currentWidget() is not self.home_tab)
-        self.update_logs()
+        previous = getattr(self, '_last_tab_widget', None)
+        current = self.tabs.currentWidget()
+        self._last_tab_widget = current
+        if previous is self.parameter_tab:
+            self._sync_trade_panel_draft(update_calculator=True, create_dialog=False)
+        self.window.notice_label.setVisible(current is not self.home_tab)
+        self._schedule_log_update()
 
     def show_details(self, page):
         for section, tabs in self.sections.items():
@@ -1845,6 +1868,14 @@ class WorkbenchLayout:
             self.window._settings_dialog.set_preview_profile(profile, emit_signal=False)
         self.set_parameter_feedback('新合约配置已保存到启动配置（OnlineTrader-overrides.json），重启后台服务后生效。')
         self.render_parameters(profile)
+
+    def clear_next_boot_saved(self, profile=None):
+        self._saved_next_boot_hash = None
+        self._saved_next_boot_profile = None
+        target = profile if profile is not None else self.profile
+        if self.window._settings_dialog is not None:
+            self.window._settings_dialog.set_preview_profile(target, emit_signal=False)
+        self.render_parameters(target)
 
     def sync_runtime_profile(self, view):
         raw = (view or {}).get('configuration', {}).get('strategy_profile')
@@ -2469,6 +2500,12 @@ class WorkbenchLayout:
         if not preserve_logs:
             self.visible_log_lines.clear()
             self.last_log_text = None
+            self._log_text_dirty = False
+            self._log_records_dirty = False
+            self._pending_log_recent = []
+            self._pending_log_codes = []
+            self._pending_log_keys = []
+            self._executor_log_cache = None
             self.log_text.clear()
             self.log_record_keys = []
             self.log_records.setRowCount(0)
@@ -2867,6 +2904,28 @@ class WorkbenchLayout:
 
     def revert_trade_parameters(self):
         dialog = self.window._settings_dialog
+        panel = getattr(self, 'trade_params_panel', None)
+        saved_next = self._saved_next_boot_profile
+        if saved_next is not None:
+            has_unsaved = panel is not None and panel.has_unsaved_changes()
+            if has_unsaved:
+                if dialog is not None:
+                    dialog.set_preview_profile(saved_next, emit_signal=False)
+                self.render_parameters(saved_next)
+                self.set_parameter_feedback('已撤销未保存修改，恢复为已保存的下次启动配置（OnlineTrader-overrides.json）。')
+                return
+            store, _ = self.window._portable_store_and_account()
+            if store is not None:
+                try:
+                    store.save_profile(self.profile)
+                except (TraderError, OSError) as error:
+                    message = f'未能撤销已保存的启动配置：{error}'
+                    self.set_parameter_feedback(message, error=True)
+                    QMessageBox.critical(self.window, '撤销配置失败', message)
+                    return
+            self.clear_next_boot_saved(self.profile)
+            self.set_parameter_feedback('已撤销下次启动配置，恢复为当前运行配置。')
+            return
         if dialog is not None:
             dialog.set_preview_profile(self.profile, emit_signal=False)
         self.render_parameters(self.profile)
@@ -3163,7 +3222,7 @@ class WorkbenchLayout:
                        if row['ready'] else f'{code} 行情未就绪')
             self.add_activity(message)
         self.window.show_home_feedback(f'行情订阅完成 · {sum(row["ready"] for row in rows)} / {len(rows)} 个品种就绪。')
-        self.update_logs()
+        self._schedule_log_update()
 
     def reference_quotes_failed(self, code):
         account_id = self._active_market_account_id()
@@ -4160,7 +4219,7 @@ class WorkbenchLayout:
         self.log_contract_filter.currentTextChanged.connect(self.update_logs)
         self.log_search = QLineEdit()
         self.log_search.setPlaceholderText('搜索已加载日志')
-        self.log_search.textChanged.connect(self.update_logs)
+        self.log_search.textChanged.connect(self._log_search_timer.start)
         self.log_count = QLabel('0 行')
         self.log_source_status = QLabel('日志来源未绑定')
         layout.addLayout(row(self.log_time_filter, self.log_contract_filter, self.log_filter,
@@ -4197,6 +4256,7 @@ class WorkbenchLayout:
         self.log_text.setReadOnly(True)
         self.log_text.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.log_view_tabs.addTab(self.log_text, '原始文本')
+        self.log_view_tabs.currentChanged.connect(self._on_log_view_tab_changed)
         layout.addWidget(self.log_view_tabs, 1)
         self.render_log_detail()
 
@@ -4370,7 +4430,23 @@ class WorkbenchLayout:
     def executor_log(self, run):
         phases = []
         run_identity = self.log_binding[0]
-        for path in (executor_log_path(run), *sorted(run.glob('phase-*.json'))):
+        phase_paths = (executor_log_path(run), *sorted(run.glob('phase-*.json')))
+        extra_paths = (
+            run / 'startup-failure.json',
+            run / 'target-owner-status.json',
+            run / 'runtime-failure.json',
+            run / 'target-owner-diagnostics.json',
+            run.with_name(run.name + '.operation-log-recovery.json'),
+            run / 'strategy-log.jsonl',
+            run / 'order-blocking-log.jsonl',
+        )
+        all_paths = (*phase_paths, *extra_paths)
+        tail_versions = tuple((str(path), self.log_tail(path).version) for path in all_paths)
+        cache_key = (str(run), run_identity, tail_versions)
+        cached = getattr(self, '_executor_log_cache', None)
+        if cached is not None and cached[0] == cache_key:
+            return list(cached[1])
+        for path in phase_paths:
             for record in self.log_tail(path).read(path):
                 phase = record.get('phase')
                 if not isinstance(phase, str):
@@ -4530,6 +4606,7 @@ class WorkbenchLayout:
                    else '收敛' if event == 'CONVERGENCE_ACTION'
                    else '阻挡')
             phases.append(WorkbenchLogLine(f'[{at}] [{tag}] {" · ".join(parts)}', category, moment))
+        self._executor_log_cache = (cache_key, list(phases))
         return phases
 
     def comparison_logs(self, run):
@@ -4604,6 +4681,50 @@ class WorkbenchLayout:
                 product.append(WorkbenchLogLine(f"[{at}] [执行器] {label} {plan.get('contract_id','—')} {detail}".rstrip(), category, moment))
         return product, dsv
 
+    def _schedule_log_update(self, *_):
+        if (self.tabs.currentWidget() is not self.diagnostic_sections.parentWidget()
+                or self.diagnostic_sections.currentWidget() is not self.log_tab):
+            return
+        timer = getattr(self, '_log_update_pending_timer', None)
+        if timer is not None:
+            if not timer.isActive():
+                timer.start()
+        else:
+            self.update_logs()
+
+    def _render_log_text(self):
+        content = '\n'.join(self.visible_log_lines) or '当前没有可显示的运行记录'
+        if content != self.last_log_text:
+            self.last_log_text = content
+            scrollbar = self.log_text.verticalScrollBar()
+            position = scrollbar.value()
+            follow = position >= scrollbar.maximum() - 4
+            self.log_text.setPlainText(content)
+            scrollbar.setValue(scrollbar.maximum() if follow else position)
+        self._log_text_dirty = False
+
+    def _render_log_records(self):
+        keys = getattr(self, '_pending_log_keys', [])
+        if keys != getattr(self, 'log_record_keys', None):
+            self.log_record_keys = keys
+            rows = []
+            codes = getattr(self, '_pending_log_codes', ())
+            for line in getattr(self, '_pending_log_recent', ()):
+                message = line.text.split('] ', 2)[-1]
+                code = next((code for code in codes if code in message), '—')
+                severity = {'error': '异常', 'warning': '警告'}.get(line.category, '信息')
+                rows.append((line.timestamp.strftime('%H:%M:%S') if line.timestamp else '—', severity, code, message))
+            self.fill_selectable(self.log_records, rows, keys)
+            self.render_log_detail()
+        self._log_records_dirty = False
+
+    def _on_log_view_tab_changed(self, _index):
+        if self.log_view_tabs.currentWidget() is self.log_text:
+            if getattr(self, '_log_text_dirty', False) or self.last_log_text is None:
+                self._render_log_text()
+        elif getattr(self, '_log_records_dirty', False):
+            self._render_log_records()
+
     def update_logs(self, *_):
         if (self.tabs.currentWidget() is not self.diagnostic_sections.parentWidget()
                 or self.diagnostic_sections.currentWidget() is not self.log_tab):
@@ -4674,25 +4795,16 @@ class WorkbenchLayout:
         self.visible_log_lines = [line.text for line in visible]
         recent = visible[-200:][::-1]
         keys = [(line.text, line.timestamp) for line in recent]
-        if keys != getattr(self, 'log_record_keys', None):
-            self.log_record_keys = keys
-            rows = []
-            for line in recent:
-                message = line.text.split('] ', 2)[-1]
-                code = next((code for code in codes if code in message), '—')
-                severity = {'error': '异常', 'warning': '警告'}.get(line.category, '信息')
-                rows.append((line.timestamp.strftime('%H:%M:%S') if line.timestamp else '—', severity, code, message))
-            self.fill_selectable(self.log_records, rows, keys)
-            self.render_log_detail()
-        content = '\n'.join(self.visible_log_lines) or '当前没有可显示的运行记录'
+        self._pending_log_recent = recent
+        self._pending_log_codes = codes
+        self._pending_log_keys = keys
         self.log_count.setText(f'{len(self.visible_log_lines)} 行')
-        if content != self.last_log_text:
-            self.last_log_text = content
-            scrollbar = self.log_text.verticalScrollBar()
-            position = scrollbar.value()
-            follow = position >= scrollbar.maximum()-4
-            self.log_text.setPlainText(content)
-            scrollbar.setValue(scrollbar.maximum() if follow else position)
+        if self.log_view_tabs.currentWidget() is self.log_text:
+            self._log_records_dirty = keys != getattr(self, 'log_record_keys', None)
+            self._render_log_text()
+        else:
+            self._render_log_records()
+            self._log_text_dirty = True
         self._last_log_update_signature = update_signature
 
     def instruments_page(self, layout):
@@ -5188,4 +5300,4 @@ class WorkbenchLayout:
             self.last_state = state
             self.add_activity(self.window.connection_detail.text())
         self.render_dashboard_events(view)
-        self.update_logs()
+        self._schedule_log_update()
