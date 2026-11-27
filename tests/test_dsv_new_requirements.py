@@ -1,6 +1,6 @@
 import unittest
 from online_trader.configuration.baseline import load_confirmed_baseline
-from online_trader.dsv_core.transition import ordinary_entry
+from online_trader.dsv_core.transition import continuation_entry, ordinary_entry
 
 
 def _base_inputs():
@@ -64,6 +64,7 @@ class DsvNewRequirementsTests(unittest.TestCase):
     def test_morning_open_gap_over_3pct_without_night_fill_blocks_entry(self):
         """Rule 4: If night had no open fill, morning open gap > 3% of open_offset must block entry."""
         state, frame, market, spec, settings = _base_inputs()
+        settings["no_open_after_open"] = False
         market["opening_session"] = True
         market["tick"]["native_time"] = "2026-11-09T09:00:10+08:00"
         frame["wall_time"] = "2026-11-09T09:00:10+08:00"
@@ -71,7 +72,28 @@ class DsvNewRequirementsTests(unittest.TestCase):
         market["tick"]["last"] = "1057"
         market["tick"]["ask1"] = "1057"
         res = ordinary_entry(state, frame, market, spec, settings, active_symbols=0, open_symbols=0)
+        self.assertEqual(res["reason"], "MORNING_OPEN_GAP_BLOCK")
         self.assertNotIn("target", res)
+
+        # If night had an open fill, 5% opening chase window still allows it
+        state["night_had_open_fill"] = True
+        res_with_fill = ordinary_entry(state, frame, market, spec, settings, active_symbols=0, open_symbols=0)
+        self.assertIn("target", res_with_fill)
+
+    def test_continuation_geometry_filter_blocks_on_exact_equality(self):
+        """Rule 4: continuation_entry must also block when high - low >= 2 * opening - stop."""
+        state, frame, market, spec, settings = _base_inputs()
+        settings["no_open_after_open"] = False
+        market["opening_session"] = True
+        market["tick"]["native_time"] = "2026-11-09T09:00:10+08:00"
+        frame["wall_time"] = "2026-11-09T09:00:10+08:00"
+        market["tick"]["day_high"] = "1094"
+        market["tick"]["day_low"] = "1000"
+        market["tick"]["last"] = "1056"
+        market["tick"]["ask1"] = "1056"
+        state["night_reference"] = {"complete": True, "high": "1094", "low": "1000", "last": "1060"}
+        res = continuation_entry(state, frame, market, spec, settings, active_symbols=0, open_symbols=0)
+        self.assertIsNone(res)
 
 
 if __name__ == "__main__":

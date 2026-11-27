@@ -100,6 +100,17 @@ def _opening_observation(state, market, start, last, lines, stop, profit, spec, 
     return meta, None
 
 
+def _morning_gap_blocked(state, market, direction, last, theory, opening):
+    """Block morning entry when night had no open fill and open price gaps > 3% of open_offset."""
+    if not market.get('opening_session') or state.get('night_had_open_fill'):
+        return False
+    open_price = price_value(market.get('morning_open_price') or market['tick'].get('open'))
+    if open_price is None:
+        open_price = last
+    gap = (open_price - theory) if direction == 'LONG' else (theory - open_price)
+    return gap > opening * 0.03
+
+
 def continuation_entry(state, frame, market, spec, settings, *, active_symbols, open_symbols):
     tick, night = market['tick'], state.get('night_reference')
     if (not settings['continuation_entry'] or state.get('continuation_attempted') or
@@ -121,13 +132,16 @@ def continuation_entry(state, frame, market, spec, settings, *, active_symbols, 
         return None
     maximum = geometry_limit(opening, stop)
     wait = (_clock(frame, market, 'opening') - start).total_seconds()
-    if (maximum > 0 and high - low > maximum or settings['no_open_after_open'] and
+    if (maximum > 0 and high - low >= maximum or settings['no_open_after_open'] and
             not settings['continuation_ignore_no_open'] and 0 <= wait < float(settings['no_open_after_open_minutes']) * 60):
         night.pop('fallback', None)
         return None
     direction = continuation_direction(last, float(night['last']), float(night['high']), float(night['low']),
                                        opening, night.get('fallback'))
     if direction is None or settings['max_symbols_enabled'] and open_symbols >= settings['max_symbols_on']:
+        return None
+    cont_theory = float(night['low']) + opening if direction == 'LONG' else float(night['high']) - opening
+    if _morning_gap_blocked(state, market, direction, last, cont_theory, opening):
         return None
     lots = _lots(market, settings, spec, active_symbols)
     if not lots or not market.get('min_order_qty', 1) <= lots <= market.get('max_order_qty', 2_147_483_647):
@@ -238,6 +252,8 @@ def _ordinary_target(state, frame, market, spec, settings, active_symbols, open_
     if settings['max_symbols_enabled'] and open_symbols >= settings['max_symbols_on']:
         return {'reason': 'ACTIVE_SYMBOL_LIMIT', 'consume': bar}
     theory = lines[direction]
+    if _morning_gap_blocked(state, market, direction, last, theory, opening):
+        return {'reason': 'MORNING_OPEN_GAP_BLOCK', 'consume': bar}
     previous_stop = state.get('last_stop')
     if previous_stop and previous_stop['direction'] == direction:
         if settings['stop_cooldown_enabled'] and previous_stop.get('until') is not None:
