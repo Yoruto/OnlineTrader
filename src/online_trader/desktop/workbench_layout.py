@@ -351,6 +351,7 @@ OWNER_RECOVERY_MESSAGES = {
     'E_DSV_SDK_CLOCK': 'SDK 时间与本次交易日无法一致核对',
     'E_DSV_NIGHT_BOUNDARY': '夜盘交易日边界无法确认',
     'E_CLOCK_INPUT': '本机时间输入无法用于安全交易',
+    'OPENING_SCOPE_EXPIRED': '当前交易日历或授权窗口已过期，正在等待新交易日日历自动更新（如遇节假日或持续未恢复请重启程序）',
 }
 
 DIAGNOSTIC_EVENT_MESSAGES = {

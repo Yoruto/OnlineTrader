@@ -449,8 +449,10 @@ class CommandBus(QObject):
     _DEFINITE_SUBMIT_REJECTIONS = {
         'E_AUTH', 'E_BUSY', 'E_CAPABILITY', 'E_CONFIG_EDIT', 'E_CONTEXT_EXPIRED',
         'E_BOOT_MISMATCH', 'E_NOT_READY', 'E_REVISION_CONFLICT', 'E_SCHEMA', 'E_SCOPE',
-        'E_OWNERSHIP', 'E_RULE_UNAPPROVED', 'E_UNSUPPORTED',
-        'E_DSV_COMMAND', 'E_DSV_SCOPE', 'E_DSV_SDK_CLOCK', 'E_DSV_SYNC',
+        'E_OWNERSHIP', 'E_RULE_UNAPPROVED', 'E_UNSUPPORTED', 'E_DUPLICATE_CONFLICT',
+        'E_STARTUP_METADATA', 'E_CALENDAR_INCOMPLETE', 'E_ONLINE_SCOPE',
+        'E_DSV_COMMAND', 'E_DSV_SCOPE', 'E_DSV_SDK_CLOCK', 'E_DSV_SDK_SCOPE',
+        'E_DSV_SDK_SYNC', 'E_DSV_SYNC', 'E_DSV_DUPLICATE_CONFLICT',
         'E_DSV_NATIVE_ID', 'E_DSV_OWNERSHIP',
     }
 
@@ -550,6 +552,24 @@ class CommandBus(QObject):
             self._requests.pop(request_id, None)
             raise
         self.feedback.emit(f'正在查询原命令 {command_id}。')
+
+    def acknowledge_unknown(self, command_id):
+        """Explicitly release an unresolved UNKNOWN command after user verification."""
+        self._require_pending_storage()
+        prior = self.store.pending.get(command_id)
+        if prior is None:
+            raise TraderError('E_OWNERSHIP', '只能解除本次工作台会话中保留的原命令 ID')
+        if prior.status not in {PendingCommandStatus.OUTCOME_UNKNOWN, PendingCommandStatus.SUBMISSION_UNKNOWN}:
+            raise TraderError('E_NOT_READY', '该命令仍在处理中，暂不允许解除锁定')
+        try:
+            records = self._registry.remove(command_id, prior.account_key, prior.operation)
+        except TraderError as error:
+            self._record_storage_error(error)
+            raise
+        cleared = replace(prior, status=PendingCommandStatus.REJECTED, reason='USER_ACKNOWLEDGED_UNKNOWN')
+        self._replace_pending(records)
+        self.command_changed.emit(cleared)
+        self.feedback.emit(f'已人工确认解除未决命令 {command_id} 的本地锁定；请核对持仓与委托后再继续操作。')
 
     @property
     def has_inflight(self):

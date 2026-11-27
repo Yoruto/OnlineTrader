@@ -362,11 +362,18 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
 
         contracts = tuple(grant.value.get('contracts', ()))
         close_deadlines = _build_close_deadlines(calendar, contracts)
+        loop_state['close_deadlines_key'] = (calendar.content_hash, contracts)
+
+        def _active_scope():
+            active_cal = getattr(owner.adapter, 'calendar', None) or calendar
+            active_contracts = tuple(getattr(owner.adapter, 'contracts', ()) or contracts)
+            return active_cal, active_contracts
 
         def current_trading_day(current_day=None, now=None):
+            active_cal, active_contracts = _active_scope()
             base_day = current_day or owner.snapshot().get('trading_day') or grant.value['trading_day']
             return resolve_active_trading_day(
-                calendar, contracts, base_day, now, clock=clock)
+                active_cal, active_contracts, base_day, now, clock=clock)
 
         def is_complete():
             return bool(connection.broker_connected and connection.complete())
@@ -377,6 +384,7 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
         )
 
         def tick():
+            nonlocal close_deadlines
             execute_owner_tick(
                 owner, binding=binding, current_trading_day=current_trading_day,
                 is_complete=is_complete, history_writer=history_writer,
@@ -387,6 +395,11 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
             if diagnostic_report_request is None:
                 return
             try:
+                active_cal, active_contracts = _active_scope()
+                scope_key = (active_cal.content_hash, active_contracts)
+                if scope_key != loop_state.get('close_deadlines_key'):
+                    close_deadlines = _build_close_deadlines(active_cal, active_contracts)
+                    loop_state['close_deadlines_key'] = scope_key
                 active_day = owner.snapshot().get('trading_day')
                 if active_day:
                     loop_state['diagnostic_observed_days'].add(active_day)
@@ -395,7 +408,7 @@ def run_target_owner(*, grant, profile, calendar, credentials, output, pipe,
                     clock=clock,
                     loop_state=loop_state,
                     boot_id=binding.boot_id,
-                    calendar_hash=calendar.content_hash,
+                    calendar_hash=active_cal.content_hash,
                     diagnostic_sink=diagnostic_sink,
                     diagnostic_report_request=diagnostic_report_request,
                     allowed_days=loop_state['diagnostic_observed_days'],

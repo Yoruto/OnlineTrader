@@ -547,6 +547,7 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
     storage_failed = bool(snapshot.get('storage_failed', False))
     clock_fault = snapshot.get('clock_recovery_required')
     owner_fault = snapshot.get('owner_fault_code')
+    scope_expired = bool(snapshot.get('scope_expired_at'))
     maintenance = snapshot.get('maintenance')
     responsibility = snapshot.get('responsibility_summary')
     if not isinstance(responsibility, dict):
@@ -579,11 +580,12 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
                       (responsibility['blockers'][0] if responsibility.get('blockers') else 'RUNTIME_NOT_READY'))
         elif operation == 'ARM_ENTRIES':
             allowed = (synchronized and not snapshot['running'] and not clock_fault
-                       and not owner_fault and maintenance is None)
+                       and not owner_fault and not scope_expired and maintenance is None)
             reason = (None if allowed else
                       'MAINTENANCE_IN_FLIGHT' if maintenance is not None else
                       'CLOCK_FAULT' if clock_fault else
                       owner_fault if owner_fault else
+                      'SCOPE_EXPIRED' if scope_expired else
                       'ALREADY_ARMED' if snapshot['running'] else 'RUNTIME_NOT_READY')
         elif operation == 'SAVE_DSV_PARAMETERS':
             allowed = synchronized and not clock_fault and not owner_fault and maintenance is None
@@ -652,6 +654,8 @@ def workbench_view(snapshot, *, profile, adapter=None, configuration_revision, p
         if owner_fault_detail:
             block['detail'] = owner_fault_detail
         blocks.append(block)
+    if scope_expired:
+        blocks.append({'reason_code': 'OPENING_SCOPE_EXPIRED', 'active': True})
     if isinstance(market_health, dict) and market_health.get('feed_entry_blocked') and synchronized and not clock_fault and not owner_fault:
         blocks.append({'reason_code': 'MARKET_FEED_' + str(market_health.get('status') or 'DEGRADED'), 'active': True})
     observed_at_utc = _utc_now()

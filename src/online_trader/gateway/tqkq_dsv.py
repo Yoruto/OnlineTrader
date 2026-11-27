@@ -367,6 +367,12 @@ class TqKqDsvPort(TqKqPort):
             raise TraderError('E_ONLINE_SCOPE','The native adapter calendar differs from the strategy grant')
         self.calendar=calendar
 
+    def update_scope(self,grant,calendar):
+        if calendar.content_hash!=grant.value['calendar_hash']:
+            raise TraderError('E_ONLINE_SCOPE','The native adapter calendar differs from the strategy grant')
+        self.grant=grant
+        self.calendar=calendar
+
     def snapshot(self, *, now=None):
         value=super().snapshot()
         if self.calendar is None:raise TraderError('E_CALENDAR','Explicit strategy calendar is required')

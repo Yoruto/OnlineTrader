@@ -55,5 +55,5 @@ Runtime 按合约独立计算市场阶段与权限（`market_phase`、`can_open`
 
 - **三档 Owner 异常分类**：`TRANSIENT_DISCONNECT`（瞬时断连，保留授权代际并重连）、`PERSISTENT_DISARM`（持久故障，解除开仓权限并置 `NEEDS_REVIEW` + `recovery_required`）、`FAIL_STOP`（存储或核心不变量破坏，安全停机）。`ControlServer` 遇未预期异常关闭客户端连接并 fail-closed。
 - **授权代际（`authority_generation`）**：自动 `arm=True` 绑定当前代际；人工 `STOP`/`PAUSE` 或 `PERSISTENT_DISARM` 立即作废代际防复活，瞬时断线重连保留代际。
-- **交易日与时钟**：`resolve_active_trading_day()` 仅在所有作用域日历 `complete=True` 且活跃合约交易日一致时推进，冲突则 fail-closed 报 `E_DSV_SCOPE`。执行器使用应用内 NTP 校准的 UTC（单调时钟推进）；校时异常时暂停新开仓，同次启动内可凭原账户原账本 UTC 锚点（最长 15 分钟）继续维护既有持仓保护，超时或重启需重新授时。
+- **交易日与时钟**：`resolve_active_trading_day()` 仅在所有作用域日历 `complete=True` 且活跃合约交易日一致时推进，冲突则 fail-closed 报 `E_DSV_SCOPE`。Standalone 长时跨日运行超出原日历/窗口覆盖时，由 Owner 按当前合约行情与 SDK 交易日历自动续展下一交易日并同步更新连接作用域（保持 `resume_entries_on_day_change=False`，换日后维持 `DISARMED`；节假日前后未确认夜盘安排仍 fail-closed）。执行器使用应用内 NTP 校准的 UTC（单调时钟推进）；校时异常时暂停新开仓，同次启动内可凭原账户原账本 UTC 锚点（最长 15 分钟）继续维护既有持仓保护，超时或重启需重新授时。
 - **合并交易所平仓路由**：`DCE`、`CZCE`、`CFFEX`、`GFEX` 平仓路由显式启用 `historical_first_on_combined=True`，`SHFE` / `INE` 按今昨仓严格分桶路由（不静默回退错误仓位类型）。

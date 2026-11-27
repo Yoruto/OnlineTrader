@@ -149,6 +149,7 @@ class DsvSdkAdapter:
         self._trading_status_objs = {}
         self._trading_status_failed = set()
         self._broker_phase_overrides = {}
+        self._last_calendar_refresh_attempt_mono = None
 
     def matches_online_scope(self, account, provider, *, owner_mode='REPLACEMENT'):
         return (self.grant is not None and self.owner_mode == owner_mode
@@ -436,6 +437,157 @@ class DsvSdkAdapter:
         finally:
             self.enabled = previous_enabled
 
+    def _needs_standalone_calendar_refresh(self, sample):
+        if getattr(self, 'owner_mode', None) != 'STANDALONE':
+            return False
+        if self.grant is None or self.calendar is None or not self.contracts:
+            return False
+        if not callable(getattr(self.api, 'get_trading_calendar', None)):
+            return False
+        not_after = datetime.fromisoformat(self.grant.value['not_after_utc'].replace('Z', '+00:00'))
+        if sample.utc > not_after:
+            return True
+        return any(not self.calendar.query(code, sample.now_utc)['complete'] for code in self.contracts)
+
+    def _maybe_refresh_standalone_calendar(self, session, sample):
+        """Extend Standalone calendar and grant into the next trading day without auto-arming."""
+        if not self._needs_standalone_calendar_refresh(sample):
+            return False
+        now_mono = time.monotonic()
+        last_attempt = getattr(self, '_last_calendar_refresh_attempt_mono', None)
+        if last_attempt is not None and now_mono - last_attempt < 30.0:
+            return False
+        self._last_calendar_refresh_attempt_mono = now_mono
+        try:
+            local = sample.utc.astimezone(_BEIJING)
+            local_day = local.date()
+            schedules = {}
+            for code in self.contracts:
+                quote = self.quotes.get(code)
+                if quote is None:
+                    quote = self.api.get_quote(code)
+                    self.quotes[code] = quote
+                if _get(quote, 'expired') is not False:
+                    return False
+                periods = _get(quote, 'trading_time')
+                schedules[code] = {
+                    'day': _periods(_get(periods, 'day'), night=False),
+                    'night': _periods(_get(periods, 'night'), night=True),
+                }
+            cal_start = local_day - timedelta(days=20)
+            cal_end = local_day + timedelta(days=20)
+            calendar_dates = _calendar_dates(
+                self.api.get_trading_calendar(cal_start, cal_end), cal_start, cal_end,
+            )
+            days = sorted(day for day, trading in calendar_dates.items() if trading)
+            candidates = [
+                day for day in days
+                if any(
+                    datetime.combine(day, datetime.min.time(), _BEIJING) + timedelta(seconds=periods['day'][-1][1]) > local
+                    for periods in schedules.values()
+                )
+            ]
+            if not candidates:
+                return False
+            target = candidates[0]
+            target_str = target.isoformat()
+            prior = next((day for day in reversed(days) if day < target), None)
+            if prior is None:
+                return False
+            gap = [prior + timedelta(days=i) for i in range(1, (target - prior).days)]
+            holiday_gap = any(day.weekday() < 5 and not calendar_dates[day] for day in gap)
+            if holiday_gap and local.date() < target and any(schedules[code]['night'] for code in self.contracts):
+                return False
+            session_kinds = (('day', target),) if holiday_gap else (('night', prior), ('day', target))
+            calendar_record = self.calendar.to_record()
+            periods_map = {row['contract_id']: list(row['sessions']) for row in calendar_record['contracts']}
+            all_opened = [datetime.fromisoformat(calendar_record['coverage_from_utc'].replace('Z', '+00:00'))]
+            all_closed = [datetime.fromisoformat(calendar_record['coverage_to_utc'].replace('Z', '+00:00'))]
+            new_closes = []
+            changed = False
+            for code in self.contracts:
+                existing = periods_map.get(code) or []
+                if any(item.get('trading_day') == target_str for item in existing):
+                    for item in existing:
+                        if item.get('trading_day') == target_str:
+                            new_closes.append(datetime.fromisoformat(item['close_utc'].replace('Z', '+00:00')))
+                    continue
+                appended = []
+                for kind, actual in session_kinds:
+                    kind_periods = schedules[code][kind]
+                    midnight = datetime.combine(actual, datetime.min.time(), _BEIJING)
+                    for index, (start_sec, end_sec) in enumerate(kind_periods):
+                        begin = midnight + timedelta(seconds=start_sec)
+                        finish = midnight + timedelta(seconds=end_sec)
+                        appended.append({
+                            'session_id': f'{target_str}-{kind}-{index}',
+                            'trading_day': target_str,
+                            'open_utc': _utc(begin),
+                            'close_utc': _utc(finish),
+                            'is_opening_session': index == 0,
+                            'force_close_at_end': index == len(kind_periods) - 1,
+                        })
+                        all_opened.append(begin.astimezone(timezone.utc))
+                        all_closed.append(finish.astimezone(timezone.utc) + timedelta(seconds=1))
+                        new_closes.append(finish.astimezone(timezone.utc))
+                if not appended:
+                    return False
+                periods_map[code] = existing + appended
+                changed = True
+            if not new_closes:
+                return False
+            merged_record = {
+                'schema_version': calendar_record['schema_version'],
+                'calendar_id': calendar_record['calendar_id'],
+                'calendar_version': calendar_record['calendar_version'],
+                'complete': True,
+                'coverage_from_utc': _utc(min(all_opened)),
+                'coverage_to_utc': _utc(max(all_closed)),
+                'contracts': [{'contract_id': code, 'sessions': sessions} for code, sessions in periods_map.items()],
+            }
+            extended_calendar = TradingCalendar.from_record(merged_record)
+            grant_value = self.grant.value
+            new_days = sorted(set(grant_value.get('trading_days', [grant_value['trading_day']])) | {target_str})
+            if len(new_days) > 366:
+                return False
+            start_dt = datetime.fromisoformat(grant_value['not_before_utc'].replace('Z', '+00:00'))
+            old_end_dt = datetime.fromisoformat(grant_value['not_after_utc'].replace('Z', '+00:00'))
+            new_end_dt = max(old_end_dt, max(new_closes))
+            if (new_end_dt - start_dt).total_seconds() > 366 * 86400:
+                return False
+            if not changed and new_end_dt <= old_end_dt and target_str in grant_value.get('trading_days', ()):
+                return False
+            grant_value['trading_days'] = new_days
+            grant_value['not_after_utc'] = _utc(new_end_dt)
+            grant_value['calendar_hash'] = extended_calendar.content_hash
+            grant_value['resume_entries_on_day_change'] = False
+            extended_grant = DsvSimulationGrant.parse(canonical_bytes(grant_value))
+            extended_periods = {row['contract_id']: row['sessions'] for row in extended_calendar.to_record()['contracts']}
+            day_sets = [{period['trading_day'] for period in extended_periods[code]} for code in self.contracts]
+            extended_days = sorted(set.intersection(*day_sets)) if day_sets else []
+            if target_str not in extended_days:
+                return False
+            self.calendar = extended_calendar
+            self.periods = extended_periods
+            self.trading_days = extended_days
+            self.grant = extended_grant
+            if self.connection is not None and callable(getattr(self.connection, 'update_scope', None)):
+                self.connection.update_scope(extended_grant, extended_calendar)
+            if hasattr(self, '_schedule_display_cache'):
+                self._schedule_display_cache.clear()
+            self._last_idle_signature = None
+            self._foreign_trades = None
+            clearer = getattr(session, 'clear_scope_expired_for_rollover', None)
+            if callable(clearer):
+                clearer(
+                    trading_days=extended_days,
+                    calendar_hash=extended_calendar.content_hash,
+                    not_after_utc=grant_value['not_after_utc'],
+                )
+            return True
+        except (TraderError, OSError, ValueError, TypeError, KeyError):
+            return False
+
     def command(self, session, command, *, prepared_contracts=None):
         """Run a user command through the same owner and committed effect path."""
         state = self._bind(session)
@@ -477,6 +629,8 @@ class DsvSdkAdapter:
                     self.trading_days = prepared_contracts['trading_days']
                     if prepared_contracts['grant'] is not None:
                         self.grant = prepared_contracts['grant']
+                    if self.connection is not None and self.grant is not None and callable(getattr(self.connection, 'update_scope', None)):
+                        self.connection.update_scope(self.grant, self.calendar)
                     for code in added:
                         self.quotes[code] = prepared_contracts['quotes'].get(code) or self.api.get_quote(code)
                         self.minutes[code] = self.api.get_kline_serial(code, 60, data_length=500)
@@ -552,10 +706,16 @@ class DsvSdkAdapter:
                 self.disconnect(session)
                 return {'type': 'DISCONNECTED', 'synchronized': False}
             day_held = False
+            calendar_refreshed = False
             if callable(trading_day):
                 current_day = state['trading_day']
                 day_held = not self._protection_clock_ready() or bool(self._health.get('reason'))
+                if not day_held:
+                    calendar_refreshed = self._maybe_refresh_standalone_calendar(session, sample)
                 trading_day = current_day if day_held else trading_day(current_day, sample.utc)
+            if calendar_refreshed:
+                force_full_round = True
+                state = session.snapshot()
             if not force_full_round and self._can_skip_idle_round(
                 state, sample, trading_day, updated=updated, timers=timers, day_held=day_held,
             ):

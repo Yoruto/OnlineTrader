@@ -341,6 +341,32 @@ class DsvSession:
         self._check_owner()
         self.command({'id': 'sdk-startup-stop-' + uuid4().hex, 'action': 'STOP'})
 
+    def clear_scope_expired_for_rollover(self, *, trading_days, calendar_hash, not_after_utc):
+        """Clear scope_expired_at after Standalone calendar/grant rollover, keeping DISARMED."""
+        self._check_owner()
+        if self._busy:
+            raise TraderError('E_DSV_OWNER', 'Do not reenter the account owner from the order port')
+        if not self._state.get('scope_expired_at'):
+            return False
+        state = copy.deepcopy(self._state)
+        prior = state.pop('scope_expired_at', None)
+        state['running'] = False
+        try:
+            with self._journal.transaction():
+                self._journal.event('OPENING_SCOPE_EXTENDED', {
+                    'previous_scope_expired_at': prior,
+                    'trading_days': list(trading_days),
+                    'calendar_hash': calendar_hash,
+                    'not_after_utc': not_after_utc,
+                    'entry_authority': 'DISARMED',
+                })
+                self._journal.save(state)
+        except sqlite3.Error as error:
+            self._failed = True
+            raise TraderError('E_DSV_STORE', 'Extended scope could not be recorded; owner requires restart') from error
+        self._state = state
+        return True
+
     def disable_entries_for_clock(self):
         self._check_owner()
 

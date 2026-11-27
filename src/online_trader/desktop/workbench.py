@@ -902,6 +902,8 @@ class WorkbenchWindow(StatusWindow):
                     account_pseudonym=self._diagnostic_account_pseudonym,
                     payload={'operation': operation},
                 )
+            if error.code == 'E_PENDING_COMMAND':
+                self._prompt_unresolved_command_recovery(bus, operation)
             return
         if self._diagnostic_sink is not None:
             self._diagnostic_sink.record(
@@ -933,6 +935,44 @@ class WorkbenchWindow(StatusWindow):
             bus.query(command_id)
         except TraderError as error:
             self.show_home_feedback(f'Runtime 回执未查询 · {error.code} · {error}')
+
+    def _prompt_unresolved_command_recovery(self, bus, operation):
+        if self.view is None:
+            return
+        account_key = self.view.get('account_key')
+        candidate = next(
+            (
+                item for item in bus.store.pending.values()
+                if item.account_key == account_key
+                and item.operation == operation
+                and item.status.value in {'OUTCOME_UNKNOWN', 'SUBMISSION_UNKNOWN'}
+            ),
+            None,
+        )
+        if candidate is None:
+            return
+        reason_text = f'（原因：{candidate.reason}）' if candidate.reason else ''
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle('存在结果未知的历史命令')
+        box.setText(
+            f'原命令 {candidate.command_id} 仍保留在本机未决列表{reason_text}，'
+            '因此当前同类操作已被拦截以防重复提交。\n\n'
+            '建议先点击「查询原回执」核实；若原命令未落盘或后台已重启，'
+            '请在确认当前持仓与委托无误后点击「已核对，解除锁定」。'
+        )
+        query_btn = box.addButton('查询原回执', QMessageBox.ButtonRole.ActionRole)
+        clear_btn = box.addButton('已核对，解除锁定', QMessageBox.ButtonRole.AcceptRole)
+        box.addButton('取消', QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is query_btn:
+            self._start_runtime_receipt({'command_id': candidate.command_id})
+        elif clicked is clear_btn:
+            try:
+                bus.acknowledge_unknown(candidate.command_id)
+            except TraderError as ack_error:
+                self.show_home_feedback(f'解除未决命令锁定失败 · {ack_error.code} · {ack_error}')
     def force_recover_workbench(self):
         if self.paired_launcher is not None or self.store is None or self.selected_account is None:
             self._recovery_feedback('请选择普通工作台的模拟账号。')
