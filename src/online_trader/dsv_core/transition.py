@@ -201,7 +201,7 @@ def _ordinary_signal(state, frame, market, spec, settings, active_symbols, open_
     if min(opening, stop, profit) <= 0:
         return {'reason': 'OFFSETS_UNAVAILABLE'}
     lines = trigger_prices(high, low, opening)
-    geometry_block = high - low > geometry_limit(opening, stop)
+    geometry_block = high - low >= geometry_limit(opening, stop)
     bar = tick['candle_id']
     if state['last_signal_bar'] == bar:
         return {'reason': 'GEOMETRY_BLOCK' if geometry_block else 'BAR_CONSUMED'}

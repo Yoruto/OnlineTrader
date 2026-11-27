@@ -150,6 +150,7 @@ class DsvSdkAdapter:
         self._trading_status_failed = set()
         self._broker_phase_overrides = {}
         self._last_calendar_refresh_attempt_mono = None
+        self._last_calendar_refresh_diag = None
 
     def matches_online_scope(self, account, provider, *, owner_mode='REPLACEMENT'):
         return (self.grant is not None and self.owner_mode == owner_mode
@@ -449,6 +450,29 @@ class DsvSdkAdapter:
             return True
         return any(not self.calendar.query(code, sample.now_utc)['complete'] for code in self.contracts)
 
+    def _record_calendar_refresh_failure(self, stage, *, reason=None, error=None):
+        """Emit rate-limited, sanitized diagnostics when Standalone rollover cannot proceed."""
+        now_mono = time.monotonic()
+        raw_code = getattr(error, 'code', None) if error is not None else None
+        error_code = raw_code if isinstance(raw_code, str) and raw_code.startswith('E_') else None
+        exc_type = type(error).__name__ if error is not None else 'NONE'
+        resolved_reason = reason or error_code or exc_type
+        key = (stage, error_code, exc_type, resolved_reason)
+        previous = getattr(self, '_last_calendar_refresh_diag', None)
+        if previous is not None and previous[0] == key and now_mono - previous[1] < 300.0:
+            return
+        self._last_calendar_refresh_diag = (key, now_mono)
+        self._diag().emit(
+            'CALENDAR_ROLLOVER_FAILED',
+            level=logging.WARNING,
+            component='OWNER',
+            priority='HIGH',
+            stage=stage,
+            reason=resolved_reason,
+            category=exc_type,
+            error_code=error_code,
+        )
+
     def _maybe_refresh_standalone_calendar(self, session, sample):
         """Extend Standalone calendar and grant into the next trading day without auto-arming."""
         if not self._needs_standalone_calendar_refresh(sample):
@@ -458,6 +482,7 @@ class DsvSdkAdapter:
         if last_attempt is not None and now_mono - last_attempt < 30.0:
             return False
         self._last_calendar_refresh_attempt_mono = now_mono
+        stage = 'QUOTE_SCHEDULE'
         try:
             local = sample.utc.astimezone(_BEIJING)
             local_day = local.date()
@@ -468,17 +493,19 @@ class DsvSdkAdapter:
                     quote = self.api.get_quote(code)
                     self.quotes[code] = quote
                 if _get(quote, 'expired') is not False:
+                    self._record_calendar_refresh_failure(stage, reason='CONTRACT_EXPIRED')
                     return False
                 periods = _get(quote, 'trading_time')
                 schedules[code] = {
                     'day': _periods(_get(periods, 'day'), night=False),
                     'night': _periods(_get(periods, 'night'), night=True),
                 }
+            stage = 'SDK_CALENDAR_FETCH'
             cal_start = local_day - timedelta(days=20)
             cal_end = local_day + timedelta(days=20)
-            calendar_dates = _calendar_dates(
-                self.api.get_trading_calendar(cal_start, cal_end), cal_start, cal_end,
-            )
+            raw_calendar = self.api.get_trading_calendar(cal_start, cal_end)
+            stage = 'CALENDAR_PARSE'
+            calendar_dates = _calendar_dates(raw_calendar, cal_start, cal_end)
             days = sorted(day for day, trading in calendar_dates.items() if trading)
             candidates = [
                 day for day in days
@@ -488,16 +515,20 @@ class DsvSdkAdapter:
                 )
             ]
             if not candidates:
+                self._record_calendar_refresh_failure(stage, reason='NO_CANDIDATE_DAY')
                 return False
             target = candidates[0]
             target_str = target.isoformat()
             prior = next((day for day in reversed(days) if day < target), None)
             if prior is None:
+                self._record_calendar_refresh_failure(stage, reason='PRIOR_DAY_MISSING')
                 return False
             gap = [prior + timedelta(days=i) for i in range(1, (target - prior).days)]
             holiday_gap = any(day.weekday() < 5 and not calendar_dates[day] for day in gap)
             if holiday_gap and local.date() < target and any(schedules[code]['night'] for code in self.contracts):
+                self._record_calendar_refresh_failure(stage, reason='HOLIDAY_GAP_UNCONFIRMED')
                 return False
+            stage = 'BUILD_CALENDAR'
             session_kinds = (('day', target),) if holiday_gap else (('night', prior), ('day', target))
             calendar_record = self.calendar.to_record()
             periods_map = {row['contract_id']: list(row['sessions']) for row in calendar_record['contracts']}
@@ -531,10 +562,12 @@ class DsvSdkAdapter:
                         all_closed.append(finish.astimezone(timezone.utc) + timedelta(seconds=1))
                         new_closes.append(finish.astimezone(timezone.utc))
                 if not appended:
+                    self._record_calendar_refresh_failure(stage, reason='EMPTY_SESSIONS')
                     return False
                 periods_map[code] = existing + appended
                 changed = True
             if not new_closes:
+                self._record_calendar_refresh_failure(stage, reason='NO_NEW_CLOSES')
                 return False
             merged_record = {
                 'schema_version': calendar_record['schema_version'],
@@ -546,14 +579,17 @@ class DsvSdkAdapter:
                 'contracts': [{'contract_id': code, 'sessions': sessions} for code, sessions in periods_map.items()],
             }
             extended_calendar = TradingCalendar.from_record(merged_record)
+            stage = 'BUILD_GRANT'
             grant_value = self.grant.value
             new_days = sorted(set(grant_value.get('trading_days', [grant_value['trading_day']])) | {target_str})
             if len(new_days) > 366:
+                self._record_calendar_refresh_failure(stage, reason='TRADING_DAYS_LIMIT_EXCEEDED')
                 return False
             start_dt = datetime.fromisoformat(grant_value['not_before_utc'].replace('Z', '+00:00'))
             old_end_dt = datetime.fromisoformat(grant_value['not_after_utc'].replace('Z', '+00:00'))
             new_end_dt = max(old_end_dt, max(new_closes))
             if (new_end_dt - start_dt).total_seconds() > 366 * 86400:
+                self._record_calendar_refresh_failure(stage, reason='GRANT_WINDOW_LIMIT_EXCEEDED')
                 return False
             if not changed and new_end_dt <= old_end_dt and target_str in grant_value.get('trading_days', ()):
                 return False
@@ -566,8 +602,10 @@ class DsvSdkAdapter:
             day_sets = [{period['trading_day'] for period in extended_periods[code]} for code in self.contracts]
             extended_days = sorted(set.intersection(*day_sets)) if day_sets else []
             if target_str not in extended_days:
+                self._record_calendar_refresh_failure(stage, reason='TARGET_DAY_INTERSECTION_MISSING')
                 return False
-        except Exception:
+        except Exception as error:
+            self._record_calendar_refresh_failure(stage, error=error)
             return False
         # Commit journal disarm/rollover state before mutating live adapter scope;
         # storage or owner invariant failures must propagate (never be swallowed).
@@ -588,6 +626,7 @@ class DsvSdkAdapter:
             self._schedule_display_cache.clear()
         self._last_idle_signature = None
         self._foreign_trades = None
+        self._last_calendar_refresh_diag = None
         return True
 
     def command(self, session, command, *, prepared_contracts=None):
