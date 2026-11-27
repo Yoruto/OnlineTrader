@@ -342,19 +342,27 @@ class DsvSession:
         self.command({'id': 'sdk-startup-stop-' + uuid4().hex, 'action': 'STOP'})
 
     def clear_scope_expired_for_rollover(self, *, trading_days, calendar_hash, not_after_utc):
-        """Clear scope_expired_at after Standalone calendar/grant rollover, keeping DISARMED."""
+        """Enforce expired-scope disarm semantics and clear scope_expired_at on Standalone rollover."""
         self._check_owner()
         if self._busy:
             raise TraderError('E_DSV_OWNER', 'Do not reenter the account owner from the order port')
-        if not self._state.get('scope_expired_at'):
-            return False
         state = copy.deepcopy(self._state)
         prior = state.pop('scope_expired_at', None)
+        was_running = bool(state.get('running'))
         state['running'] = False
+        positions_updated = False
+        for row in state['symbols'].values():
+            if position := row['position']:
+                if not position.get('entry_stopped') or position.get('preserve_open_on_stop'):
+                    position.update(entry_stopped=True, preserve_open_on_stop=False)
+                    positions_updated = True
+        if prior is None and not was_running and not positions_updated:
+            return False
         try:
             with self._journal.transaction():
                 self._journal.event('OPENING_SCOPE_EXTENDED', {
                     'previous_scope_expired_at': prior,
+                    'previous_running': was_running,
                     'trading_days': list(trading_days),
                     'calendar_hash': calendar_hash,
                     'not_after_utc': not_after_utc,

@@ -567,26 +567,28 @@ class DsvSdkAdapter:
             extended_days = sorted(set.intersection(*day_sets)) if day_sets else []
             if target_str not in extended_days:
                 return False
-            self.calendar = extended_calendar
-            self.periods = extended_periods
-            self.trading_days = extended_days
-            self.grant = extended_grant
-            if self.connection is not None and callable(getattr(self.connection, 'update_scope', None)):
-                self.connection.update_scope(extended_grant, extended_calendar)
-            if hasattr(self, '_schedule_display_cache'):
-                self._schedule_display_cache.clear()
-            self._last_idle_signature = None
-            self._foreign_trades = None
-            clearer = getattr(session, 'clear_scope_expired_for_rollover', None)
-            if callable(clearer):
-                clearer(
-                    trading_days=extended_days,
-                    calendar_hash=extended_calendar.content_hash,
-                    not_after_utc=grant_value['not_after_utc'],
-                )
-            return True
-        except (TraderError, OSError, ValueError, TypeError, KeyError):
+        except Exception:
             return False
+        # Commit journal disarm/rollover state before mutating live adapter scope;
+        # storage or owner invariant failures must propagate (never be swallowed).
+        clearer = getattr(session, 'clear_scope_expired_for_rollover', None)
+        if callable(clearer):
+            clearer(
+                trading_days=extended_days,
+                calendar_hash=extended_calendar.content_hash,
+                not_after_utc=grant_value['not_after_utc'],
+            )
+        self.calendar = extended_calendar
+        self.periods = extended_periods
+        self.trading_days = extended_days
+        self.grant = extended_grant
+        if self.connection is not None and callable(getattr(self.connection, 'update_scope', None)):
+            self.connection.update_scope(extended_grant, extended_calendar)
+        if hasattr(self, '_schedule_display_cache'):
+            self._schedule_display_cache.clear()
+        self._last_idle_signature = None
+        self._foreign_trades = None
+        return True
 
     def command(self, session, command, *, prepared_contracts=None):
         """Run a user command through the same owner and committed effect path."""

@@ -39,7 +39,9 @@ class PendingCommandRegistry:
                               and item.operation == pending.operation
                               and item.scope_hash in (None, pending.scope_hash)), None)
             if duplicate is not None and duplicate.command_id != pending.command_id:
-                raise TraderError('E_PENDING_COMMAND', f'原命令 {duplicate.command_id} 仍在本次会话处理中')
+                error = TraderError('E_PENDING_COMMAND', f'原命令 {duplicate.command_id} 仍在本次会话处理中')
+                error.blocked_command_id = duplicate.command_id
+                raise error
             if existing is None and len(self._records) >= self.LIMIT:
                 raise TraderError('E_PENDING_CAPACITY', '本次工作台会话的未决命令已满')
             self._records[pending.command_id] = pending

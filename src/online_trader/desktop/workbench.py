@@ -687,14 +687,20 @@ class WorkbenchWindow(StatusWindow):
             self._show_receipt(receipt)
             if pending.status.value in {'COMPLETED', 'REJECTED'}:
                 self.receipt_identity = None
-        elif pending.status.value != 'LOCAL_NOT_ENQUEUED':
+        elif pending.status.value != 'LOCAL_NOT_ENQUEUED' and pending.reason != 'USER_ACKNOWLEDGED_UNKNOWN':
             self.receipt_identity = {'command_id': pending.command_id}
         is_param_cmd = (pending.command_id in self._pending_parameter_command_ids
                         or pending.operation == 'SAVE_DSV_PARAMETERS')
         if is_param_cmd and pending.status.value in {'COMPLETED', 'REJECTED'}:
             self._pending_parameter_command_ids.discard(pending.command_id)
             fallback = self._pending_parameter_fallback.pop(pending.command_id, None)
-            if pending.status.value == 'COMPLETED':
+            if pending.reason == 'USER_ACKNOWLEDGED_UNKNOWN':
+                if fallback is not None:
+                    self._pending_focus_contracts = ()
+                self.dashboard.set_parameter_feedback('已解除原参数保存命令的本地锁定，请以当前工作台显示的有效参数为准。')
+                if self.view is not None:
+                    self.render_view()
+            elif pending.status.value == 'COMPLETED':
                 if fallback is not None:
                     self.dashboard.set_parameter_feedback('新合约已加入运行中策略，正在监控面板同步行情。')
                 else:
@@ -903,7 +909,9 @@ class WorkbenchWindow(StatusWindow):
                     payload={'operation': operation},
                 )
             if error.code == 'E_PENDING_COMMAND':
-                self._prompt_unresolved_command_recovery(bus, operation)
+                self._prompt_unresolved_command_recovery(
+                    bus, operation, blocked_command_id=getattr(error, 'blocked_command_id', None),
+                )
             return
         if self._diagnostic_sink is not None:
             self._diagnostic_sink.record(
@@ -936,20 +944,15 @@ class WorkbenchWindow(StatusWindow):
         except TraderError as error:
             self.show_home_feedback(f'Runtime 回执未查询 · {error.code} · {error}')
 
-    def _prompt_unresolved_command_recovery(self, bus, operation):
-        if self.view is None:
+    def _prompt_unresolved_command_recovery(self, bus, operation, *, blocked_command_id=None):
+        if self.view is None or not blocked_command_id:
             return
         account_key = self.view.get('account_key')
-        candidate = next(
-            (
-                item for item in bus.store.pending.values()
-                if item.account_key == account_key
-                and item.operation == operation
-                and item.status.value in {'OUTCOME_UNKNOWN', 'SUBMISSION_UNKNOWN'}
-            ),
-            None,
-        )
-        if candidate is None:
+        candidate = bus.store.pending.get(blocked_command_id)
+        if (candidate is None
+                or candidate.account_key != account_key
+                or candidate.operation != operation
+                or candidate.status.value not in {'OUTCOME_UNKNOWN', 'SUBMISSION_UNKNOWN'}):
             return
         reason_text = f'（原因：{candidate.reason}）' if candidate.reason else ''
         box = QMessageBox(self)
